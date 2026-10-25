@@ -141,6 +141,13 @@ impl CompanionDb {
         self.transaction(|conn| write_index(conn, case_id, entry, keywords, context))
     }
 
+    /// The ids of the case's entries that have an index row.
+    pub fn indexed_entry_ids(&self, case_id: i64) -> Result<HashSet<i64>> {
+        let mut stmt = self.conn.prepare("SELECT entry_id FROM entry_fts WHERE case_id = ?")?;
+        let rows = stmt.query_map([case_id], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn remove_entry_index(&self, entry_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM entry_fts WHERE entry_id = ?", [entry_id])?;

@@ -1,5 +1,7 @@
 //! The analytical companion: derived data and model-assisted questions, kept in a database of its own.
 
+#[cfg(feature = "gui")]
+pub mod enrich;
 #[doc(hidden)]
 pub mod fake_llm;
 #[cfg(feature = "gui")]
