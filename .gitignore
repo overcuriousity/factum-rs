@@ -6,3 +6,4 @@
 .env
 /vendor
 /THIRD-PARTY-LICENSES.md
+.superpowers/
