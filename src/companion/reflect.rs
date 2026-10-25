@@ -44,6 +44,8 @@ const EXAMPLES: usize = 3;
 const K_NEW: usize = 5;
 const K_QUESTION_DIFF: usize = 3;
 const K_QUESTION_FULL: usize = 5;
+/// Entries enriched before a pass, and shown verbatim in a case's first full pass; the rest are timeline lines.
+const RECENT: usize = 20;
 
 /// Full when forced, on the first pass of a case and on every `FULL_EVERY`th pass.
 pub fn choose_kind(cdb: &CompanionDb, case_id: i64, forced_full: bool) -> Result<PassKind> {
@@ -241,7 +243,10 @@ fn reflect(
 
     index_unindexed(case_db, cdb, case_id)?;
     let new_ids: Vec<i64> = new.iter().map(|e| e.id).collect();
-    let unenriched = cdb.unenriched(case_id, &new_ids)?;
+    // the newest only; the thread's backlog enrichment covers the rest
+    let mut unenriched = cdb.unenriched(case_id, &new_ids)?;
+    unenriched.sort_unstable();
+    let unenriched = unenriched.split_off(unenriched.len().saturating_sub(RECENT));
     if !unenriched.is_empty()
         && let Err(e) = enrich(case_db, cdb, client, case_id, &unenriched)
     {
@@ -260,6 +265,7 @@ fn reflect(
         data: &data,
         guideline,
         goal: &case_settings.goal,
+        last_seen,
         new: &new,
         open: &open,
     };
@@ -445,6 +451,7 @@ struct PromptInput<'a> {
     data: &'a CaseData,
     guideline: &'a str,
     goal: &'a str,
+    last_seen: i64,
     /// entries after the last pass, by leaf index
     new: &'a [&'a Entry],
     open: &'a [Question],
@@ -477,6 +484,14 @@ impl PromptInput<'_> {
             .iter()
             .map(|q| question_line(q.id, q.archetype.as_str(), &q.text, &q.rests_on, q.rating.as_str()))
             .collect();
+        // the first pass of a case shows only the newest entries verbatim, the rest as a compact timeline
+        let verbatim: HashSet<i64> = if self.last_seen == 0 {
+            let mut ids: Vec<i64> = new_ids.iter().copied().collect();
+            ids.sort_unstable();
+            ids.split_off(ids.len().saturating_sub(RECENT)).into_iter().collect()
+        } else {
+            new_ids.clone()
+        };
         // pinned notes are already shown verbatim above
         let (entries_name, entries) = if full {
             let timeline = self
@@ -485,7 +500,7 @@ impl PromptInput<'_> {
                 .iter()
                 .filter(|e| !e.is_pinned)
                 .map(|e| {
-                    if new_ids.contains(&e.id) {
+                    if verbatim.contains(&e.id) {
                         entry_line(e, label(e))
                     } else {
                         timeline_line(e, label(e))

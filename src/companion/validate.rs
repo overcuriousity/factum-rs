@@ -7,14 +7,33 @@ use serde_json::Value;
 use super::questions::{Archetype, NewQuestion, Question, RatedExample, Rating};
 
 /// Cuts the first JSON object out of a model reply (fences and prose dropped) and repairs trailing commas,
-/// single-quoted or bare keys and a cut-off tail. `None` when there is no `{`.
+/// single-quoted or bare keys and a cut-off tail. A `{` in the prose before the object is skipped: the first
+/// candidate whose repair parses wins, else the repair from the first `{`. A candidate inside an earlier one is
+/// not tried, so a broken object never gives way to one of its own items. `None` when there is no `{`.
 pub fn repair_json(text: &str) -> Option<String> {
-    repair_from(text, text.find('{')?)
+    repair_first_parsing(text, &['{'])
 }
 
-/// Like `repair_json`, but the document may start with `[` or `{`, whichever comes first.
+/// Like `repair_json`, but the document may start with `[` or `{`.
 fn repair_json_or_array(text: &str) -> Option<String> {
-    repair_from(text, text.find(['{', '['])?)
+    repair_first_parsing(text, &['{', '['])
+}
+
+fn repair_first_parsing(text: &str, open: &[char]) -> Option<String> {
+    let mut first = None;
+    let mut end = 0;
+    for (start, _) in text.match_indices(open) {
+        if start < end {
+            continue;
+        }
+        let (repaired, consumed) = repair_from(text, start);
+        if serde_json::from_str::<Value>(&repaired).is_ok() {
+            return Some(repaired);
+        }
+        end = start + text[start..].chars().take(consumed).map(char::len_utf8).sum::<usize>();
+        first.get_or_insert(repaired);
+    }
+    first
 }
 
 fn is_bare(c: char) -> bool {
@@ -29,7 +48,8 @@ fn trim_trailing_comma(out: &mut String) {
     }
 }
 
-fn repair_from(text: &str, start: usize) -> Option<String> {
+/// The repaired document from `start` and the number of characters it consumed.
+fn repair_from(text: &str, start: usize) -> (String, usize) {
     let chars: Vec<char> = text[start..].chars().collect();
     let mut out = String::new();
     let mut stack: Vec<char> = Vec::new();
@@ -70,7 +90,7 @@ fn repair_from(text: &str, start: usize) -> Option<String> {
                 // a mismatched closer closes whatever is open
                 out.push(stack.pop().unwrap_or(c));
                 if stack.is_empty() {
-                    return Some(out);
+                    return (out, i + 1);
                 }
             }
             c if is_bare(c) => {
@@ -101,7 +121,7 @@ fn repair_from(text: &str, start: usize) -> Option<String> {
     while let Some(closer) = stack.pop() {
         out.push(closer);
     }
-    Some(out)
+    (out, chars.len())
 }
 
 /// What call two of a pass returns, after parsing.
@@ -347,6 +367,10 @@ mod tests {
     fn repair_strips_fences_and_prose() {
         assert_eq!(
             repair_json("Here is the JSON:\n```json\n{\"a\":1}\n```").unwrap(),
+            "{\"a\":1}"
+        );
+        assert_eq!(
+            repair_json("Fill the {placeholders} first, then:\n{\"a\":1}").unwrap(),
             "{\"a\":1}"
         );
     }

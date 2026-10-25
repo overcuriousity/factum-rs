@@ -293,11 +293,12 @@ impl Companion {
         }
     }
 
-    /// A case the companion has never seen gets its first pass at once; the time of its last pass is shown.
+    /// A case the companion has never seen gets a full first pass after the quiet period, so it can be opted out
+    /// before anything is sent; the time of its last pass is shown.
     fn selected_case(&mut self, case_id: i64) -> Result<()> {
         if self.cdb.case_settings(case_id)?.is_none() && !self.entry_ids(case_id)?.is_empty() {
             self.cdb.ensure_case(case_id)?;
-            self.scheduler.first_seen(case_id);
+            self.scheduler.first_seen(case_id, Instant::now());
         } else {
             self.pick_up_unseen(case_id)?;
         }

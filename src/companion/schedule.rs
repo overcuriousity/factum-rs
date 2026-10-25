@@ -1,5 +1,6 @@
 //! When a case gets its next pass: a quiet period after the last change, a minimum spacing between passes, forced
-//! passes at once, the selected case first. Pure: the caller supplies the clock.
+//! passes at once, a case's first pass after the quiet period (so it can be opted out first), the selected case
+//! first. Pure: the caller supplies the clock.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -16,6 +17,8 @@ struct Pending {
     last_pass: Option<Instant>,
     /// due now and full, regardless of changes and spacing
     forced: bool,
+    /// the next pass is full, after the quiet period
+    full: bool,
 }
 
 #[derive(Default)]
@@ -43,9 +46,12 @@ impl Scheduler {
         self.selected = case_id;
     }
 
-    /// A case the companion has not seen before: due now, full, no quiet period.
-    pub fn first_seen(&mut self, case_id: i64) {
-        self.force(case_id);
+    /// A case the companion has not seen before: full, after the quiet period, so it can be opted out before any
+    /// of its content is sent.
+    pub fn first_seen(&mut self, case_id: i64, now: Instant) {
+        let pending = self.cases.entry(case_id).or_default();
+        pending.last_change = Some(now);
+        pending.full = true;
     }
 
     /// The pass ran (or was given up): the changes so far are seen and the spacing starts.
@@ -54,6 +60,7 @@ impl Scheduler {
         pending.last_change = None;
         pending.last_pass = Some(now);
         pending.forced = false;
+        pending.full = false;
     }
 
     /// A change not yet seen by a pass, or a forced pass, is waiting.
@@ -75,7 +82,7 @@ impl Scheduler {
             .iter()
             .filter(|(_, p)| p.forced || self.settled(p, now))
             .min_by_key(|(id, p)| (!p.forced, self.selected != Some(**id), p.last_change, **id))
-            .map(|(id, p)| (*id, p.forced))
+            .map(|(id, p)| (*id, p.forced || p.full))
     }
 
     fn settled(&self, p: &Pending, now: Instant) -> bool {
@@ -131,14 +138,15 @@ mod tests {
     }
 
     #[test]
-    fn force_and_first_seen_are_due_immediately_and_full() {
+    fn force_is_due_immediately_and_first_seen_after_the_quiet_period_both_full() {
         let now = Instant::now();
         let mut s = Scheduler::new();
         s.force(1);
         assert_eq!(s.next_due(now), Some((1, true)));
         let mut s = Scheduler::new();
-        s.first_seen(1);
-        assert_eq!(s.next_due(now), Some((1, true)));
+        s.first_seen(1, now);
+        assert_eq!(s.next_due(now + secs(29)), None);
+        assert_eq!(s.next_due(now + QUIET_PERIOD), Some((1, true)));
     }
 
     #[test]
