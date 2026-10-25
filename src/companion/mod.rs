@@ -1,6 +1,8 @@
 //! The analytical companion: derived data and model-assisted questions, kept in a database of its own.
 
+pub mod prompts;
 pub mod store;
+pub mod tokens;
 
 use std::path::{Path, PathBuf};
 
