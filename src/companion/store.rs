@@ -87,6 +87,7 @@ CREATE TABLE rated_examples(
     archetype TEXT NOT NULL DEFAULT '',
     embedding BLOB NULL,
     source_case_id INTEGER,
+    source_question_id INTEGER,
     created_utc TEXT NOT NULL
 );
 CREATE VIRTUAL TABLE rated_fts USING fts5(example_id UNINDEXED, body);
