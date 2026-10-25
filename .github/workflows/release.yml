@@ -1,0 +1,199 @@
+name: Release
+
+# Builds the binaries for every new version tag (v2.0.1, ...) and publishes them as a GitHub release:
+#   factum-<target>.tar.gz / .zip      GUI + CLI (Linux builds run on glibc 2.28 and newer)
+#   factum-cli-x86_64-unknown-linux-musl.tar.gz   static command-line build (no GUI), e.g. for Alpine
+#   factum-<version>-vendored-source.tar.gz       source with all dependencies, for offline builds
+#   SHA256SUMS (+ SHA256SUMS.asc when the RELEASE_GPG_KEY secret is set), install.sh, install.ps1
+# Asset names carry no version, so .../releases/latest/download/<asset> always points to the newest release.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build again, e.g. v2.0.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Check version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: tag
+        name: Tag, Cargo.toml and CHANGELOG.md agree
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::tag $tag does not match the version in Cargo.toml ($cargo_version)"; exit 1
+          fi
+          if ! grep -q "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section '## [$version]'"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }} ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, zig: x86_64-unknown-linux-gnu.2.28, name: factum }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, zig: aarch64-unknown-linux-gnu.2.28, name: factum }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, zig: x86_64-unknown-linux-musl, name: factum-cli, flags: --no-default-features }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: factum }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: factum }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: factum, exe: .exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zig
+        run: |
+          python3 -m venv /tmp/zig
+          /tmp/zig/bin/pip install --quiet ziglang==0.17.0 cargo-zigbuild
+          echo /tmp/zig/bin >> "$GITHUB_PATH"
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.zig }}" ]; then
+            cargo zigbuild --locked --release ${{ matrix.flags }} --target ${{ matrix.zig }}
+          else
+            cargo build --locked --release ${{ matrix.flags }} --target ${{ matrix.target }}
+          fi
+      - name: Smoke test
+        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/factum${{ matrix.exe }}
+          "$bin" --version
+          export FACTUM_DB="$RUNNER_TEMP/smoke/factum.db"
+          "$bin" --new-case SMOKE-1 "Release smoke test"
+          "$bin" "a note from the release build #smoke 10.0.0.1"
+          "$bin" --export --format html,pdf,md,bundle --out "$RUNNER_TEMP/smoke/out"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Third-party licenses
+        shell: bash
+        run: cargo about generate --locked -o THIRD-PARTY-LICENSES.md packaging/third-party.hbs
+      - name: Package
+        shell: bash
+        run: scripts/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/factum${{ matrix.exe }} ${{ matrix.name }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  source:
+    name: Vendored source archive
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Source with all dependencies, for offline builds
+        run: |
+          name="factum-${{ needs.prepare.outputs.version }}-vendored-source"
+          mkdir -p dist "$RUNNER_TEMP/$name"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/$name"
+          cd "$RUNNER_TEMP/$name"
+          mkdir -p .cargo
+          cargo vendor --locked vendor > .cargo/config.toml
+          cargo build --locked --offline --release --no-default-features --target-dir "$RUNNER_TEMP/check"
+          tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [prepare, build, source]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cp install.sh install.ps1 dist/
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Sign the checksums
+        env:
+          RELEASE_GPG_KEY: ${{ secrets.RELEASE_GPG_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        if: env.RELEASE_GPG_KEY != ''
+        run: |
+          echo "$RELEASE_GPG_KEY" | gpg --batch --import
+          gpg --batch --pinentry-mode loopback --passphrase "$RELEASE_GPG_PASSPHRASE" \
+              --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      - name: Release notes
+        run: |
+          version="${{ needs.prepare.outputs.version }}"
+          awk -v v="$version" '$0 ~ "^## \\[" v "\\]" {found=1; next} found && /^## \[/ {exit} found' CHANGELOG.md > notes.md
+          cat >> notes.md <<EOF
+
+          ## Install
+
+          Linux and macOS:
+
+              curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+
+          Windows (PowerShell):
+
+              irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
+
+          Air-gapped machines: copy the archive for your platform, \`SHA256SUMS\` and \`install.sh\` (or \`install.ps1\`)
+          and run \`sh install.sh --archive <archive>\`. See docs/AIRGAP.md. Check the build provenance with
+          \`gh attestation verify <file> --repo ${{ github.repository }}\`.
+          EOF
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ needs.prepare.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --title "factum ${{ needs.prepare.outputs.version }}" --notes-file notes.md --verify-tag
+          fi

@@ -2,7 +2,7 @@
 name = "factum"
 version = "2.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "Forensic note-taking with GPG-signed, tamper-evident (RFC 9162 Merkle tree) case logs"
 authors = ["Mario Stöckl <mstoeck3@hs-mittweida.de>"]
 license = "BSD-3-Clause"
