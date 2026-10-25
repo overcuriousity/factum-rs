@@ -5,6 +5,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Analytical companion: an optional, LLM-backed mentor that keeps a short list of open analytical questions per case
+  (Companion → Settings…, per-case switch and case goal in the Case menu, questions in the side panel, Ask and
+  History). Its state lives in a separate `*.companion.db`; nothing it writes enters the log, exports or verification
+- `factum --questions [CASE]` lists the open questions of a case without creating anything
+- `FACTUM_COMPANION_API_KEY` overrides the stored API key
+
 ### Changed
 - GUI: the notes are a flat log separated by hairlines instead of boxed cards; the focused and the pinned note are
   marked by a bar on the left. Tighter padding fits more entries on screen; corners are square or 2 px

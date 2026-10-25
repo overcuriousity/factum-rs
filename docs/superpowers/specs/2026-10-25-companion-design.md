@@ -88,7 +88,8 @@ Tables (final column lists are the builder's; these are the required contents):
   withdrawn, plus, minus, restored).
 - `passes(id, case_id, kind, started_utc, finished_utc, model, status, error, entries_from, entries_to,
   prompt_chars, output_chars)`: one row per reflection pass, `kind` is `diff` or `full`.
-- `rated_examples(id, text, rating, archetype, embedding BLOB NULL, source_case_id, created_utc)`: global.
+- `rated_examples(id, text, rating, archetype, embedding BLOB NULL, source_case_id, source_question_id, created_utc)`: global.
+  `source_question_id` lets a re-rating (plus to minus or back) remove the question's earlier example.
 - `archetype_weights(archetype, plus_count, minus_count)`: global.
 
 Scoping rule: `enrichment`, `entry_fts`, `questions`, `question_entries`, `question_events`, `passes` and
@@ -146,7 +147,8 @@ in the tree. Selecting a case that has entries but no companion state runs one f
 timeline, so the first questions appear within one pass; the newest 20 entries are enriched before it, the rest of
 the history is enriched afterwards in batches of 50, newest first, only while the thread has nothing else to do.
 Retrieval over not-yet-enriched entries works on their raw text. The status item shows "indexing n of m" during
-backlog enrichment. The companion thread serves cases in the order: the selected case first, then any other case
+backlog enrichment. While the endpoint is unreachable the companion thread re-probes every 60 s on its own; after a
+pass fails with a model-call error the case is retried once after the minimum spacing. The companion thread serves cases in the order: the selected case first, then any other case
 with pending changes, one at a time.
 
 ### 4.3 GUI
@@ -227,7 +229,8 @@ Order and cutting rule for a reflection pass:
 4. Pinned notes, verbatim, with timestamps and evidence id (never cut; if they alone overflow, the pass is refused).
 5. Open questions: id, archetype, text, entry ids, rating (never cut; the ≤ 7 cap keeps this small).
 6. New entries since the last pass, verbatim, oldest first, each as `#id · timestamp · evidence · text` (cut from the
-   oldest end second; a pass that cuts here is followed by another pass covering the rest).
+   newest end second in a diff pass, so `last_seen_entry_id` advances only to the newest entry that stayed in the
+   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end).
 7. Related older entries: retrieved (4.6) for the new entries and for each open question, de-duplicated, with the
    same line format (cut first, lowest rank first).
 8. Rated examples: the three nearest plus and three nearest minus examples to the new entries' text, labelled
@@ -309,14 +312,16 @@ JSON object only:
 
 The format is described in the instruction; no grammar or JSON schema is sent, since constrained decoding
 measurably hurts small models' accuracy. On the OpenAI protocol call two also sends
-`response_format: {"type":"json_object"}`; if the server answers 400 to that, the request is repeated without it
-and the fact is remembered for the session. On the Anthropic protocol nothing else is sent: assistant prefill is
+`response_format: {"type":"json_object"}`; if the server answers 400 naming `response_format`, the request is
+repeated without it and the fact is remembered for the session. A 400 naming `max_tokens` repeats the request with
+`max_completion_tokens`, also remembered for the session. On the Anthropic protocol nothing else is sent: assistant prefill is
 rejected by current Claude models and `output_config` is not expected from local Anthropic-compatible servers, so
 instruction plus repair and validation is the whole mechanism on both protocols. Cloud Claude models are in scope.
 
 **Validation** (no model involved), applied to call two's output in this order:
-1. `finish_reason == "length"`, `truncated`, or an empty body: the pass fails; retry once with section 7 halved, then
-   give up (status "failed", logged with the error, questions unchanged).
+1. `finish_reason == "length"`, `truncated`, or an empty body: the pass fails; retry once with section 7 capped at
+   half the lines the first packing kept (no retry when it kept none), then give up (status "failed", logged with the
+   error, questions unchanged).
 2. Syntactic repair of the JSON (unquoted keys, trailing commas, a missing closing brace); if repair fails, as 1.
 3. Every question id must be open in this case; every entry id must exist in this case and, for `answered`, be one
    of the new entries or an entry newer than the question; every `rests_on` id must exist in this case. Items that
@@ -333,8 +338,10 @@ instruction plus repair and validation is the whole mechanism on both protocols.
 Surviving changes are applied in one transaction: answered questions get `state=answered`, `resolved_entry_id`,
 and a `linked` event; withdrawn get `state=withdrawn`; new questions get the next `position` and their
 `question_entries`; the pass row is finished; `last_seen_entry_id` advances to the newest entry included in
-section 6. Call failures (network, 4xx, 5xx, timeout) retry once after 5 s, then fail the pass; the thread goes back
-to waiting and the status bar shows the reason. A pass never leaves the ledger half-applied.
+section 6. Call failures retry once after 5 s, and only network errors, timeouts, 408, 409, 429 and 5xx (other 4xx
+fail at once); then the pass fails, the thread goes back to waiting and the status bar shows the reason. A budget
+refusal is recorded with status `failed` and the reason `case too large for this model's context`. For the
+every-tenth-pass rule `pass_count` counts only successful passes. A pass never leaves the ledger half-applied.
 
 Timeouts: 5 s for probes and model listing, 180 s per model call (setting, builder's default), 60 s for Ask.
 
@@ -388,7 +395,7 @@ links. The answer is not stored.
 
 ### 4.11 Dependencies
 
-- `ureq` 3 (rustls, no tokio) for HTTP; `serde` with derive for request and response types (`serde_json` exists).
+- `ureq` 3 (rustls with the platform verifier, no tokio) for HTTP; `about.toml` accepts CDLA-Permissive-2.0 for the webpki root crates; `serde` with derive for request and response types (`serde_json` exists).
 - SQLite FTS5 is already compiled into the bundled SQLite (rusqlite `bundled`), so no new native code.
 - No ONNX, no llama.cpp, no model files, no embeddings call. The endpoint is used for chat only.
 - All new code behind the existing `gui` feature except the companion database, retrieval and CLI `--questions`,
