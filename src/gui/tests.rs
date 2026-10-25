@@ -313,3 +313,87 @@ fn dark_theme_renders() {
     harness.run_ok();
     screenshot(&mut harness, "case-light");
 }
+
+fn open_companion_settings(harness: &mut Harness<'_, FactumApp>) {
+    harness.get_by_label("Companion").click();
+    harness.run_ok();
+    harness.get_by_label("Settings…").click();
+    harness.run_ok();
+}
+
+fn settings_dialog<'a>(harness: &'a Harness<'_, FactumApp>) -> &'a CompanionSettingsDialog {
+    match harness.state().dialogs.last() {
+        Some(Dialog::CompanionSettings(dialog)) => dialog,
+        _ => panic!("the companion settings dialog is not open"),
+    }
+}
+
+fn type_into(harness: &mut Harness<'_, FactumApp>, label: &str, text: &str) {
+    harness.get_by_label(label).focus();
+    harness.run_ok();
+    harness.get_by_label(label).type_text(text);
+    harness.run_ok();
+}
+
+/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit).
+fn run_until(harness: &mut Harness<'_, FactumApp>, done: impl Fn(&Harness<'_, FactumApp>) -> bool) {
+    for _ in 0..30 {
+        harness.run_ok();
+        if done(harness) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn companion_menu_absent_until_configured_and_settings_dialog_lists_models() {
+    let fixture = Fixture::new();
+    let llm = crate::companion::fake_llm::FakeLlm::start();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    assert!(harness.query_by_label_contains("QUESTIONS").is_none());
+    assert!(harness.query_by_label_contains("companion:").is_none());
+    open_companion_settings(&mut harness);
+    assert_eq!(
+        settings_dialog(&harness).models_status,
+        "Set the endpoint URL to load the model list."
+    );
+    type_into(&mut harness, "Endpoint URL", &llm.url);
+    run_until(&mut harness, |h| {
+        settings_dialog(h).models_status == "2 models from the endpoint."
+    });
+    assert_eq!(settings_dialog(&harness).models_status, "2 models from the endpoint.");
+    screenshot(&mut harness, "companion-settings");
+}
+
+#[test]
+fn settings_dialog_saves_trimmed_and_starts_thread() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    type_into(&mut harness, "Endpoint URL", " http://127.0.0.1:1 ");
+    type_into(&mut harness, "Model", " m ");
+    harness.get_by_label("OK").click();
+    harness.run_ok();
+    let cdb = CompanionDb::open_for(&fixture.path).unwrap();
+    let saved = Settings::load(&cdb).unwrap();
+    assert_eq!(saved.model, "m");
+    assert_eq!(saved.endpoint_url, "http://127.0.0.1:1");
+    assert!(harness.state().companion_started);
+}
+
+#[test]
+fn test_connection_reports_unreachable() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    type_into(&mut harness, "Endpoint URL", "http://127.0.0.1:1");
+    // the dialog scrolls in a small window
+    harness.get_by_label("Test connection").scroll_to_me();
+    harness.run_ok();
+    harness.get_by_label("Test connection").click();
+    run_until(&mut harness, |h| settings_dialog(h).probe.is_some());
+    let probe = settings_dialog(&harness).probe.clone().unwrap();
+    assert!(probe.unwrap_err().contains("Unreachable"));
+}

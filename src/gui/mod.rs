@@ -2,6 +2,7 @@
 //! the right. Everything shown is cached in a [`View`] that is rebuilt after every change, so drawing a frame
 //! never queries the database.
 
+mod companion_dialogs;
 mod dialogs;
 mod theme;
 mod widgets;
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 use egui::{Align, Key, KeyboardShortcut, Layout, Margin, Modifiers, RichText, TextEdit};
 
 use crate::cases::Case;
+use crate::companion::{CompanionDb, Settings};
 use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
@@ -25,6 +27,7 @@ use crate::seals::{REASON_CHECKPOINT, SEAL_DIR_SETTING};
 use crate::services::Factum;
 use crate::signer::{ACTIVE_KEY_SETTING, GnupgSigner, Signer};
 use crate::verifier::{CaseReport, SignatureCheck};
+use companion_dialogs::CompanionSettingsDialog;
 use dialogs::{Dialog, DialogResult, NoGpgChoice, Pending, VerifyAction, VerifyWindow};
 use theme::{SMALL_SIZE, THEMES};
 use widgets::{Card, CardAction, CardView, CheckView};
@@ -171,6 +174,11 @@ struct FactumApp {
     focus_search: bool,
     focus_composer: bool,
     gpg_status: (String, bool),
+    // None when the companion database cannot be opened: the companion is absent
+    companion_db: Option<CompanionDb>,
+    companion_settings: Settings,
+    // stands in for the companion thread until it exists: set while the settings are configured
+    companion_started: bool,
 }
 
 impl FactumApp {
@@ -187,6 +195,18 @@ impl FactumApp {
             .unwrap_or(DEFAULT_SIDE_PANEL_WIDTH);
         theme::apply(ctx, &theme);
         let data_version = db.data_version().unwrap_or_default();
+        let companion_db = CompanionDb::open_for(&db.path)
+            .inspect_err(|e| log::error!("The companion database cannot be opened: {e}"))
+            .ok();
+        let companion_settings = companion_db
+            .as_ref()
+            .and_then(|cdb| {
+                Settings::load(cdb)
+                    .inspect_err(|e| log::error!("The companion settings cannot be read: {e}"))
+                    .ok()
+            })
+            .unwrap_or_default();
+        let companion_started = companion_db.is_some() && companion_settings.is_configured();
         let mut app = Self {
             db,
             signer,
@@ -222,6 +242,9 @@ impl FactumApp {
             focus_search: false,
             focus_composer: false,
             gpg_status: (String::new(), false),
+            companion_db,
+            companion_settings,
+            companion_started,
         };
         // pre-select the CLI active case or evidence so notes are shown on startup
         let factum = app.factum();
@@ -946,7 +969,25 @@ impl FactumApp {
             DialogResult::SealFolder(folder) => {
                 let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
             }
+            DialogResult::CompanionSettings(settings) => {
+                let Some(cdb) = &self.companion_db else { return };
+                let saved = settings.save(cdb);
+                if self.run(saved).is_some() {
+                    self.companion_started = settings.is_configured();
+                    self.companion_settings = settings;
+                }
+            }
+            DialogResult::CaseGoal { case_id, goal } => {
+                let Some(cdb) = &self.companion_db else { return };
+                let saved = cdb.set_case_goal(case_id, &goal);
+                self.run(saved);
+            }
         }
+    }
+
+    fn open_companion_settings(&mut self) {
+        let dialog = CompanionSettingsDialog::new(&self.companion_settings, self.db.path.clone());
+        self.dialogs.push(Dialog::CompanionSettings(Box::new(dialog)));
     }
 
     fn choose_seal_folder(&mut self) {
@@ -1174,6 +1215,15 @@ impl FactumApp {
                 ui.separator();
                 if ui.button("Seal Folder…").clicked() {
                     self.choose_seal_folder();
+                }
+            });
+            ui.menu_button("Companion", |ui| {
+                if ui
+                    .add_enabled(self.companion_db.is_some(), egui::Button::new("Settings…"))
+                    .on_disabled_hover_text("The companion database cannot be opened; see the log.")
+                    .clicked()
+                {
+                    self.open_companion_settings();
                 }
             });
             ui.menu_button("Help", |ui| {

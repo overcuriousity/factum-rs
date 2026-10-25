@@ -18,7 +18,7 @@ pub struct Worker<T> {
 }
 
 impl<T: Send + 'static> Worker<T> {
-    fn spawn(ctx: &egui::Context, work: impl FnOnce() -> T + Send + 'static) -> Self {
+    pub(crate) fn spawn(ctx: &egui::Context, work: impl FnOnce() -> T + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::channel();
         let ctx = ctx.clone();
         let handle = std::thread::spawn(move || {
