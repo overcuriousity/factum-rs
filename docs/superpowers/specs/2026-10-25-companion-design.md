@@ -45,7 +45,8 @@ Anti-goals (a build that does these has failed even if it works)
 - A question that was rated minus coming back in different words.
 - Questions reshuffling between passes so the list cannot be used as a place to resume.
 - Questions that cite entries which do not exist or do not say what the question claims.
-- Pop-ups, spinners in the reading column, or any companion section, status item or Case-menu item shown while unconfigured or switched off.
+- Pop-ups, spinners in the reading column, or any companion section, status item or Case-menu item shown while
+  unconfigured or switched off.
 - Compatibility with factum-notes (Python) broken: the case database schema and its version stay untouched.
 
 ## 3. Constraints
