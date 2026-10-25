@@ -56,6 +56,13 @@ impl Scheduler {
         pending.forced = false;
     }
 
+    /// A change not yet seen by a pass, or a forced pass, is waiting.
+    pub fn is_pending(&self, case_id: i64) -> bool {
+        self.cases
+            .get(&case_id)
+            .is_some_and(|p| p.forced || p.last_change.is_some())
+    }
+
     /// Forgets the case, pending changes included.
     pub fn clear(&mut self, case_id: i64) {
         self.cases.remove(&case_id);

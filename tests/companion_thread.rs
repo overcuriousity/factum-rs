@@ -105,6 +105,7 @@ fn failed_pass_is_reported_and_does_not_spin() {
     });
     assert!(matches!(status.state, State::Failed(_)), "{status:?}");
     assert!(status.line().starts_with("companion: last pass failed: "));
+    // the one retry it is owed waits for the minimum spacing
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(fake.requests().len(), 3);
     handle.shutdown();

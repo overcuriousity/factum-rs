@@ -26,6 +26,8 @@ use crate::signer::GnupgSigner;
 const TICK: Duration = Duration::from_secs(1);
 /// Entries per backlog enrichment step.
 const BACKLOG_BATCH: usize = 50;
+/// How often an unreachable endpoint is asked again.
+const REPROBE: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
@@ -131,6 +133,11 @@ impl CompanionHandle {
             let _ = thread.join();
         }
     }
+
+    /// Stops the thread without waiting for it: it ends after the work in hand.
+    pub fn detach(self) {
+        self.send(Command::Shutdown);
+    }
 }
 
 fn lock(status: &Mutex<Status>) -> MutexGuard<'_, Status> {
@@ -166,16 +173,19 @@ fn run(
         scheduler: Scheduler::new(),
         selected: None,
         full_next: HashSet::new(),
+        retried: HashSet::new(),
         enrich_tried: HashSet::new(),
+        last_probe: Instant::now(),
+        after_indexing: State::Idle,
     };
-    companion.reload_settings();
+    companion.guarded(|c| c.reload_settings());
     loop {
         let mut next = receiver.recv_timeout(TICK);
         // every queued command before the next pass, so a Shutdown does not wait behind one
         loop {
             match next {
                 Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
-                Ok(cmd) => companion.handle(cmd),
+                Ok(cmd) => companion.guarded(|c| c.handle(cmd)),
                 Err(RecvTimeoutError::Timeout) => break,
             }
             next = receiver.try_recv().map_err(|e| match e {
@@ -183,7 +193,7 @@ fn run(
                 mpsc::TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
             });
         }
-        companion.tick();
+        companion.guarded(Companion::tick);
     }
 }
 
@@ -199,8 +209,13 @@ struct Companion {
     selected: Option<i64>,
     /// cases whose next pass is full because the last one resolved many questions
     full_next: HashSet<i64>,
-    /// entries backlog enrichment has asked for (or given up on) since the last settings change
+    /// cases already given their one retry after a failed model call, until a new change or a successful pass
+    retried: HashSet<i64>,
+    /// entries backlog enrichment has asked for (or given up on), until a successful probe or pass
     enrich_tried: HashSet<i64>,
+    last_probe: Instant,
+    /// what the status shows again once indexing ends
+    after_indexing: State,
 }
 
 impl Companion {
@@ -213,12 +228,45 @@ impl Companion {
         self.ctx.request_repaint();
     }
 
+    /// The thread outlives a panic outside the pass and enrichment guards.
+    fn guarded(&mut self, f: impl FnOnce(&mut Self)) {
+        if catch_unwind(AssertUnwindSafe(|| f(self))).is_err() {
+            log::error!("companion: internal error");
+            self.set_state(State::Failed("internal error".into()));
+        }
+    }
+
+    fn end_indexing(&self) {
+        if matches!(self.state(), State::Indexing { .. }) {
+            self.set_state(self.after_indexing.clone());
+        }
+    }
+
+    /// Entries a pass has not seen yet, on a case that can run, get a pass in due course (after a switch-off or
+    /// an unarchive, say).
+    fn pick_up_unseen(&mut self, case_id: i64) -> Result<()> {
+        let Some(case) = self.cdb.case_settings(case_id)? else {
+            return Ok(());
+        };
+        let newest = self.entry_ids(case_id)?.first().copied().unwrap_or(0);
+        if newest > case.last_seen_entry_id && !self.scheduler.is_pending(case_id) && self.runnable(case_id)? {
+            self.scheduler.changed(case_id, Instant::now());
+        }
+        Ok(())
+    }
+
     fn handle(&mut self, cmd: Command) {
         match cmd {
-            Command::CaseChanged(case_id) => self.scheduler.changed(case_id, Instant::now()),
+            Command::CaseChanged(case_id) => {
+                self.retried.remove(&case_id);
+                self.scheduler.changed(case_id, Instant::now());
+            }
             Command::Selected(case_id) => {
                 self.selected = case_id;
                 self.scheduler.select(case_id);
+                if case_id.is_none() {
+                    self.end_indexing();
+                }
                 if let Some(case_id) = case_id
                     && let Err(e) = self.selected_case(case_id)
                 {
@@ -226,15 +274,20 @@ impl Companion {
                 }
             }
             Command::Rethink(case_id) | Command::GoalChanged(case_id) => self.scheduler.force(case_id),
-            Command::CaseToggled(case_id) => match self.cdb.case_settings(case_id) {
-                Ok(Some(case)) if !case.enabled => self.scheduler.clear(case_id),
-                Ok(_) => {}
-                Err(e) => log::warn!("companion: case {case_id} settings cannot be read: {e}"),
-            },
-            Command::SettingsChanged => {
-                self.enrich_tried.clear();
-                self.reload_settings();
+            Command::CaseToggled(case_id) => {
+                let toggled = match self.cdb.case_settings(case_id) {
+                    Ok(Some(case)) if !case.enabled => {
+                        self.scheduler.clear(case_id);
+                        Ok(())
+                    }
+                    Ok(_) => self.pick_up_unseen(case_id),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = toggled {
+                    log::warn!("companion: case {case_id} settings cannot be read: {e}");
+                }
             }
+            Command::SettingsChanged => self.reload_settings(),
             Command::Probe => self.probe(),
             Command::Shutdown => {}
         }
@@ -245,6 +298,8 @@ impl Companion {
         if self.cdb.case_settings(case_id)?.is_none() && !self.entry_ids(case_id)?.is_empty() {
             self.cdb.ensure_case(case_id)?;
             self.scheduler.first_seen(case_id);
+        } else {
+            self.pick_up_unseen(case_id)?;
         }
         let mut status = lock(&self.status);
         if !status.last_pass_utc.contains_key(&case_id)
@@ -266,6 +321,7 @@ impl Companion {
 
     fn probe(&mut self) {
         self.client = None;
+        self.last_probe = Instant::now();
         if !self.settings.is_configured() {
             self.set_state(State::Off);
             return;
@@ -278,6 +334,7 @@ impl Companion {
                     client.set_context_window(listed.and_then(|m| m.max_input_tokens));
                 }
                 self.client = Some(client);
+                self.enrich_tried.clear();
                 lock(&self.status).model = self.settings.model.clone();
                 self.set_state(State::Idle);
             }
@@ -306,6 +363,9 @@ impl Companion {
     }
 
     fn tick(&mut self) {
+        if self.client.is_none() && self.state() == State::Unreachable && self.last_probe.elapsed() >= REPROBE {
+            self.probe();
+        }
         if self.client.is_none() {
             return;
         }
@@ -320,9 +380,7 @@ impl Companion {
                 }
             }
         }
-        if matches!(self.state(), State::Idle | State::Indexing { .. }) {
-            self.backlog();
-        }
+        self.backlog();
     }
 
     fn reflect(&mut self, case_id: i64, forced: bool) {
@@ -352,12 +410,20 @@ impl Companion {
                 } else {
                     self.full_next.remove(&case_id);
                 }
+                self.retried.remove(&case_id);
+                self.enrich_tried.clear();
                 lock(&self.status).last_pass_utc.insert(case_id, utc_now());
                 self.set_state(State::Idle);
             }
             // nothing ran: whatever was shown before stays
             Ok(Err(PassError::NothingNew | PassError::Archived)) => self.set_state(before),
-            Ok(Err(e)) => self.set_state(State::Failed(e.to_string())),
+            Ok(Err(e)) => {
+                // the endpoint may recover: one more try after the spacing, not a loop
+                if matches!(e, PassError::Llm(_)) && self.retried.insert(case_id) {
+                    self.scheduler.changed(case_id, Instant::now());
+                }
+                self.set_state(State::Failed(e.to_string()));
+            }
             Err(_) => {
                 log::error!("companion pass on case {case_id} panicked");
                 self.set_state(State::Failed("internal error".into()));
@@ -390,12 +456,14 @@ impl Companion {
             .filter(|id| !self.enrich_tried.contains(id))
             .collect();
         if pending.is_empty() {
-            if matches!(self.state(), State::Indexing { .. }) {
-                self.set_state(State::Idle);
-            }
+            self.end_indexing();
             return;
         }
         let done = total - unenriched.len();
+        let state = self.state();
+        if !matches!(state, State::Indexing { .. }) {
+            self.after_indexing = state;
+        }
         self.set_state(State::Indexing { done, total });
         let batch = &pending[..pending.len().min(BACKLOG_BATCH)];
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -412,14 +480,14 @@ impl Companion {
                         total,
                     });
                 } else {
-                    self.set_state(State::Idle);
+                    self.end_indexing();
                 }
             }
             Ok(Err(e)) => {
                 log::warn!("companion: backlog enrichment of case {case_id} failed: {e}");
-                // until the settings change, so a dead endpoint is not asked again and again
+                // until the next successful probe or pass, so a dead endpoint is not asked again and again
                 self.enrich_tried.extend(&pending);
-                self.set_state(State::Idle);
+                self.end_indexing();
             }
             Err(_) => {
                 log::error!("companion: backlog enrichment of case {case_id} panicked");
