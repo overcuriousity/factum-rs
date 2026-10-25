@@ -610,3 +610,36 @@ fn signed_copy_keeps_gpg_line_endings() {
     let bytes = std::fs::read(path).unwrap();
     assert!(!bytes.windows(3).any(|w| w == b"\r\r\n") && bytes.windows(2).any(|w| w == b"\r\n"));
 }
+
+// --- companion
+
+#[test]
+fn case_database_verifies_unchanged_after_companion_use() {
+    use factum::companion::{Archetype, CompanionDb, NewQuestion, Rating};
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    for number in 0..3 {
+        factum
+            .append(case_id, "note", &format!("note {number}"), Append::default())
+            .unwrap();
+    }
+    factum.seal(case_id, "checkpoint").unwrap();
+    let tables_before = f.count("SELECT COUNT(*) FROM sqlite_master");
+    let companion = CompanionDb::open_for(&f.db.path).unwrap();
+    let q = NewQuestion {
+        text: "What explains the gap?".into(),
+        archetype: Archetype::Causality,
+        rests_on: vec![1],
+    };
+    let id = companion.insert_question(case_id, None, &q).unwrap();
+    companion.rate_question(id, Rating::Minus).unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    assert_eq!(f.count("PRAGMA user_version"), factum::db::SCHEMA_VERSION);
+    assert_eq!(f.count("SELECT COUNT(*) FROM sqlite_master"), tables_before);
+    assert_eq!(
+        f.count("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%question%'"),
+        0
+    );
+}
