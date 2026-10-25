@@ -8,10 +8,14 @@
 //! - body and secondary text ≥ 7:1 contrast, metadata ≥ 4.5:1 in both themes
 //! - Atkinson Hyperlegible Next for text (letter differentiation: Il1, O0), JetBrains Mono for hashes,
 //!   timestamps, key ids and IoCs; 16 px note text, about 70 characters per line
+//! - the log is a flat list separated by hairlines, not a stack of boxed cards: spacing carries the grouping (the
+//!   gap inside a note is smaller than the gap between notes, Gestalt proximity; grouping matters more than
+//!   whitespace, Tullis 1983), so more entries fit on screen; corners are square or 2 px, a style choice without
+//!   a usability cost
 
 use std::sync::Arc;
 
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Theme, Visuals};
+use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Theme, Visuals};
 
 pub const THEMES: [&str; 3] = ["system", "light", "dark"];
 
@@ -177,6 +181,17 @@ fn visuals(dark: bool) -> Visuals {
     widgets.inactive.bg_stroke = Stroke::new(1.0, p.border);
     widgets.hovered.bg_stroke = Stroke::new(1.0, p.accent);
     widgets.active.bg_stroke = Stroke::new(1.5, p.accent);
+    for state in [
+        &mut widgets.noninteractive,
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.corner_radius = CornerRadius::same(2);
+    }
+    visuals.window_corner_radius = CornerRadius::same(2);
+    visuals.menu_corner_radius = CornerRadius::same(2);
     visuals
 }
 
