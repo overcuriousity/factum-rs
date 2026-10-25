@@ -309,13 +309,16 @@ impl Client {
         };
         let mut body = json!({"model": self.settings.model, limit: req.max_tokens});
         if self.settings.protocol == Protocol::OpenAi {
-            let system = json!({"role": "system", "content": req.system});
-            body["messages"] = Value::Array(std::iter::once(system).chain(turns).collect());
+            // an empty system prompt is left out on both protocols
+            let system = (!req.system.is_empty()).then(|| json!({"role": "system", "content": req.system}));
+            body["messages"] = Value::Array(system.into_iter().chain(turns).collect());
             if json_mode {
                 body["response_format"] = json!({"type": "json_object"});
             }
         } else {
-            body["system"] = json!(req.system);
+            if !req.system.is_empty() {
+                body["system"] = json!(req.system);
+            }
             body["messages"] = Value::Array(turns.collect());
         }
         let text = send(
