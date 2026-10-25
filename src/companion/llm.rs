@@ -141,6 +141,8 @@ fn send(settings: &Settings, url: &str, body: Option<&str>, timeout: Duration) -
     let mut config = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
+        // a redirect could carry the API key to another host
+        .max_redirects(0)
         .tls_config(tls);
     if !settings.user_agent.is_empty() {
         config = config.user_agent(settings.user_agent.as_str());
@@ -166,7 +168,8 @@ fn send(settings: &Settings, url: &str, body: Option<&str>, timeout: Duration) -
     let mut response = result.map_err(map_error)?;
     let status = response.status().as_u16();
     let text = response.body_mut().read_to_string().map_err(map_error)?;
-    if status >= 400 {
+    // redirects are not followed, so a 3xx is a failure too
+    if status >= 300 {
         return Err(LlmError::Http { status, body: text });
     }
     Ok(text)

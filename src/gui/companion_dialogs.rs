@@ -36,6 +36,9 @@ pub struct CompanionSettingsDialog {
     /// a key is stored and the field is empty: the stored key is kept
     pub key_stored: bool,
     stored_key: String,
+    /// the stored key goes only to the endpoint it was saved for
+    saved_url: String,
+    saved_protocol: Protocol,
     saved_model: String,
     context_window: String,
     /// the case database; "Test connection" saves through its companion database
@@ -74,6 +77,8 @@ impl CompanionSettingsDialog {
             } else {
                 String::new()
             },
+            saved_url: settings.endpoint_url.trim().to_string(),
+            saved_protocol: settings.protocol,
             saved_model: settings.model.clone(),
             context_window: settings.context_window.map(|n| n.to_string()).unwrap_or_default(),
             db_path,
@@ -98,6 +103,17 @@ impl CompanionSettingsDialog {
             *field = field.trim().to_string();
         }
         s.context_window = self.context_window.trim().parse().ok();
+        s
+    }
+
+    /// The draft as the listing and the probe send it: without the stored key once URL or protocol differ from
+    /// the saved ones, so a key never reaches an endpoint it was not saved for.
+    fn connection_settings(&self) -> Settings {
+        let mut s = self.settings();
+        let typed = !self.draft.api_key.trim().is_empty();
+        if !typed && (s.endpoint_url != self.saved_url || s.protocol != self.saved_protocol) {
+            s.api_key.clear();
+        }
         s
     }
 
@@ -144,7 +160,7 @@ impl CompanionSettingsDialog {
             });
             self.take_models(result);
         }
-        let settings = self.settings();
+        let settings = self.connection_settings();
         if settings.endpoint_url.is_empty() {
             self.models_worker = None;
             self.listed_for = None;
@@ -180,6 +196,7 @@ impl CompanionSettingsDialog {
         self.probe = None;
         self.models_worker = None;
         self.models_status = "Loading models from the endpoint…".into();
+        let settings = self.connection_settings();
         self.listed_for = Some(Self::connection_hash(&settings));
         self.probe_worker = Some(Worker::spawn(ctx, move || llm::probe(&settings).map_err(reason)));
     }
@@ -244,6 +261,12 @@ impl CompanionSettingsDialog {
                 )
             });
             connection_edited |= key.changed();
+            if self.key_stored && ui.small_button("Clear stored key").clicked() {
+                // saving now writes an empty key, unless one is typed
+                self.key_stored = false;
+                self.stored_key.clear();
+                connection_edited = true;
+            }
             ui.label(small(
                 "The key is stored as entered in the companion database: keep the database folder private.",
             ));
