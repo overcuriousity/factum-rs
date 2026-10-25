@@ -207,7 +207,7 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: Color32, fill: Color32, stroke: Strok
     Frame::new()
         .fill(fill)
         .stroke(stroke)
-        .corner_radius(CornerRadius::same(4))
+        .corner_radius(CornerRadius::same(2))
         .inner_margin(Margin::symmetric(6, 1))
         .show(ui, |ui| ui.label(RichText::new(text).size(SMALL_SIZE).color(fg)))
         .inner
@@ -276,30 +276,50 @@ pub struct CardView<'a> {
     pub now: DateTime<Utc>,
 }
 
-/// Draws a note card; returns the response of the card itself (for scrolling to it).
+/// Inner margin of log rows: notes and system entries start their text at the same x.
+const ROW_MARGIN: Margin = Margin {
+    left: 12,
+    right: 10,
+    top: 8,
+    bottom: 8,
+};
+
+/// The hairline under each log row, and a bar on the left edge for the focused or pinned note.
+fn row_rules(ui: &egui::Ui, rect: egui::Rect, bar: Option<Color32>) {
+    let p = theme::current(ui.ctx());
+    ui.painter()
+        .hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, p.border));
+    if let Some(color) = bar {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
+            0.0,
+            color,
+        );
+    }
+}
+
+/// Draws a note as a row of the log; returns the response of the row itself (for scrolling to it).
 pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut Vec<CardAction>) -> egui::Response {
     let p = *theme::current(ui.ctx());
     let entry = &card.entry;
     let id = ui.scope_id().with(("card", entry.id, view.compact));
     let hovered_before = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
-    let stroke = if view.focused {
-        Stroke::new(1.5, p.accent)
+    let bar = if view.focused {
+        Some(p.accent)
     } else if entry.is_pinned && !view.compact {
-        Stroke::new(1.0, p.warn)
+        Some(p.warn)
     } else {
-        Stroke::new(1.0, p.border)
+        None
     };
     let width = ui.available_width().min(MAX_CARD_WIDTH);
     let response = ui
         .scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
             ui.set_max_width(width);
-            Frame::new()
-                .fill(p.surface)
-                .stroke(stroke)
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(Margin::symmetric(14, 10))
+            let frame = Frame::new()
+                .fill(if view.focused { p.surface } else { Color32::TRANSPARENT })
+                .inner_margin(ROW_MARGIN)
                 .show(ui, |ui| {
-                    ui.set_width(width - 30.0);
+                    ui.set_width(width - ROW_MARGIN.sum().x);
                     // header: timestamp, entry id, age, version; signature and pin on the right
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -415,6 +435,7 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                             .on_hover_text(evidence);
                     }
                 });
+            row_rules(ui, frame.response.rect, bar);
         })
         .response;
     let hovered = response.contains_pointer();
@@ -442,8 +463,13 @@ pub fn system_row(ui: &mut egui::Ui, entry: &Entry, check: CheckView, actions: &
     let response = ui
         .scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
             ui.set_max_width(width);
-            Frame::new().inner_margin(Margin::symmetric(14, 2)).show(ui, |ui| {
-                ui.set_width(width - 28.0);
+            let margin = Margin {
+                top: 4,
+                bottom: 4,
+                ..ROW_MARGIN
+            };
+            let frame = Frame::new().inner_margin(margin).show(ui, |ui| {
+                ui.set_width(width - margin.sum().x);
                 ui.horizontal(|ui| {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         signature_label(ui, entry, check, false);
@@ -464,6 +490,7 @@ pub fn system_row(ui: &mut egui::Ui, entry: &Entry, check: CheckView, actions: &
                     });
                 });
             });
+            row_rules(ui, frame.response.rect, None);
         })
         .response;
     response.context_menu(|ui| menu(ui, actions));

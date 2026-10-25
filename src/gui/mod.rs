@@ -1548,9 +1548,7 @@ impl FactumApp {
                                 history_open: self.history_open.contains(&card.entry.id),
                                 now,
                             };
-                            let response = widgets::note_card(ui, card, &view, &mut actions);
-                            ui.add_space(8.0);
-                            response
+                            widgets::note_card(ui, card, &view, &mut actions)
                         }
                         Item::System(entry) => widgets::system_row(ui, entry, self.check_view(entry), &mut actions),
                     };
@@ -1716,7 +1714,6 @@ impl FactumApp {
                             now,
                         };
                         widgets::note_card(ui, card, &view, &mut actions);
-                        ui.add_space(6.0);
                     }
                 }
                 SideTab::Iocs => {
@@ -1827,12 +1824,12 @@ fn tree_row(ui: &mut egui::Ui, selected: bool, text: RichText, count: usize, ind
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
     if selected || response.hovered() {
         let fill = if selected { p.accent_soft } else { p.panel };
-        ui.painter().rect_filled(rect, 4.0, fill);
+        ui.painter().rect_filled(rect, 2.0, fill);
     }
     if selected {
         ui.painter().rect_filled(
             egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
-            1.0,
+            0.0,
             p.accent,
         );
     }

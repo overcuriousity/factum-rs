@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- GUI: the notes are a flat log separated by hairlines instead of boxed cards; the focused and the pinned note are
+  marked by a bar on the left. Tighter padding fits more entries on screen; corners are square or 2 px
+
 ## [2.0.0] - 2026-10-25
 
 First release of the Rust port of factum-notes. Databases (schema 3), seal files and verification bundles are
