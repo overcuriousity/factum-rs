@@ -93,7 +93,7 @@ fn route(settings: &Settings, chat: bool) -> String {
     let path = match (settings.protocol, chat) {
         (Protocol::OpenAi, false) => "models",
         (Protocol::OpenAi, true) => "chat/completions",
-        (Protocol::Anthropic, false) => "v1/models",
+        (Protocol::Anthropic, false) => "v1/models?limit=1000",
         (Protocol::Anthropic, true) => "v1/messages",
     };
     format!("{base}/{path}")
@@ -230,6 +230,7 @@ pub struct Client {
     retry_delay: Duration,
     calibration: Cell<Calibration>,
     json_rejected: Cell<bool>,
+    completion_param: Cell<bool>,
 }
 
 impl Client {
@@ -243,6 +244,7 @@ impl Client {
             retry_delay,
             calibration: Cell::new(Calibration::default()),
             json_rejected: Cell::new(false),
+            completion_param: Cell::new(false),
         }
     }
 
@@ -258,6 +260,7 @@ impl Client {
     pub fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         match self.chat_once(req) {
             Err(e) if e.is_retryable() => {
+                log::warn!("companion request failed, retrying once: {e}");
                 std::thread::sleep(self.retry_delay);
                 self.chat_once(req)
             }
@@ -265,26 +268,46 @@ impl Client {
         }
     }
 
-    /// A 400 while JSON mode is requested means the server does not know `response_format`:
-    /// ask again without it, and do not use it again.
+    /// OpenAI-compatible servers may reject `response_format` or `max_tokens` (reasoning models
+    /// want `max_completion_tokens`) with a 400 naming it: resend without or with the other
+    /// name, and remember that for the session.
     fn chat_once(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
-        let json_mode = req.json && self.settings.protocol == Protocol::OpenAi && !self.json_rejected.get();
-        match self.post_chat(req, json_mode) {
-            Err(LlmError::Http { status: 400, .. }) if json_mode => {
-                self.json_rejected.set(true);
-                self.post_chat(req, false)
+        let mut json_mode = req.json && self.settings.protocol == Protocol::OpenAi && !self.json_rejected.get();
+        let mut completion_param = self.completion_param.get();
+        let mut result = self.post_chat(req, json_mode, completion_param);
+        for _ in 0..2 {
+            let Err(LlmError::Http { status: 400, body }) = &result else {
+                break;
+            };
+            if self.settings.protocol != Protocol::OpenAi {
+                break;
             }
-            other => other,
+            if json_mode && body.contains("response_format") {
+                self.json_rejected.set(true);
+                json_mode = false;
+            } else if !completion_param && body.contains("max_tokens") {
+                self.completion_param.set(true);
+                completion_param = true;
+            } else {
+                break;
+            }
+            result = self.post_chat(req, json_mode, completion_param);
         }
+        result
     }
 
-    fn post_chat(&self, req: &ChatRequest, json_mode: bool) -> Result<ChatResponse, LlmError> {
+    fn post_chat(&self, req: &ChatRequest, json_mode: bool, completion_param: bool) -> Result<ChatResponse, LlmError> {
         let role = |r: Role| if r == Role::User { "user" } else { "assistant" };
         let turns = req
             .turns
             .iter()
             .map(|&(r, text)| json!({"role": role(r), "content": text}));
-        let mut body = json!({"model": self.settings.model, "max_tokens": req.max_tokens});
+        let limit = if completion_param {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        let mut body = json!({"model": self.settings.model, limit: req.max_tokens});
         if self.settings.protocol == Protocol::OpenAi {
             let system = json!({"role": "system", "content": req.system});
             body["messages"] = Value::Array(std::iter::once(system).chain(turns).collect());
@@ -374,7 +397,7 @@ mod tests {
         let models = list_models(&settings(&fake.url, Protocol::Anthropic)).unwrap();
         assert_eq!(models[0].max_input_tokens, Some(200000));
         let r = &fake.requests()[0];
-        assert_eq!(r.path, "/v1/models");
+        assert_eq!(r.path.split('?').next(), Some("/v1/models"));
         assert!(has_header(r, "x-api-key", "k"));
         assert!(has_header(r, "anthropic-version", "2023-06-01"));
     }
@@ -393,7 +416,7 @@ mod tests {
     #[test]
     fn chat_openai_json_mode_falls_back_on_400() {
         let fake = FakeLlm::start();
-        fake.push(400, "{}");
+        fake.push(400, r#"{"error":{"message":"unknown parameter: response_format"}}"#);
         fake.push(200, &openai_chat("{\"a\":1}", "stop", 10));
         fake.push(200, &openai_chat("{\"a\":2}", "stop", 10));
         let c = client(openai(&fake));
@@ -404,6 +427,18 @@ mod tests {
         assert!(reqs[0].body.contains("json_object"));
         assert!(!reqs[1].body.contains("json_object"));
         assert!(!reqs[2].body.contains("json_object"));
+    }
+
+    #[test]
+    fn chat_openai_falls_back_to_max_completion_tokens() {
+        let fake = FakeLlm::start();
+        fake.push(400, r#"{"error":{"message":"Unsupported parameter: 'max_tokens'"}}"#);
+        fake.push(200, &openai_chat("ok", "stop", 1));
+        let turns = [(Role::User, "hi")];
+        assert_eq!(client(openai(&fake)).chat(&req(&turns, false)).unwrap().text, "ok");
+        let reqs = fake.requests();
+        assert!(reqs[1].body.contains("max_completion_tokens"));
+        assert!(!reqs[1].body.contains("\"max_tokens\""));
     }
 
     #[test]
