@@ -33,10 +33,11 @@ pub const FULL_AFTER_RESOLVED: usize = 3;
 
 const OUTPUT_RESERVE: usize = 1500;
 const TIMEOUT: Duration = Duration::from_secs(180);
-/// The window assumed when the settings name none (the client keeps no model listing).
+/// The window assumed when neither the settings nor the endpoint listing name one.
 const DEFAULT_CONTEXT_WINDOW: u32 = 16_000;
 const NO_GOAL: &str = "No case goal has been set.";
 const NEW_ENTRIES: &str = "new entries";
+const RELATED: &str = "related";
 /// Rated examples of each kind in the prompt.
 const EXAMPLES: usize = 3;
 /// Related entries per new entry, per open question in a diff pass and in a full pass.
@@ -262,9 +263,14 @@ fn reflect(
         new: &new,
         open: &open,
     };
-    let window = client.settings().context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let window = client
+        .settings()
+        .context_window
+        .or(client.context_window())
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let room = budget(window, OUTPUT_RESERVE);
-    let packed = pack(input.sections(1)?, room, &client.calibration())?;
+    let sections = input.sections()?;
+    let packed = pack(sections.clone(), room, &client.calibration())?;
     log.prompt_chars = packed.text.chars().count();
     if !packed.cut.is_empty() {
         log::info!("companion pass {pass_id}: lines cut for space: {:?}", packed.cut);
@@ -287,8 +293,21 @@ fn reflect(
     }
     let output = match serialize(client, &packed.text, &reasoning.text, log) {
         Err(PassError::Output(reason)) => {
+            // the prompt as sent, with half of the related lines it kept; without any, a retry could not be smaller
+            let mut retry = sections;
+            apply_cuts(&mut retry, &packed.cut);
+            let related = retry
+                .iter_mut()
+                .find(|s| s.name == RELATED)
+                .expect("the related section is always built");
+            if related.lines.is_empty() {
+                return Err(PassError::Output(format!(
+                    "{reason}; no related entries to drop for a retry"
+                )));
+            }
+            related.lines.truncate(related.lines.len() / 2);
             log::warn!("companion pass {pass_id}: {reason}; retrying with half the related entries");
-            let smaller = pack(input.sections(2)?, room, &client.calibration())?;
+            let smaller = pack(retry, room, &client.calibration())?;
             serialize(client, &smaller.text, &reasoning.text, log)?
         }
         other => other?,
@@ -343,6 +362,21 @@ fn reflect(
         entries_to: log.entries_to,
         dropped: validated.dropped,
     })
+}
+
+/// Drops from every section the lines the packing dropped, from the same end.
+fn apply_cuts(sections: &mut [Section], cut: &[(&'static str, usize)]) {
+    for section in sections {
+        let Some(&(_, dropped)) = cut.iter().find(|(name, _)| *name == section.name) else {
+            continue;
+        };
+        let dropped = dropped.min(section.lines.len());
+        if matches!(section.cut, Cut::Lines { from_start: true, .. }) {
+            section.lines.drain(..dropped);
+        } else {
+            section.lines.truncate(section.lines.len() - dropped);
+        }
+    }
 }
 
 /// The newest entry a diff pass covers: the newest one, or, when the new entries were cut from the newest end, the
@@ -421,8 +455,8 @@ fn section(name: &'static str, lines: Vec<String>, cut: Cut, kind: TextKind) -> 
 }
 
 impl PromptInput<'_> {
-    /// The sections of spec 4.5 in order; `related_divisor` divides the number of related entries per query.
-    fn sections(&self, related_divisor: usize) -> Result<Vec<Section>> {
+    /// The sections of spec 4.5 in order.
+    fn sections(&self) -> Result<Vec<Section>> {
         let full = self.kind == PassKind::Full;
         let labels: HashMap<i64, &str> = self
             .data
@@ -469,7 +503,7 @@ impl PromptInput<'_> {
             (NEW_ENTRIES, lines)
         };
         let related = self
-            .related(&new_ids, &pinned, related_divisor)?
+            .related(&new_ids, &pinned)?
             .into_iter()
             .map(|e| entry_line(e, label(e)))
             .collect();
@@ -515,7 +549,7 @@ impl PromptInput<'_> {
                 TextKind::Dense,
             ),
             section(
-                "related",
+                RELATED,
                 related,
                 Cut::Lines {
                     priority: 1,
@@ -538,7 +572,7 @@ impl PromptInput<'_> {
 
     /// Older entries retrieved for every new entry and open question, without the pinned and new ones, best rank
     /// first: every query's first hit, then every second hit, and so on.
-    fn related(&self, new_ids: &HashSet<i64>, pinned: &[&Entry], divisor: usize) -> Result<Vec<&Entry>> {
+    fn related(&self, new_ids: &HashSet<i64>, pinned: &[&Entry]) -> Result<Vec<&Entry>> {
         let mut exclude = new_ids.clone();
         exclude.extend(pinned.iter().map(|e| e.id));
         let importance = self.cdb.importance_map(self.case_id)?;
@@ -556,10 +590,6 @@ impl PromptInput<'_> {
         // entry id -> (best rank, best score)
         let mut best: HashMap<i64, (usize, f32)> = HashMap::new();
         for (text, k) in queries {
-            let k = k / divisor.max(1);
-            if k == 0 {
-                continue;
-            }
             let query = RetrievalQuery {
                 case_id: self.case_id,
                 text,

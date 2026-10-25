@@ -192,8 +192,14 @@ fn diff_pass_cut_new_entries_are_covered_next_time() {
     let seen = e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id;
     assert_eq!(s.entries_to, seen);
     assert!(seen < newest(&e));
+    assert!(!e.fake.requests().last().unwrap().body.contains("Fragment 6:"));
     script(&e, json!({"new": []}));
     assert!(run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).is_ok());
+    assert_eq!(
+        e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id,
+        newest(&e)
+    );
+    assert!(e.fake.requests().last().unwrap().body.contains("Fragment 6:"));
 }
 
 #[test]
@@ -231,20 +237,27 @@ fn instruction_in_a_note_cannot_bypass_validation() {
 fn truncated_serialization_retries_with_smaller_related_then_fails() {
     let e = env();
     let q = question(&e, "Where did the uploaded webshell come from?");
+    e.cdb.set_last_seen(e.case, newest(&e), 0).unwrap();
+    // related to the older "Apache access.log shows a POST to x.php"
+    e.f.factum()
+        .create_note("A second POST to x.php in access.log", None, e.case)
+        .unwrap();
     e.fake.push(200, &ok("[]"));
     e.fake.push(200, &ok("Reasoning about #1."));
     e.fake.push(200, &openai_chat(r#"{"answered":"#, "length", 100));
     e.fake.push(200, &openai_chat(r#"{"answered":"#, "length", 100));
-    assert!(matches!(pass(&e, PassKind::Full), Err(PassError::Output(_))));
+    assert!(matches!(pass(&e, PassKind::Diff), Err(PassError::Output(_))));
     assert_eq!(last_status(&e), "failed");
     assert_eq!(open_ids(&e), vec![q]);
-    let serialize = e
+    let serialize: Vec<usize> = e
         .fake
         .requests()
         .iter()
         .filter(|r| r.body.contains("turn your reasoning above into one JSON object"))
-        .count();
-    assert_eq!(serialize, 2);
+        .map(|r| r.body.len())
+        .collect();
+    assert_eq!(serialize.len(), 2);
+    assert!(serialize[1] < serialize[0], "the retry is smaller");
 }
 
 #[test]
