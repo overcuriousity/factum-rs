@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+use super::enrich::index_unindexed;
 use super::llm::{ChatRequest, Client, Role};
 use super::prompts::{ABSTAIN_PREFIX, ask_system, entry_line};
 use super::reflect::{PassError, load_case};
@@ -31,7 +32,7 @@ pub struct Answer {
     pub abstained: bool,
 }
 
-/// Asks one question. The answer is not stored. Reads what exists: entries that were never indexed are not found.
+/// Asks one question. The answer is not stored. Indexes entries not yet indexed first; without any excerpt the answer is an abstention and no model is called.
 pub fn ask(
     case_db: &Db,
     cdb: &CompanionDb,
@@ -39,6 +40,7 @@ pub fn ask(
     case_id: i64,
     question: &str,
 ) -> Result<Answer, PassError> {
+    index_unindexed(case_db, cdb, case_id)?;
     let data = load_case(case_db, case_id)?;
     cdb.ensure_case(case_id)?;
     let importance = cdb.importance_map(case_id)?;
@@ -91,6 +93,15 @@ pub fn ask(
         ids.push(entry.id);
     }
 
+    if excerpts.is_empty() {
+        return Ok(Answer {
+            text: ABSTAIN_PREFIX.to_string(),
+            references: Vec::new(),
+            unsupported: Vec::new(),
+            abstained: true,
+        });
+    }
+
     let prompt = format!("Question: {question}\n\nExcerpts:\n\n{}", excerpts.join(SEPARATOR));
     let system = ask_system();
     let response = client.chat(&ChatRequest {
@@ -113,20 +124,25 @@ pub fn ask(
 }
 
 /// Every `[n]` of the text whose `n` names an excerpt (1-based into `ids`), once, in order of first appearance.
+/// Also `[1, 2]` and `[1,2]`; a bracket with anything else inside (a range, a word) is no reference.
 fn references(text: &str, ids: &[i64]) -> Vec<(usize, i64)> {
     let mut found: Vec<(usize, i64)> = Vec::new();
     for (open, _) in text.match_indices('[') {
         let rest = &text[open + 1..];
         let Some(close) = rest.find(']') else { continue };
-        let digits = &rest[..close];
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        let parts: Vec<&str> = rest[..close]
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if parts.is_empty() || !parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_digit())) {
             continue;
         }
-        let Ok(n) = digits.parse::<usize>() else { continue };
-        if let Some(&id) = n.checked_sub(1).and_then(|i| ids.get(i))
-            && !found.iter().any(|&(seen, _)| seen == n)
-        {
-            found.push((n, id));
+        for n in parts.iter().filter_map(|p| p.parse::<usize>().ok()) {
+            if let Some(&id) = n.checked_sub(1).and_then(|i| ids.get(i))
+                && !found.iter().any(|&(seen, _)| seen == n)
+            {
+                found.push((n, id));
+            }
         }
     }
     found
@@ -138,15 +154,26 @@ pub fn unsupported_literals(answer: &str, excerpts: &[String]) -> Vec<String> {
     const PUNCTUATION: &[char] = &['.', ',', ';', ':', '(', ')', '[', ']', '"', '\''];
     let haystack = excerpts.join("\n").to_lowercase();
     let mut found: Vec<String> = Vec::new();
-    for token in answer.split_whitespace() {
-        let token = token.trim_matches(PUNCTUATION);
-        let command = token.len() > 2 && token.starts_with('`') && token.ends_with('`');
-        let core = token.trim_matches('`').trim_matches(PUNCTUATION);
-        if core.is_empty() || !(command || is_literal(core)) {
+    let mut check = |literal: &str| {
+        if !haystack.contains(&literal.to_lowercase()) && !found.iter().any(|f| f == literal) {
+            found.push(literal.to_string());
+        }
+    };
+    // split at backticks: odd segments with a closing backtick are commands, tested whole; the rest is prose
+    let segments: Vec<&str> = answer.split('`').collect();
+    for (i, segment) in segments.iter().enumerate() {
+        if i % 2 == 1 && i + 1 < segments.len() {
+            let command = segment.trim();
+            if !command.is_empty() {
+                check(command);
+            }
             continue;
         }
-        if !haystack.contains(&core.to_lowercase()) && !found.iter().any(|f| f == core) {
-            found.push(core.to_string());
+        for token in segment.split_whitespace() {
+            let token = token.trim_matches(PUNCTUATION);
+            if is_literal(token) {
+                check(token);
+            }
         }
     }
     found
@@ -170,9 +197,9 @@ mod tests {
     #[test]
     fn literals_not_in_excerpts_are_flagged() {
         let u = unsupported_literals(
-            "See /etc/vz/conf and md5 0123456789abcdef0123456789abcdef and port 8080",
+            "See /etc/vz/conf and md5 0123456789abcdef0123456789abcdef and port 8080, run `vzctl enter 101`.",
             &["found /etc/vz/conf".into()],
         );
-        assert_eq!(u, vec!["0123456789abcdef0123456789abcdef", "8080"]);
+        assert_eq!(u, vec!["0123456789abcdef0123456789abcdef", "8080", "vzctl enter 101"]);
     }
 }
