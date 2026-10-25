@@ -4,6 +4,7 @@
 
 mod companion_dialogs;
 mod companion_panel;
+mod companion_windows;
 mod dialogs;
 mod theme;
 mod widgets;
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant};
 use egui::{Align, Key, KeyboardShortcut, Layout, Margin, Modifiers, RichText, TextEdit};
 
 use crate::cases::Case;
+use crate::companion::ask::Answer;
 use crate::companion::thread::{Command, CompanionHandle, Status};
 use crate::companion::{CompanionDb, Settings, companion_db_path};
 use crate::db::Db;
@@ -31,6 +33,7 @@ use crate::signer::{ACTIVE_KEY_SETTING, GnupgSigner, Signer};
 use crate::verifier::{CaseReport, SignatureCheck};
 use companion_dialogs::CompanionSettingsDialog;
 use companion_panel::{CompanionView, PanelAction};
+use companion_windows::{CompanionWindow, WindowAction};
 use dialogs::{Dialog, DialogResult, NoGpgChoice, Pending, VerifyAction, VerifyWindow};
 use theme::{SMALL_SIZE, THEMES};
 use widgets::{Card, CardAction, CardView, CheckView};
@@ -164,6 +167,9 @@ struct FactumApp {
     verify_job: Option<VerifyJob>,
     dialogs: Vec<Dialog>,
     verify_windows: Vec<VerifyWindow>,
+    companion_windows: Vec<CompanionWindow>,
+    // running Ask calls, by case
+    ask_jobs: Vec<(i64, workers::Worker<workers::AskResult>)>,
     next_window_id: u64,
     gpg_help_prompted: bool,
     // asked once per GUI session before sealing without a key
@@ -242,6 +248,8 @@ impl FactumApp {
             verify_job: None,
             dialogs: Vec::new(),
             verify_windows: Vec::new(),
+            companion_windows: Vec::new(),
+            ask_jobs: Vec::new(),
             next_window_id: 0,
             gpg_help_prompted: false,
             no_gpg_key_prompted: false,
@@ -369,8 +377,22 @@ impl FactumApp {
             Ok(view) => self.view = view,
             Err(e) => log::error!("Failed to populate the window: {e}"),
         }
+        self.reload_history();
         self.notify_companion();
         self.check_shown_signatures(ctx);
+    }
+
+    /// Rereads the rows of the open history windows: ratings, passes and the windows' own buttons change them.
+    fn reload_history(&mut self) {
+        let Some(cdb) = &self.companion_db else { return };
+        for window in &mut self.companion_windows {
+            if let CompanionWindow::History { case_id, rows, .. } = window {
+                match cdb.resolved_questions(*case_id) {
+                    Ok(questions) => *rows = questions,
+                    Err(e) => log::error!("The companion history cannot be read: {e}"),
+                }
+            }
+        }
     }
 
     /// Sends `CaseChanged` for every case the companion knows (it has a `case_settings` row) with entries the thread
@@ -650,6 +672,23 @@ impl FactumApp {
                 Ok(report) => self.show_case_report(report),
                 Err(message) => self.message("Factum", format!("Verification failed: {message}")),
             }
+        }
+        let mut finished = Vec::new();
+        self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll() {
+            Some(result) => {
+                finished.push((*case_id, result));
+                false
+            }
+            None => true,
+        });
+        for (case_id, result) in finished {
+            self.set_ask_state(case_id, |answer, error, running| {
+                *running = false;
+                match result {
+                    Ok(a) => *answer = Some(a),
+                    Err(e) => *error = Some(format!("Asking failed: {e}")),
+                }
+            });
         }
         if let Some(handle) = &self.companion {
             let status = handle.status();
@@ -1144,14 +1183,98 @@ impl FactumApp {
                     self.open_case_goal(case_id);
                 }
             }
-            PanelAction::OpenHistory => log::info!("The companion history is not available yet."),
-            PanelAction::OpenAsk => log::info!("Asking the companion is not available yet."),
+            PanelAction::OpenHistory => {
+                if let Some(case_id) = case_id {
+                    self.open_companion_window(CompanionWindow::History {
+                        case_id,
+                        rows: Vec::new(),
+                        open: true,
+                    });
+                }
+            }
+            PanelAction::OpenAsk => {
+                if let Some(case_id) = case_id {
+                    self.open_companion_window(CompanionWindow::Ask {
+                        case_id,
+                        question: String::new(),
+                        answer: None,
+                        error: None,
+                        running: false,
+                        open: true,
+                    });
+                }
+            }
             PanelAction::Rethink => {
                 if let Some(case_id) = case_id {
                     self.send_companion(Command::Rethink(case_id));
                 }
             }
             PanelAction::OpenSettings => self.open_companion_settings(),
+        }
+    }
+
+    /// Opens the window, unless one of its kind is already open for the case.
+    fn open_companion_window(&mut self, window: CompanionWindow) {
+        let same = |w: &CompanionWindow| match (w, &window) {
+            (CompanionWindow::History { case_id: a, .. }, CompanionWindow::History { case_id: b, .. })
+            | (CompanionWindow::Ask { case_id: a, .. }, CompanionWindow::Ask { case_id: b, .. }) => a == b,
+            _ => false,
+        };
+        if !self.companion_windows.iter().any(same) {
+            self.companion_windows.push(window);
+            self.reload_history();
+        }
+    }
+
+    fn handle_window_action(&mut self, action: WindowAction, ctx: &egui::Context) {
+        match action {
+            WindowAction::Jump(entry_id) => self.jump_to_entry(entry_id),
+            WindowAction::Unlink(question_id) => {
+                let Some(cdb) = &self.companion_db else { return };
+                let unlinked = cdb.unlink_question(question_id);
+                self.run(unlinked);
+            }
+            WindowAction::Restore(question_id) => {
+                let Some(cdb) = &self.companion_db else { return };
+                let restored = cdb.restore_question(question_id);
+                self.run(restored);
+            }
+            WindowAction::Ask { case_id, question } => {
+                let Some(cdb) = &self.companion_db else { return };
+                let worker = workers::ask(
+                    ctx,
+                    self.db.path.clone(),
+                    cdb.path.clone(),
+                    self.companion_settings.clone(),
+                    case_id,
+                    question,
+                );
+                self.ask_jobs.push((case_id, worker));
+                self.set_ask_state(case_id, |answer, error, running| {
+                    *answer = None;
+                    *error = None;
+                    *running = true;
+                });
+            }
+            WindowAction::CopyAnswer(text) => ctx.copy_text(text),
+        }
+    }
+
+    /// Updates the Ask window of the case, if it is still open.
+    fn set_ask_state(&mut self, case: i64, f: impl FnOnce(&mut Option<Answer>, &mut Option<String>, &mut bool)) {
+        for window in &mut self.companion_windows {
+            if let CompanionWindow::Ask {
+                case_id,
+                answer,
+                error,
+                running,
+                ..
+            } = window
+                && *case_id == case
+            {
+                f(answer, error, running);
+                return;
+            }
         }
     }
 
@@ -2189,6 +2312,14 @@ impl eframe::App for FactumApp {
                     }
                 }
             }
+        }
+        let mut window_actions = Vec::new();
+        for window in &mut self.companion_windows {
+            window.show(&ctx, &mut window_actions);
+        }
+        self.companion_windows.retain(CompanionWindow::is_open);
+        for action in window_actions {
+            self.handle_window_action(action, &ctx);
         }
         self.verification_progress(&ctx);
         if let Some(dialog) = self.dialogs.last_mut()
