@@ -24,11 +24,7 @@ impl Factum<'_> {
                 unique.push(format);
             }
         }
-        let unknown: Vec<&str> = unique
-            .iter()
-            .copied()
-            .filter(|f| !FORMATS.contains(f))
-            .collect();
+        let unknown: Vec<&str> = unique.iter().copied().filter(|f| !FORMATS.contains(f)).collect();
         if !unknown.is_empty() || unique.is_empty() {
             let given = if unknown.is_empty() {
                 "none given".to_string()
@@ -45,9 +41,7 @@ impl Factum<'_> {
         let seal_id = self.seal(case_id, REASON_EXPORT)?;
         let report = self.verify_case(case_id, None)?;
         let exported_utc = utc_now();
-        let seal = self
-            .get_tree_head(seal_id)?
-            .expect("the seal was just created");
+        let seal = self.get_tree_head(seal_id)?.expect("the seal was just created");
         let model = self.build_model(report, seal, self.signer.active_key(), &exported_utc)?;
         // built by concatenation: case file numbers may contain dots, which with_extension would cut off
         let stem = format!(
@@ -75,16 +69,8 @@ impl Factum<'_> {
             }
         }
         if unique.contains(&"bundle") {
-            let reports = [
-                ("report.html", html),
-                ("report.pdf", pdf),
-                ("report.md", markdown),
-            ];
-            written.push(self.build_bundle(
-                &model,
-                &reports,
-                &out_dir.join(format!("{stem}.zip")),
-            )?);
+            let reports = [("report.html", html), ("report.pdf", pdf), ("report.md", markdown)];
+            written.push(self.build_bundle(&model, &reports, &out_dir.join(format!("{stem}.zip")))?);
         }
         Ok(written)
     }

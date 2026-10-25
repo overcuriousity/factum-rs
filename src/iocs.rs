@@ -13,18 +13,9 @@ use crate::error::Result;
 pub static IOC_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
     let octet = r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
     vec![
-        (
-            "ip",
-            Regex::new(&format!(r"\b(?:{octet}\.){{3}}{octet}\b")).unwrap(),
-        ),
-        (
-            "domain",
-            Regex::new(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b").unwrap(),
-        ),
-        (
-            "url",
-            Regex::new(r"\bhttps?://[^\s/$.?#].[^\s]*\b").unwrap(),
-        ),
+        ("ip", Regex::new(&format!(r"\b(?:{octet}\.){{3}}{octet}\b")).unwrap()),
+        ("domain", Regex::new(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b").unwrap()),
+        ("url", Regex::new(r"\bhttps?://[^\s/$.?#].[^\s]*\b").unwrap()),
         (
             "email",
             Regex::new(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b").unwrap(),
@@ -40,14 +31,13 @@ pub static IOC_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(||
 /// "domains" ending in one of these are almost always file names (evil.exe, notes.txt), not network indicators
 pub static DOMAIN_EXCLUDED_SUFFIXES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
-        "exe", "dll", "sys", "bat", "cmd", "ps1", "psm1", "vbs", "js", "jse", "hta", "msi", "scr",
-        "lnk", "jar", "py", "pyc", "sh", "bin", "elf", "so", "dylib", "app", "dmg", "pkg", "deb",
-        "rpm", "apk", "txt", "log", "csv", "json", "xml", "yml", "yaml", "ini", "cfg", "conf",
-        "md", "html", "htm", "php", "asp", "aspx", "doc", "docx", "docm", "xls", "xlsx", "xlsm",
-        "ppt", "pptx", "pdf", "rtf", "odt", "zip", "rar", "7z", "gz", "tgz", "tar", "bz2", "xz",
-        "cab", "iso", "img", "vhd", "vhdx", "vmdk", "e01", "dd", "raw", "mem", "dmp", "pcap",
-        "pcapng", "evtx", "reg", "db", "sqlite", "dat", "tmp", "bak", "png", "jpg", "jpeg", "gif",
-        "bmp", "ico", "svg", "mp3", "mp4", "mov", "avi", "wav",
+        "exe", "dll", "sys", "bat", "cmd", "ps1", "psm1", "vbs", "js", "jse", "hta", "msi", "scr", "lnk", "jar", "py",
+        "pyc", "sh", "bin", "elf", "so", "dylib", "app", "dmg", "pkg", "deb", "rpm", "apk", "txt", "log", "csv",
+        "json", "xml", "yml", "yaml", "ini", "cfg", "conf", "md", "html", "htm", "php", "asp", "aspx", "doc", "docx",
+        "docm", "xls", "xlsx", "xlsm", "ppt", "pptx", "pdf", "rtf", "odt", "zip", "rar", "7z", "gz", "tgz", "tar",
+        "bz2", "xz", "cab", "iso", "img", "vhd", "vhdx", "vmdk", "e01", "dd", "raw", "mem", "dmp", "pcap", "pcapng",
+        "evtx", "reg", "db", "sqlite", "dat", "tmp", "bak", "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "mp3",
+        "mp4", "mov", "avi", "wav",
     ]
     .into_iter()
     .collect()
@@ -104,10 +94,7 @@ pub fn parse_ioc_from_note(conn: &Connection, entry_id: i64, text: &str) -> Resu
             params![entry_id, ioc_id],
         )?;
     }
-    log::debug!(
-        "Parsed and added {} new IOCs from entry ID {entry_id}",
-        new_ids.len()
-    );
+    log::debug!("Parsed and added {} new IOCs from entry ID {entry_id}", new_ids.len());
     Ok(new_ids)
 }
 
@@ -126,9 +113,7 @@ fn grouped(conn: &Connection, column: &str, id: i64) -> Result<BTreeMap<String, 
     );
     let mut statement = conn.prepare(&sql)?;
     let mut result: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let rows = statement.query_map([id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows = statement.query_map([id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
     for row in rows {
         let (ioc_type, value) = row?;
         result.entry(ioc_type).or_default().push(value);
@@ -141,18 +126,12 @@ pub fn get_iocs_for_case(conn: &Connection, case_id: i64) -> Result<BTreeMap<Str
     grouped(conn, "case_id", case_id)
 }
 
-pub fn get_iocs_for_evidence(
-    conn: &Connection,
-    evidence_id: i64,
-) -> Result<BTreeMap<String, Vec<String>>> {
+pub fn get_iocs_for_evidence(conn: &Connection, evidence_id: i64) -> Result<BTreeMap<String, Vec<String>>> {
     grouped(conn, "evidence_id", evidence_id)
 }
 
 pub fn remove_orphaned_iocs(conn: &Connection) -> Result<usize> {
-    Ok(conn.execute(
-        "DELETE FROM ioc WHERE id NOT IN (SELECT ioc_id FROM entry_ioc_map)",
-        [],
-    )?)
+    Ok(conn.execute("DELETE FROM ioc WHERE id NOT IN (SELECT ioc_id FROM entry_ioc_map)", [])?)
 }
 
 #[cfg(test)]

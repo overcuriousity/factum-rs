@@ -39,10 +39,10 @@ pub fn expand_user(path: &str) -> PathBuf {
     if path == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
     }
-    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(path)
 }
@@ -62,10 +62,7 @@ pub fn parse_dotenv(text: &str) -> HashMap<String, String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line
-            .strip_prefix("export ")
-            .map(str::trim_start)
-            .unwrap_or(line);
+        let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
@@ -76,10 +73,7 @@ pub fn parse_dotenv(text: &str) -> HashMap<String, String> {
                 Some(end) => {
                     let inner = &value[1..1 + end];
                     if quote == '"' {
-                        inner
-                            .replace("\\n", "\n")
-                            .replace("\\\"", "\"")
-                            .replace("\\\\", "\\")
+                        inner.replace("\\n", "\n").replace("\\\"", "\"").replace("\\\\", "\\")
                     } else {
                         inner.to_string()
                     }
@@ -141,9 +135,8 @@ mod tests {
 
     #[test]
     fn dotenv_parsing() {
-        let values = parse_dotenv(
-            "# comment\nLOG_LEVEL=debug # inline\nexport FACTUM_DB=\"/a b/f.db\"\nX='y #z'\nbroken\n",
-        );
+        let values =
+            parse_dotenv("# comment\nLOG_LEVEL=debug # inline\nexport FACTUM_DB=\"/a b/f.db\"\nX='y #z'\nbroken\n");
         assert_eq!(values["LOG_LEVEL"], "debug");
         assert_eq!(values["FACTUM_DB"], "/a b/f.db");
         assert_eq!(values["X"], "y #z");
@@ -154,10 +147,7 @@ mod tests {
     fn seal_dir_from_values() {
         let mut env = HashMap::new();
         assert_eq!(Config::from_values(&env).seal_dir, None);
-        env.insert(
-            "FACTUM_SEAL_DIR".to_string(),
-            "/media/usb/seals".to_string(),
-        );
+        env.insert("FACTUM_SEAL_DIR".to_string(), "/media/usb/seals".to_string());
         assert_eq!(
             Config::from_values(&env).seal_dir,
             Some(PathBuf::from("/media/usb/seals"))
@@ -168,9 +158,6 @@ mod tests {
     fn defaults() {
         let config = Config::from_values(&HashMap::new());
         assert_eq!(config.log_level, "INFO");
-        assert!(
-            config.db_path.ends_with("factum/factum.db")
-                || config.db_path.ends_with("factum\\factum.db")
-        );
+        assert!(config.db_path.ends_with("factum/factum.db") || config.db_path.ends_with("factum\\factum.db"));
     }
 }

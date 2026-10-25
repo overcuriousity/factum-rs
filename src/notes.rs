@@ -77,10 +77,10 @@ impl Entry {
 
     /// The clearsigned block that signs this entry.
     pub fn any_signature(&self) -> Option<&str> {
-        self.signature.as_deref().filter(|s| !s.is_empty()).or(self
-            .late_signature
-            .as_ref()
-            .map(|late| late.signature.as_str()))
+        self.signature
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(self.late_signature.as_ref().map(|late| late.signature.as_str()))
     }
 }
 
@@ -88,18 +88,13 @@ impl Entry {
 pub fn parse_payload(payload_json: Option<&str>) -> Value {
     match payload_json {
         None | Some("") => Value::Null,
-        Some(text) => {
-            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
-        }
+        Some(text) => serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string())),
     }
 }
 
 /// match text literally anywhere, % and _ in the filter are not wildcards
 pub fn like_substring(text: &str) -> String {
-    let escaped = text
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
+    let escaped = text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
     format!("%{escaped}%")
 }
 
@@ -138,12 +133,7 @@ impl EntryFilter<'_> {
 }
 
 impl Factum<'_> {
-    pub fn create_note(
-        &self,
-        note_text: &str,
-        evidence_id: Option<i64>,
-        case_id: i64,
-    ) -> Result<i64> {
+    pub fn create_note(&self, note_text: &str, evidence_id: Option<i64>, case_id: i64) -> Result<i64> {
         if strip(note_text).is_empty() {
             return Err(FactumError::general("The note is empty."));
         }
@@ -169,9 +159,7 @@ impl Factum<'_> {
                     )));
                 }
                 Some((_, Some(_))) => {
-                    return Err(FactumError::general(format!(
-                        "Evidence #{evidence_id} was deleted."
-                    )));
+                    return Err(FactumError::general(format!("Evidence #{evidence_id} was deleted.")));
                 }
                 Some((_, None)) => {}
             }
@@ -202,11 +190,8 @@ impl Factum<'_> {
         // versions never branch: a correction always attaches to the newest version of the line
         let newest = self.latest_version_id(note_id)?;
         let move_pin = |conn: &rusqlite::Connection, new_id: i64| -> Result<()> {
-            let pinned: i64 = conn.query_row(
-                "SELECT is_pinned FROM entries WHERE id = ?",
-                [newest],
-                |row| row.get(0),
-            )?;
+            let pinned: i64 =
+                conn.query_row("SELECT is_pinned FROM entries WHERE id = ?", [newest], |row| row.get(0))?;
             if pinned != 0 {
                 conn.execute("UPDATE entries SET is_pinned = 0 WHERE id = ?", [newest])?;
                 conn.execute("UPDATE entries SET is_pinned = 1 WHERE id = ?", [new_id])?;
@@ -242,7 +227,12 @@ impl Factum<'_> {
             .query_row(
                 "SELECT signature, signed_utc FROM late_signatures WHERE target = 'entry' AND target_id = ?",
                 [entry_id],
-                |row| Ok(LateSignature { signature: row.get(0)?, signed_utc: row.get(1)? }),
+                |row| {
+                    Ok(LateSignature {
+                        signature: row.get(0)?,
+                        signed_utc: row.get(1)?,
+                    })
+                },
             )
             .optional()?;
         Ok(Some(entry))
@@ -275,11 +265,9 @@ impl Factum<'_> {
             let corrects: Option<Option<i64>> = self
                 .db
                 .conn
-                .query_row(
-                    "SELECT corrects_id FROM entries WHERE id = ?",
-                    [first],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT corrects_id FROM entries WHERE id = ?", [first], |row| {
+                    row.get(0)
+                })
                 .optional()?;
             match corrects {
                 Some(Some(previous)) => first = previous,
@@ -297,8 +285,7 @@ impl Factum<'_> {
     ///
     /// search matches the entry text or one of its tags/labels anywhere, case-insensitively for ASCII.
     pub fn list_entries(&self, case_id: i64, filter: &EntryFilter<'_>) -> Result<Vec<i64>> {
-        let mut conditions =
-            vec!["NOT EXISTS (SELECT 1 FROM entries s WHERE s.corrects_id = e.id)".to_string()];
+        let mut conditions = vec!["NOT EXISTS (SELECT 1 FROM entries s WHERE s.corrects_id = e.id)".to_string()];
         let mut values: Vec<Box<dyn ToSql>> = vec![Box::new(case_id)];
         if let Some(evidence_id) = filter.evidence_id {
             conditions.push("e.evidence_id = ?".into());

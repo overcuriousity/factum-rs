@@ -16,16 +16,13 @@ use factum::signer::{FakeSigner, GnupgSigner, Signer};
 use factum::verifier::Level;
 use sha2::Digest;
 
-const TRICKY: &str =
-    "<script>alert(1)</script> **bold** ```fence``` \n-----BEGIN PGP SIGNATURE-----";
+const TRICKY: &str = "<script>alert(1)</script> **bold** ```fence``` \n-----BEGIN PGP SIGNATURE-----";
 const EXPORTED: &str = "2026-10-05T12:00:00.000Z";
 
 fn model_case(factum: &Factum) -> i64 {
     let case_id = factum.create_case("C-1", "Case <b>", "desc").unwrap();
     let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
-    let first = factum
-        .create_note("first", Some(evidence_id), case_id)
-        .unwrap();
+    let first = factum.create_note("first", Some(evidence_id), case_id).unwrap();
     factum.create_note(TRICKY, None, case_id).unwrap();
     factum.correct_note(first, "first, corrected").unwrap();
     factum::tags::add_label(factum.db, first, "review").unwrap();
@@ -51,20 +48,11 @@ fn model(f: &Fixture) -> ReportModel {
 fn timeline_shows_newest_version_at_the_original_position() {
     let f = Fixture::new();
     let model = model(&f);
-    let texts: Vec<&str> = model
-        .timeline
-        .iter()
-        .map(|item| item.text.as_str())
-        .collect();
+    let texts: Vec<&str> = model.timeline.iter().map(|item| item.text.as_str()).collect();
     assert_eq!(texts[2..], ["first, corrected", TRICKY]);
     let corrected = &model.timeline[2];
     assert!(corrected.version == 2 && corrected.origin_id != corrected.entry_id);
-    assert!(
-        corrected
-            .correction_note()
-            .unwrap()
-            .starts_with("Corrected ")
-    );
+    assert!(corrected.correction_note().unwrap().starts_with("Corrected "));
     assert_eq!(model.appendix.len(), 5); // every leaf, including the superseded version
 }
 
@@ -109,12 +97,7 @@ fn notes_come_first_and_technical_data_last() {
         let activity = text.find("Case activity").unwrap();
         let verification = text.find("Verification").unwrap();
         let appendix = text.find("Integrity appendix").unwrap();
-        assert!(
-            notes < corrected
-                && corrected < activity
-                && activity < verification
-                && verification < appendix
-        );
+        assert!(notes < corrected && corrected < activity && activity < verification && verification < appendix);
         // hashes and signatures stay out of the readable part
         let readable = &text[..verification];
         assert!(!readable.contains(&model.timeline.last().unwrap().leaf_hash[..12]));
@@ -143,14 +126,8 @@ fn failing_case_shows_fail_banner() {
     let factum = f.factum();
     let case_id = model_case(&factum);
     let seal_id = factum.seal(case_id, "export").unwrap();
-    let last = build(&factum, case_id, seal_id, None)
-        .timeline
-        .last()
-        .unwrap()
-        .entry_id;
-    f.exec(&format!(
-        "UPDATE entries SET text = 'tampered' WHERE id = {last}"
-    ));
+    let last = build(&factum, case_id, seal_id, None).timeline.last().unwrap().entry_id;
+    f.exec(&format!("UPDATE entries SET text = 'tampered' WHERE id = {last}"));
     let failing = build(&factum, case_id, seal_id, None);
     let html = render_html(&failing, false);
     assert!(html.contains("Verification: FAIL") && html.contains("status-FAIL"));
@@ -159,10 +136,7 @@ fn failing_case_shows_fail_banner() {
     assert!(html.contains("This note failed the integrity check"));
     let markdown = render_markdown(&failing);
     assert!(markdown.find("> **FAIL**").unwrap() < markdown.find("## Notes").unwrap());
-    assert!(
-        markdown.contains("**Result: FAIL**")
-            && markdown.contains("This note failed the integrity check")
-    );
+    assert!(markdown.contains("**Result: FAIL**") && markdown.contains("This note failed the integrity check"));
 }
 
 #[test]
@@ -193,33 +167,18 @@ fn export_all_formats() {
     let factum = f.factum();
     let case_id = export_case(&factum);
     let out = f.path().join("out");
-    let paths = factum
-        .export(case_id, &["html", "pdf", "md", "bundle"], &out)
-        .unwrap();
+    let paths = factum.export(case_id, &["html", "pdf", "md", "bundle"], &out).unwrap();
     let suffixes: Vec<String> = paths
         .iter()
         .map(|p| p.extension().unwrap().to_string_lossy().into_owned())
         .collect();
     assert_eq!(suffixes, vec!["html", "pdf", "md", "zip"]);
-    assert!(
-        paths
-            .iter()
-            .all(|p| std::fs::metadata(p).unwrap().len() > 0)
-    );
+    assert!(paths.iter().all(|p| std::fs::metadata(p).unwrap().len() > 0));
     assert_eq!(
-        factum
-            .list_tree_heads(case_id)
-            .unwrap()
-            .last()
-            .unwrap()
-            .reason,
+        factum.list_tree_heads(case_id).unwrap().last().unwrap().reason,
         "export"
     );
-    assert!(
-        std::fs::read_to_string(&paths[0])
-            .unwrap()
-            .contains("Verification: OK")
-    );
+    assert!(std::fs::read_to_string(&paths[0]).unwrap().contains("Verification: OK"));
     let pdf = std::fs::read(&paths[1]).unwrap();
     assert!(pdf.starts_with(b"%PDF-") && pdf.len() > 1000);
     assert!(read_zip(&paths[3])["report.pdf"].starts_with(b"%PDF-"));
@@ -276,16 +235,8 @@ fn pdf_is_well_formed() {
     assert!(checked > 10);
     assert!(text.matches("/Type /Page ").count() > 2);
     if which::which("pdftotext").is_ok() {
-        let output = Command::new("pdftotext")
-            .arg(&path)
-            .arg("-")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let output = Command::new("pdftotext").arg(&path).arg("-").output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let extracted = String::from_utf8_lossy(&output.stdout);
         assert!(
             extracted.contains("Case <b>") && extracted.contains("Integrity appendix"),
@@ -349,9 +300,7 @@ fn case_with_unparsable_payload_is_still_exported() {
     f.exec(&format!(
         "UPDATE entries SET payload_json = '{{bad' WHERE case_id = {case_id} AND kind = 'system'"
     ));
-    let paths = factum
-        .export(case_id, &["html", "bundle"], f.path())
-        .unwrap();
+    let paths = factum.export(case_id, &["html", "bundle"], f.path()).unwrap();
     assert!(
         std::fs::read_to_string(&paths[0])
             .unwrap()
@@ -368,13 +317,7 @@ const REPORTS: [(&str, &[u8]); 3] = [
     ("report.md", b"# report"),
 ];
 
-fn make_bundle(
-    db: &factum::Db,
-    signer: &dyn Signer,
-    seal_dir: &Path,
-    out_dir: &Path,
-    case_file: &str,
-) -> PathBuf {
+fn make_bundle(db: &factum::Db, signer: &dyn Signer, seal_dir: &Path, out_dir: &Path, case_file: &str) -> PathBuf {
     let factum = Factum::with_seal_dir(db, signer, Some(seal_dir.to_path_buf()));
     let case_id = factum.create_case(case_file, "Case", "").unwrap();
     let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
@@ -388,9 +331,7 @@ fn make_bundle(
         .iter()
         .map(|(name, content)| (*name, content.to_vec()))
         .collect();
-    factum
-        .build_bundle(&model, &reports, &out_dir.join("C-1.zip"))
-        .unwrap()
+    factum.build_bundle(&model, &reports, &out_dir.join("C-1.zip")).unwrap()
 }
 
 fn read_zip(path: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -478,10 +419,7 @@ fn verify_py_reports_a_tampered_payload_instead_of_crashing() {
     let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
     let mut data = case_json(&bundle);
     data["entries"][1]["payload"] = "not an object".into();
-    rewrite_zip(
-        &bundle,
-        &[("case.json", serde_json::to_vec(&data).unwrap())],
-    );
+    rewrite_zip(&bundle, &[("case.json", serde_json::to_vec(&data).unwrap())]);
     let Some((code, output)) = run_verify(&bundle, None, &[]) else {
         return;
     };
@@ -504,10 +442,7 @@ fn verify_py_reports_references_to_unknown_evidence() {
         .find(|e| e["kind"] == "note")
         .unwrap();
     note["evidence_id"] = 999.into();
-    rewrite_zip(
-        &bundle,
-        &[("case.json", serde_json::to_vec(&data).unwrap())],
-    );
+    rewrite_zip(&bundle, &[("case.json", serde_json::to_vec(&data).unwrap())]);
     let Some((_, output)) = run_verify(&bundle, None, &[]) else {
         return;
     };
@@ -540,10 +475,7 @@ fn verify_py_accepts_a_clean_bundle_and_detects_changes() {
     let mut data = case_json(&bundle);
     data["entries"][3]["text"] = "forged".into();
     let original = read_zip(&bundle);
-    rewrite_zip(
-        &bundle,
-        &[("case.json", serde_json::to_vec(&data).unwrap())],
-    );
+    rewrite_zip(&bundle, &[("case.json", serde_json::to_vec(&data).unwrap())]);
     let (code, output) = run_verify(&bundle, Some(&home.path()), &[]).unwrap();
     assert_eq!(code, 1);
     assert!(
@@ -566,10 +498,7 @@ fn verify_py_accepts_a_clean_bundle_and_detects_changes() {
         .collect();
     rewrite_zip(&bundle, &changes);
     let (code, output) = run_verify(&bundle, Some(&home.path()), &[]).unwrap();
-    assert!(
-        code == 1 && output.contains("Manifest: signature invalid"),
-        "{output}"
-    );
+    assert!(code == 1 && output.contains("Manifest: signature invalid"), "{output}");
 }
 
 #[test]
@@ -578,19 +507,12 @@ fn verify_py_with_bundled_keys() {
     let f = Fixture::new();
     let signer = gpg_signer(&f.db, &home);
     let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
-    let empty_home = tempfile::Builder::new()
-        .prefix("fe-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let empty_home = tempfile::Builder::new().prefix("fe-").tempdir_in("/tmp").unwrap();
     let Some((code, output)) = run_verify(&bundle, Some(empty_home.path()), &[]) else {
         return;
     };
-    assert!(
-        code == 1 && output.contains("signing key not in keyring"),
-        "{output}"
-    );
-    let (code, output) =
-        run_verify(&bundle, Some(empty_home.path()), &["--use-bundled-keys"]).unwrap();
+    assert!(code == 1 && output.contains("signing key not in keyring"), "{output}");
+    let (code, output) = run_verify(&bundle, Some(empty_home.path()), &["--use-bundled-keys"]).unwrap();
     assert_eq!(code, 0, "{output}");
     assert!(output.contains("Compare them with a trusted source"));
     let _ = Command::new("gpgconf")
@@ -605,13 +527,7 @@ fn non_ascii_case_file_seals_verify_outside_factum() {
     let home = require_gpg!("Factum Test <test@factum.invalid>");
     let f = Fixture::new();
     let signer = gpg_signer(&f.db, &home);
-    let bundle = make_bundle(
-        &f.db,
-        &signer,
-        &f.seal_dir,
-        f.path(),
-        "2026/04 Müller Łódź 🦊",
-    );
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "2026/04 Müller Łódź 🦊");
     for item in std::fs::read_dir(&f.seal_dir).unwrap() {
         let path = item.unwrap().path();
         if path.extension().is_some_and(|e| e == "asc") {
@@ -622,11 +538,7 @@ fn non_ascii_case_file_seals_verify_outside_factum() {
                 .arg(&path)
                 .output()
                 .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         }
     }
     let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
@@ -643,24 +555,15 @@ fn verify_py_accepts_seals_made_before_a_rename() {
     let factum = Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
     factum.seal(case_id, "checkpoint").unwrap();
-    factum
-        .update_case(case_id, "C-renamed", "Case", "")
-        .unwrap();
+    factum.update_case(case_id, "C-renamed", "Case", "").unwrap();
     let seal_id = factum.seal(case_id, "export").unwrap();
     let model = build(&factum, case_id, seal_id, signer.active_key().as_deref());
-    assert_eq!(
-        model.report.overall(),
-        Level::Ok,
-        "{:?}",
-        model.report.findings
-    );
+    assert_eq!(model.report.overall(), Level::Ok, "{:?}", model.report.findings);
     let reports: Vec<(&str, Vec<u8>)> = REPORTS
         .iter()
         .map(|(name, content)| (*name, content.to_vec()))
         .collect();
-    let bundle = factum
-        .build_bundle(&model, &reports, &f.path().join("b.zip"))
-        .unwrap();
+    let bundle = factum.build_bundle(&model, &reports, &f.path().join("b.zip")).unwrap();
     let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
         return;
     };

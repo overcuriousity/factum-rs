@@ -74,11 +74,9 @@ pub fn add_case_row(db: &Db, case_file: &str, archived: bool) -> i64 {
 pub fn add_raw_entry(db: &Db, case_id: i64, text: &str, corrects_id: Option<i64>) -> i64 {
     let index: i64 = db
         .conn
-        .query_row(
-            "SELECT COUNT(*) FROM entries WHERE case_id = ?",
-            [case_id],
-            |r| r.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM entries WHERE case_id = ?", [case_id], |r| {
+            r.get(0)
+        })
         .unwrap();
     db.conn
         .execute(

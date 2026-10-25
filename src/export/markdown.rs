@@ -5,9 +5,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::html::{evidence_cells, technical_rows};
-use super::model::{
-    ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary,
-};
+use super::model::{ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
 use crate::verifier::Level;
 
 /// a line starting like this would turn into a list, heading, rule or code block
@@ -81,15 +79,9 @@ pub fn render_markdown(model: &ReportModel) -> String {
         "**Opened:** {}{archived}  ",
         readable_utc(Some(&case.created_utc))
     ));
-    lines.push(format!(
-        "**Exported:** {}",
-        readable_utc(Some(&model.exported_utc))
-    ));
+    lines.push(format!("**Exported:** {}", readable_utc(Some(&model.exported_utc))));
     lines.push(String::new());
-    lines.push(format!(
-        "> **{overall}** — {}",
-        inline(&status_sentence(report))
-    ));
+    lines.push(format!("> **{overall}** — {}", inline(&status_sentence(report))));
     lines.push(String::new());
     lines.push(format!("## Notes ({})", notes.len()));
     lines.push(String::new());
@@ -111,17 +103,13 @@ pub fn render_markdown(model: &ReportModel) -> String {
         lines.push(String::new());
         let mut details = Vec::new();
         if item.status == Level::Fail {
-            details
-                .push("**⚠ This note failed the integrity check — see Verification.**".to_string());
+            details.push("**⚠ This note failed the integrity check — see Verification.**".to_string());
         }
         if let Some(note) = item.correction_note() {
             details.push(format!("_{}_", inline(&note)));
         }
         if !item.labels.is_empty() {
-            details.push(format!(
-                "_Labels (not signed): {}_",
-                inline(&item.labels.join(", "))
-            ));
+            details.push(format!("_Labels (not signed): {}_", inline(&item.labels.join(", "))));
         }
         details.push(format!("<sub>Note \\#{}</sub>", item.origin_id));
         lines.push(details.join("  \n"));
@@ -134,10 +122,7 @@ pub fn render_markdown(model: &ReportModel) -> String {
         lines.push("| # | Description | Hash | Added | Deleted |".into());
         lines.push("|---|---|---|---|---|".into());
         for item in &model.evidence {
-            let cells: Vec<String> = evidence_cells(item)
-                .iter()
-                .map(|cell| inline(cell))
-                .collect();
+            let cells: Vec<String> = evidence_cells(item).iter().map(|cell| inline(cell)).collect();
             lines.push(format!("| {} |", cells.join(" | ")));
         }
     }
@@ -175,10 +160,7 @@ pub fn render_markdown(model: &ReportModel) -> String {
         lines.push(String::new());
     }
     let technical = technical_rows(model);
-    lines.push(format!(
-        "- **Exported with key:** {}",
-        inline(&technical[0].1)
-    ));
+    lines.push(format!("- **Exported with key:** {}", inline(&technical[0].1)));
     let seal = &model.seal;
     let unsigned = if seal.signature.as_deref().is_some_and(|s| !s.is_empty()) {
         ""
@@ -192,12 +174,7 @@ pub fn render_markdown(model: &ReportModel) -> String {
     for (fingerprint, username) in &report.signers {
         lines.push(format!(
             "- **Signer:** {} `{fingerprint}`",
-            inline(
-                username
-                    .as_deref()
-                    .filter(|u| !u.is_empty())
-                    .unwrap_or("unknown")
-            )
+            inline(username.as_deref().filter(|u| !u.is_empty()).unwrap_or("unknown"))
         ));
     }
     lines.extend([

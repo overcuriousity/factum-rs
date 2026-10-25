@@ -69,11 +69,7 @@ impl ReportEntry {
             "untrusted" => format!("signed {key}, untrusted key ✗"),
             _ => "unsigned".into(),
         };
-        format!(
-            "#{} · leaf {}… · {signature}",
-            self.entry_id,
-            head(&self.leaf_hash, 12)
-        )
+        format!("#{} · leaf {}… · {signature}", self.entry_id, head(&self.leaf_hash, 12))
     }
 
     pub fn correction_note(&self) -> Option<String> {
@@ -92,10 +88,7 @@ impl ReportEntry {
         let mut lines = vec![
             format!("Entry #{}, leaf {}", self.entry_id, self.leaf_index),
             format!("Leaf hash:  {}", self.leaf_hash),
-            format!(
-                "Tree head:  size {}, root {}",
-                self.tree_size, self.root_hash
-            ),
+            format!("Tree head:  size {}, root {}", self.tree_size, self.root_hash),
             format!(
                 "Signature:  {}{}",
                 self.signature_state,
@@ -128,17 +121,11 @@ pub struct ReportModel {
 
 impl ReportModel {
     pub fn notes(&self) -> Vec<&ReportEntry> {
-        self.timeline
-            .iter()
-            .filter(|item| item.kind == "note")
-            .collect()
+        self.timeline.iter().filter(|item| item.kind == "note").collect()
     }
 
     pub fn activity(&self) -> Vec<&ReportEntry> {
-        self.timeline
-            .iter()
-            .filter(|item| item.kind == "system")
-            .collect()
+        self.timeline.iter().filter(|item| item.kind == "system").collect()
     }
 }
 
@@ -247,12 +234,7 @@ impl Factum<'_> {
         let evidence = self.evidence_rows(case_id)?;
         let names: HashMap<i64, String> = evidence
             .iter()
-            .map(|item| {
-                (
-                    item.id,
-                    format!("Evidence #{} {}", item.id, item.description),
-                )
-            })
+            .map(|item| (item.id, format!("Evidence #{} {}", item.id, item.description)))
             .collect();
         let late = self.late_signatures()?;
         let mut origin: HashMap<i64, i64> = HashMap::new();
@@ -298,14 +280,10 @@ impl Factum<'_> {
                     .filter(|f| !f.is_empty())
                     .map(|f| tail(f, 8).to_string()),
                 fingerprint: check.fingerprint.clone().filter(|f| !f.is_empty()),
-                signature: entry
-                    .signature
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        late.get(&("entry".to_string(), entry.id))
-                            .map(|(signature, _)| signature.clone())
-                    }),
+                signature: entry.signature.clone().filter(|s| !s.is_empty()).or_else(|| {
+                    late.get(&("entry".to_string(), entry.id))
+                        .map(|(signature, _)| signature.clone())
+                }),
                 leaf_hash: entry.leaf_hash.clone(),
                 tree_size: entry.tree_size,
                 root_hash: entry.root_hash.clone(),

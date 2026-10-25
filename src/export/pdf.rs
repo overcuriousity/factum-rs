@@ -12,9 +12,7 @@ use flate2::write::ZlibEncoder;
 use ttf_parser::{Face, GlyphId};
 
 use super::html::{ALERT, evidence_cells, meta_rows, technical_rows};
-use super::model::{
-    ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary,
-};
+use super::model::{ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
 use crate::verifier::Level;
 
 const SANS: &[u8] = include_bytes!("../../assets/fonts/AtkinsonHyperlegibleNext-Regular.ttf");
@@ -263,11 +261,7 @@ impl Writer {
         let runs = self.runs(style, text);
         let (r, g, b) = style.color;
         for run in runs {
-            let hex: String = run
-                .glyphs
-                .iter()
-                .map(|glyph| format!("{glyph:04X}"))
-                .collect();
+            let hex: String = run.glyphs.iter().map(|glyph| format!("{glyph:04X}")).collect();
             let width: f32 = run
                 .glyphs
                 .iter()
@@ -314,21 +308,15 @@ impl Writer {
         self.paragraph_with_background(style, text, indent, None);
     }
 
-    fn paragraph_with_background(
-        &mut self,
-        style: Style,
-        text: &str,
-        indent: f32,
-        background: Option<Rgb>,
-    ) {
+    fn paragraph_with_background(&mut self, style: Style, text: &str, indent: f32, background: Option<Rgb>) {
         let padding = if background.is_some() { 5.0 } else { 0.0 };
         let width = CONTENT_WIDTH - indent - 2.0 * padding;
         let lines = self.wrap(&style, text, width);
         let height = style.line_height();
-        if background.is_some() {
+        if let Some(color) = background {
             self.ensure(height + 2.0 * padding);
             self.fill_rect(
-                background.unwrap(),
+                color,
                 MARGIN_X + indent,
                 self.y - padding,
                 CONTENT_WIDTH - indent,
@@ -370,14 +358,7 @@ impl Writer {
         self.paragraph(style, text, 0.0);
         if rule {
             self.y -= 2.0;
-            self.line(
-                BORDER,
-                0.8,
-                MARGIN_X,
-                self.y,
-                MARGIN_X + CONTENT_WIDTH,
-                self.y,
-            );
+            self.line(BORDER, 0.8, MARGIN_X, self.y, MARGIN_X + CONTENT_WIDTH, self.y);
         }
         self.y -= size * 0.4;
     }
@@ -426,11 +407,7 @@ impl Writer {
                     .map(|(cell, width)| self.wrap(&style, cell, width - 2.0 * padding))
                     .collect();
                 let line_count = wrapped.iter().map(Vec::len).max().unwrap_or(1);
-                (
-                    style,
-                    wrapped,
-                    line_count as f32 * style.line_height() + 2.0 * padding,
-                )
+                (style, wrapped, line_count as f32 * style.line_height() + 2.0 * padding)
             })
             .collect();
         for (index, (style, wrapped, height)) in laid_out.iter().enumerate() {
@@ -446,8 +423,7 @@ impl Writer {
             for (lines, width) in wrapped.iter().zip(&widths) {
                 self.stroke_rect(BORDER, x, self.y - height, *width, height);
                 for (number, line) in lines.iter().enumerate() {
-                    let baseline =
-                        self.y - padding - number as f32 * style.line_height() - size * 1.05;
+                    let baseline = self.y - padding - number as f32 * style.line_height() - size * 1.05;
                     self.draw_text(&style, line, x + padding, baseline);
                 }
                 x += width;
@@ -481,8 +457,7 @@ impl Writer {
         self.fill_rect(background, MARGIN_X, self.y - height, CONTENT_WIDTH, height);
         self.stroke_rect(border, MARGIN_X, self.y - height, CONTENT_WIDTH, height);
         for (number, line) in lines.iter().enumerate() {
-            let baseline =
-                self.y - padding - number as f32 * style.line_height() - style.size * 1.05;
+            let baseline = self.y - padding - number as f32 * style.line_height() - style.size * 1.05;
             self.draw_text(&style, line, MARGIN_X + padding, baseline);
         }
         self.y -= height;
@@ -495,12 +470,7 @@ impl Writer {
             let text = format!("{title} · page {} of {count}", number + 1);
             let width = self.width(&style, &text);
             self.current = number;
-            self.draw_text(
-                &style,
-                &text,
-                PAGE_WIDTH - MARGIN_X - width,
-                MARGIN_BOTTOM / 2.0,
-            );
+            self.draw_text(&style, &text, PAGE_WIDTH - MARGIN_X - width, MARGIN_BOTTOM / 2.0);
         }
     }
 
@@ -536,8 +506,7 @@ impl Objects {
 
     fn write(&mut self, id: usize, body: &[u8]) {
         self.offsets[id - 1] = self.out.len();
-        self.out
-            .extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        self.out.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
         self.out.extend_from_slice(body);
         self.out.extend_from_slice(b"\nendobj\n");
     }
@@ -566,11 +535,7 @@ fn to_unicode(used: &BTreeMap<u16, char>) -> String {
         let _ = writeln!(cmap, "{} beginbfchar", chunk.len());
         for (glyph, c) in chunk {
             let mut buffer = [0u16; 2];
-            let units: String = c
-                .encode_utf16(&mut buffer)
-                .iter()
-                .map(|u| format!("{u:04X}"))
-                .collect();
+            let units: String = c.encode_utf16(&mut buffer).iter().map(|u| format!("{u:04X}")).collect();
             let _ = writeln!(cmap, "<{glyph:04X}> <{units}>");
         }
         cmap.push_str("endbfchar\n");
@@ -684,12 +649,9 @@ fn serialize(fonts: &[Font], pages: &[String], title: &str) -> Vec<u8> {
     );
 
     let xref = objects.out.len();
-    let mut trailer = format!(
-        "xref\n0 {}\n0000000000 65535 f \n",
-        objects.offsets.len() + 1
-    );
+    let mut trailer = format!("xref\n0 {}\n0000000000 65535 f \n", objects.offsets.len() + 1);
     for offset in &objects.offsets {
-        let _ = write!(trailer, "{offset:010} 00000 n \n");
+        let _ = writeln!(trailer, "{offset:010} 00000 n ");
     }
     let _ = write!(
         trailer,
@@ -758,14 +720,7 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
         asides.push(format!("Note #{}", item.origin_id));
         pdf.paragraph(aside, &asides.join(" · "), 0.0);
         pdf.space(5.0);
-        pdf.line(
-            rgb(0xe8e6e0),
-            0.5,
-            MARGIN_X,
-            pdf.y,
-            MARGIN_X + CONTENT_WIDTH,
-            pdf.y,
-        );
+        pdf.line(rgb(0xe8e6e0), 0.5, MARGIN_X, pdf.y, MARGIN_X + CONTENT_WIDTH, pdf.y);
     }
 
     pdf.heading("Evidence", 14.0, true);
@@ -786,18 +741,10 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
 
     pdf.heading("Case activity", 14.0, true);
     for item in model.activity() {
-        let flag = if item.status == Level::Fail {
-            " ⚠ FAIL"
-        } else {
-            ""
-        };
+        let flag = if item.status == Level::Fail { " ⚠ FAIL" } else { "" };
         pdf.bullet(
             Style::new(FontId::Sans, 9.5, SECONDARY),
-            &format!(
-                "{} — {}{flag}",
-                readable_utc(Some(&item.origin_created_utc)),
-                item.text
-            ),
+            &format!("{} — {}{flag}", readable_utc(Some(&item.origin_created_utc)), item.text),
         );
     }
 
@@ -812,10 +759,7 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
             Level::Fail => FAIL,
             _ => SECONDARY,
         };
-        pdf.bullet(
-            Style::new(FontId::Sans, 9.0, color),
-            &format!("{level} {message}"),
-        );
+        pdf.bullet(Style::new(FontId::Sans, 9.0, color), &format!("{level} {message}"));
     }
     pdf.space(6.0);
     pdf.meta_table(&technical_rows(model), FontId::Mono, 8.0);
@@ -839,12 +783,7 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
             0.0,
         );
         pdf.space(2.0);
-        pdf.paragraph_with_background(
-            code,
-            &item.integrity_lines().join("\n"),
-            0.0,
-            Some(CODE_BACKGROUND),
-        );
+        pdf.paragraph_with_background(code, &item.integrity_lines().join("\n"), 0.0, Some(CODE_BACKGROUND));
     }
 
     let title = format!("Case report {}", case.case_file);

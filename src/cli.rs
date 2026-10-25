@@ -81,9 +81,7 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn parse_from_strs<I: IntoIterator<Item = S>, S: Into<std::ffi::OsString> + Clone>(
-        argv: I,
-    ) -> Self {
+    pub fn parse_from_strs<I: IntoIterator<Item = S>, S: Into<std::ffi::OsString> + Clone>(argv: I) -> Self {
         Self::parse_from(std::iter::once("factum".into()).chain(argv.into_iter().map(Into::into)))
     }
 }
@@ -99,10 +97,10 @@ pub fn find_case_id(factum: &Factum, query: &str) -> Result<Option<i64>> {
         return Ok(factum.get_case(case_id)?.map(|_| case_id));
     }
     for candidate in factum.list_cases(true)? {
-        if let Some(case) = factum.get_case(candidate)? {
-            if query == case.case_file || query == case.case_name {
-                return Ok(Some(candidate));
-            }
+        if let Some(case) = factum.get_case(candidate)?
+            && (query == case.case_file || query == case.case_name)
+        {
+            return Ok(Some(candidate));
         }
     }
     Ok(None)
@@ -111,13 +109,10 @@ pub fn find_case_id(factum: &Factum, query: &str) -> Result<Option<i64>> {
 pub fn resolve_case(factum: &Factum, query: &str) -> Result<i64> {
     if query == ACTIVE {
         return factum.get_active_case_id()?.ok_or_else(|| {
-            FactumError::general(
-                "No active case. Pass a case or set one with 'factum --set-active case <id>'.",
-            )
+            FactumError::general("No active case. Pass a case or set one with 'factum --set-active case <id>'.")
         });
     }
-    find_case_id(factum, query)?
-        .ok_or_else(|| FactumError::general(format!("No case found matching '{query}'.")))
+    find_case_id(factum, query)?.ok_or_else(|| FactumError::general(format!("No case found matching '{query}'.")))
 }
 
 pub fn find_evidence_id(factum: &Factum, query: &str, active_case_id: i64) -> Result<Option<i64>> {
@@ -126,10 +121,7 @@ pub fn find_evidence_id(factum: &Factum, query: &str, active_case_id: i64) -> Re
         return Ok(evidence_ids.contains(&id).then_some(id));
     }
     for id in evidence_ids {
-        if factum
-            .get_evidence(id)?
-            .is_some_and(|e| e.description == query)
-        {
+        if factum.get_evidence(id)?.is_some_and(|e| e.description == query) {
             return Ok(Some(id));
         }
     }
@@ -149,16 +141,8 @@ fn list_cases(factum: &Factum, include_archived: bool, out: &mut dyn Write) -> R
         };
         let markers = format!(
             "{}{}",
-            if Some(case_id) == active {
-                " [active]"
-            } else {
-                ""
-            },
-            if case.is_archived() {
-                " [archived]"
-            } else {
-                ""
-            }
+            if Some(case_id) == active { " [active]" } else { "" },
+            if case.is_archived() { " [archived]" } else { "" }
         );
         writeln!(
             out,
@@ -213,34 +197,23 @@ fn set_active(factum: &Factum, type_str: &str, query: &str, out: &mut dyn Write)
         "case" => {
             let case_id = find_case_id(factum, query)?;
             match case_id {
-                Some(case_id) if factum.set_active_case(case_id)? => {
-                    writeln!(out, "Active case set to #{case_id}.")?
-                }
+                Some(case_id) if factum.set_active_case(case_id)? => writeln!(out, "Active case set to #{case_id}.")?,
                 _ => {
-                    return Err(FactumError::general(format!(
-                        "No case found matching '{query}'."
-                    )));
+                    return Err(FactumError::general(format!("No case found matching '{query}'.")));
                 }
             }
         }
         "evidence" => {
             let active_case_id = factum.get_active_case_id()?.ok_or_else(|| {
-                FactumError::general(
-                    "No active case. Set an active case before setting active evidence.",
-                )
+                FactumError::general("No active case. Set an active case before setting active evidence.")
             })?;
             if query.to_lowercase() == "none" {
                 factum.set_active_evidence(None)?;
-                writeln!(
-                    out,
-                    "Active evidence cleared. Notes will be added to the active case."
-                )?;
+                writeln!(out, "Active evidence cleared. Notes will be added to the active case.")?;
                 return Ok(());
             }
             match find_evidence_id(factum, query, active_case_id)? {
-                Some(id) if factum.set_active_evidence(Some(id))? => {
-                    writeln!(out, "Active evidence set to #{id}.")?
-                }
+                Some(id) if factum.set_active_evidence(Some(id))? => writeln!(out, "Active evidence set to #{id}.")?,
                 _ => {
                     return Err(FactumError::general(format!(
                         "No evidence found matching '{query}' in the active case."
@@ -267,17 +240,11 @@ fn set_active(factum: &Factum, type_str: &str, query: &str, out: &mut dyn Write)
 
 fn warn_unsigned(signer: &dyn Signer) {
     if signer.active_key().is_none() {
-        log::warn!(
-            "No GPG key is active: the seal is stored unsigned. Sign it later with 'factum --sign-unsigned'."
-        );
+        log::warn!("No GPG key is active: the seal is stored unsigned. Sign it later with 'factum --sign-unsigned'.");
     }
 }
 
-pub fn print_report(
-    report: &CaseReport,
-    verbose: bool,
-    out: &mut dyn Write,
-) -> std::io::Result<()> {
+pub fn print_report(report: &CaseReport, verbose: bool, out: &mut dyn Write) -> std::io::Result<()> {
     for finding in &report.findings {
         writeln!(out, "  {:4}  {}", finding.level, finding.message)?;
     }
@@ -316,11 +283,7 @@ pub fn print_report(
         writeln!(
             out,
             "{}",
-            format!(
-                "  signed by {fingerprint} {}",
-                username.as_deref().unwrap_or("")
-            )
-            .trim_end()
+            format!("  signed by {fingerprint} {}", username.as_deref().unwrap_or("")).trim_end()
         )?;
     }
     Ok(())
@@ -349,9 +312,9 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         factum.set_active_case(case_id)?;
         writeln!(out, "Case #{case_id} created and set as the active case.")?;
     } else if let Some(description) = &args.new_evidence {
-        let case_id = factum.get_active_case_id()?.ok_or_else(|| {
-            FactumError::general("No active case. Set an active case before adding evidence.")
-        })?;
+        let case_id = factum
+            .get_active_case_id()?
+            .ok_or_else(|| FactumError::general("No active case. Set an active case before adding evidence."))?;
         let evidence_id = factum.create_evidence(case_id, description, &args.hash)?;
         writeln!(
             out,
@@ -360,8 +323,7 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
     } else if let Some(values) = &args.set_active {
         set_active(factum, &values[0], &values[1], out)?;
     } else if let Some(values) = &args.correct {
-        let note_id = parse_int(&values[0])
-            .ok_or_else(|| FactumError::general("NOTE_ID must be a number."))?;
+        let note_id = parse_int(&values[0]).ok_or_else(|| FactumError::general("NOTE_ID must be a number."))?;
         let new_id = factum.correct_note(note_id, &values[1])?;
         let corrects = factum
             .get_entry(new_id)?
@@ -394,19 +356,14 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
     } else if let Some(query) = &args.export {
         let case_id = resolve_case(factum, query)?;
         warn_unsigned(factum.signer);
-        let formats: Vec<&str> = args
-            .format
-            .split(',')
-            .map(strip)
-            .filter(|f| !f.is_empty())
-            .collect();
+        let formats: Vec<&str> = args.format.split(',').map(strip).filter(|f| !f.is_empty()).collect();
         for path in factum.export(case_id, &formats, &args.out)? {
             writeln!(out, "{}", path.display())?;
         }
     } else if let Some(note) = args.note.as_deref().filter(|n| !n.is_empty()) {
-        let active_case_id = factum.get_active_case_id()?.ok_or_else(|| {
-            FactumError::general("No active case. Set an active case before adding notes.")
-        })?;
+        let active_case_id = factum
+            .get_active_case_id()?
+            .ok_or_else(|| FactumError::general("No active case. Set an active case before adding notes."))?;
         let note_id = factum.create_note(note, factum.get_active_evidence_id()?, active_case_id)?;
         writeln!(out, "Note #{note_id} added.")?;
     } else {
@@ -417,13 +374,7 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
 }
 
 /// Runs one CLI command and returns the exit code. Without a signer, gpg is only started when needed.
-pub fn run(
-    db: &Db,
-    args: &Args,
-    signer: Option<&dyn Signer>,
-    seal_dir: Option<PathBuf>,
-    out: &mut dyn Write,
-) -> i32 {
+pub fn run(db: &Db, args: &Args, signer: Option<&dyn Signer>, seal_dir: Option<PathBuf>, out: &mut dyn Write) -> i32 {
     let lazy = LazySigner::new(db);
     let signer: &dyn Signer = signer.unwrap_or(&lazy);
     let mut factum = Factum::new(db, signer);

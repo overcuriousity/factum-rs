@@ -53,3 +53,6 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot", "eframe"] }

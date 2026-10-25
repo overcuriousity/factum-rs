@@ -79,9 +79,7 @@ fn write_value(out: &mut String, value: &Value, indent: Option<usize>, level: us
 
 /// ISO 8601 with milliseconds, e.g. 2026-10-05T14:03:22.417Z
 pub fn utc_now() -> String {
-    chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string()
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// File-name friendly form of a utc_now() timestamp: 20261005T140322417Z
@@ -127,10 +125,7 @@ mod tests {
 
     #[test]
     fn canonical_json_keeps_non_ascii_characters() {
-        assert_eq!(
-            canonical_json(&json!({"t": "Müller ✓"})),
-            r#"{"t":"Müller ✓"}"#
-        );
+        assert_eq!(canonical_json(&json!({"t": "Müller ✓"})), r#"{"t":"Müller ✓"}"#);
     }
 
     #[test]
@@ -158,10 +153,7 @@ mod tests {
 
     #[test]
     fn compact_utc_strips_separators() {
-        assert_eq!(
-            compact_utc("2026-10-05T14:03:22.417Z"),
-            "20261005T140322417Z"
-        );
+        assert_eq!(compact_utc("2026-10-05T14:03:22.417Z"), "20261005T140322417Z");
     }
 
     const CLEARSIGNED: &str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n{\"a\":1}\n- -----BEGIN PGP SIGNATURE----- inside the text\n-----BEGIN PGP SIGNATURE-----\n\niHUEARYKAB0WIQ==\n-----END PGP SIGNATURE-----\n";

@@ -72,12 +72,7 @@ impl GpgOutput {
     }
 }
 
-fn run_gpg(
-    binary: &Path,
-    home: Option<&Path>,
-    args: &[&str],
-    input: &[u8],
-) -> std::io::Result<GpgOutput> {
+fn run_gpg(binary: &Path, home: Option<&Path>, args: &[&str], input: &[u8]) -> std::io::Result<GpgOutput> {
     let mut command = Command::new(binary);
     // gpg writes user IDs in its messages in the locale's charset unless told otherwise; status lines on stderr
     command.args([
@@ -134,15 +129,15 @@ fn unescape_colons(field: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'x') {
-            if let Some(hex) = field
+        if bytes[index] == b'\\'
+            && bytes.get(index + 1) == Some(&b'x')
+            && let Some(hex) = field
                 .get(index + 2..index + 4)
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
-            {
-                out.push(hex);
-                index += 4;
-                continue;
-            }
+        {
+            out.push(hex);
+            index += 4;
+            continue;
         }
         out.push(bytes[index]);
         index += 1;
@@ -189,12 +184,7 @@ fn verify_result(output: &GpgOutput) -> VerifyResult {
     let mut status: Option<&str> = None;
     for (key, values) in &output.status {
         let first = values.first().cloned();
-        let rest = || {
-            values
-                .get(1..)
-                .map(|v| v.join(" "))
-                .filter(|s| !s.is_empty())
-        };
+        let rest = || values.get(1..).map(|v| v.join(" ")).filter(|s| !s.is_empty());
         match key.as_str() {
             "GOODSIG" => {
                 result.valid = true;
@@ -276,9 +266,7 @@ impl GnupgSigner {
         let binary = which::which("gpg").ok();
         if binary.is_none() {
             // gpg is not installed (common on Windows without Gpg4win): notes can still be written, unsigned
-            log::warn!(
-                "GPG is not available, nothing will be signed: gpg is not installed or not on the PATH"
-            );
+            log::warn!("GPG is not available, nothing will be signed: gpg is not installed or not on the PATH");
         }
         Self {
             binary,
@@ -327,10 +315,7 @@ impl GnupgSigner {
             Some(Ok(output)) if output.has("SIG_CREATED") && !output.stdout.is_empty() => {
                 return Some(String::from_utf8_lossy(&output.stdout).into_owned());
             }
-            Some(Ok(output)) => log::error!(
-                "GPG {what} failed for key {key}: {}",
-                gpg_error(&output.stderr)
-            ),
+            Some(Ok(output)) => log::error!("GPG {what} failed for key {key}: {}", gpg_error(&output.stderr)),
             Some(Err(e)) => log::error!("Error signing: {e}"),
             None => {}
         }
@@ -345,10 +330,7 @@ impl Signer for GnupgSigner {
     }
 
     fn active_key(&self) -> Option<String> {
-        self.active_key_id
-            .borrow()
-            .clone()
-            .filter(|key| !key.is_empty())
+        self.active_key_id.borrow().clone().filter(|key| !key.is_empty())
     }
 
     fn list_keys(&self) -> Vec<GpgKey> {
@@ -490,9 +472,7 @@ impl Signer for LazySigner<'_> {
         self.get().verify_signature(clearsigned)
     }
     fn last_sign_failed(&self) -> bool {
-        self.inner
-            .get()
-            .is_some_and(|signer| signer.last_sign_failed())
+        self.inner.get().is_some_and(|signer| signer.last_sign_failed())
     }
     fn gpg_home(&self) -> Option<PathBuf> {
         None
@@ -514,8 +494,7 @@ pub struct FakeSigner {
 
 impl FakeSigner {
     pub const PREFIX: &'static str = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: FAKE\n\n";
-    pub const SUFFIX: &'static str =
-        "\n-----BEGIN PGP SIGNATURE-----\nFAKE\n-----END PGP SIGNATURE-----\n";
+    pub const SUFFIX: &'static str = "\n-----BEGIN PGP SIGNATURE-----\nFAKE\n-----END PGP SIGNATURE-----\n";
 
     pub fn new(active: bool) -> Self {
         Self::with_trust(active, "TRUST_ULTIMATE")
@@ -576,10 +555,7 @@ impl Signer for FakeSigner {
     fn sign_detached(&self, data: &[u8]) -> Option<String> {
         use sha2::Digest;
         self.active_key_id.borrow().as_ref()?;
-        Some(format!(
-            "FAKE DETACHED {}",
-            hex::encode(sha2::Sha256::digest(data))
-        ))
+        Some(format!("FAKE DETACHED {}", hex::encode(sha2::Sha256::digest(data))))
     }
     fn export_public_keys(&self, _fingerprints: &[String]) -> String {
         String::new()
@@ -589,15 +565,8 @@ impl Signer for FakeSigner {
         let ok = signature.starts_with(Self::PREFIX) && signature.ends_with(Self::SUFFIX);
         VerifyResult {
             valid: ok,
-            status: if ok {
-                "signature valid"
-            } else {
-                "bad signature"
-            }
-            .into(),
-            signed_text: ok.then(|| {
-                signature[Self::PREFIX.len()..signature.len() - Self::SUFFIX.len()].to_string()
-            }),
+            status: if ok { "signature valid" } else { "bad signature" }.into(),
+            signed_text: ok.then(|| signature[Self::PREFIX.len()..signature.len() - Self::SUFFIX.len()].to_string()),
             key_id: Some("FAKEKEY1".into()),
             fingerprint: Some("FAKEFINGERPRINT1".into()),
             username: Some("Fake Signer".into()),
@@ -628,10 +597,7 @@ mod tests {
         let keys = parse_key_listing(listing);
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].keyid, "AAAABBBBCCCCDDDD");
-        assert_eq!(
-            keys[0].fingerprint,
-            "0123456789ABCDEF0123456789ABCDEFAAAABBBB"
-        );
+        assert_eq!(keys[0].fingerprint, "0123456789ABCDEF0123456789ABCDEFAAAABBBB");
         assert_eq!(keys[0].uids, vec!["Jürgen : <j@x.invalid>"]);
         assert!(keys[0].cap.contains('s'));
     }
@@ -639,9 +605,7 @@ mod tests {
     #[test]
     fn gpg_error_drops_status_lines() {
         assert_eq!(
-            gpg_error(
-                "[GNUPG:] NEWSIG\ngpg: can't connect to the keyboxd: IPC connect call failed\n"
-            ),
+            gpg_error("[GNUPG:] NEWSIG\ngpg: can't connect to the keyboxd: IPC connect call failed\n"),
             "gpg: can't connect to the keyboxd: IPC connect call failed"
         );
     }
@@ -650,8 +614,7 @@ mod tests {
     fn invalid_signature_without_status_reports_gpg_error() {
         let output = GpgOutput {
             stdout: Vec::new(),
-            stderr: "[GNUPG:] NEWSIG\ngpg: can't connect to the keyboxd: IPC connect call failed\n"
-                .into(),
+            stderr: "[GNUPG:] NEWSIG\ngpg: can't connect to the keyboxd: IPC connect call failed\n".into(),
             status: vec![("NEWSIG".into(), vec![])],
         };
         let result = verify_result(&output);
@@ -673,10 +636,6 @@ mod tests {
         assert_eq!(service.sign_text("x"), None);
         assert_eq!(service.sign_detached(b"x"), None);
         assert_eq!(service.export_public_keys(&["F".into()]), "");
-        assert!(
-            !service
-                .verify_signature("-----BEGIN PGP SIGNED MESSAGE-----")
-                .valid
-        );
+        assert!(!service.verify_signature("-----BEGIN PGP SIGNED MESSAGE-----").valid);
     }
 }

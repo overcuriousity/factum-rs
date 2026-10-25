@@ -58,12 +58,7 @@ pub struct Ref {
 }
 
 impl Finding {
-    pub fn new(
-        level: Level,
-        code: &'static str,
-        message: impl Into<String>,
-        reference: Ref,
-    ) -> Self {
+    pub fn new(level: Level, code: &'static str, message: impl Into<String>, reference: Ref) -> Self {
         Self {
             level,
             code,
@@ -104,11 +99,7 @@ impl SignatureCheck {
 }
 
 pub fn worst<'f>(findings: impl IntoIterator<Item = &'f Finding>) -> Level {
-    findings
-        .into_iter()
-        .map(|f| f.level)
-        .max()
-        .unwrap_or(Level::Ok)
+    findings.into_iter().map(|f| f.level).max().unwrap_or(Level::Ok)
 }
 
 #[derive(Debug, Clone)]
@@ -173,16 +164,11 @@ impl CaseReport {
     }
 
     pub fn count(&self, status: Level) -> usize {
-        self.entries
-            .iter()
-            .filter(|result| result.status() == status)
-            .count()
+        self.entries.iter().filter(|result| result.status() == status).count()
     }
 
     pub fn entry_result(&self, entry_id: i64) -> Option<&EntryResult> {
-        self.entries
-            .iter()
-            .find(|result| result.entry.id == entry_id)
+        self.entries.iter().find(|result| result.entry.id == entry_id)
     }
 }
 
@@ -205,8 +191,7 @@ fn text_value(text: &str) -> Value {
 }
 
 fn optional_value(text: &Option<String>) -> Value {
-    text.as_ref()
-        .map_or(Value::Null, |t| Value::String(t.clone()))
+    text.as_ref().map_or(Value::Null, |t| Value::String(t.clone()))
 }
 
 /// A dict key like Python's: integer ids sort numerically, anything else after them.
@@ -255,9 +240,7 @@ impl Factum<'_> {
             .db
             .conn
             .prepare("SELECT target, target_id, signature, signed_utc FROM late_signatures")?;
-        let rows = statement.query_map([], |row| {
-            Ok(((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?)))
-        })?;
+        let rows = statement.query_map([], |row| Ok(((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?))))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -284,10 +267,7 @@ impl Factum<'_> {
             },
             valid: result.valid,
             covers_payload: result.signed_text.as_deref() == Some(expected),
-            trusted: result
-                .trust
-                .as_deref()
-                .is_some_and(|t| TRUSTED.contains(&t)),
+            trusted: result.trust.as_deref().is_some_and(|t| TRUSTED.contains(&t)),
             status: result.status,
             key_id: result.key_id,
             fingerprint: result.fingerprint,
@@ -298,8 +278,7 @@ impl Factum<'_> {
     }
 
     pub fn signature_findings(check: &SignatureCheck, what: &str, reference: Ref) -> Vec<Finding> {
-        let finding =
-            |level, code, message: String| vec![Finding::new(level, code, message, reference)];
+        let finding = |level, code, message: String| vec![Finding::new(level, code, message, reference)];
         let or_none = |value: &Option<String>| value.clone().unwrap_or_else(|| "None".into());
         if !check.present {
             return finding(Level::Fail, "unsigned", format!("{what} is not signed."));
@@ -309,10 +288,7 @@ impl Factum<'_> {
                 return finding(
                     Level::Fail,
                     "key_unknown",
-                    format!(
-                        "{what}: signing key {} is not in the keyring.",
-                        or_none(&check.key_id)
-                    ),
+                    format!("{what}: signing key {} is not in the keyring.", or_none(&check.key_id)),
                 );
             }
             return finding(
@@ -343,10 +319,7 @@ impl Factum<'_> {
             return finding(
                 Level::Warn,
                 "signed_later",
-                format!(
-                    "{what} was signed later on {}.",
-                    or_none(&check.late_signed_utc)
-                ),
+                format!("{what} was signed later on {}.", or_none(&check.late_signed_utc)),
             );
         }
         Vec::new()
@@ -430,16 +403,13 @@ impl Factum<'_> {
                 check
             } else {
                 SignatureCheck {
-                    present: row.signature.as_deref().is_some_and(|s| !s.is_empty())
-                        || late_signature.is_some(),
+                    present: row.signature.as_deref().is_some_and(|s| !s.is_empty()) || late_signature.is_some(),
                     ..Default::default()
                 }
             };
             if let Some(corrects_id) = row.corrects_id {
                 let target = by_id.get(&corrects_id);
-                if row.kind != "note"
-                    || target.is_none_or(|t| t.kind != "note" || t.leaf_index >= row.leaf_index)
-                {
+                if row.kind != "note" || target.is_none_or(|t| t.kind != "note" || t.leaf_index >= row.leaf_index) {
                     findings.push(Finding::new(
                         Level::Fail,
                         "correction_target",
@@ -467,11 +437,7 @@ impl Factum<'_> {
         let case_id: i64 = self
             .db
             .conn
-            .query_row(
-                "SELECT case_id FROM entries WHERE id = ?",
-                [entry_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT case_id FROM entries WHERE id = ?", [entry_id], |row| row.get(0))
             .optional()?
             .ok_or_else(|| FactumError::general(format!("Entry #{entry_id} does not exist.")))?;
         let only = HashSet::from([entry_id]);
@@ -501,9 +467,7 @@ impl Factum<'_> {
             return vec![Finding::new(
                 Level::Fail,
                 "seal_truncated",
-                format!(
-                    "{what}: covers {tree_size} entries but the log has only {size} — entries were removed."
-                ),
+                format!("{what}: covers {tree_size} entries but the log has only {size} — entries were removed."),
                 reference,
             )];
         }
@@ -518,11 +482,7 @@ impl Factum<'_> {
         Vec::new()
     }
 
-    pub fn verify_case(
-        &self,
-        case_id: i64,
-        mut progress: Option<Progress<'_>>,
-    ) -> Result<CaseReport> {
+    pub fn verify_case(&self, case_id: i64, mut progress: Option<Progress<'_>>) -> Result<CaseReport> {
         let case = self.load_case_row(case_id)?;
         let rows = self.load_entries(case_id)?;
         let late = self.late_signatures()?;
@@ -545,18 +505,9 @@ impl Factum<'_> {
                 entry_id: None,
                 tree_head_id: Some(head.id),
             };
-            let what = format!(
-                "Seal #{} (size {}, {})",
-                head.id, head.tree_size, head.reason
-            );
-            let mut head_findings = Self::head_findings(
-                head.tree_size,
-                &head.root_hash,
-                &roots,
-                size,
-                &what,
-                reference,
-            );
+            let what = format!("Seal #{} (size {}, {})", head.id, head.tree_size, head.reason);
+            let mut head_findings =
+                Self::head_findings(head.tree_size, &head.root_hash, &roots, size, &what, reference);
             let expected = seal_payload(
                 case_id,
                 &head.case_file,
@@ -571,15 +522,15 @@ impl Factum<'_> {
                 &expected,
             );
             head_findings.extend(Self::signature_findings(&check, &what, reference));
-            if let Some(file_path) = head.file_path.as_deref().filter(|p| !p.is_empty()) {
-                if !Path::new(file_path).exists() {
-                    head_findings.push(Finding::new(
-                        Level::Warn,
-                        "seal_file_missing",
-                        format!("{what}: external copy {file_path} is missing."),
-                        reference,
-                    ));
-                }
+            if let Some(file_path) = head.file_path.as_deref().filter(|p| !p.is_empty())
+                && !Path::new(file_path).exists()
+            {
+                head_findings.push(Finding::new(
+                    Level::Warn,
+                    "seal_file_missing",
+                    format!("{what}: external copy {file_path} is missing."),
+                    reference,
+                ));
             }
             findings.extend(head_findings.iter().cloned());
             heads.push(TreeHeadResult {
@@ -654,10 +605,7 @@ impl Factum<'_> {
                 let finding = Finding::new(
                     Level::Warn,
                     "not_sealed",
-                    format!(
-                        "Entry #{} was added after the newest seal.",
-                        result.entry.id
-                    ),
+                    format!("Entry #{} was added after the newest seal.", result.entry.id),
                     Ref {
                         entry_id: Some(result.entry.id),
                         tree_head_id: None,
@@ -724,12 +672,8 @@ impl Factum<'_> {
                 _ => None,
             })
             .collect();
-        let event_of = |payload: &serde_json::Map<String, Value>| {
-            payload
-                .get("event")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        };
+        let event_of =
+            |payload: &serde_json::Map<String, Value>| payload.get("event").and_then(Value::as_str).map(str::to_string);
         let last = |names: &[&str]| {
             events
                 .iter()
@@ -738,17 +682,9 @@ impl Factum<'_> {
                 .cloned()
         };
         let mut failures = Vec::new();
-        let mut fail = |message: String| {
-            failures.push(Finding::new(
-                Level::Fail,
-                "metadata",
-                message,
-                Ref::default(),
-            ))
-        };
-        let get = |payload: &serde_json::Map<String, Value>, key: &str| {
-            payload.get(key).cloned().unwrap_or(Value::Null)
-        };
+        let mut fail = |message: String| failures.push(Finding::new(Level::Fail, "metadata", message, Ref::default()));
+        let get =
+            |payload: &serde_json::Map<String, Value>, key: &str| payload.get(key).cloned().unwrap_or(Value::Null);
 
         match last(&["case_created", "case_edited"]) {
             None => fail("The case has no 'case created' entry in its log.".into()),
@@ -768,25 +704,23 @@ impl Factum<'_> {
                 }
             }
         }
-        if let Some(created) = last(&["case_created"]) {
-            if get(&created, "created_utc") != text_value(&case.created_utc) {
-                fail("The case creation time was changed outside the log.".into());
-            }
+        if let Some(created) = last(&["case_created"])
+            && get(&created, "created_utc") != text_value(&case.created_utc)
+        {
+            fail("The case creation time was changed outside the log.".into());
         }
         let expected_archived = match last(&["case_archived", "case_reopened"]) {
-            Some(state) if event_of(&state).as_deref() == Some("case_archived") => {
-                get(&state, "archived_utc")
-            }
+            Some(state) if event_of(&state).as_deref() == Some("case_archived") => get(&state, "archived_utc"),
             _ => Value::Null,
         };
         if optional_value(&case.archived_utc) != expected_archived {
             fail("The archive state of the case was changed outside the log.".into());
         }
 
-        let mut statement = self.db.conn.prepare(&format!(
-            "SELECT {} FROM evidence WHERE case_id = ?",
-            Evidence::COLUMNS
-        ))?;
+        let mut statement = self
+            .db
+            .conn
+            .prepare(&format!("SELECT {} FROM evidence WHERE case_id = ?", Evidence::COLUMNS))?;
         let evidence_rows: BTreeMap<i64, Evidence> = statement
             .query_map([case.id], Evidence::from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -843,13 +777,13 @@ impl Factum<'_> {
             }
         }
         for row in rows {
-            if let Some(evidence_id) = row.evidence_id {
-                if !created_events.contains_key(&IdKey::Int(evidence_id)) {
-                    fail(format!(
-                        "Entry #{} refers to evidence #{evidence_id}, which was not created in this case.",
-                        row.id
-                    ));
-                }
+            if let Some(evidence_id) = row.evidence_id
+                && !created_events.contains_key(&IdKey::Int(evidence_id))
+            {
+                fail(format!(
+                    "Entry #{} refers to evidence #{evidence_id}, which was not created in this case.",
+                    row.id
+                ));
             }
         }
         Ok(failures)

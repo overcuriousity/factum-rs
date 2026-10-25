@@ -19,15 +19,7 @@ pub fn lstrip(text: &str) -> &str {
 fn is_line_break(c: char) -> bool {
     matches!(
         c,
-        '\n' | '\r'
-            | '\u{b}'
-            | '\u{c}'
-            | '\u{1c}'
-            | '\u{1d}'
-            | '\u{1e}'
-            | '\u{85}'
-            | '\u{2028}'
-            | '\u{2029}'
+        '\n' | '\r' | '\u{b}' | '\u{c}' | '\u{1c}' | '\u{1d}' | '\u{1e}' | '\u{85}' | '\u{2028}' | '\u{2029}'
     )
 }
 
@@ -67,10 +59,7 @@ pub fn tail(text: &str, count: usize) -> &str {
     if total <= count {
         return text;
     }
-    let (index, _) = text
-        .char_indices()
-        .nth(total - count)
-        .expect("index is in range");
+    let (index, _) = text.char_indices().nth(total - count).expect("index is in range");
     &text[index..]
 }
 
@@ -109,9 +98,7 @@ pub fn repr(text: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32))
-            }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
             c => out.push(c),
         }
     }
