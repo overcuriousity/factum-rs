@@ -164,7 +164,7 @@ jobs:
           echo "$RELEASE_GPG_KEY" | gpg --batch --import
           gpg --batch --pinentry-mode loopback --passphrase "$RELEASE_GPG_PASSPHRASE" \
               --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
       - name: Release notes
