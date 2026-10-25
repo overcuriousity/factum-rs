@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Factum Notes
+Comment=Forensic notes with signed, tamper-evident case logs
+Exec=factum --gui
+Icon=factum
+Terminal=false
+Categories=Office;Utility;
+StartupWMClass=factum
