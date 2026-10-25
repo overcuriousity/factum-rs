@@ -96,7 +96,14 @@ factum --list-gpg && factum --set-active gpg <key-id>
 To verify bundles from colleagues offline, import their public keys and set the trust you have checked; or run
 `python3 verify.py bundle.zip --use-bundled-keys` and compare the printed fingerprints with a trusted list.
 
-## 4. Updating
+## 4. Companion
+
+The optional analytical companion needs only an OpenAI- or Anthropic-compatible endpoint reachable on the lab network,
+for example a local inference server. No model files ship with factum, and nothing else leaves the machine. For
+`https://` endpoints TLS uses the system trust store, so install the lab's CA there. Without a configured endpoint
+the companion does nothing.
+
+## 5. Updating
 
 Repeat step 1 with the new release. Databases are kept; factum only refuses databases of an older, incompatible
 schema and never modifies them.

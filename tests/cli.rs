@@ -337,3 +337,46 @@ fn signature_check_of_a_damaged_signature_is_invalid() {
     assert!(check(good).valid && check(good).covers_payload && check(good).trusted);
     assert!(!check(bad).valid);
 }
+
+#[test]
+fn questions_without_companion_db_says_not_configured() {
+    let f = Fixture::new();
+    f.factum().create_case("C-1", "Case", "").unwrap();
+    let (code, out) = run(&f, &f.signer, &["--questions", "C-1"]);
+    assert_eq!((code, out.trim()), (0, "The companion is not configured."));
+    assert!(!factum::companion::companion_db_path(&f.db.path).exists());
+}
+
+#[test]
+fn questions_lists_open_in_position_order() {
+    use factum::companion::{Archetype, CompanionDb, NewQuestion};
+    let f = Fixture::new();
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    let companion = CompanionDb::open_for(&f.db.path).unwrap();
+    let ask = |text: &str, rests_on: Vec<i64>| {
+        let q = NewQuestion {
+            text: text.into(),
+            archetype: Archetype::Corroborate,
+            rests_on,
+        };
+        companion.insert_question(case_id, None, &q).unwrap()
+    };
+    let first = ask("Who else saw the login?", vec![3, 5]);
+    let second = ask("Was the log rotated?", vec![]);
+    let (code, out) = run(&f, &f.signer, &["--questions", "C-1"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(code, 0);
+    assert_eq!(lines.len(), 2, "{out}");
+    assert_eq!(
+        lines[0],
+        format!("Q{first} [corroborate] Who else saw the login?  (rests on #3, #5)")
+    );
+    assert!(
+        lines[1].starts_with(&format!("Q{second} [corroborate] Was the log rotated?")),
+        "{out}"
+    );
+    // an empty case says so
+    f.factum().create_case("C-2", "Empty", "").unwrap();
+    let (_, out) = run(&f, &f.signer, &["--questions", "C-2"]);
+    assert_eq!(out.trim(), "No open questions.");
+}
