@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use chrono::DateTime;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::store::CompanionDb;
 use crate::canonical::utc_now;
@@ -12,8 +12,6 @@ use crate::notes::Entry;
 
 /// BM25 candidates taken before the boosts are applied.
 const CANDIDATES: usize = 30;
-/// Separates the entry text from keywords and context in an index body, so the two can be rebuilt independently.
-const BODY_SEPARATOR: char = '\u{1f}';
 
 /// The model's reading of one entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,21 +39,26 @@ pub struct RetrievalQuery<'a> {
     pub newest_created_utc: &'a str,
 }
 
-fn enrichment_part(keywords: &[String], context: &str) -> String {
-    let mut part = keywords.join(" ");
-    if !context.trim().is_empty() {
-        part.push(' ');
-        part.push_str(context.trim());
+/// The index body: text, keywords and context separated by spaces.
+fn body(text: &str, keywords: &[String], context: &str) -> String {
+    let mut body = text.to_string();
+    for part in [keywords.join(" "), context.trim().to_string()] {
+        if !part.is_empty() {
+            body.push(' ');
+            body.push_str(&part);
+        }
     }
-    part.replace(BODY_SEPARATOR, " ")
+    body
 }
 
-fn body(text: &str, keywords: &[String], context: &str) -> String {
-    format!(
-        "{}{BODY_SEPARATOR}{}",
-        text.replace(BODY_SEPARATOR, " "),
-        enrichment_part(keywords, context)
-    )
+/// Replaces the index row of the entry.
+fn write_index(conn: &Connection, case_id: i64, entry: &Entry, keywords: &[String], context: &str) -> Result<()> {
+    conn.execute("DELETE FROM entry_fts WHERE entry_id = ?", [entry.id])?;
+    conn.execute(
+        "INSERT INTO entry_fts (entry_id, case_id, body) VALUES (?, ?, ?)",
+        params![entry.id, case_id, body(&entry.text, keywords, context)],
+    )?;
+    Ok(())
 }
 
 /// Splits on whitespace, keeps tokens of two or more characters and quotes each; empty when nothing is left.
@@ -124,14 +127,7 @@ pub fn retrieve(
 impl CompanionDb {
     /// Replaces the index row of the entry; its body is the text plus keywords and context.
     pub fn index_entry(&self, case_id: i64, entry: &Entry, keywords: &[String], context: &str) -> Result<()> {
-        self.transaction(|conn| {
-            conn.execute("DELETE FROM entry_fts WHERE entry_id = ?", [entry.id])?;
-            conn.execute(
-                "INSERT INTO entry_fts (entry_id, case_id, body) VALUES (?, ?, ?)",
-                params![entry.id, case_id, body(&entry.text, keywords, context)],
-            )?;
-            Ok(())
-        })
+        self.transaction(|conn| write_index(conn, case_id, entry, keywords, context))
     }
 
     pub fn remove_entry_index(&self, entry_id: i64) -> Result<()> {
@@ -140,9 +136,8 @@ impl CompanionDb {
         Ok(())
     }
 
-    /// Stores the enrichment and rebuilds the entry's index body, keeping its text. An entry that is not indexed yet
-    /// gets only the enrichment row: `index_entry` has the text.
-    pub fn upsert_enrichment(&self, case_id: i64, e: &Enrichment) -> Result<()> {
+    /// Stores the enrichment and replaces the entry's index row (text, keywords, context) in one transaction.
+    pub fn upsert_enrichment(&self, case_id: i64, entry: &Entry, e: &Enrichment) -> Result<()> {
         let keywords = serde_json::to_string(&e.keywords).expect("a list of strings serialises");
         self.transaction(|conn| {
             conn.execute(
@@ -159,20 +154,7 @@ impl CompanionDb {
                     utc_now()
                 ],
             )?;
-            let old: Option<String> = conn
-                .query_row("SELECT body FROM entry_fts WHERE entry_id = ?", [e.entry_id], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            if let Some(old) = old {
-                let text = old.split_once(BODY_SEPARATOR).map_or(old.as_str(), |(text, _)| text);
-                conn.execute("DELETE FROM entry_fts WHERE entry_id = ?", [e.entry_id])?;
-                conn.execute(
-                    "INSERT INTO entry_fts (entry_id, case_id, body) VALUES (?, ?, ?)",
-                    params![e.entry_id, case_id, body(text, &e.keywords, &e.context)],
-                )?;
-            }
-            Ok(())
+            write_index(conn, case_id, entry, &e.keywords, &e.context)
         })
     }
 
@@ -392,6 +374,7 @@ mod tests {
         index(&db, 2, "second");
         db.upsert_enrichment(
             1,
+            &entry(1, "first"),
             &Enrichment {
                 entry_id: 1,
                 keywords: vec!["alpha".into()],
