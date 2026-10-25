@@ -39,16 +39,28 @@ pub struct RetrievalQuery<'a> {
     pub newest_created_utc: &'a str,
 }
 
-/// The index body: text, keywords and context separated by spaces.
+/// Splits on whitespace and strips opening brackets and quotes and trailing punctuation from every token, so that
+/// "found." matches "found": the tokenizer keeps `.` and `:` inside tokens. Paths and file names stay intact.
+pub fn normalise_tokens(text: &str) -> String {
+    text.split_whitespace()
+        .map(|token| {
+            token
+                .trim_start_matches(['(', '[', '"', '\''])
+                .trim_end_matches(['.', ',', ':', ';', '!', '?', ')', ']', '"', '\''])
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The index body: text, keywords and context, normalised and separated by spaces.
 fn body(text: &str, keywords: &[String], context: &str) -> String {
-    let mut body = text.to_string();
-    for part in [keywords.join(" "), context.trim().to_string()] {
-        if !part.is_empty() {
-            body.push(' ');
-            body.push_str(&part);
-        }
-    }
-    body
+    [text, &keywords.join(" "), context]
+        .iter()
+        .map(|part| normalise_tokens(part))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Replaces the index row of the entry.
@@ -61,9 +73,10 @@ fn write_index(conn: &Connection, case_id: i64, entry: &Entry, keywords: &[Strin
     Ok(())
 }
 
-/// Splits on whitespace, keeps tokens of two or more characters and quotes each; empty when nothing is left.
+/// Normalises the tokens, keeps those of two or more characters and quotes each; empty when nothing is left.
 pub fn fts_query(text: &str) -> String {
-    text.split_whitespace()
+    normalise_tokens(text)
+        .split_whitespace()
         .filter(|token| token.chars().count() >= 2)
         .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
@@ -85,14 +98,11 @@ pub fn bm25(db: &CompanionDb, case_id: i64, query: &str, limit: usize) -> Result
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn age_days(created: &str, newest: &str) -> f32 {
-    match (
-        DateTime::parse_from_rfc3339(created),
-        DateTime::parse_from_rfc3339(newest),
-    ) {
-        (Ok(created), Ok(newest)) => (newest - created).num_milliseconds().max(0) as f32 / 86_400_000.0,
-        _ => 0.0,
-    }
+/// None when a timestamp does not parse.
+fn age_days(created: &str, newest: &str) -> Option<f32> {
+    let created = DateTime::parse_from_rfc3339(created).ok()?;
+    let newest = DateTime::parse_from_rfc3339(newest).ok()?;
+    Some((newest - created).num_milliseconds().max(0) as f32 / 86_400_000.0)
 }
 
 /// BM25 top candidates, normalised by the best score, with a small boost for importance and recency.
@@ -110,9 +120,10 @@ pub fn retrieve(
         .map(|(entry_id, score)| {
             let normalised = if best > 0.0 { score / best } else { 0.0 };
             let importance = f32::from(importance.get(&entry_id).copied().unwrap_or(0)) / 10.0;
-            let recency = created.get(&entry_id).map_or(0.0, |created| {
-                0.5_f32.powf(age_days(created, q.newest_created_utc) / 30.0)
-            });
+            let recency = created
+                .get(&entry_id)
+                .and_then(|created| age_days(created, q.newest_created_utc))
+                .map_or(0.0, |age| 0.5_f32.powf(age / 30.0));
             Hit {
                 entry_id,
                 score: normalised + 0.05 * importance + 0.05 * recency,
@@ -266,10 +277,13 @@ mod tests {
         index(&db, 1, "Copied the share to /vz/private/101 on the NAS");
         index(&db, 2, "Nothing relevant about backups here");
         index(&db, 3, "Image md5 d41d8cd98f00b204e9800998ecf8427e verified");
+        index(&db, 4, "Webshell found. Shell uploaded: yes");
         let by_path = bm25(&db, 1, &fts_query("/vz/private/101"), 10).unwrap();
         assert_eq!(by_path.iter().map(|h| h.0).collect::<Vec<_>>(), vec![1]);
         let by_hash = bm25(&db, 1, &fts_query("d41d8cd98f00b204e9800998ecf8427e"), 10).unwrap();
         assert_eq!(by_hash.iter().map(|h| h.0).collect::<Vec<_>>(), vec![3]);
+        let by_word = bm25(&db, 1, &fts_query("found uploaded"), 10).unwrap();
+        assert_eq!(by_word.iter().map(|h| h.0).collect::<Vec<_>>(), vec![4]);
     }
 
     #[test]
