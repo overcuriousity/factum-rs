@@ -452,12 +452,13 @@ impl CompanionDb {
         Ok(())
     }
 
+    /// Passes of the case that finished with status "ok"; skipped and failed ones do not count.
     pub fn pass_count(&self, case_id: i64) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COUNT(*) FROM passes WHERE case_id = ?", [case_id], |row| {
-                row.get(0)
-            })?)
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM passes WHERE case_id = ? AND status = 'ok'",
+            [case_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// The latest finished pass of the case: id, finished_utc, status.
@@ -473,23 +474,56 @@ impl CompanionDb {
             .optional()?)
     }
 
+    fn rated_examples(&self, rating: Rating, query: Option<&str>, limit: i64) -> Result<Vec<RatedExample>> {
+        let sql = match query {
+            Some(_) => {
+                "SELECT e.id, e.text, e.rating, e.archetype, COALESCE(e.source_case_id, 0) FROM rated_fts \
+                 JOIN rated_examples e ON e.id = rated_fts.example_id WHERE rated_fts MATCH ?3 AND e.rating = ?1 \
+                 ORDER BY bm25(rated_fts) LIMIT ?2"
+            }
+            None => {
+                "SELECT id, text, rating, archetype, COALESCE(source_case_id, 0) FROM rated_examples \
+                 WHERE rating = ?1 ORDER BY id DESC LIMIT ?2"
+            }
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let map = |row: &Row| {
+            Ok(RatedExample {
+                id: row.get(0)?,
+                text: row.get(1)?,
+                rating: Rating::parse(&row.get::<_, String>(2)?),
+                archetype: Archetype::parse(&row.get::<_, String>(3)?),
+                source_case_id: row.get(4)?,
+            })
+        };
+        let rows = match query {
+            Some(query) => stmt.query_map(params![rating.as_str(), limit, query], map)?,
+            None => stmt.query_map(params![rating.as_str(), limit], map)?,
+        };
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Questions the user rejected, newest first.
     pub fn minus_examples(&self) -> Result<Vec<RatedExample>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, text, rating, archetype, COALESCE(source_case_id, 0) FROM rated_examples \
-             WHERE rating = 'minus' ORDER BY id DESC",
-        )?;
-        Ok(stmt
-            .query_map([], |row| {
-                Ok(RatedExample {
-                    id: row.get(0)?,
-                    text: row.get(1)?,
-                    rating: Rating::parse(&row.get::<_, String>(2)?),
-                    archetype: Archetype::parse(&row.get::<_, String>(3)?),
-                    source_case_id: row.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?)
+        self.rated_examples(Rating::Minus, None, -1)
+    }
+
+    /// Questions the user found useful, newest first.
+    pub fn plus_examples(&self) -> Result<Vec<RatedExample>> {
+        self.rated_examples(Rating::Plus, None, -1)
+    }
+
+    /// The `limit` examples of the rating that match the FTS query best; the newest ones when the query is empty or
+    /// matches none.
+    pub fn nearest_examples(&self, rating: Rating, fts_query: &str, limit: usize) -> Result<Vec<RatedExample>> {
+        let limit = limit as i64;
+        if !fts_query.is_empty() {
+            let nearest = self.rated_examples(rating, Some(fts_query), limit)?;
+            if !nearest.is_empty() {
+                return Ok(nearest);
+            }
+        }
+        self.rated_examples(rating, None, limit)
     }
 
     /// Per archetype: (archetype, plus ratings, minus ratings).
@@ -592,7 +626,7 @@ mod tests {
         db.begin_pass(1, PassKind::Full, "m").unwrap();
         db.begin_pass(2, PassKind::Diff, "m").unwrap();
         db.finish_pass(p1, "ok", None, 0, 9, 100, 50).unwrap();
-        assert_eq!(db.pass_count(1).unwrap(), 2);
+        assert_eq!(db.pass_count(1).unwrap(), 1, "only passes finished ok count");
         let (id, _finished, status) = db.last_finished_pass(1).unwrap().unwrap();
         assert_eq!((id, status.as_str()), (p1, "ok"));
         assert_eq!(db.last_finished_pass(2).unwrap(), None);

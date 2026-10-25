@@ -8,6 +8,8 @@ pub mod fake_llm;
 pub mod llm;
 pub mod prompts;
 pub mod questions;
+#[cfg(feature = "gui")]
+pub mod reflect;
 pub mod retrieval;
 pub mod store;
 pub mod tokens;

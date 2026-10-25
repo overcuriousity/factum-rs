@@ -231,6 +231,8 @@ pub struct Client {
     calibration: Cell<Calibration>,
     json_rejected: Cell<bool>,
     completion_param: Cell<bool>,
+    /// the model's input window from the endpoint's listing, when known
+    context_window: Cell<Option<u32>>,
 }
 
 impl Client {
@@ -245,6 +247,7 @@ impl Client {
             calibration: Cell::new(Calibration::default()),
             json_rejected: Cell::new(false),
             completion_param: Cell::new(false),
+            context_window: Cell::new(None),
         }
     }
 
@@ -254,6 +257,16 @@ impl Client {
 
     pub fn calibration(&self) -> Calibration {
         self.calibration.get()
+    }
+
+    /// Remembers the model's input window, e.g. Anthropic's `max_input_tokens` from the probe listing.
+    pub fn set_context_window(&self, window: Option<u32>) {
+        self.context_window.set(window);
+    }
+
+    /// The window from the listing; the `context_window` setting takes precedence over it.
+    pub fn context_window(&self) -> Option<u32> {
+        self.context_window.get()
     }
 
     /// One retry after the retry delay on a retryable error.
@@ -309,13 +322,16 @@ impl Client {
         };
         let mut body = json!({"model": self.settings.model, limit: req.max_tokens});
         if self.settings.protocol == Protocol::OpenAi {
-            let system = json!({"role": "system", "content": req.system});
-            body["messages"] = Value::Array(std::iter::once(system).chain(turns).collect());
+            // an empty system prompt is left out on both protocols
+            let system = (!req.system.is_empty()).then(|| json!({"role": "system", "content": req.system}));
+            body["messages"] = Value::Array(system.into_iter().chain(turns).collect());
             if json_mode {
                 body["response_format"] = json!({"type": "json_object"});
             }
         } else {
-            body["system"] = json!(req.system);
+            if !req.system.is_empty() {
+                body["system"] = json!(req.system);
+            }
             body["messages"] = Value::Array(turns.collect());
         }
         let text = send(
