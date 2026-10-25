@@ -452,12 +452,13 @@ impl CompanionDb {
         Ok(())
     }
 
+    /// Passes of the case that finished with status "ok"; skipped and failed ones do not count.
     pub fn pass_count(&self, case_id: i64) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("SELECT COUNT(*) FROM passes WHERE case_id = ?", [case_id], |row| {
-                row.get(0)
-            })?)
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM passes WHERE case_id = ? AND status = 'ok'",
+            [case_id],
+            |row| row.get(0),
+        )?)
     }
 
     /// The latest finished pass of the case: id, finished_utc, status.
@@ -625,7 +626,7 @@ mod tests {
         db.begin_pass(1, PassKind::Full, "m").unwrap();
         db.begin_pass(2, PassKind::Diff, "m").unwrap();
         db.finish_pass(p1, "ok", None, 0, 9, 100, 50).unwrap();
-        assert_eq!(db.pass_count(1).unwrap(), 2);
+        assert_eq!(db.pass_count(1).unwrap(), 1, "only passes finished ok count");
         let (id, _finished, status) = db.last_finished_pass(1).unwrap().unwrap();
         assert_eq!((id, status.as_str()), (p1, "ok"));
         assert_eq!(db.last_finished_pass(2).unwrap(), None);
