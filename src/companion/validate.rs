@@ -155,7 +155,7 @@ pub fn parse_pass_output(text: &str) -> Result<PassOutput, String> {
 /// (entry id, keywords, context, importance)
 pub type EnrichmentItem = (i64, Vec<String>, String, u8);
 
-/// Reads `[{"entry": id, "keywords": [...], "context": "...", "importance": n}]` (a wrapping object with one
+/// Reads `[{"id": id, "keywords": [...], "context": "...", "importance": n}]` ("entry" works as well; a wrapping object with one
 /// array field is accepted too). Importance is clamped into `u8`; range checks and unknown ids are the caller's.
 pub fn parse_enrichment_output(text: &str) -> Result<Vec<EnrichmentItem>, String> {
     let repaired = repair_json_or_array(text).ok_or("no JSON in the reply")?;
@@ -168,7 +168,7 @@ pub fn parse_enrichment_output(text: &str) -> Result<Vec<EnrichmentItem>, String
     Ok(items
         .iter()
         .filter_map(|item| {
-            let entry = item["entry"].as_i64()?;
+            let entry = item["entry"].as_i64().or_else(|| item["id"].as_i64())?;
             let importance = item["importance"].as_i64()?;
             let keywords = item["keywords"]
                 .as_array()
