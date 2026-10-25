@@ -114,7 +114,7 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Nothing it produces enters the log, exports, bundles or verification, and a case verifies identically with or
   without it. Case content is sent to the endpoint you configure, nowhere else
 - **Companion → Settings…**: endpoint URL, protocol (OpenAI- or Anthropic-compatible), API key and model; a local
-  server on the lab network works. Until it is configured, no companion element appears in the GUI
+  server on the lab network works. Until it is configured, no companion section, status item or Case-menu item appears
 - **Case menu**: "Companion for this case" switches it per case, "Case goal…" gives it the question the case is meant
   to answer
 - The questions sit in the side panel; **+** and **−** rate them, which shapes later questions. The questions menu has
@@ -145,7 +145,7 @@ factum --set-active case 1              # by ID, file number or name; clears the
 factum --list-evidence                  # evidence of the active case
 factum --set-active evidence none       # notes go to the case itself again
 factum --verify [case] [-v]             # exit code 1 if verification fails
-factum --questions [case]             # open companion questions (read-only)
+factum --questions [case]              # open companion questions (read-only)
 factum --checkpoint [case]              # seal the current state
 factum --sign-unsigned [case]           # sign entries and seals created without a key
 factum --export [case] --format html,pdf,md,bundle --out ./reports
@@ -201,7 +201,7 @@ directory; real environment variables override both. See [.env.example](.env.exa
 | `LOG_LEVEL`       | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`; `--log-level` overrides it          |
 | `FACTUM_DB`       | Path of the database file                                                                     |
 | `FACTUM_SEAL_DIR` | Folder for external seal copies; must already exist (default: GUI setting, else `seals/` next to the database) |
-| `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key |
+| `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                    |
 
 A launcher (application menu, Start menu) does not read `.env` from a working directory: put settings in the user
 config directory.
