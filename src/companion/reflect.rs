@@ -140,17 +140,17 @@ struct PassLog {
 }
 
 /// What a pass reads from the case database.
-struct CaseData {
+pub(super) struct CaseData {
     case: Case,
     /// deleted items included
-    evidence: Vec<Evidence>,
+    pub(super) evidence: Vec<Evidence>,
     /// the newest version of every entry, system entries included, by leaf index
-    entries: Vec<Entry>,
+    pub(super) entries: Vec<Entry>,
     /// creation time of every entry id, superseded versions included
-    created: HashMap<i64, String>,
+    pub(super) created: HashMap<i64, String>,
 }
 
-fn load_case(case_db: &Db, case_id: i64) -> Result<CaseData> {
+pub(super) fn load_case(case_db: &Db, case_id: i64) -> Result<CaseData> {
     let signer = GnupgSigner::without_key(None);
     let factum = Factum::new(case_db, &signer);
     let case = factum
