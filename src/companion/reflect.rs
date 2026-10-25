@@ -14,7 +14,7 @@ use super::prompts::{
 use super::questions::{PassKind, Question, Rating};
 use super::retrieval::{RetrievalQuery, fts_query, retrieve};
 use super::store::CompanionDb;
-use super::tokens::{BudgetError, Cut, Section, TextKind, budget, pack};
+use super::tokens::{BudgetError, Cut, Packed, Section, TextKind, budget, pack};
 use super::validate::{PassOutput, ValidationContext, parse_pass_output, validate};
 use crate::Factum;
 use crate::cases::Case;
@@ -36,6 +36,7 @@ const TIMEOUT: Duration = Duration::from_secs(180);
 /// The window assumed when the settings name none (the client keeps no model listing).
 const DEFAULT_CONTEXT_WINDOW: u32 = 16_000;
 const NO_GOAL: &str = "No case goal has been set.";
+const NEW_ENTRIES: &str = "new entries";
 /// Rated examples of each kind in the prompt.
 const EXAMPLES: usize = 3;
 /// Related entries per new entry, per open question in a diff pass and in a full pass.
@@ -268,6 +269,9 @@ fn reflect(
     if !packed.cut.is_empty() {
         log::info!("companion pass {pass_id}: lines cut for space: {:?}", packed.cut);
     }
+    if kind == PassKind::Diff {
+        log.entries_to = covered_to(&new, &packed, last_seen, room)?;
+    }
 
     // the packed prompt is the first user turn of both calls, so a prompt cache can serve the second
     let reasoning = client.chat(&ChatRequest {
@@ -293,7 +297,7 @@ fn reflect(
     let resolved = cdb.resolved_questions(case_id)?;
     let minus = cdb.minus_examples()?;
     let existing: HashSet<i64> = data.created.keys().copied().collect();
-    let new_set: HashSet<i64> = new_ids.iter().copied().collect();
+    let new_set: HashSet<i64> = new_ids.iter().copied().filter(|&id| id <= log.entries_to).collect();
     let validated = validate(
         output,
         &ValidationContext {
@@ -339,6 +343,34 @@ fn reflect(
         entries_to: log.entries_to,
         dropped: validated.dropped,
     })
+}
+
+/// The newest entry a diff pass covers: the newest one, or, when the new entries were cut from the newest end, the
+/// newest one before the first cut line (pinned ones are shown in their own section). Nothing left is a budget error.
+fn covered_to(new: &[&Entry], packed: &Packed, last_seen: i64, budget: usize) -> std::result::Result<i64, PassError> {
+    let listed: Vec<&Entry> = new.iter().copied().filter(|e| !e.is_pinned).collect();
+    let dropped = packed
+        .cut
+        .iter()
+        .find(|(name, _)| *name == NEW_ENTRIES)
+        .map_or(0, |&(_, n)| n);
+    if dropped == 0 {
+        return Ok(new.iter().map(|e| e.id).max().unwrap_or(last_seen).max(last_seen));
+    }
+    if dropped >= listed.len() {
+        return Err(PassError::Budget(BudgetError::Uncuttable {
+            section: NEW_ENTRIES,
+            needed: packed.tokens,
+            budget,
+        }));
+    }
+    let first_cut = listed[listed.len() - dropped].id;
+    Ok(new
+        .iter()
+        .map(|e| e.id)
+        .filter(|&id| id < first_cut)
+        .max()
+        .unwrap_or(last_seen))
 }
 
 /// Call two: the reasoning back to the model, a flat JSON object out. A cut-off, empty or unreadable answer is an
@@ -434,7 +466,7 @@ impl PromptInput<'_> {
                 .filter(|e| !e.is_pinned)
                 .map(|e| entry_line(e, label(e)))
                 .collect();
-            ("new entries", lines)
+            (NEW_ENTRIES, lines)
         };
         let related = self
             .related(&new_ids, &pinned, related_divisor)?
@@ -475,9 +507,10 @@ impl PromptInput<'_> {
             section(
                 entries_name,
                 entries,
+                // the timeline loses its oldest lines; a diff pass its newest, which the next pass covers
                 Cut::Lines {
                     priority: 2,
-                    from_start: true,
+                    from_start: full,
                 },
                 TextKind::Dense,
             ),

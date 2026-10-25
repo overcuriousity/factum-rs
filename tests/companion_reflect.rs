@@ -176,6 +176,27 @@ fn diff_pass_answers_withdraws_and_respects_plus() {
 }
 
 #[test]
+fn diff_pass_cut_new_entries_are_covered_next_time() {
+    let e = env();
+    e.cdb.set_last_seen(e.case, newest(&e), 0).unwrap();
+    for n in 1..=6 {
+        let text = format!("Fragment {n}: {}", "carved file fragment ".repeat(95));
+        e.f.factum().create_note(&text, None, e.case).unwrap();
+    }
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(5000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    e.fake.push(200, &ok("[]")); // at this window enrichment needs two batches
+    script(&e, json!({"new": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).unwrap();
+    let seen = e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id;
+    assert_eq!(s.entries_to, seen);
+    assert!(seen < newest(&e));
+    script(&e, json!({"new": []}));
+    assert!(run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).is_ok());
+}
+
+#[test]
 fn invalid_ids_and_duplicates_are_dropped_not_fatal() {
     let e = env();
     script(
@@ -243,7 +264,8 @@ fn choose_kind_rules() {
     let e = env();
     let begin = |n: usize| {
         for _ in 0..n {
-            e.cdb.begin_pass(e.case, PassKind::Diff, "m").unwrap();
+            let id = e.cdb.begin_pass(e.case, PassKind::Diff, "m").unwrap();
+            e.cdb.finish_pass(id, "ok", None, 0, 0, 0, 0).unwrap();
         }
     };
     assert_eq!(choose_kind(&e.cdb, e.case, false).unwrap(), PassKind::Full);
