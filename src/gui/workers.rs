@@ -1,5 +1,5 @@
-//! Work that must not block the GUI: whole-case verification and the signature checks of the entries on
-//! screen. SQLite connections are bound to their thread, so each worker opens its own; workers only read.
+//! Work that must not block the GUI: whole-case verification, the signature checks of the entries on screen and
+//! asking the companion. SQLite connections are bound to their thread, so each worker opens its own; workers only read.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -7,6 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
+use crate::companion::ask::Answer;
+use crate::companion::llm::Client;
+use crate::companion::{CompanionDb, Settings};
 use crate::db::Db;
 use crate::services::Factum;
 use crate::signer::GnupgSigner;
@@ -121,5 +124,24 @@ pub fn check_signatures(
             log::error!("Checking signatures failed: {e}");
             HashMap::new()
         })
+    })
+}
+
+pub type AskResult = Result<Answer, String>;
+
+/// Asks the companion on a thread of its own, with its own connections, so it never waits behind a running pass.
+pub fn ask(
+    ctx: &egui::Context,
+    db_path: PathBuf,
+    companion_path: PathBuf,
+    settings: Settings,
+    case_id: i64,
+    question: String,
+) -> Worker<AskResult> {
+    Worker::spawn(ctx, move || {
+        let db = Db::open(&db_path).map_err(|e| e.to_string())?;
+        let cdb = CompanionDb::open(&companion_path).map_err(|e| e.to_string())?;
+        let client = Client::new(settings);
+        crate::companion::ask::ask(&db, &cdb, &client, case_id, &question).map_err(|e| e.to_string())
     })
 }
