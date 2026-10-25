@@ -313,6 +313,14 @@ impl CompanionDb {
                 .ok_or_else(|| FactumError::general(format!("Question {id} does not exist")))?;
             let previous = Rating::parse(&previous);
             if previous == rating {
+                // a restored question keeps its minus: rating it again rejects it again, the example is already there
+                if rating == Rating::Minus && state_of(conn, id)? == QuestionState::Open {
+                    conn.execute(
+                        "UPDATE questions SET state = 'rejected', resolved_utc = ? WHERE id = ?",
+                        params![utc_now(), id],
+                    )?;
+                    add_event(conn, id, "minus", None, None)?;
+                }
                 return Ok(());
             }
             if previous != Rating::None {
@@ -572,6 +580,9 @@ mod tests {
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].rating, Rating::Minus);
         assert_eq!(open[0].state, QuestionState::Open);
+        db.rate_question(a, Rating::Minus).unwrap();
+        assert!(db.open_questions(1).unwrap().is_empty());
+        assert_eq!(db.minus_examples().unwrap().len(), 1);
     }
 
     #[test]
