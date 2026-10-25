@@ -102,7 +102,7 @@ jobs:
       - name: Package
         shell: bash
         run: scripts/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/factum${{ matrix.exe }} ${{ matrix.name }} dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}-${{ matrix.target }}
           path: dist/*
@@ -127,7 +127,7 @@ jobs:
           cargo vendor --locked vendor > .cargo/config.toml
           cargo build --locked --offline --release --no-default-features --target-dir "$RUNNER_TEMP/check"
           tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/dist/$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source
           path: dist/*
