@@ -107,7 +107,7 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
         .unwrap_or(0);
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
-    let listing = method == "GET" && path.ends_with("/models");
+    let listing = method == "GET" && path.split('?').next().is_some_and(|p| p.ends_with("/models"));
     shared.requests.lock().unwrap().push(FakeRequest {
         method,
         path,
