@@ -45,7 +45,7 @@ Anti-goals (a build that does these has failed even if it works)
 - A question that was rated minus coming back in different words.
 - Questions reshuffling between passes so the list cannot be used as a place to resume.
 - Questions that cite entries which do not exist or do not say what the question claims.
-- Pop-ups, spinners in the reading column, or any companion element shown while unconfigured or switched off.
+- Pop-ups, spinners in the reading column, or any companion section, status item or Case-menu item shown while unconfigured or switched off.
 - Compatibility with factum-notes (Python) broken: the case database schema and its version stay untouched.
 
 ## 3. Constraints
@@ -88,8 +88,9 @@ Tables (final column lists are the builder's; these are the required contents):
   withdrawn, plus, minus, restored).
 - `passes(id, case_id, kind, started_utc, finished_utc, model, status, error, entries_from, entries_to,
   prompt_chars, output_chars)`: one row per reflection pass, `kind` is `diff` or `full`.
-- `rated_examples(id, text, rating, archetype, embedding BLOB NULL, source_case_id, source_question_id, created_utc)`: global.
-  `source_question_id` lets a re-rating (plus to minus or back) remove the question's earlier example.
+- `rated_examples(id, text, rating, archetype, embedding BLOB NULL, source_case_id, source_question_id,
+  created_utc)`: global. `source_question_id` lets a re-rating (plus to minus or back) remove the question's earlier
+  example.
 - `archetype_weights(archetype, plus_count, minus_count)`: global.
 
 Scoping rule: `enrichment`, `entry_fts`, `questions`, `question_entries`, `question_events`, `passes` and
@@ -136,8 +137,9 @@ The settings dialog (menu: Companion → Settings…) copies Vestigo's experienc
 
 Availability: the companion is *configured* when URL, protocol and model are set and `enabled` is on. It is
 *available* when the last probe succeeded; the probe runs at GUI start and whenever settings change, and the result
-is kept until the next probe. Unconfigured means no companion element anywhere in the GUI. Configured but
-unavailable means the elements show, passes do not run, and the status bar says why.
+is kept until the next probe. Unconfigured means no companion section, status item or Case-menu item appears (the
+Companion menu stays, to configure it). Configured but unavailable means the elements show, passes do not run, and
+the status bar says why.
 
 Per case: Case menu → "Companion for this case" (checkbox, default on). Off hides the section for that case and stops
 passes for it. Case menu → "Case goal…" opens a multi-line text dialog that writes `case_settings.goal`.
@@ -148,8 +150,8 @@ timeline, so the first questions appear within one pass; the newest 20 entries a
 the history is enriched afterwards in batches of 50, newest first, only while the thread has nothing else to do.
 Retrieval over not-yet-enriched entries works on their raw text. The status item shows "indexing n of m" during
 backlog enrichment. While the endpoint is unreachable the companion thread re-probes every 60 s on its own; after a
-pass fails with a model-call error the case is retried once after the minimum spacing. The companion thread serves cases in the order: the selected case first, then any other case
-with pending changes, one at a time.
+pass fails with a model-call error the case is retried once after the minimum spacing. The companion thread serves
+cases in the order: the selected case first, then any other case with pending changes, one at a time.
 
 ### 4.3 GUI
 
@@ -219,7 +221,8 @@ for prose, chars/2.4 for JSON and identifier-heavy text; when a response carries
 recalibrated from them for the session. Budget: `0.8 × context_window − output_reserve`, where `context_window` is
 the setting; else, for the Anthropic protocol, the `max_input_tokens` field of the chosen model from the models
 listing; else 16k, so an unknown endpoint never overflows. `output_reserve` is 1 500 tokens for a reflection pass, 800 for enrichment, 1 000 for Ask. A call
-is refused (and logged, status "budget") if a section that cannot be cut does not fit.
+is refused and recorded as a failed pass with the reason `case too large for this model's context` if a section that
+cannot be cut does not fit.
 
 Order and cutting rule for a reflection pass:
 1. Global guideline (never cut).
@@ -314,7 +317,8 @@ The format is described in the instruction; no grammar or JSON schema is sent, s
 measurably hurts small models' accuracy. On the OpenAI protocol call two also sends
 `response_format: {"type":"json_object"}`; if the server answers 400 naming `response_format`, the request is
 repeated without it and the fact is remembered for the session. A 400 naming `max_tokens` repeats the request with
-`max_completion_tokens`, also remembered for the session. On the Anthropic protocol nothing else is sent: assistant prefill is
+`max_completion_tokens`, also remembered for the session. On the Anthropic protocol nothing else is sent: assistant
+prefill is
 rejected by current Claude models and `output_config` is not expected from local Anthropic-compatible servers, so
 instruction plus repair and validation is the whole mechanism on both protocols. Cloud Claude models are in scope.
 
@@ -383,7 +387,7 @@ links. The answer is not stored.
 
 ### 4.10 Error handling and status
 
-- Unconfigured: nothing exists.
+- Unconfigured: no companion section, status item or Case-menu item; only the Companion menu to configure it.
 - Configured, probe failed: section shown with "endpoint unreachable"; questions stay as they were; no passes.
 - Pass failure: status shows "last pass failed: <short reason>" until the next successful pass; the pass row holds
   the full error. Questions are never cleared on failure.
@@ -395,7 +399,8 @@ links. The answer is not stored.
 
 ### 4.11 Dependencies
 
-- `ureq` 3 (rustls with the platform verifier, no tokio) for HTTP; `about.toml` accepts CDLA-Permissive-2.0 for the webpki root crates; `serde` with derive for request and response types (`serde_json` exists).
+- `ureq` 3 (rustls with the platform verifier, no tokio) for HTTP; `about.toml` accepts CDLA-Permissive-2.0 for the
+  webpki root crates; `serde` with derive for request and response types (`serde_json` exists).
 - SQLite FTS5 is already compiled into the bundled SQLite (rusqlite `bundled`), so no new native code.
 - No ONNX, no llama.cpp, no model files, no embeddings call. The endpoint is used for chat only.
 - All new code behind the existing `gui` feature except the companion database, retrieval and CLI `--questions`,

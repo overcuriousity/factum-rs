@@ -634,6 +634,7 @@ fn case_database_verifies_unchanged_after_companion_use() {
     };
     let id = companion.insert_question(case_id, None, &q).unwrap();
     companion.rate_question(id, Rating::Minus).unwrap();
+    assert_eq!(companion.minus_examples().unwrap().len(), 1);
     let report = factum.verify_case(case_id, None).unwrap();
     assert!(report.findings.is_empty(), "{:?}", report.findings);
     assert_eq!(f.count("PRAGMA user_version"), factum::db::SCHEMA_VERSION);
