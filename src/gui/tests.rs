@@ -565,3 +565,86 @@ fn local_note_sends_case_changed() {
     harness.run_ok();
     assert!(commands.try_iter().any(|cmd| cmd == Command::CaseChanged(case_id)));
 }
+
+/// Opens an item of the Questions section's ▾ menu.
+fn questions_menu(harness: &mut Harness<'_, FactumApp>, item: &str) {
+    harness.get_by_label("▾").click();
+    harness.run_ok();
+    harness.get_by_label(item).click();
+    harness.run_ok();
+}
+
+#[test]
+fn history_lists_resolved_and_unlink_restores() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let (case_id, versions) = first_note_versions(&fixture);
+    let answered = ask(&cdb, case_id, "Which tool imaged the disk?", vec![versions[1]]);
+    let rejected = ask(&cdb, case_id, "Who held the disk overnight?", vec![versions[1]]);
+    let pass = cdb.begin_pass(case_id, crate::companion::PassKind::Full, "m").unwrap();
+    cdb.answer_question(answered, versions[1], pass).unwrap();
+    cdb.rate_question(rejected, Rating::Minus).unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    questions_menu(&mut harness, "History…");
+    assert!(harness.query_by_label("Which tool imaged the disk?").is_some());
+    assert!(harness.query_by_label("Who held the disk overnight?").is_some());
+    screenshot(&mut harness, "companion-history");
+    harness.get_by_label("Unlink").click();
+    harness.run_ok();
+    harness.get_by_label("Restore").click();
+    harness.run_ok();
+    let open: Vec<i64> = cdb.open_questions(case_id).unwrap().iter().map(|q| q.id).collect();
+    assert_eq!(open, [answered, rejected]);
+    assert!(harness.query_by_label("Unlink").is_none());
+    assert!(harness.query_by_label("No resolved questions.").is_some());
+    assert!(harness.query_by_label("QUESTIONS 2").is_some());
+}
+
+#[test]
+fn ask_window_runs_on_worker_and_shows_references() {
+    let fixture = Fixture::new();
+    let llm = crate::companion::fake_llm::FakeLlm::start();
+    let cdb = CompanionDb::open_for(&fixture.path).unwrap();
+    Settings {
+        endpoint_url: llm.url.clone(),
+        model: "m".into(),
+        ..Settings::default()
+    }
+    .save(&cdb)
+    .unwrap();
+    llm.push(200, &crate::companion::fake_llm::openai_chat("See [1].", "stop", 10));
+    let (_, versions) = first_note_versions(&fixture);
+    let mut harness = fixture.harness();
+    // pinned notes come first: the corrected note is excerpt [1]
+    harness.state().factum().set_pinned(versions[1], true).unwrap();
+    select_case(&mut harness);
+    questions_menu(&mut harness, "Ask…");
+    type_into(&mut harness, "Question", "Which tool imaged the disk?");
+    harness.get_by_label("Ask").click();
+    let link = format!("[1] #{}", versions[1]);
+    run_until(&mut harness, |h| h.query_by_label(&link).is_some());
+    assert!(harness.query_by_label("See [1].").is_some());
+    assert!(
+        harness
+            .query_by_label_contains("not found in the cited entries")
+            .is_none()
+    );
+    screenshot(&mut harness, "companion-ask");
+    harness.get_by_label(&link).click();
+    harness.run_ok();
+    assert_eq!(harness.state().focused_card, Some(versions[1]));
+}
+
+#[test]
+fn rethink_sends_command() {
+    let fixture = Fixture::new();
+    configure_companion(&fixture);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    let commands = harness.state_mut().install_companion_stub();
+    harness.run_ok();
+    questions_menu(&mut harness, "Re-think now");
+    assert!(commands.try_iter().any(|cmd| cmd == Command::Rethink(case_id)));
+}
