@@ -103,7 +103,6 @@ pub enum Dialog {
         text: String,
     },
     CompanionSettings(Box<CompanionSettingsDialog>),
-    #[expect(dead_code, reason = "the Case menu opens it once the companion thread exists")]
     CaseGoal {
         case_id: i64,
         goal: String,
@@ -280,13 +279,14 @@ impl Dialog {
         match self {
             Dialog::CompanionSettings(dialog) => dialog.show(ui, ctx),
             Dialog::CaseGoal { case_id, goal } => {
-                title(ui, "Case goal");
+                let heading = ui.label(RichText::new("Case goal").heading());
                 ui.label(
                     RichText::new("What this case has to establish; the companion asks its questions toward it.")
                         .size(SMALL_SIZE)
                         .color(p.muted),
                 );
-                ui.add(TextEdit::multiline(goal).desired_rows(4).desired_width(f32::INFINITY));
+                ui.add(TextEdit::multiline(goal).desired_rows(4).desired_width(f32::INFINITY))
+                    .labelled_by(heading.id);
                 let (ok, cancel) = buttons(ui, "OK", true);
                 if ok {
                     return Some(DialogResult::CaseGoal {
