@@ -146,6 +146,24 @@ pub struct Settings {
     pub enabled: bool,
 }
 
+/// Unconfigured: what a companion database without settings rows loads as (minus the environment key).
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            endpoint_url: String::new(),
+            protocol: Protocol::OpenAi,
+            api_key: String::new(),
+            api_key_from_env: false,
+            user_agent: String::new(),
+            extra_headers: String::new(),
+            model: String::new(),
+            context_window: None,
+            global_guideline: prompts::DEFAULT_GUIDELINE.to_string(),
+            enabled: true,
+        }
+    }
+}
+
 impl Settings {
     pub fn load(db: &CompanionDb) -> Result<Self> {
         Self::load_with_env(db, std::env::var(ENV_API_KEY).ok())
