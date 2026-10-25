@@ -5,6 +5,7 @@ pub mod questions;
 pub mod retrieval;
 pub mod store;
 pub mod tokens;
+pub mod validate;
 
 use std::path::{Path, PathBuf};
 
