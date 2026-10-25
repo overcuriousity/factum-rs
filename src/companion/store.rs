@@ -270,19 +270,29 @@ impl CompanionDb {
         )))
     }
 
-    /// Runs f in a transaction: committed on Ok, rolled back on Err.
+    /// Runs f in a transaction: committed on Ok, rolled back on Err. Inside another transaction it runs as a
+    /// savepoint, so the outer transaction decides.
     pub fn transaction<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        self.conn.execute_batch("BEGIN")?;
+        let (begin, commit, rollback) = if self.conn.is_autocommit() {
+            ("BEGIN", "COMMIT", "ROLLBACK")
+        } else {
+            (
+                "SAVEPOINT nested",
+                "RELEASE nested",
+                "ROLLBACK TO nested; RELEASE nested",
+            )
+        };
+        self.conn.execute_batch(begin)?;
         match f(&self.conn) {
             Ok(value) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
+                if let Err(e) = self.conn.execute_batch(commit) {
+                    let _ = self.conn.execute_batch(rollback);
                     return Err(e.into());
                 }
                 Ok(value)
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                let _ = self.conn.execute_batch(rollback);
                 Err(e)
             }
         }
