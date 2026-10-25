@@ -37,9 +37,7 @@ pub fn leaf_data(
 
 /// What an entry's signature covers: its leaf and the tree head right after it was appended.
 pub fn entry_signed_payload(leaf_hash: &str, tree_size: i64, root_hash: &str) -> String {
-    canonical_json(
-        &json!({"format": FORMAT, "leaf_hash": leaf_hash, "root_hash": root_hash, "tree_size": tree_size}),
-    )
+    canonical_json(&json!({"format": FORMAT, "leaf_hash": leaf_hash, "root_hash": root_hash, "tree_size": tree_size}))
 }
 
 /// Something to do inside the append transaction, after the entry row was inserted (gets the new entry id).
@@ -57,9 +55,10 @@ pub struct Append<'f> {
 
 impl Factum<'_> {
     pub fn leaf_hashes(&self, case_id: i64) -> Result<Vec<String>> {
-        let mut statement = self.db.conn.prepare_cached(
-            "SELECT leaf_hash FROM entries WHERE case_id = ? ORDER BY leaf_index",
-        )?;
+        let mut statement = self
+            .db
+            .conn
+            .prepare_cached("SELECT leaf_hash FROM entries WHERE case_id = ? ORDER BY leaf_index")?;
         let rows = statement.query_map([case_id], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -95,8 +94,7 @@ impl Factum<'_> {
                 FORMAT,
             );
             let leaf = merkle::leaf_hash(data.as_bytes());
-            let mut parsed: Vec<merkle::Hash> =
-                hashes.iter().map(|h| merkle::from_hex(h)).collect();
+            let mut parsed: Vec<merkle::Hash> = hashes.iter().map(|h| merkle::from_hex(h)).collect();
             parsed.push(leaf);
             let leaf = hex::encode(leaf);
             let root = hex::encode(merkle::root(&parsed));
@@ -111,16 +109,12 @@ impl Factum<'_> {
                 )));
             }
             let result = (|| -> Result<Option<i64>> {
-                let size: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM entries WHERE case_id = ?",
-                    [case_id],
-                    |row| row.get(0),
-                )?;
+                let size: i64 = conn.query_row("SELECT COUNT(*) FROM entries WHERE case_id = ?", [case_id], |row| {
+                    row.get(0)
+                })?;
                 if size != leaf_index {
                     // another process appended while we were signing: our tree head is stale
-                    log::info!(
-                        "Case #{case_id} log changed while signing (attempt {attempt}), retrying."
-                    );
+                    log::info!("Case #{case_id} log changed while signing (attempt {attempt}), retrying.");
                     return Ok(None);
                 }
                 if !options.allow_archived {
@@ -128,11 +122,9 @@ impl Factum<'_> {
                 }
                 if let Some(corrects_id) = options.corrects_id {
                     let corrected: Option<i64> = conn
-                        .query_row(
-                            "SELECT 1 FROM entries WHERE corrects_id = ?",
-                            [corrects_id],
-                            |row| row.get(0),
-                        )
+                        .query_row("SELECT 1 FROM entries WHERE corrects_id = ?", [corrects_id], |row| {
+                            row.get(0)
+                        })
                         .optional()?;
                     if corrected.is_some() {
                         return Err(FactumError::invalid_correction(format!(
@@ -176,9 +168,7 @@ impl Factum<'_> {
                         let _ = conn.execute_batch("ROLLBACK");
                         return Err(e.into());
                     }
-                    log::debug!(
-                        "Entry #{entry_id} appended to case #{case_id} at leaf {leaf_index}."
-                    );
+                    log::debug!("Entry #{entry_id} appended to case #{case_id} at leaf {leaf_index}.");
                     return Ok(entry_id);
                 }
                 Ok(None) => {

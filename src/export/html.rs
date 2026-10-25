@@ -1,8 +1,6 @@
 //! Self-contained HTML report: the notes first, the verification data at the end.
 
-use super::model::{
-    ReportEntry, ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary,
-};
+use super::model::{ReportEntry, ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
 use crate::pystr::html_escape as escape;
 use crate::verifier::Level;
 
@@ -38,18 +36,11 @@ ul.activity { font-size: .9em; color: #57534e; padding-left: 1.2em; }
 pub const ALERT: &str = "⚠ This note failed the integrity check — see Verification.";
 
 fn row(label: &str, value: &str) -> String {
-    format!(
-        "<tr><td><b>{}</b></td><td>{}</td></tr>",
-        escape(label),
-        escape(value)
-    )
+    format!("<tr><td><b>{}</b></td><td>{}</td></tr>", escape(label), escape(value))
 }
 
 fn note_html(item: &ReportEntry) -> String {
-    let mut head = format!(
-        "<b>{}</b>",
-        escape(&readable_utc(Some(&item.origin_created_utc)))
-    );
+    let mut head = format!("<b>{}</b>", escape(&readable_utc(Some(&item.origin_created_utc))));
     if let Some(evidence) = &item.evidence {
         head += &format!(" · {}", escape(evidence));
     }
@@ -65,16 +56,10 @@ fn note_html(item: &ReportEntry) -> String {
         asides.push(escape(&note));
     }
     if !item.labels.is_empty() {
-        asides.push(format!(
-            "Labels (not signed): {}",
-            escape(&item.labels.join(", "))
-        ));
+        asides.push(format!("Labels (not signed): {}", escape(&item.labels.join(", "))));
     }
     asides.push(format!("Note #{}", item.origin_id));
-    parts.push(format!(
-        "<div class='aside'>{}</div></div>",
-        asides.join(" · ")
-    ));
+    parts.push(format!("<div class='aside'>{}</div></div>", asides.join(" · ")));
     parts.concat()
 }
 
@@ -137,17 +122,11 @@ pub fn technical_rows(model: &ReportModel) -> Vec<(&'static str, String)> {
     let mut rows = vec![
         (
             "Exported with key",
-            model
-                .exporting_key
-                .clone()
-                .unwrap_or_else(|| "none (unsigned)".into()),
+            model.exporting_key.clone().unwrap_or_else(|| "none (unsigned)".into()),
         ),
         (
             "Export seal",
-            format!(
-                "{} entries, root {}{unsigned}",
-                seal.tree_size, seal.root_hash
-            ),
+            format!("{} entries, root {}{unsigned}", seal.tree_size, seal.root_hash),
         ),
     ];
     for (fingerprint, username) in &model.report.signers {
@@ -155,10 +134,7 @@ pub fn technical_rows(model: &ReportModel) -> Vec<(&'static str, String)> {
             "Signer",
             format!(
                 "{} — {fingerprint}",
-                username
-                    .as_deref()
-                    .filter(|u| !u.is_empty())
-                    .unwrap_or("unknown")
+                username.as_deref().filter(|u| !u.is_empty()).unwrap_or("unknown")
             ),
         ));
     }
@@ -179,11 +155,7 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
         format!("<h1>{}</h1>", escape(&case.case_name)),
         "<table class='meta'>".into(),
     ];
-    parts.extend(
-        meta_rows(model)
-            .iter()
-            .map(|(label, value)| row(label, value)),
-    );
+    parts.extend(meta_rows(model).iter().map(|(label, value)| row(label, value)));
     parts.push("</table>".into());
     parts.push(format!(
         "<div class='status status-{overall}'><b>{overall}</b> — {}</div>",
@@ -198,7 +170,10 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
     if model.evidence.is_empty() {
         parts.push("<p>No evidence items.</p>".into());
     } else {
-        parts.push("<table class='grid'><tr><th>#</th><th>Description</th><th>Hash</th><th>Added</th><th>Deleted</th></tr>".into());
+        parts.push(
+            "<table class='grid'><tr><th>#</th><th>Description</th><th>Hash</th><th>Added</th><th>Deleted</th></tr>"
+                .into(),
+        );
         for item in &model.evidence {
             let cells: String = evidence_cells(item)
                 .iter()
@@ -225,10 +200,7 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
 
     parts.push("<div class='technical'>".into());
     parts.push(format!("<h2>Verification: {overall}</h2>"));
-    parts.push(format!(
-        "<p class='mono'>{}</p>",
-        escape(&verification_summary(report))
-    ));
+    parts.push(format!("<p class='mono'>{}</p>", escape(&verification_summary(report))));
     let findings = grouped_findings(report);
     if !findings.is_empty() {
         let items: String = findings
@@ -238,24 +210,12 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
         parts.push(format!("<ul>{items}</ul>"));
     }
     parts.push("<table class='meta mono'>".into());
-    parts.extend(
-        technical_rows(model)
-            .iter()
-            .map(|(label, value)| row(label, value)),
-    );
+    parts.extend(technical_rows(model).iter().map(|(label, value)| row(label, value)));
     parts.push("</table>".into());
     parts.push("<h2>Integrity appendix</h2>".into());
-    parts.push(
-        "<p>Every log entry in log order, including superseded versions of corrected notes.</p>"
-            .into(),
-    );
+    parts.push("<p>Every log entry in log order, including superseded versions of corrected notes.</p>".into());
     parts.push("<div class='appendix'>".into());
-    parts.extend(
-        model
-            .appendix
-            .iter()
-            .map(|item| appendix_html(item, print_variant)),
-    );
+    parts.extend(model.appendix.iter().map(|item| appendix_html(item, print_variant)));
     parts.push("</div></div></body></html>".into());
     parts.join("\n")
 }

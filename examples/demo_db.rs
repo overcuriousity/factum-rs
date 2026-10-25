@@ -19,10 +19,18 @@ fn main() -> factum::Result<()> {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     )?;
     let memory = factum.create_evidence(case_id, "FS01 memory dump", "")?;
-    factum.create_note("Arrived on site, FS01 isolated from the network by the customer at 08:12 local time. #timeline", None, case_id)?;
+    factum.create_note(
+        "Arrived on site, FS01 isolated from the network by the customer at 08:12 local time. #timeline",
+        None,
+        case_id,
+    )?;
     let first = factum.create_note("Found suspicious binary C:\\Users\\Public\\svch0st.exe, beaconing to 185.220.101.4 and evil-cdn.example.com #malware", Some(disk), case_id)?;
     factum.correct_note(first, "Found suspicious binary C:\\Users\\Public\\svch0st.exe, beaconing to 185.220.101.47 and evil-cdn.example.com #malware")?;
-    factum.create_note("Ransom note README_RESTORE.txt in every share; contact mail recover@protonmail.example #ransomware", Some(disk), case_id)?;
+    factum.create_note(
+        "Ransom note README_RESTORE.txt in every share; contact mail recover@protonmail.example #ransomware",
+        Some(disk),
+        case_id,
+    )?;
     let pinned = factum.create_note("Volatility: injected code in explorer.exe (PID 4120), MD5 of dump 9e107d9d372bb6826bd81d3542a419d6 #persistence", Some(memory), case_id)?;
     factum.pin_note(pinned)?;
     factum::tags::add_label(&db, pinned, "review")?;
@@ -38,8 +46,7 @@ fn main() -> factum::Result<()> {
         )
         .and_then(|_| {
             factum.create_note(
-                &"The scheduled task \\Microsoft\\Windows\\Update\\Sync runs every 15 minutes. "
-                    .repeat(6),
+                &"The scheduled task \\Microsoft\\Windows\\Update\\Sync runs every 15 minutes. ".repeat(6),
                 None,
                 case_id,
             )

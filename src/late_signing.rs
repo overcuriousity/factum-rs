@@ -83,14 +83,10 @@ impl Factum<'_> {
         let (case_id, signature) =
             row.ok_or_else(|| FactumError::general(format!("Entry #{entry_id} does not exist.")))?;
         if self.is_signed("entry", entry_id, signature.as_deref())? {
-            return Err(FactumError::general(format!(
-                "Entry #{entry_id} is already signed."
-            )));
+            return Err(FactumError::general(format!("Entry #{entry_id} is already signed.")));
         }
         let report = self.ensure_log_intact(case_id)?;
-        let result = report
-            .entry_result(entry_id)
-            .expect("the entry is in its case log");
+        let result = report.entry_result(entry_id).expect("the entry is in its case log");
         self.sign_entry_result(result)
     }
 
@@ -110,9 +106,7 @@ impl Factum<'_> {
             .get_tree_head(tree_head_id)?
             .ok_or_else(|| FactumError::general(format!("Seal #{tree_head_id} does not exist.")))?;
         if self.is_signed("tree_head", tree_head_id, head.signature.as_deref())? {
-            return Err(FactumError::general(format!(
-                "Seal #{tree_head_id} is already signed."
-            )));
+            return Err(FactumError::general(format!("Seal #{tree_head_id} is already signed.")));
         }
         self.ensure_log_intact(head.case_id)?;
         self.sign_tree_head_row(&head)

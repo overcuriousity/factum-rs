@@ -32,3 +32,6 @@ pub use error::{ErrorKind, FactumError, Result};
 pub use services::Factum;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(feature = "gui")]
+pub mod gui;

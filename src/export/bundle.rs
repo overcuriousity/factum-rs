@@ -72,8 +72,7 @@ A correction is a note whose `corrects_id` points to an earlier note of the same
 "#;
 
 fn optional(text: &Option<String>) -> Value {
-    text.as_ref()
-        .map_or(Value::Null, |t| Value::String(t.clone()))
+    text.as_ref().map_or(Value::Null, |t| Value::String(t.clone()))
 }
 
 impl Factum<'_> {
@@ -87,35 +86,31 @@ impl Factum<'_> {
             .map(|item| (item.entry_id, &item.labels))
             .collect();
         let mut signatures = BTreeMap::new();
-        let mut signature_fields =
-            |target: &str, id: i64, signature: Option<&str>, prefix: &str, width: usize| {
-                let mut fields = Map::new();
-                fields.insert("signature_file".into(), Value::Null);
-                fields.insert("late_signature_file".into(), Value::Null);
-                fields.insert("late_signed_utc".into(), Value::Null);
-                if let Some(signature) = signature.filter(|s| !s.is_empty()) {
-                    let name = format!("signatures/{prefix}-{id:0width$}.asc");
-                    signatures.insert(name.clone(), signature.to_string());
-                    fields.insert("signature_file".into(), Value::String(name));
-                }
-                if let Some((signature, signed_utc)) = late.get(&(target.to_string(), id)) {
-                    let name = format!("signatures/late-{prefix}-{id:0width$}.asc");
-                    signatures.insert(name.clone(), signature.clone());
-                    fields.insert("late_signature_file".into(), Value::String(name));
-                    fields.insert("late_signed_utc".into(), Value::String(signed_utc.clone()));
-                }
-                fields
-            };
+        let mut signature_fields = |target: &str, id: i64, signature: Option<&str>, prefix: &str, width: usize| {
+            let mut fields = Map::new();
+            fields.insert("signature_file".into(), Value::Null);
+            fields.insert("late_signature_file".into(), Value::Null);
+            fields.insert("late_signed_utc".into(), Value::Null);
+            if let Some(signature) = signature.filter(|s| !s.is_empty()) {
+                let name = format!("signatures/{prefix}-{id:0width$}.asc");
+                signatures.insert(name.clone(), signature.to_string());
+                fields.insert("signature_file".into(), Value::String(name));
+            }
+            if let Some((signature, signed_utc)) = late.get(&(target.to_string(), id)) {
+                let name = format!("signatures/late-{prefix}-{id:0width$}.asc");
+                signatures.insert(name.clone(), signature.clone());
+                fields.insert("late_signature_file".into(), Value::String(name));
+                fields.insert("late_signed_utc".into(), Value::String(signed_utc.clone()));
+            }
+            fields
+        };
         let mut entries = Vec::new();
         for result in &model.report.entries {
             let entry = &result.entry;
             let entry_labels = if entry.kind == "system" {
                 Vec::new()
             } else {
-                labels
-                    .get(&entry.id)
-                    .map(|l| (*l).clone())
-                    .unwrap_or_default()
+                labels.get(&entry.id).map(|l| (*l).clone()).unwrap_or_default()
             };
             let mut item = json!({
                 "id": entry.id, "leaf_index": entry.leaf_index, "kind": entry.kind, "evidence_id": entry.evidence_id,
@@ -167,12 +162,7 @@ impl Factum<'_> {
         Ok((data, signatures))
     }
 
-    pub fn build_bundle(
-        &self,
-        model: &ReportModel,
-        reports: &[(&str, Vec<u8>)],
-        out_path: &Path,
-    ) -> Result<PathBuf> {
+    pub fn build_bundle(&self, model: &ReportModel, reports: &[(&str, Vec<u8>)], out_path: &Path) -> Result<PathBuf> {
         let (data, signatures) = self.case_data(model)?;
         let mut fingerprints: Vec<String> = model
             .report
@@ -213,17 +203,14 @@ impl Factum<'_> {
         }
         let file = std::fs::File::create(out_path)?;
         let mut zip = zip::ZipWriter::new(file);
-        let options =
-            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        let zip_error = |e: zip::result::ZipError| {
-            FactumError::general(format!("The bundle could not be written: {e}"))
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let zip_error =
+            |e: zip::result::ZipError| FactumError::general(format!("The bundle could not be written: {e}"));
+        let add = |zip: &mut zip::ZipWriter<std::fs::File>, name: &str, content: &[u8]| -> Result<()> {
+            zip.start_file(name, options).map_err(zip_error)?;
+            zip.write_all(content)?;
+            Ok(())
         };
-        let add =
-            |zip: &mut zip::ZipWriter<std::fs::File>, name: &str, content: &[u8]| -> Result<()> {
-                zip.start_file(name, options).map_err(zip_error)?;
-                zip.write_all(content)?;
-                Ok(())
-            };
         for (name, content) in &files {
             add(&mut zip, name, content)?;
         }

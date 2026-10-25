@@ -19,14 +19,7 @@ fn rows(db: &Db, case_id: i64) -> Vec<Row> {
         .unwrap();
     statement
         .query_map([case_id], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         })
         .unwrap()
         .map(Result::unwrap)
@@ -44,9 +37,7 @@ fn root_of(stored: &[Row]) -> String {
 fn first_append_is_a_one_leaf_tree() {
     let f = Fixture::new();
     let case_id = add_case_row(&f.db, "C-1", false);
-    f.factum()
-        .append(case_id, "note", "first", Append::default())
-        .unwrap();
+    f.factum().append(case_id, "note", "first", Append::default()).unwrap();
     let stored = rows(&f.db, case_id);
     let (index, leaf, size, root, signature, _) = &stored[0];
     assert_eq!((*index, *size, root), (0, 1, leaf));
@@ -61,15 +52,10 @@ fn root_covers_all_leaves() {
     let f = Fixture::new();
     let case_id = add_case_row(&f.db, "C-1", false);
     for text in ["a", "b", "c"] {
-        f.factum()
-            .append(case_id, "note", text, Append::default())
-            .unwrap();
+        f.factum().append(case_id, "note", text, Append::default()).unwrap();
     }
     let stored = rows(&f.db, case_id);
-    assert_eq!(
-        stored.iter().map(|r| r.2).collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
+    assert_eq!(stored.iter().map(|r| r.2).collect::<Vec<_>>(), vec![1, 2, 3]);
     assert_eq!(stored[2].3, root_of(&stored));
 }
 
@@ -87,10 +73,7 @@ fn text_is_stored_exactly() {
 fn archived_case_is_refused() {
     let f = Fixture::new();
     let case_id = add_case_row(&f.db, "C-1", true);
-    let error = f
-        .factum()
-        .append(case_id, "note", "x", Append::default())
-        .unwrap_err();
+    let error = f.factum().append(case_id, "note", "x", Append::default()).unwrap_err();
     assert!(error.is(ErrorKind::CaseArchived));
     assert!(rows(&f.db, case_id).is_empty());
     f.factum()
@@ -112,10 +95,7 @@ fn signing_failure_saves_nothing() {
     let f = Fixture::new();
     let case_id = add_case_row(&f.db, "C-1", false);
     f.signer.fail_next.set(true);
-    let error = f
-        .factum()
-        .append(case_id, "note", "x", Append::default())
-        .unwrap_err();
+    let error = f.factum().append(case_id, "note", "x", Append::default()).unwrap_err();
     assert!(error.is(ErrorKind::Signing));
     assert!(rows(&f.db, case_id).is_empty());
 }
@@ -124,9 +104,7 @@ fn signing_failure_saves_nothing() {
 fn without_active_key_entries_are_unsigned() {
     let f = Fixture::with_signer(FakeSigner::new(false));
     let case_id = add_case_row(&f.db, "C-1", false);
-    f.factum()
-        .append(case_id, "note", "x", Append::default())
-        .unwrap();
+    f.factum().append(case_id, "note", "x", Append::default()).unwrap();
     assert_eq!(rows(&f.db, case_id)[0].4, None);
 }
 
@@ -135,9 +113,7 @@ fn notes_get_tags_system_entries_do_not() {
     let f = Fixture::new();
     let case_id = add_case_row(&f.db, "C-1", false);
     let factum = f.factum();
-    let note = factum
-        .append(case_id, "note", "#malware", Append::default())
-        .unwrap();
+    let note = factum.append(case_id, "note", "#malware", Append::default()).unwrap();
     let system = factum
         .append(
             case_id,
@@ -153,18 +129,10 @@ fn notes_get_tags_system_entries_do_not() {
         tags::get_tags_for_entry(&f.db.conn, note).unwrap(),
         vec![("malware".to_string(), "text".to_string())]
     );
-    assert!(
-        tags::get_tags_for_entry(&f.db.conn, system)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(tags::get_tags_for_entry(&f.db.conn, system).unwrap().is_empty());
     let stored: String =
         f.db.conn
-            .query_row(
-                "SELECT payload_json FROM entries WHERE id = ?",
-                [system],
-                |r| r.get(0),
-            )
+            .query_row("SELECT payload_json FROM entries WHERE id = ?", [system], |r| r.get(0))
             .unwrap();
     assert_eq!(stored, r#"{"event":"x"}"#);
 }
@@ -173,9 +141,7 @@ fn notes_get_tags_system_entries_do_not() {
 fn on_commit_failure_rolls_back_the_entry() {
     let f = Fixture::new();
     let case_id = add_case_row(&f.db, "C-1", false);
-    let broken = |_: &rusqlite::Connection, _: i64| -> factum::Result<()> {
-        Err(factum::FactumError::general("boom"))
-    };
+    let broken = |_: &rusqlite::Connection, _: i64| -> factum::Result<()> { Err(factum::FactumError::general("boom")) };
     assert!(
         f.factum()
             .append(
@@ -193,12 +159,7 @@ fn on_commit_failure_rolls_back_the_entry() {
 }
 
 /// A signer that lets "another process" (its own connection) append before every signature.
-fn racing_signer(
-    db_path: &std::path::Path,
-    case_id: i64,
-    races: usize,
-    text: &'static str,
-) -> FakeSigner {
+fn racing_signer(db_path: &std::path::Path, case_id: i64, races: usize, text: &'static str) -> FakeSigner {
     let other_db = Db::open(db_path).unwrap();
     let other_signer = FakeSigner::new(true);
     let mut remaining = races;
@@ -226,10 +187,7 @@ fn concurrent_append_retries_and_never_forks() {
     let summary: Vec<(&str, i64, i64)> = stored.iter().map(|r| (r.5.as_str(), r.0, r.2)).collect();
     assert_eq!(
         summary,
-        vec![
-            ("written by the CLI meanwhile", 0, 1),
-            ("written by the GUI", 1, 2)
-        ]
+        vec![("written by the CLI meanwhile", 0, 1), ("written by the GUI", 1, 2)]
     );
     assert_eq!(stored[1].3, root_of(&stored));
 }
@@ -244,10 +202,7 @@ fn gives_up_after_three_races() {
         .unwrap_err();
     assert!(error.is(ErrorKind::LogChanged) && error.message.contains("nothing was saved"));
     assert_eq!(
-        rows(&f.db, case_id)
-            .iter()
-            .map(|r| r.5.as_str())
-            .collect::<Vec<_>>(),
+        rows(&f.db, case_id).iter().map(|r| r.5.as_str()).collect::<Vec<_>>(),
         vec!["race", "race", "race"]
     );
 }
@@ -257,9 +212,7 @@ fn correcting_an_already_corrected_entry_is_refused() {
     let f = Fixture::new();
     let case_id = add_case_row(&f.db, "C-1", false);
     let factum = f.factum();
-    let original = factum
-        .append(case_id, "note", "v1", Append::default())
-        .unwrap();
+    let original = factum.append(case_id, "note", "v1", Append::default()).unwrap();
     factum
         .append(
             case_id,
@@ -291,13 +244,8 @@ fn locked_database_is_a_clear_error() {
     let case_id = add_case_row(&f.db, "C-1", false);
     let blocker = Db::open(&f.db.path).unwrap();
     blocker.conn.execute_batch("BEGIN IMMEDIATE").unwrap(); // another factum process holds the write lock
-    f.db.conn
-        .busy_timeout(std::time::Duration::from_millis(50))
-        .unwrap();
-    let error = f
-        .factum()
-        .append(case_id, "note", "x", Append::default())
-        .unwrap_err();
+    f.db.conn.busy_timeout(std::time::Duration::from_millis(50)).unwrap();
+    let error = f.factum().append(case_id, "note", "x", Append::default()).unwrap_err();
     assert!(error.message.contains("locked"), "{error}");
     blocker.conn.execute_batch("ROLLBACK").unwrap();
     assert!(rows(&f.db, case_id).is_empty());
@@ -312,11 +260,7 @@ fn create_case_writes_case_created_entry() {
     let case_id = factum.create_case(" C-1 ", "", "desc").unwrap();
     let case = factum.get_case(case_id).unwrap().unwrap();
     assert_eq!(
-        (
-            case.case_file.as_str(),
-            case.case_name.as_str(),
-            case.is_archived()
-        ),
+        (case.case_file.as_str(), case.case_name.as_str(), case.is_archived()),
         ("C-1", "C-1", false)
     );
     assert_eq!(
@@ -354,10 +298,7 @@ fn update_case_writes_case_edited() {
     let case_id = factum.create_case("C-1", "Old", "").unwrap();
     factum.update_case(case_id, "C-1", "New", "more").unwrap();
     assert_eq!(factum.get_case(case_id).unwrap().unwrap().case_name, "New");
-    assert_eq!(
-        system_events(&f.db, case_id).last().unwrap()["event"],
-        "case_edited"
-    );
+    assert_eq!(system_events(&f.db, case_id).last().unwrap()["event"], "case_edited");
 }
 
 #[test]
@@ -373,10 +314,7 @@ fn archive_makes_case_read_only_hidden_and_sealed() {
         system_events(&f.db, case_id).last().unwrap(),
         &json!({"event": "case_archived", "case_id": case_id, "archived_utc": case.archived_utc})
     );
-    assert_eq!(
-        factum.get_tree_head(tree_head_id).unwrap().unwrap().reason,
-        "archive"
-    );
+    assert_eq!(factum.get_tree_head(tree_head_id).unwrap().unwrap().reason, "archive");
     assert!(factum.list_cases(false).unwrap().is_empty());
     assert_eq!(factum.list_cases(true).unwrap(), vec![case_id]);
     assert!(
@@ -385,12 +323,7 @@ fn archive_makes_case_read_only_hidden_and_sealed() {
             .unwrap_err()
             .is(ErrorKind::CaseArchived)
     );
-    assert!(
-        factum
-            .set_active_case(case_id)
-            .unwrap_err()
-            .is(ErrorKind::CaseArchived)
-    );
+    assert!(factum.set_active_case(case_id).unwrap_err().is(ErrorKind::CaseArchived));
     assert!(
         factum
             .create_evidence(case_id, "disk", "")
@@ -472,11 +405,7 @@ fn delete_permanently_needs_archive_and_exact_case_file() {
         "entry_tag_map",
         "entry_ioc_map",
     ] {
-        assert_eq!(
-            f.count(&format!("SELECT COUNT(*) FROM {table}")),
-            0,
-            "{table}"
-        );
+        assert_eq!(f.count(&format!("SELECT COUNT(*) FROM {table}")), 0, "{table}");
     }
 }
 
@@ -485,15 +414,10 @@ fn create_evidence_writes_system_entry_without_evidence_id() {
     let f = Fixture::new();
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let evidence_id = factum
-        .create_evidence(case_id, " Laptop HDD ", " abc ")
-        .unwrap();
+    let evidence_id = factum.create_evidence(case_id, " Laptop HDD ", " abc ").unwrap();
     let evidence = factum.get_evidence(evidence_id).unwrap().unwrap();
     assert_eq!(
-        (
-            evidence.description.as_str(),
-            evidence.evidence_hash.as_str()
-        ),
+        (evidence.description.as_str(), evidence.evidence_hash.as_str()),
         ("Laptop HDD", "abc")
     );
     assert_eq!(
@@ -530,14 +454,8 @@ fn only_empty_evidence_can_be_deleted() {
     );
     factum.delete_evidence(empty).unwrap();
     assert!(factum.get_evidence(empty).unwrap().unwrap().is_deleted());
-    assert_eq!(
-        factum.list_evidence_for_case(case_id, false).unwrap(),
-        vec![used]
-    );
-    assert_eq!(
-        factum.list_evidence_for_case(case_id, true).unwrap(),
-        vec![empty, used]
-    );
+    assert_eq!(factum.list_evidence_for_case(case_id, false).unwrap(), vec![used]);
+    assert_eq!(factum.list_evidence_for_case(case_id, true).unwrap(), vec![empty, used]);
     assert_eq!(
         system_events(&f.db, case_id).last().unwrap()["event"],
         "evidence_deleted"
@@ -560,10 +478,7 @@ fn set_active_evidence_activates_its_case() {
 
 fn case_with_evidence(factum: &Factum) -> (i64, i64) {
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    (
-        case_id,
-        factum.create_evidence(case_id, "disk", "").unwrap(),
-    )
+    (case_id, factum.create_evidence(case_id, "disk", "").unwrap())
 }
 
 #[test]
@@ -571,9 +486,7 @@ fn create_note_on_case_and_evidence() {
     let f = Fixture::new();
     let factum = f.factum();
     let (case_id, evidence_id) = case_with_evidence(&factum);
-    let note = factum
-        .create_note("on evidence", Some(evidence_id), case_id)
-        .unwrap();
+    let note = factum.create_note("on evidence", Some(evidence_id), case_id).unwrap();
     let entry = factum.get_entry(note).unwrap().unwrap();
     assert_eq!(
         (entry.kind.as_str(), entry.evidence_id, entry.leaf_index),
@@ -616,9 +529,7 @@ fn system_entries_cannot_be_corrected() {
     let f = Fixture::new();
     let factum = f.factum();
     let (case_id, _) = case_with_evidence(&factum);
-    let system_entry = factum
-        .list_entries(case_id, &EntryFilter::default())
-        .unwrap()[0];
+    let system_entry = factum.list_entries(case_id, &EntryFilter::default()).unwrap()[0];
     assert!(
         factum
             .correct_note(system_entry, "x")
@@ -633,13 +544,9 @@ fn list_entries_shows_newest_versions_at_the_original_position() {
     let factum = f.factum();
     let (case_id, evidence_id) = case_with_evidence(&factum);
     let first = factum.create_note("first", None, case_id).unwrap();
-    let second = factum
-        .create_note("second", Some(evidence_id), case_id)
-        .unwrap();
+    let second = factum.create_note("second", Some(evidence_id), case_id).unwrap();
     let first_v2 = factum.correct_note(first, "first, corrected").unwrap();
-    let all = factum
-        .list_entries(case_id, &EntryFilter::default())
-        .unwrap();
+    let all = factum.list_entries(case_id, &EntryFilter::default()).unwrap();
     assert_eq!(all[2..], [first_v2, second]);
     assert_eq!(
         factum.list_entries(case_id, &EntryFilter::notes()).unwrap(),
@@ -649,10 +556,7 @@ fn list_entries_shows_newest_versions_at_the_original_position() {
         evidence_id: Some(evidence_id),
         ..Default::default()
     };
-    assert_eq!(
-        factum.list_entries(case_id, &on_evidence).unwrap(),
-        vec![second]
-    );
+    assert_eq!(factum.list_entries(case_id, &on_evidence).unwrap(), vec![second]);
 }
 
 #[test]
@@ -683,12 +587,8 @@ fn search_matches_text_tags_labels_and_system_entries() {
     let f = Fixture::new();
     let factum = f.factum();
     let (case_id, _) = case_with_evidence(&factum);
-    let in_text = factum
-        .create_note("Found PowerShell history", None, case_id)
-        .unwrap();
-    let tagged = factum
-        .create_note("see #persistence", None, case_id)
-        .unwrap();
+    let in_text = factum.create_note("Found PowerShell history", None, case_id).unwrap();
+    let tagged = factum.create_note("see #persistence", None, case_id).unwrap();
     let labelled = factum.create_note("plain", None, case_id).unwrap();
     tags::add_label(&f.db, labelled, "powershell-review").unwrap();
     let search = |text| {
@@ -738,12 +638,7 @@ fn pinning_is_refused_on_archived_cases() {
     let (case_id, _) = case_with_evidence(&factum);
     let note = factum.create_note("x", None, case_id).unwrap();
     factum.archive_case(case_id).unwrap();
-    assert!(
-        factum
-            .pin_note(note)
-            .unwrap_err()
-            .is(ErrorKind::CaseArchived)
-    );
+    assert!(factum.pin_note(note).unwrap_err().is(ErrorKind::CaseArchived));
 }
 
 // --- tags and IOCs
@@ -757,18 +652,10 @@ fn text_tags_are_parsed_with_source_text() {
         "found #malware and #persistence #malware",
         None,
     );
-    tags::parse_tags_from_note(
-        &f.db.conn,
-        entry_id,
-        "found #malware and #persistence #malware",
-    )
-    .unwrap();
+    tags::parse_tags_from_note(&f.db.conn, entry_id, "found #malware and #persistence #malware").unwrap();
     assert_eq!(
         tags::get_tags_for_entry(&f.db.conn, entry_id).unwrap(),
-        vec![
-            ("malware".into(), "text".into()),
-            ("persistence".into(), "text".into())
-        ]
+        vec![("malware".into(), "text".into()), ("persistence".into(), "text".into())]
     );
 }
 
@@ -782,10 +669,7 @@ fn label_does_not_replace_text_tag_and_cannot_remove_it() {
     assert_eq!(tags::remove_label(&f.db, entry_id, "malware").unwrap(), 0);
     assert_eq!(
         tags::get_tags_for_entry(&f.db.conn, entry_id).unwrap(),
-        vec![
-            ("malware".into(), "text".into()),
-            ("review".into(), "label".into())
-        ]
+        vec![("malware".into(), "text".into()), ("review".into(), "label".into())]
     );
     assert_eq!(tags::remove_label(&f.db, entry_id, "review").unwrap(), 1);
     assert_eq!(

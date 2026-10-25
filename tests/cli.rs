@@ -42,11 +42,7 @@ fn add_and_correct_a_note() {
     let note_id = factum.list_entries(case_id, &EntryFilter::notes()).unwrap()[0];
     assert_eq!(code, 0);
     assert!(out.contains(&format!("Note #{note_id} added.")));
-    let (_, out) = run(
-        &f,
-        &f.signer,
-        &["--correct", &note_id.to_string(), "second version"],
-    );
+    let (_, out) = run(&f, &f.signer, &["--correct", &note_id.to_string(), "second version"]);
     assert!(out.contains(&format!("(corrects #{note_id})")), "{out}");
 }
 
@@ -60,10 +56,7 @@ fn notes_go_to_the_active_evidence() {
     let (code, out) = run(&f, &f.signer, &["--set-active", "evidence", "disk"]);
     assert_eq!(
         (code, out.trim()),
-        (
-            0,
-            format!("Active evidence set to #{evidence_id}.").as_str()
-        )
+        (0, format!("Active evidence set to #{evidence_id}.").as_str())
     );
     run(&f, &f.signer, &["on the disk"]);
     let on_disk = EntryFilter {
@@ -83,13 +76,7 @@ fn new_case_and_evidence_from_the_cli() {
     let (code, out) = run(
         &f,
         &f.signer,
-        &[
-            "--new-case",
-            "2026/7",
-            "Phishing",
-            "--description",
-            "mail server",
-        ],
+        &["--new-case", "2026/7", "Phishing", "--description", "mail server"],
     );
     assert_eq!(code, 0, "{out}");
     let factum = f.factum();
@@ -103,23 +90,12 @@ fn new_case_and_evidence_from_the_cli() {
         ),
         ("2026/7", "Phishing", "mail server")
     );
-    let (code, out) = run(
-        &f,
-        &f.signer,
-        &["--new-evidence", "mailbox export", "--hash", "abc"],
-    );
+    let (code, out) = run(&f, &f.signer, &["--new-evidence", "mailbox export", "--hash", "abc"]);
     assert_eq!(code, 0, "{out}");
     let [evidence_id] = factum.list_evidence_for_case(case_id, false).unwrap()[..] else {
         panic!()
     };
-    assert_eq!(
-        factum
-            .get_evidence(evidence_id)
-            .unwrap()
-            .unwrap()
-            .evidence_hash,
-        "abc"
-    );
+    assert_eq!(factum.get_evidence(evidence_id).unwrap().unwrap().evidence_hash, "abc");
     assert_eq!(
         factum
             .verify_case(case_id, None)
@@ -151,10 +127,7 @@ fn verify_exit_codes() {
     run(&f, &f.signer, &["--checkpoint"]);
     let (code, out) = run(&f, &f.signer, &["--verify", "-v"]);
     assert_eq!(code, 0);
-    assert!(
-        out.contains("Case C-1: OK") && out.contains("[OK  ] #"),
-        "{out}"
-    );
+    assert!(out.contains("Case C-1: OK") && out.contains("[OK  ] #"), "{out}");
     f.exec("UPDATE entries SET text = 'tampered'");
     let (code, out) = run(&f, &f.signer, &["--verify", "C-1"]);
     assert_eq!(code, 1);
@@ -220,16 +193,10 @@ fn optional_case_arguments_parse_like_argparse() {
     let args = Args::parse_from_strs(["--verify", "-v"]);
     assert_eq!((args.verify.as_deref(), args.verbose), (Some(""), true));
     let args = Args::parse_from_strs(["--export", "C-1", "--format", "md"]);
-    assert_eq!(
-        (args.export.as_deref(), args.format.as_str()),
-        (Some("C-1"), "md")
-    );
+    assert_eq!((args.export.as_deref(), args.format.as_str()), (Some("C-1"), "md"));
     let args = Args::parse_from_strs(["--set-active", "evidence", "none"]);
     assert_eq!(args.set_active.unwrap(), vec!["evidence", "none"]);
-    assert_eq!(
-        Args::parse_from_strs(["a note"]).note.as_deref(),
-        Some("a note")
-    );
+    assert_eq!(Args::parse_from_strs(["a note"]).note.as_deref(), Some("a note"));
 }
 
 #[test]
@@ -299,10 +266,7 @@ fn active_key_is_remembered() {
     let home = require_gpg!("Factum Test <test@factum.invalid>");
     let f = Fixture::new();
     let key = gpg(&f, &home).active_key().unwrap();
-    assert_eq!(
-        GnupgSigner::new(&f.db, Some(home.path())).active_key(),
-        Some(key)
-    );
+    assert_eq!(GnupgSigner::new(&f.db, Some(home.path())).active_key(), Some(key));
 }
 
 #[test]
@@ -312,17 +276,10 @@ fn real_gpg_end_to_end() {
     let signer = gpg(&f, &home);
     let factum = factum::Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    factum
-        .create_note("signed for real", None, case_id)
-        .unwrap();
+    factum.create_note("signed for real", None, case_id).unwrap();
     factum.seal(case_id, "checkpoint").unwrap();
     let report = factum.verify_case(case_id, None).unwrap();
-    assert_eq!(
-        report.overall(),
-        factum::verifier::Level::Ok,
-        "{:?}",
-        report.findings
-    );
+    assert_eq!(report.overall(), factum::verifier::Level::Ok, "{:?}", report.findings);
 }
 
 #[test]
@@ -354,20 +311,12 @@ fn signature_check_of_a_damaged_signature_is_invalid() {
     let bad = factum.create_note("bad", None, case_id).unwrap();
     let signature = factum.get_entry(bad).unwrap().unwrap().signature.unwrap();
     let mut lines: Vec<String> = signature.lines().map(str::to_string).collect();
-    let index = lines
-        .iter()
-        .position(|l| l == "-----BEGIN PGP SIGNATURE-----")
-        .unwrap()
-        + 2;
+    let index = lines.iter().position(|l| l == "-----BEGIN PGP SIGNATURE-----").unwrap() + 2;
     let line = &lines[index];
     lines[index] = format!(
         "{}{}",
         &line[..line.len() - 4],
-        if line.ends_with("AAAA") {
-            "BBBB"
-        } else {
-            "AAAA"
-        }
+        if line.ends_with("AAAA") { "BBBB" } else { "AAAA" }
     );
     f.db.conn
         .execute(

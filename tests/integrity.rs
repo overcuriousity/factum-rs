@@ -19,12 +19,7 @@ fn make_case(factum: &Factum, entries: usize, case_file: &str) -> i64 {
     let case_id = add_case_row(factum.db, case_file, false);
     for number in 0..entries {
         factum
-            .append(
-                case_id,
-                "note",
-                &format!("note {number}"),
-                Append::default(),
-            )
+            .append(case_id, "note", &format!("note {number}"), Append::default())
             .unwrap();
     }
     case_id
@@ -60,14 +55,7 @@ fn seal_records_current_head_and_writes_signed_file() {
         (head.tree_size, head.root_hash.clone()),
         (2, hex::encode(merkle::root(&hashes)))
     );
-    let expected = seal_payload(
-        case_id,
-        "C-1",
-        2,
-        &head.root_hash,
-        &head.created_utc,
-        "checkpoint",
-    );
+    let expected = seal_payload(case_id, "C-1", 2, &head.root_hash, &head.created_utc, "checkpoint");
     assert_eq!(
         head.signature.as_deref(),
         Some(FakeSigner::fake_signature(&expected).as_str())
@@ -82,10 +70,7 @@ fn seal_records_current_head_and_writes_signed_file() {
             .unwrap()
             .starts_with(&format!("C-1_{case_id}_size2_"))
     );
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap(),
-        head.signature.unwrap()
-    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), head.signature.unwrap());
 }
 
 #[test]
@@ -109,12 +94,7 @@ fn signing_failure_creates_no_seal() {
     let factum = f.factum();
     let case_id = make_case(&factum, 2, "C-1");
     f.signer.fail_next.set(true);
-    assert!(
-        factum
-            .seal(case_id, "checkpoint")
-            .unwrap_err()
-            .is(ErrorKind::Signing)
-    );
+    assert!(factum.seal(case_id, "checkpoint").unwrap_err().is(ErrorKind::Signing));
     assert!(factum.list_tree_heads(case_id).unwrap().is_empty());
 }
 
@@ -157,14 +137,7 @@ fn read_seal_files_ignores_other_cases() {
     let case_id = make_case(&factum, 2, "C-1");
     factum.seal(case_id, "checkpoint").unwrap();
     // same case id, different case file: a seal of another database sharing this folder
-    let other = seal_payload(
-        case_id,
-        "OTHER",
-        99,
-        "00",
-        "2026-01-01T00:00:00.000Z",
-        "checkpoint",
-    );
+    let other = seal_payload(case_id, "OTHER", 99, "00", "2026-01-01T00:00:00.000Z", "checkpoint");
     std::fs::write(f.seal_dir.join("OTHER_1_size99_x.json"), other).unwrap();
     std::fs::write(f.seal_dir.join("garbage.asc"), "not a seal").unwrap();
     let found = factum.read_seal_files(case_id).unwrap();
@@ -261,10 +234,7 @@ fn sealed_case_with_external_folder_is_ok() {
     assert_eq!(report.count(Level::Ok), 5);
     assert_eq!(
         report.signers,
-        vec![(
-            "FAKEFINGERPRINT1".to_string(),
-            Some("Fake Signer".to_string())
-        )]
+        vec![("FAKEFINGERPRINT1".to_string(), Some("Fake Signer".to_string()))]
     );
 }
 
@@ -275,10 +245,7 @@ fn unsealed_entries_and_default_seal_folder_warn() {
     let (case_id, _, _) = verifier_case(&factum);
     let report = factum.verify_case(case_id, None).unwrap();
     assert_eq!(report.overall(), Level::Warn);
-    assert_eq!(
-        codes(&report, None),
-        HashSet::from(["not_sealed", "seal_dir_default"])
-    );
+    assert_eq!(codes(&report, None), HashSet::from(["not_sealed", "seal_dir_default"]));
 }
 
 #[test]
@@ -290,10 +257,7 @@ fn unicode_and_crlf_text_verifies() {
         .create_note("Müller ✓ 🦊\r\nzweite Zeile  ", None, case_id)
         .unwrap();
     factum.seal(case_id, "checkpoint").unwrap();
-    assert_eq!(
-        factum.verify_case(case_id, None).unwrap().overall(),
-        Level::Ok
-    );
+    assert_eq!(factum.verify_case(case_id, None).unwrap().overall(), Level::Ok);
 }
 
 #[test]
@@ -302,10 +266,7 @@ fn modified_text_fails() {
     let factum = f.factum();
     let (case_id, _, notes) = verifier_case(&factum);
     factum.seal(case_id, "checkpoint").unwrap();
-    f.exec(&format!(
-        "UPDATE entries SET text = 'changed' WHERE id = {}",
-        notes[1]
-    ));
+    f.exec(&format!("UPDATE entries SET text = 'changed' WHERE id = {}", notes[1]));
     let report = factum.verify_case(case_id, None).unwrap();
     assert_eq!(report.overall(), Level::Fail);
     assert_eq!(report.entry_result(notes[1]).unwrap().status(), Level::Fail);
@@ -340,20 +301,12 @@ fn rewritten_hashes_without_the_key_fail_on_signatures() {
         f.db.conn
             .execute(
                 "UPDATE entries SET text = ?, leaf_hash = ?, root_hash = ? WHERE id = ?",
-                rusqlite::params![
-                    text,
-                    hex::encode(leaf),
-                    hex::encode(accumulator.root()),
-                    entry.id
-                ],
+                rusqlite::params![text, hex::encode(leaf), hex::encode(accumulator.root()), entry.id],
             )
             .unwrap();
     }
     let report = factum.verify_case(case_id, None).unwrap();
-    assert_eq!(
-        codes(&report, Some(Level::Fail)),
-        HashSet::from(["signature_mismatch"])
-    );
+    assert_eq!(codes(&report, Some(Level::Fail)), HashSet::from(["signature_mismatch"]));
 }
 
 #[test]
@@ -362,10 +315,7 @@ fn deleted_middle_entry_fails() {
     let factum = f.factum();
     let (case_id, _, notes) = verifier_case(&factum);
     f.exec(&format!("DELETE FROM entries WHERE id = {}", notes[0]));
-    let failures = codes(
-        &factum.verify_case(case_id, None).unwrap(),
-        Some(Level::Fail),
-    );
+    let failures = codes(&factum.verify_case(case_id, None).unwrap(), Some(Level::Fail));
     assert!(failures.contains("gap") && failures.contains("tree_head"));
 }
 
@@ -382,11 +332,7 @@ fn truncation_after_a_seal_fails_even_without_the_database_seal() {
     let report = factum.verify_case(case_id, None).unwrap();
     assert!(codes(&report, Some(Level::Fail)).contains("seal_truncated"));
     assert_eq!(
-        report
-            .tree_heads
-            .iter()
-            .map(|h| h.source)
-            .collect::<Vec<_>>(),
+        report.tree_heads.iter().map(|h| h.source).collect::<Vec<_>>(),
         vec![SealSource::File]
     );
 }
@@ -399,13 +345,7 @@ fn edited_evidence_row_fails() {
     f.exec(&format!(
         "UPDATE evidence SET evidence_hash = 'other' WHERE id = {evidence_id}"
     ));
-    assert!(
-        codes(
-            &factum.verify_case(case_id, None).unwrap(),
-            Some(Level::Fail)
-        )
-        .contains("metadata")
-    );
+    assert!(codes(&factum.verify_case(case_id, None).unwrap(), Some(Level::Fail)).contains("metadata"));
 }
 
 #[test]
@@ -418,16 +358,10 @@ fn edited_case_row_and_archive_state_fail() {
         utc_now()
     ));
     let report = factum.verify_case(case_id, None).unwrap();
-    let failures: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|f| f.code == "metadata")
-        .collect();
+    let failures: Vec<_> = report.findings.iter().filter(|f| f.code == "metadata").collect();
     assert_eq!(failures.len(), 2);
     assert!(
-        failures[0]
-            .message
-            .contains("(log: 'Case', database: 'renamed')"),
+        failures[0].message.contains("(log: 'Case', database: 'renamed')"),
         "{}",
         failures[0].message
     );
@@ -444,13 +378,7 @@ fn correction_pointing_at_another_case_fails() {
         "UPDATE entries SET corrects_id = {foreign} WHERE id = {}",
         notes[2]
     ));
-    assert!(
-        codes(
-            &factum.verify_case(case_id, None).unwrap(),
-            Some(Level::Fail)
-        )
-        .contains("correction_target")
-    );
+    assert!(codes(&factum.verify_case(case_id, None).unwrap(), Some(Level::Fail)).contains("correction_target"));
 }
 
 #[test]
@@ -458,13 +386,7 @@ fn unsigned_entries_fail() {
     let f = Fixture::with_signer(FakeSigner::new(false));
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    assert!(
-        codes(
-            &factum.verify_case(case_id, None).unwrap(),
-            Some(Level::Fail)
-        )
-        .contains("unsigned")
-    );
+    assert!(codes(&factum.verify_case(case_id, None).unwrap(), Some(Level::Fail)).contains("unsigned"));
 }
 
 #[test]
@@ -478,10 +400,7 @@ fn late_signature_is_only_a_warning() {
         entry.tree_size,
         &entry.root_hash,
     ));
-    f.exec(&format!(
-        "UPDATE entries SET signature = NULL WHERE id = {}",
-        notes[0]
-    ));
+    f.exec(&format!("UPDATE entries SET signature = NULL WHERE id = {}", notes[0]));
     f.db.conn
         .execute(
             "INSERT INTO late_signatures (target, target_id, signature, signed_utc) VALUES ('entry', ?, ?, ?)",
@@ -500,13 +419,7 @@ fn untrusted_key_fails() {
     let (case_id, _, _) = verifier_case(&f.factum());
     let untrusted = FakeSigner::with_trust(true, "TRUST_UNDEFINED");
     let factum = Factum::with_seal_dir(&f.db, &untrusted, Some(f.seal_dir.clone()));
-    assert!(
-        codes(
-            &factum.verify_case(case_id, None).unwrap(),
-            Some(Level::Fail)
-        )
-        .contains("key_untrusted")
-    );
+    assert!(codes(&factum.verify_case(case_id, None).unwrap(), Some(Level::Fail)).contains("key_untrusted"));
 }
 
 #[test]
@@ -515,9 +428,7 @@ fn verify_entry_checks_one_signature() {
     let factum = f.factum();
     let (_, _, notes) = verifier_case(&factum);
     let result = factum.verify_entry(notes[1]).unwrap();
-    assert!(
-        result.status() == Level::Ok && result.signature.valid && result.recomputed_tree_size == 4
-    );
+    assert!(result.status() == Level::Ok && result.signature.valid && result.recomputed_tree_size == 4);
 }
 
 #[test]
@@ -563,13 +474,7 @@ fn unreachable_seal_folder_is_reported() {
     let (case_id, _, _) = verifier_case(&f.factum());
     f.factum().seal(case_id, "checkpoint").unwrap();
     let unplugged = Factum::with_seal_dir(&f.db, &f.signer, Some(f.path().join("unplugged")));
-    assert!(
-        codes(
-            &unplugged.verify_case(case_id, None).unwrap(),
-            Some(Level::Warn)
-        )
-        .contains("seal_dir_unreachable")
-    );
+    assert!(codes(&unplugged.verify_case(case_id, None).unwrap(), Some(Level::Warn)).contains("seal_dir_unreachable"));
 }
 
 #[test]
@@ -578,9 +483,7 @@ fn renaming_a_case_keeps_earlier_seals_valid() {
     let factum = f.factum();
     let (case_id, _, _) = verifier_case(&factum);
     factum.seal(case_id, "checkpoint").unwrap();
-    factum
-        .update_case(case_id, "C-renamed", "Case", "")
-        .unwrap();
+    factum.update_case(case_id, "C-renamed", "Case", "").unwrap();
     factum.seal(case_id, "checkpoint").unwrap();
     let report = factum.verify_case(case_id, None).unwrap();
     assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
@@ -592,20 +495,12 @@ fn seal_files_from_before_a_rename_still_detect_truncation() {
     let factum = f.factum();
     let (case_id, _, _) = verifier_case(&factum);
     factum.seal(case_id, "checkpoint").unwrap();
-    factum
-        .update_case(case_id, "C-renamed", "Case", "")
-        .unwrap();
+    factum.update_case(case_id, "C-renamed", "Case", "").unwrap();
     // drop the rename entry and the newest note: the old-name seal file (5 entries) now exceeds the log
     f.exec(&format!(
         "DELETE FROM entries WHERE case_id = {case_id} AND leaf_index >= 4; DELETE FROM tree_heads;"
     ));
-    assert!(
-        codes(
-            &factum.verify_case(case_id, None).unwrap(),
-            Some(Level::Fail)
-        )
-        .contains("seal_truncated")
-    );
+    assert!(codes(&factum.verify_case(case_id, None).unwrap(), Some(Level::Fail)).contains("seal_truncated"));
 }
 
 // --- late signing
@@ -615,9 +510,7 @@ fn unsigned_case(f: &Fixture) -> (i64, i64, i64) {
     f.signer.set_active(false);
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let note = factum
-        .create_note("written without a key", None, case_id)
-        .unwrap();
+    let note = factum.create_note("written without a key", None, case_id).unwrap();
     let tree_head_id = factum.seal(case_id, "checkpoint").unwrap();
     f.signer.set_active(true);
     (case_id, note, tree_head_id)
@@ -648,17 +541,9 @@ fn sign_tree_head_writes_signed_copy_next_to_the_unsigned_file() {
     let (_, _, tree_head_id) = unsigned_case(&f);
     let factum = f.factum();
     factum.sign_tree_head(tree_head_id).unwrap();
-    let path = PathBuf::from(
-        factum
-            .get_tree_head(tree_head_id)
-            .unwrap()
-            .unwrap()
-            .file_path
-            .unwrap(),
-    );
+    let path = PathBuf::from(factum.get_tree_head(tree_head_id).unwrap().unwrap().file_path.unwrap());
     assert!(path.with_extension("asc").exists());
-    let payload: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     assert_eq!(payload["tree_size"], 2);
 }
 
@@ -683,22 +568,14 @@ fn already_signed_entry_is_refused() {
     let (_, note, _) = unsigned_case(&f);
     let factum = f.factum();
     factum.sign_entry(note).unwrap();
-    assert!(
-        factum
-            .sign_entry(note)
-            .unwrap_err()
-            .message
-            .contains("already signed")
-    );
+    assert!(factum.sign_entry(note).unwrap_err().message.contains("already signed"));
 }
 
 #[test]
 fn broken_log_is_not_signed() {
     let f = Fixture::new();
     let (case_id, note, _) = unsigned_case(&f);
-    f.exec(&format!(
-        "UPDATE entries SET text = 'tampered' WHERE id = {note}"
-    ));
+    f.exec(&format!("UPDATE entries SET text = 'tampered' WHERE id = {note}"));
     let error = f.factum().sign_all_unsigned(case_id).unwrap_err();
     assert!(error.is(ErrorKind::LogBroken) && error.message.contains("Nothing was signed"));
 }
@@ -718,9 +595,7 @@ fn signed_copy_replaces_the_unsigned_seal_file_in_verification() {
     let (case_id, _, _) = unsigned_case(&f);
     let factum = f.factum();
     factum.sign_all_unsigned(case_id).unwrap();
-    assert!(
-        !codes(&factum.verify_case(case_id, None).unwrap(), None).contains("seal_file_unsigned")
-    );
+    assert!(!codes(&factum.verify_case(case_id, None).unwrap(), None).contains("seal_file_unsigned"));
 }
 
 #[test]
@@ -730,15 +605,8 @@ fn signed_copy_keeps_gpg_line_endings() {
     f.signer.crlf.set(true);
     let factum = f.factum();
     factum.sign_tree_head(tree_head_id).unwrap();
-    let path = PathBuf::from(
-        factum
-            .get_tree_head(tree_head_id)
-            .unwrap()
-            .unwrap()
-            .file_path
-            .unwrap(),
-    )
-    .with_extension("asc");
+    let path =
+        PathBuf::from(factum.get_tree_head(tree_head_id).unwrap().unwrap().file_path.unwrap()).with_extension("asc");
     let bytes = std::fs::read(path).unwrap();
     assert!(!bytes.windows(3).any(|w| w == b"\r\r\n") && bytes.windows(2).any(|w| w == b"\r\n"));
 }

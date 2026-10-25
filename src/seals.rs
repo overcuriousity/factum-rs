@@ -72,10 +72,7 @@ impl SealFile {
     }
 
     pub fn text_field(&self, key: &str) -> Option<String> {
-        self.payload
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        self.payload.get(key).and_then(Value::as_str).map(str::to_string)
     }
 }
 
@@ -117,10 +114,7 @@ pub fn resolve(path: &Path) -> PathBuf {
     let mut existing = absolute.clone();
     let mut rest = Vec::new();
     while !existing.exists() {
-        match (
-            existing.file_name().map(|n| n.to_os_string()),
-            existing.parent(),
-        ) {
+        match (existing.file_name().map(|n| n.to_os_string()), existing.parent()) {
             (Some(name), Some(parent)) => {
                 rest.push(name);
                 existing = parent.to_path_buf();
@@ -174,11 +168,7 @@ impl Factum<'_> {
     pub fn case_file(&self, case_id: i64) -> Result<String> {
         self.db
             .conn
-            .query_row(
-                "SELECT case_file FROM cases WHERE id = ?",
-                [case_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT case_file FROM cases WHERE id = ?", [case_id], |row| row.get(0))
             .optional()?
             .ok_or_else(|| FactumError::case_not_found(format!("Case #{case_id} does not exist.")))
     }
@@ -194,8 +184,7 @@ impl Factum<'_> {
         for row in rows {
             let payload_json = row?;
             // json.loads(payload_json or "null"); unparsable rows are skipped
-            let Ok(Value::Object(payload)) =
-                serde_json::from_str::<Value>(payload_json.as_deref().unwrap_or("null"))
+            let Ok(Value::Object(payload)) = serde_json::from_str::<Value>(payload_json.as_deref().unwrap_or("null"))
             else {
                 continue;
             };
@@ -214,11 +203,7 @@ impl Factum<'_> {
 
     /// (size, root hash) of the case log as it is now.
     pub fn current_head(&self, case_id: i64) -> Result<(i64, String)> {
-        let hashes: Vec<merkle::Hash> = self
-            .leaf_hashes(case_id)?
-            .iter()
-            .map(|h| merkle::from_hex(h))
-            .collect();
+        let hashes: Vec<merkle::Hash> = self.leaf_hashes(case_id)?.iter().map(|h| merkle::from_hex(h)).collect();
         Ok((hashes.len() as i64, hex::encode(merkle::root(&hashes))))
     }
 
@@ -227,26 +212,15 @@ impl Factum<'_> {
         let case_file = self.case_file(case_id)?;
         let (tree_size, root_hash) = self.current_head(case_id)?;
         let created_utc = utc_now();
-        let payload = seal_payload(
-            case_id,
-            &case_file,
-            tree_size,
-            &root_hash,
-            &created_utc,
-            reason,
-        );
-        let signature =
-            self.sign_or_fail(&payload, "GPG signing failed — the seal was not created.")?;
+        let payload = seal_payload(case_id, &case_file, tree_size, &root_hash, &created_utc, reason);
+        let signature = self.sign_or_fail(&payload, "GPG signing failed — the seal was not created.")?;
         let name = format!(
             "{}_{case_id}_size{tree_size}_{}",
             safe_filename(&case_file),
             compact_utc(&created_utc)
         );
         let folder = self.seal_dir();
-        let path = folder.join(format!(
-            "{name}{}",
-            if signature.is_some() { ".asc" } else { ".json" }
-        ));
+        let path = folder.join(format!("{name}{}", if signature.is_some() { ".asc" } else { ".json" }));
         if !folder.is_dir() && !self.seal_dir_is_default() {
             // never create an external folder: on an unmounted medium it would end up on the local disk
             return Err(FactumError::general(format!(
@@ -259,12 +233,7 @@ impl Factum<'_> {
         let content = signature.clone().unwrap_or_else(|| format!("{payload}\n"));
         std::fs::create_dir_all(&parent)
             .and_then(|_| std::fs::write(&path, content.as_bytes()))
-            .map_err(|e| {
-                FactumError::general(format!(
-                    "The seal could not be written to {}: {e}",
-                    parent.display()
-                ))
-            })?;
+            .map_err(|e| FactumError::general(format!("The seal could not be written to {}: {e}", parent.display())))?;
         let id = self.db.transaction(|conn| {
             conn.execute(
                 "INSERT INTO tree_heads (case_id, case_file, tree_size, root_hash, created_utc, reason, signature, file_path) \
@@ -324,10 +293,7 @@ impl Factum<'_> {
         signed.sort();
         unsigned.sort();
         // an unsigned seal that was signed later has a .asc with the same name; the .json is then superseded
-        let stems: Vec<_> = signed
-            .iter()
-            .map(|p| p.file_stem().map(|s| s.to_os_string()))
-            .collect();
+        let stems: Vec<_> = signed.iter().map(|p| p.file_stem().map(|s| s.to_os_string())).collect();
         unsigned.retain(|path| !stems.contains(&path.file_stem().map(|s| s.to_os_string())));
         let mut found = Vec::new();
         for path in signed.into_iter().chain(unsigned) {
@@ -354,9 +320,7 @@ impl Factum<'_> {
             {
                 continue;
             }
-            if !is_int(payload.get("tree_size"))
-                || !payload.get("root_hash").is_some_and(Value::is_string)
-            {
+            if !is_int(payload.get("tree_size")) || !payload.get("root_hash").is_some_and(Value::is_string) {
                 continue;
             }
             found.push(SealFile {
@@ -371,9 +335,7 @@ impl Factum<'_> {
 }
 
 /// The parsed payloads of a case's system entries, in log order (unparsable ones as strings).
-pub fn system_payloads<'e>(
-    entries: impl IntoIterator<Item = &'e crate::notes::Entry>,
-) -> Vec<Value> {
+pub fn system_payloads<'e>(entries: impl IntoIterator<Item = &'e crate::notes::Entry>) -> Vec<Value> {
     entries
         .into_iter()
         .filter(|e| e.kind == "system")

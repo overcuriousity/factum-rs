@@ -107,10 +107,7 @@ impl Db {
 
     pub fn open(path: &Path) -> Result<Self> {
         log::debug!("Trying to connect to database at {}", path.display());
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
+        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path).map_err(|e| {
@@ -131,17 +128,15 @@ impl Db {
     }
 
     fn initialize_schema(&self) -> Result<()> {
-        let version: i64 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let version: i64 = self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version == SCHEMA_VERSION {
             return Ok(());
         }
-        let tables: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
-            [],
-            |row| row.get(0),
-        )?;
+        let tables: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'", [], |row| {
+                    row.get(0)
+                })?;
         if version == 0 && tables == 0 {
             self.conn.execute_batch(&format!(
                 "BEGIN;{SCHEMA}PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
@@ -158,9 +153,7 @@ impl Db {
 
     /// Changes only when another connection commits, so the GUI can ignore its own writes.
     pub fn data_version(&self) -> Result<i64> {
-        Ok(self
-            .conn
-            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+        Ok(self.conn.query_row("PRAGMA data_version", [], |row| row.get(0))?)
     }
 
     /// Runs f in a transaction (like Python's `with conn:`): committed on Ok, rolled back on Err.
@@ -184,9 +177,7 @@ impl Db {
     pub fn get_setting(&self, key: &str) -> Result<String> {
         let value: Option<Option<String>> = self
             .conn
-            .query_row("SELECT value FROM settings WHERE key = ?", [key], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT value FROM settings WHERE key = ?", [key], |row| row.get(0))
             .optional()
             .inspect_err(|e| log::error!("Failed to retrieve setting for key '{key}': {e}"))?;
         match value {
@@ -225,16 +216,12 @@ impl Db {
 
 pub fn ensure_case_open(conn: &Connection, case_id: i64) -> Result<()> {
     let row: Option<Option<String>> = conn
-        .query_row(
-            "SELECT archived_utc FROM cases WHERE id = ?",
-            [case_id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT archived_utc FROM cases WHERE id = ?", [case_id], |row| {
+            row.get(0)
+        })
         .optional()?;
     match row {
-        None => Err(FactumError::case_not_found(format!(
-            "Case #{case_id} does not exist."
-        ))),
+        None => Err(FactumError::case_not_found(format!("Case #{case_id} does not exist."))),
         Some(Some(_)) => Err(FactumError::case_archived(format!(
             "Case #{case_id} is archived. Reopen it to make changes."
         ))),
@@ -244,14 +231,9 @@ pub fn ensure_case_open(conn: &Connection, case_id: i64) -> Result<()> {
 
 pub fn ensure_entry_case_open(conn: &Connection, entry_id: i64) -> Result<i64> {
     let case_id: Option<i64> = conn
-        .query_row(
-            "SELECT case_id FROM entries WHERE id = ?",
-            [entry_id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT case_id FROM entries WHERE id = ?", [entry_id], |row| row.get(0))
         .optional()?;
-    let case_id = case_id
-        .ok_or_else(|| FactumError::general(format!("Entry #{entry_id} does not exist.")))?;
+    let case_id = case_id.ok_or_else(|| FactumError::general(format!("Entry #{entry_id} does not exist.")))?;
     ensure_case_open(conn, case_id)?;
     Ok(case_id)
 }
@@ -278,10 +260,7 @@ mod tests {
     fn new_database_gets_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("f.db")).unwrap();
-        let version: i64 = db
-            .conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap();
+        let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, 3);
         for table in TABLES {
             let count: i64 = db
@@ -337,10 +316,7 @@ mod tests {
     fn foreign_keys_are_enforced() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("f.db")).unwrap();
-        let on: i64 = db
-            .conn
-            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-            .unwrap();
+        let on: i64 = db.conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
         assert_eq!(on, 1);
     }
 

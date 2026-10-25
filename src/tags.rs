@@ -21,11 +21,7 @@ pub fn add_tag(conn: &Connection, tag_text: &str) -> Result<i64> {
         "INSERT INTO tags (tag_text) VALUES (?) ON CONFLICT(tag_text) DO NOTHING",
         [tag_text],
     )?;
-    Ok(conn.query_row(
-        "SELECT id FROM tags WHERE tag_text = ?",
-        [tag_text],
-        |row| row.get(0),
-    )?)
+    Ok(conn.query_row("SELECT id FROM tags WHERE tag_text = ?", [tag_text], |row| row.get(0))?)
 }
 
 pub fn map_tag(conn: &Connection, entry_id: i64, tag_id: i64, source: &str) -> Result<usize> {
@@ -52,10 +48,7 @@ pub fn parse_tags_from_note(conn: &Connection, entry_id: i64, note_text: &str) -
             tag_ids.push(tag_id);
         }
     }
-    log::debug!(
-        "Parsed and mapped {} tags from entry ID: {entry_id}",
-        tag_ids.len()
-    );
+    log::debug!("Parsed and mapped {} tags from entry ID: {entry_id}", tag_ids.len());
     Ok(tag_ids)
 }
 

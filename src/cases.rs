@@ -23,8 +23,7 @@ impl Case {
         self.archived_utc.is_some()
     }
 
-    const COLUMNS: &'static str =
-        "id, case_file, case_name, description, created_utc, is_active, archived_utc";
+    const COLUMNS: &'static str = "id, case_file, case_name, description, created_utc, is_active, archived_utc";
 
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -73,9 +72,8 @@ impl Factum<'_> {
         );
         if let Err(e) = appended {
             // the row has no entries yet, so removing it leaves no trace in any log
-            self.db.transaction(|conn| {
-                Ok(conn.execute("DELETE FROM cases WHERE id = ?", [case_id])?)
-            })?;
+            self.db
+                .transaction(|conn| Ok(conn.execute("DELETE FROM cases WHERE id = ?", [case_id])?))?;
             return Err(e);
         }
         log::debug!("Case created with ID: {case_id}");
@@ -117,9 +115,7 @@ impl Factum<'_> {
         Ok(self
             .db
             .conn
-            .query_row("SELECT id FROM cases WHERE is_active = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT id FROM cases WHERE is_active = 1", [], |row| row.get(0))
             .optional()?)
     }
 
@@ -142,13 +138,7 @@ impl Factum<'_> {
         Ok(true)
     }
 
-    pub fn update_case(
-        &self,
-        case_id: i64,
-        case_file: &str,
-        case_name: &str,
-        description: &str,
-    ) -> Result<()> {
+    pub fn update_case(&self, case_id: i64, case_file: &str, case_name: &str, description: &str) -> Result<()> {
         let case = self.require_case(case_id)?;
         let case_file = strip(case_file);
         if case_file.is_empty() {
@@ -164,22 +154,14 @@ impl Factum<'_> {
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
             conn.execute(
                 "UPDATE cases SET case_file = ?, case_name = ?, description = ? WHERE id = ?",
-                params![
-                    updated.case_file,
-                    updated.case_name,
-                    updated.description,
-                    case_id
-                ],
+                params![updated.case_file, updated.case_name, updated.description, case_id],
             )?;
             Ok(())
         };
         self.append(
             case_id,
             KIND_SYSTEM,
-            &format!(
-                "Case details edited: {} — {}",
-                updated.case_file, updated.case_name
-            ),
+            &format!("Case details edited: {} — {}", updated.case_file, updated.case_name),
             Append {
                 payload: Some(case_payload("case_edited", &updated)),
                 on_commit: Some(&apply),
@@ -203,10 +185,7 @@ impl Factum<'_> {
                 "UPDATE cases SET archived_utc = ?, is_active = 0 WHERE id = ?",
                 params![archived_utc, case_id],
             )?;
-            conn.execute(
-                "UPDATE evidence SET is_active = 0 WHERE case_id = ?",
-                [case_id],
-            )?;
+            conn.execute("UPDATE evidence SET is_active = 0 WHERE case_id = ?", [case_id])?;
             Ok(())
         };
         self.append(
@@ -228,15 +207,10 @@ impl Factum<'_> {
 
     pub fn reopen_case(&self, case_id: i64) -> Result<()> {
         if !self.require_case(case_id)?.is_archived() {
-            return Err(FactumError::general(format!(
-                "Case #{case_id} is not archived."
-            )));
+            return Err(FactumError::general(format!("Case #{case_id} is not archived.")));
         }
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
-            conn.execute(
-                "UPDATE cases SET archived_utc = NULL WHERE id = ?",
-                [case_id],
-            )?;
+            conn.execute("UPDATE cases SET archived_utc = NULL WHERE id = ?", [case_id])?;
             Ok(())
         };
         self.append(
@@ -267,8 +241,14 @@ impl Factum<'_> {
         }
         let entries = "SELECT id FROM entries WHERE case_id = ?";
         self.db.transaction(|conn| {
-            conn.execute(&format!("DELETE FROM entry_tag_map WHERE entry_id IN ({entries})"), [case_id])?;
-            conn.execute(&format!("DELETE FROM entry_ioc_map WHERE entry_id IN ({entries})"), [case_id])?;
+            conn.execute(
+                &format!("DELETE FROM entry_tag_map WHERE entry_id IN ({entries})"),
+                [case_id],
+            )?;
+            conn.execute(
+                &format!("DELETE FROM entry_ioc_map WHERE entry_id IN ({entries})"),
+                [case_id],
+            )?;
             conn.execute(
                 &format!("DELETE FROM late_signatures WHERE target = 'entry' AND target_id IN ({entries})"),
                 [case_id],

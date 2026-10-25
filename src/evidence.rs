@@ -24,8 +24,7 @@ impl Evidence {
         self.deleted_utc.is_some()
     }
 
-    pub const COLUMNS: &'static str =
-        "id, case_id, description, evidence_hash, created_utc, is_active, deleted_utc";
+    pub const COLUMNS: &'static str = "id, case_id, description, evidence_hash, created_utc, is_active, deleted_utc";
 
     pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -42,12 +41,7 @@ impl Evidence {
 
 // intentionally no update_evidence method, as evidence should be immutable after creation
 impl Factum<'_> {
-    pub fn create_evidence(
-        &self,
-        case_id: i64,
-        description: &str,
-        evidence_hash: &str,
-    ) -> Result<i64> {
+    pub fn create_evidence(&self, case_id: i64, description: &str, evidence_hash: &str) -> Result<i64> {
         let (description, evidence_hash) = (strip(description), strip(evidence_hash));
         if description.is_empty() {
             return Err(FactumError::general("An evidence description is required."));
@@ -76,9 +70,8 @@ impl Factum<'_> {
                 ..Default::default()
             },
         ) {
-            self.db.transaction(|conn| {
-                Ok(conn.execute("DELETE FROM evidence WHERE id = ?", [evidence_id])?)
-            })?;
+            self.db
+                .transaction(|conn| Ok(conn.execute("DELETE FROM evidence WHERE id = ?", [evidence_id])?))?;
             return Err(e);
         }
         Ok(evidence_id)
@@ -100,9 +93,7 @@ impl Factum<'_> {
         Ok(self
             .db
             .conn
-            .query_row("SELECT id FROM evidence WHERE is_active = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row("SELECT id FROM evidence WHERE is_active = 1", [], |row| row.get(0))
             .optional()?)
     }
 
@@ -125,10 +116,7 @@ impl Factum<'_> {
         self.db.transaction(|conn| {
             conn.execute("UPDATE evidence SET is_active = 0", [])?;
             if let Some(evidence) = &evidence {
-                conn.execute(
-                    "UPDATE evidence SET is_active = 1 WHERE id = ?",
-                    [evidence.id],
-                )?;
+                conn.execute("UPDATE evidence SET is_active = 1 WHERE id = ?", [evidence.id])?;
                 // the active case must always be the parent of the active evidence
                 conn.execute("UPDATE cases SET is_active = (id = ?)", [evidence.case_id])?;
             }
@@ -167,16 +155,11 @@ impl Factum<'_> {
         let evidence = match self.get_evidence(evidence_id)? {
             Some(evidence) if !evidence.is_deleted() => evidence,
             _ => {
-                return Err(FactumError::general(format!(
-                    "Evidence #{evidence_id} does not exist."
-                )));
+                return Err(FactumError::general(format!("Evidence #{evidence_id} does not exist.")));
             }
         };
-        let not_empty = || {
-            FactumError::evidence_not_empty(format!(
-                "Evidence #{evidence_id} has notes and cannot be deleted."
-            ))
-        };
+        let not_empty =
+            || FactumError::evidence_not_empty(format!("Evidence #{evidence_id} has notes and cannot be deleted."));
         if self.has_entries(evidence_id)? {
             return Err(not_empty());
         }
@@ -204,7 +187,9 @@ impl Factum<'_> {
             KIND_SYSTEM,
             &format!("Evidence #{evidence_id} deleted: {}", evidence.description),
             Append {
-                payload: Some(json!({"event": "evidence_deleted", "evidence_id": evidence_id, "deleted_utc": deleted_utc})),
+                payload: Some(
+                    json!({"event": "evidence_deleted", "evidence_id": evidence_id, "deleted_utc": deleted_utc}),
+                ),
                 on_commit: Some(&apply),
                 ..Default::default()
             },
