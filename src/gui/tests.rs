@@ -552,10 +552,11 @@ fn case_toggle_hides_section_and_goal_dialog_writes_goal() {
 #[test]
 fn local_note_sends_case_changed() {
     let fixture = Fixture::new();
-    configure_companion(&fixture);
+    let cdb = configure_companion(&fixture);
     let mut harness = fixture.harness();
     select_case(&mut harness);
     let case_id = harness.state().case_id.unwrap();
+    cdb.ensure_case(case_id).unwrap(); // what the thread does when the case is selected
     let commands = harness.state_mut().install_companion_stub();
     harness.run_ok();
     let _: Vec<Command> = commands.try_iter().collect(); // what the first rebuild reports

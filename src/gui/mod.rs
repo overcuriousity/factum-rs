@@ -373,8 +373,9 @@ impl FactumApp {
         self.check_shown_signatures(ctx);
     }
 
-    /// Sends `CaseChanged` for every case with entries the thread was neither told about nor has seen in a pass;
-    /// the GUI's own writes do not move `data_version`, so this runs on every rebuild.
+    /// Sends `CaseChanged` for every case the companion knows (it has a `case_settings` row) with entries the thread
+    /// was neither told about nor has seen in a pass; the GUI's own writes do not move `data_version`, so this runs
+    /// on every rebuild.
     fn notify_companion(&mut self) {
         let (Some(handle), Some(cdb)) = (&self.companion, &self.companion_db) else {
             return;
@@ -394,7 +395,9 @@ impl FactumApp {
         for (case_id, max_id) in newest {
             let told = self.companion_seen.get(&case_id).copied().unwrap_or(0);
             let seen = match cdb.case_settings(case_id) {
-                Ok(case) => case.map_or(0, |c| c.last_seen_entry_id),
+                Ok(Some(case)) => case.last_seen_entry_id,
+                // not selected since the companion exists: its first pass starts when it is selected
+                Ok(None) => continue,
                 Err(e) => {
                     log::error!("The companion settings of case {case_id} cannot be read: {e}");
                     continue;
