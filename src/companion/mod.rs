@@ -13,7 +13,10 @@ pub mod questions;
 #[cfg(feature = "gui")]
 pub mod reflect;
 pub mod retrieval;
+pub mod schedule;
 pub mod store;
+#[cfg(feature = "gui")]
+pub mod thread;
 pub mod tokens;
 pub mod validate;
 
