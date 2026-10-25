@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::prompts;
 use crate::error::{FactumError, Result};
 
 pub const SCHEMA_VERSION: i64 = 1;
@@ -165,8 +166,10 @@ impl Settings {
             extra_headers: db.get_setting("extra_headers")?,
             model: db.get_setting("model")?,
             context_window: db.get_setting("context_window")?.trim().parse().ok(),
-            // Task 4 supplies prompts::DEFAULT_GUIDELINE as the default for an empty stored value
-            global_guideline: db.get_setting("global_guideline")?,
+            global_guideline: match db.get_setting("global_guideline")? {
+                stored if stored.trim().is_empty() => prompts::DEFAULT_GUIDELINE.to_string(),
+                stored => stored,
+            },
             enabled: enabled.is_empty() || enabled == "1",
         })
     }
