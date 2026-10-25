@@ -1,8 +1,9 @@
-//! The desktop GUI (`factum --gui`): case tree on the left, the case log in the middle, pinned notes and IoCs on
-//! the right. Everything shown is cached in a [`View`] that is rebuilt after every change, so drawing a frame
-//! never queries the database.
+//! The desktop GUI (`factum --gui`): case tree on the left, the case log in the middle, pinned notes, the
+//! companion's questions and IoCs on the right. Everything shown is cached in a [`View`] that is rebuilt after
+//! every change, so drawing a frame never queries the database.
 
 mod companion_dialogs;
+mod companion_panel;
 mod dialogs;
 mod theme;
 mod widgets;
@@ -17,7 +18,8 @@ use std::time::{Duration, Instant};
 use egui::{Align, Key, KeyboardShortcut, Layout, Margin, Modifiers, RichText, TextEdit};
 
 use crate::cases::Case;
-use crate::companion::{CompanionDb, Settings};
+use crate::companion::thread::{Command, CompanionHandle, Status};
+use crate::companion::{CompanionDb, Settings, companion_db_path};
 use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
@@ -28,6 +30,7 @@ use crate::services::Factum;
 use crate::signer::{ACTIVE_KEY_SETTING, GnupgSigner, Signer};
 use crate::verifier::{CaseReport, SignatureCheck};
 use companion_dialogs::CompanionSettingsDialog;
+use companion_panel::{CompanionView, PanelAction};
 use dialogs::{Dialog, DialogResult, NoGpgChoice, Pending, VerifyAction, VerifyWindow};
 use theme::{SMALL_SIZE, THEMES};
 use widgets::{Card, CardAction, CardView, CheckView};
@@ -85,12 +88,6 @@ pub fn run(db: Db) -> std::result::Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SideTab {
-    Pinned,
-    Iocs,
-}
-
 struct CaseNode {
     case: Case,
     notes: usize,
@@ -126,6 +123,8 @@ struct View {
     pinned_empty_text: Option<String>,
     iocs: BTreeMap<String, Vec<String>>,
     cli_active: String,
+    /// the Questions section: present while the companion is configured and a case is selected
+    companion: Option<CompanionView>,
 }
 
 struct VerifyJob {
@@ -148,8 +147,10 @@ struct FactumApp {
     show_system: bool,
     theme: String,
     side_panel: bool,
-    side_tab: SideTab,
     side_width: f32,
+    iocs_open: bool,
+    /// the scrolled height of the pinned notes in the last frame, for splitting the side panel
+    pinned_height: f32,
     composer: String,
     view: View,
     dirty: bool,
@@ -177,12 +178,20 @@ struct FactumApp {
     // None when the companion database cannot be opened: the companion is absent
     companion_db: Option<CompanionDb>,
     companion_settings: Settings,
-    // stands in for the companion thread until it exists: set while the settings are configured
-    companion_started: bool,
+    // running while the companion is configured
+    companion: Option<CompanionHandle>,
+    companion_status: Status,
+    // per case, the newest entry the thread was told about with CaseChanged
+    companion_seen: HashMap<i64, i64>,
 }
 
 impl FactumApp {
     fn new(db: Db, ctx: &egui::Context) -> Self {
+        Self::build(db, ctx, true)
+    }
+
+    /// `start_companion`: start the companion thread when it is configured (tests have no endpoint).
+    fn build(db: Db, ctx: &egui::Context, start_companion: bool) -> Self {
         let signer = GnupgSigner::new(&db, None);
         let setting = |key: &str| db.get_setting(key).unwrap_or_default();
         let mut theme = setting(THEME_SETTING);
@@ -206,7 +215,6 @@ impl FactumApp {
                     .ok()
             })
             .unwrap_or_default();
-        let companion_started = companion_db.is_some() && companion_settings.is_configured();
         let mut app = Self {
             db,
             signer,
@@ -219,8 +227,9 @@ impl FactumApp {
             show_system: true,
             theme,
             side_panel,
-            side_tab: SideTab::Pinned,
             side_width,
+            iocs_open: false,
+            pinned_height: 0.0,
             composer: String::new(),
             view: View::default(),
             dirty: true,
@@ -244,7 +253,9 @@ impl FactumApp {
             gpg_status: (String::new(), false),
             companion_db,
             companion_settings,
-            companion_started,
+            companion: None,
+            companion_status: Status::default(),
+            companion_seen: HashMap::new(),
         };
         // pre-select the CLI active case or evidence so notes are shown on startup
         let factum = app.factum();
@@ -254,7 +265,59 @@ impl FactumApp {
             app.case_id = Some(case_id);
         }
         app.update_gpg_status();
+        if start_companion && app.companion_db.is_some() && app.companion_settings.is_configured() {
+            app.start_companion(ctx);
+        }
         app
+    }
+
+    fn start_companion(&mut self, ctx: &egui::Context) {
+        let handle = CompanionHandle::start(ctx.clone(), self.db.path.clone(), companion_db_path(&self.db.path));
+        handle.send(Command::Selected(self.current_case_id()));
+        self.companion = Some(handle);
+        self.companion_seen.clear();
+        self.dirty = true; // the next rebuild tells it which cases changed
+    }
+
+    /// Starts, updates or stops the companion thread to match the saved settings.
+    fn apply_companion_settings(&mut self, ctx: &egui::Context, settings: Settings) {
+        let configured = settings.is_configured();
+        self.companion_settings = settings;
+        match self.companion.take() {
+            Some(handle) if configured => {
+                handle.send(Command::SettingsChanged);
+                self.companion = Some(handle);
+            }
+            Some(handle) => handle.detach(),
+            None if configured && self.companion_db.is_some() => self.start_companion(ctx),
+            None => {}
+        }
+        self.dirty = true;
+    }
+
+    /// "Test connection" saves the draft: after Cancel the stored settings may differ from the ones in use.
+    fn reload_companion_settings(&mut self, ctx: &egui::Context) {
+        let Some(cdb) = &self.companion_db else { return };
+        match Settings::load(cdb) {
+            Ok(settings) if settings != self.companion_settings => self.apply_companion_settings(ctx, settings),
+            Ok(_) => {}
+            Err(e) => log::error!("The companion settings cannot be read: {e}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn install_companion_stub(&mut self) -> std::sync::mpsc::Receiver<Command> {
+        let (handle, commands) = CompanionHandle::test_stub();
+        self.companion = Some(handle);
+        self.companion_seen.clear();
+        self.dirty = true;
+        commands
+    }
+
+    fn send_companion(&self, cmd: Command) {
+        if let Some(handle) = &self.companion {
+            handle.send(cmd);
+        }
     }
 
     fn factum(&self) -> Factum<'_> {
@@ -306,7 +369,42 @@ impl FactumApp {
             Ok(view) => self.view = view,
             Err(e) => log::error!("Failed to populate the window: {e}"),
         }
+        self.notify_companion();
         self.check_shown_signatures(ctx);
+    }
+
+    /// Sends `CaseChanged` for every case with entries the thread was neither told about nor has seen in a pass;
+    /// the GUI's own writes do not move `data_version`, so this runs on every rebuild.
+    fn notify_companion(&mut self) {
+        let (Some(handle), Some(cdb)) = (&self.companion, &self.companion_db) else {
+            return;
+        };
+        let newest = self
+            .db
+            .conn
+            .prepare("SELECT case_id, MAX(id) FROM entries GROUP BY case_id")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            });
+        let newest = match newest {
+            Ok(newest) => newest,
+            Err(e) => return log::error!("The newest entries cannot be read: {e}"),
+        };
+        for (case_id, max_id) in newest {
+            let told = self.companion_seen.get(&case_id).copied().unwrap_or(0);
+            let seen = match cdb.case_settings(case_id) {
+                Ok(case) => case.map_or(0, |c| c.last_seen_entry_id),
+                Err(e) => {
+                    log::error!("The companion settings of case {case_id} cannot be read: {e}");
+                    continue;
+                }
+            };
+            if max_id > told && max_id > seen {
+                handle.send(Command::CaseChanged(case_id));
+                self.companion_seen.insert(case_id, max_id);
+            }
+        }
     }
 
     fn card(&self, factum: &Factum, entry: Entry, case: &Case) -> Result<Card> {
@@ -477,6 +575,14 @@ impl FactumApp {
             parts.push(format!("Evid: {}", evidence.description));
         }
         view.cli_active = parts.join("  /  ");
+        view.companion = match (&self.companion_db, &view.case) {
+            (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
+                CompanionView::read(&factum, cdb, case.id)
+                    .inspect_err(|e| log::error!("The companion questions cannot be read: {e}"))
+                    .ok()
+            }
+            _ => None,
+        };
         Ok(view)
     }
 
@@ -542,6 +648,14 @@ impl FactumApp {
                 Err(message) => self.message("Factum", format!("Verification failed: {message}")),
             }
         }
+        if let Some(handle) = &self.companion {
+            let status = handle.status();
+            // a finished pass changed the questions
+            if status.last_pass_utc != self.companion_status.last_pass_utc {
+                self.dirty = true;
+            }
+            self.companion_status = status;
+        }
         // notes added on the command line appear here: data_version only moves on commits of other connections
         if self.last_poll.elapsed() >= Duration::from_millis(750) {
             self.last_poll = Instant::now();
@@ -592,6 +706,7 @@ impl FactumApp {
             self.evidence_id = evidence_id;
             self.focused_card = None;
             self.dirty = true;
+            self.send_companion(Command::Selected(self.current_case_id()));
         }
     }
 
@@ -894,7 +1009,7 @@ impl FactumApp {
         }
     }
 
-    fn handle_dialog_result(&mut self, result: DialogResult) {
+    fn handle_dialog_result(&mut self, result: DialogResult, ctx: &egui::Context) {
         match result {
             DialogResult::Cancel => {}
             DialogResult::NewCase {
@@ -934,7 +1049,14 @@ impl FactumApp {
             DialogResult::Confirmed(pending) => self.carry_out(pending),
             DialogResult::TypedConfirmed { case_id, typed } => {
                 let result = self.factum().delete_case_permanently(case_id, &typed);
-                self.run(result);
+                if self.run(result).is_some()
+                    && let Some(cdb) = &self.companion_db
+                {
+                    if let Err(e) = cdb.delete_case(case_id) {
+                        log::error!("The companion data of case {case_id} cannot be deleted: {e}");
+                    }
+                    self.companion_seen.remove(&case_id);
+                }
                 self.select(None, None);
             }
             DialogResult::Correct { entry_id, text } => {
@@ -973,15 +1095,60 @@ impl FactumApp {
                 let Some(cdb) = &self.companion_db else { return };
                 let saved = settings.save(cdb);
                 if self.run(saved).is_some() {
-                    self.companion_started = settings.is_configured();
-                    self.companion_settings = settings;
+                    self.apply_companion_settings(ctx, settings);
                 }
             }
             DialogResult::CaseGoal { case_id, goal } => {
                 let Some(cdb) = &self.companion_db else { return };
                 let saved = cdb.set_case_goal(case_id, &goal);
-                self.run(saved);
+                if self.run(saved).is_some() {
+                    self.send_companion(Command::GoalChanged(case_id));
+                }
             }
+        }
+    }
+
+    fn open_case_goal(&mut self, case_id: i64) {
+        let Some(cdb) = &self.companion_db else { return };
+        match cdb.case_settings(case_id) {
+            Ok(case) => self.dialogs.push(Dialog::CaseGoal {
+                case_id,
+                goal: case.map(|c| c.goal).unwrap_or_default(),
+            }),
+            Err(e) => self.message("Factum", format!("The case goal cannot be read: {e}")),
+        }
+    }
+
+    fn set_companion_for_case(&mut self, case_id: i64, enabled: bool) {
+        let Some(cdb) = &self.companion_db else { return };
+        let saved = cdb.set_case_enabled(case_id, enabled);
+        if self.run(saved).is_some() {
+            self.send_companion(Command::CaseToggled(case_id));
+        }
+    }
+
+    fn handle_panel_action(&mut self, action: PanelAction) {
+        let case_id = self.view.companion.as_ref().map(|c| c.case_id);
+        match action {
+            PanelAction::Jump(entry_id) => self.jump_to_entry(entry_id),
+            PanelAction::Rate(question_id, rating) => {
+                let Some(cdb) = &self.companion_db else { return };
+                let rated = cdb.rate_question(question_id, rating);
+                self.run(rated);
+            }
+            PanelAction::SetGoal => {
+                if let Some(case_id) = case_id {
+                    self.open_case_goal(case_id);
+                }
+            }
+            PanelAction::OpenHistory => log::info!("The companion history is not available yet."),
+            PanelAction::OpenAsk => log::info!("Asking the companion is not available yet."),
+            PanelAction::Rethink => {
+                if let Some(case_id) = case_id {
+                    self.send_companion(Command::Rethink(case_id));
+                }
+            }
+            PanelAction::OpenSettings => self.open_companion_settings(),
         }
     }
 
@@ -1054,6 +1221,10 @@ impl FactumApp {
         }
         if let Some(worker) = self.signature_worker.as_mut() {
             worker.wait();
+        }
+        // a pass can take minutes; its writes are transactional, so the thread is left to end on its own
+        if let Some(companion) = self.companion.take() {
+            companion.detach();
         }
         self.save_layout();
     }
@@ -1344,6 +1515,27 @@ impl FactumApp {
             .clicked()
         {
             self.delete_case(case_id.unwrap());
+        }
+        if self.companion_db.is_some() && self.companion_settings.is_configured() {
+            ui.separator();
+            let companion_case = self.view.companion.as_ref().map(|c| c.case_id);
+            let mut enabled = self.view.companion.as_ref().is_some_and(|c| c.enabled_for_case);
+            let toggle = ui.add_enabled(
+                companion_case.is_some(),
+                egui::Checkbox::new(&mut enabled, "Companion for this case"),
+            );
+            if toggle.changed()
+                && let Some(case_id) = companion_case
+            {
+                self.set_companion_for_case(case_id, enabled);
+            }
+            if ui
+                .add_enabled(companion_case.is_some(), egui::Button::new("Case goal…"))
+                .clicked()
+                && let Some(case_id) = companion_case
+            {
+                self.open_case_goal(case_id);
+            }
         }
     }
 
@@ -1690,8 +1882,23 @@ impl FactumApp {
         ui.add_space(6.0);
     }
 
+    /// Stacked: pinned notes on top, the companion's questions below, the IoCs collapsed at the bottom. Pinned and
+    /// Questions scroll on their own, each within about 40 % of the panel, more when the other one is short.
     fn side_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
+        let mut actions = Vec::new();
+        let mut panel_actions = Vec::new();
+        let questions_shown = self.view.companion.as_ref().is_some_and(|c| c.enabled_for_case);
+        // room for the IoCs header below
+        let share = 0.4 * (ui.available_height() - 60.0).max(120.0);
+        let questions_height = if questions_shown {
+            companion_panel::content_height(ctx)
+        } else {
+            0.0
+        };
+        let pinned_max = share + (share - questions_height).max(0.0);
+        let questions_max = share + (share - self.pinned_height).max(0.0);
+
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let pinned = if self.view.pinned.is_empty() {
@@ -1699,82 +1906,97 @@ impl FactumApp {
             } else {
                 format!("PINNED {}", self.view.pinned.len())
             };
-            let ioc_count: usize = self.view.iocs.values().map(Vec::len).sum();
-            let iocs = if ioc_count == 0 {
-                "IOCS".to_string()
-            } else {
-                format!("IOCS {ioc_count}")
-            };
-            if ui
-                .selectable_label(
-                    self.side_tab == SideTab::Pinned,
-                    RichText::new(pinned).size(SMALL_SIZE).family(theme::bold()),
-                )
-                .clicked()
-            {
-                self.side_tab = SideTab::Pinned;
-            }
-            if ui
-                .selectable_label(
-                    self.side_tab == SideTab::Iocs,
-                    RichText::new(iocs).size(SMALL_SIZE).family(theme::bold()),
-                )
-                .clicked()
-            {
-                self.side_tab = SideTab::Iocs;
-            }
-            if self.side_tab == SideTab::Pinned {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let evidence =
-                        ui.selectable_label(self.pinned_scope_evidence, RichText::new("Evidence").size(SMALL_SIZE));
-                    if evidence
-                        .on_hover_text("Pinned notes of the selected evidence")
-                        .clicked()
-                        && !self.pinned_scope_evidence
-                    {
-                        self.pinned_scope_evidence = true;
-                        self.dirty = true;
-                    }
-                    let case = ui.selectable_label(!self.pinned_scope_evidence, RichText::new("Case").size(SMALL_SIZE));
-                    if case.on_hover_text("Pinned notes of the whole case").clicked() && self.pinned_scope_evidence {
-                        self.pinned_scope_evidence = false;
-                        self.dirty = true;
-                    }
-                });
-            }
+            Self::panel_header(ui, &pinned);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let evidence =
+                    ui.selectable_label(self.pinned_scope_evidence, RichText::new("Evidence").size(SMALL_SIZE));
+                if evidence
+                    .on_hover_text("Pinned notes of the selected evidence")
+                    .clicked()
+                    && !self.pinned_scope_evidence
+                {
+                    self.pinned_scope_evidence = true;
+                    self.dirty = true;
+                }
+                let case = ui.selectable_label(!self.pinned_scope_evidence, RichText::new("Case").size(SMALL_SIZE));
+                if case.on_hover_text("Pinned notes of the whole case").clicked() && self.pinned_scope_evidence {
+                    self.pinned_scope_evidence = false;
+                    self.dirty = true;
+                }
+            });
         });
         ui.separator();
-        let mut actions = Vec::new();
-        egui::ScrollArea::vertical()
-            .id_salt("side")
-            .auto_shrink([false, false])
-            .show(ui, |ui| match self.side_tab {
-                SideTab::Pinned => {
-                    if let Some(text) = &self.view.pinned_empty_text {
-                        ui.add_space(24.0);
-                        ui.vertical_centered(|ui| ui.label(RichText::new(text).color(p.muted)));
-                    }
-                    let now = chrono::Utc::now();
-                    for card in &self.view.pinned {
-                        let view = CardView {
-                            check: self.check_view(&card.entry),
-                            compact: true,
-                            focused: false,
-                            history_open: self.history_open.contains(&card.entry.id),
-                            now,
-                        };
-                        widgets::note_card(ui, card, &view, &mut actions);
-                    }
+        let pinned = egui::ScrollArea::vertical()
+            .id_salt("pinned")
+            .auto_shrink([false, true])
+            .max_height(pinned_max)
+            .show(ui, |ui| {
+                if let Some(text) = &self.view.pinned_empty_text {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| ui.label(RichText::new(text).color(p.muted)));
+                    ui.add_space(8.0);
                 }
-                SideTab::Iocs => {
+                let now = chrono::Utc::now();
+                for card in &self.view.pinned {
+                    let view = CardView {
+                        check: self.check_view(&card.entry),
+                        compact: true,
+                        focused: false,
+                        history_open: self.history_open.contains(&card.entry.id),
+                        now,
+                    };
+                    widgets::note_card(ui, card, &view, &mut actions);
+                }
+            });
+        let height = pinned.content_size.y;
+        if (height - self.pinned_height).abs() > 0.5 {
+            self.pinned_height = height;
+            ctx.request_repaint(); // the questions take the rest of the split
+        }
+
+        if let Some(view) = self.view.companion.as_ref().filter(|c| c.enabled_for_case) {
+            ui.add_space(12.0);
+            // the header line on top of the rows' share
+            let size = egui::vec2(ui.available_width(), questions_max + 28.0);
+            ui.allocate_ui(size, |ui| {
+                companion_panel::questions_section(ui, ctx, view, &self.companion_status, &mut panel_actions);
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        let ioc_count: usize = self.view.iocs.values().map(Vec::len).sum();
+        let iocs = match (self.iocs_open, ioc_count) {
+            (true, 0) => "▾ IOCS".to_string(),
+            (false, 0) => "▸ IOCS".to_string(),
+            (true, n) => format!("▾ IOCS {n}"),
+            (false, n) => format!("▸ IOCS {n}"),
+        };
+        let header = egui::Button::new(
+            RichText::new(iocs)
+                .size(SMALL_SIZE)
+                .family(theme::bold())
+                .color(p.muted)
+                .extra_letter_spacing(1.2),
+        )
+        .frame(false);
+        if ui
+            .add(header)
+            .on_hover_text("IPs, domains, hashes, ... found in the notes")
+            .clicked()
+        {
+            self.iocs_open = !self.iocs_open;
+        }
+        if self.iocs_open {
+            egui::ScrollArea::vertical()
+                .id_salt("iocs")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                     if self.view.iocs.is_empty() {
-                        ui.add_space(24.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(
-                                RichText::new("No IoCs found. IPs, domains, hashes, ... in notes show up here.")
-                                    .color(p.muted),
-                            )
-                        });
+                        ui.label(
+                            RichText::new("No IoCs found. IPs, domains, hashes, ... in notes show up here.")
+                                .color(p.muted),
+                        );
                     }
                     for (ioc_type, values) in &self.view.iocs {
                         egui::CollapsingHeader::new(
@@ -1798,10 +2020,13 @@ impl FactumApp {
                             }
                         });
                     }
-                }
-            });
+                });
+        }
         for action in actions {
             self.handle_card_action(action, ctx);
+        }
+        for action in panel_actions {
+            self.handle_panel_action(action);
         }
     }
 
@@ -1822,6 +2047,14 @@ impl FactumApp {
                     self.open_gpg_keys();
                 }
                 ui.label(RichText::new("GPG key:").size(SMALL_SIZE).color(p.muted));
+                if self.companion.is_some() {
+                    ui.add_space(16.0);
+                    ui.label(
+                        RichText::new(self.companion_status.line())
+                            .size(SMALL_SIZE)
+                            .color(p.muted),
+                    );
+                }
             });
         });
     }
@@ -1958,8 +2191,14 @@ impl eframe::App for FactumApp {
         if let Some(dialog) = self.dialogs.last_mut()
             && let Some(result) = dialog.show(&ctx)
         {
-            self.dialogs.pop();
-            self.handle_dialog_result(result);
+            let closed = self.dialogs.pop();
+            if matches!(
+                (&closed, &result),
+                (Some(Dialog::CompanionSettings(_)), DialogResult::Cancel)
+            ) {
+                self.reload_companion_settings(&ctx);
+            }
+            self.handle_dialog_result(result, &ctx);
         }
         if ctx.input(|i| i.viewport().close_requested()) {
             self.quit();
