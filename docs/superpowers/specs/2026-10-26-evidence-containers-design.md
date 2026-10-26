@@ -273,7 +273,7 @@ container files are not copied into the bundle. `verify.py` is unchanged.
 
 - Containers written by factum open and list correctly in pyaff4 (the reference implementation) including after
   reopen and append; stream hashes verified by pyaff4 where it supports it. The pyaff4 `test_images/AFF4-L` files
-  are read by factum's verifier.
+  (legacy format) are opened by factum's verifier without a crash and reported as unsupported.
 - A database with container entries verifies cleanly in factum-notes and with `verify.py` (cross-check, as for the
   existing compatibility).
 - Interruption: killing the process mid-append leaves a container whose last closed state verifies.
