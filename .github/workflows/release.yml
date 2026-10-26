@@ -9,7 +9,7 @@ name: Release
 #
 # Releasing from the GitHub web interface: Actions -> Release -> Run workflow, pick the branch (main) and leave the
 # tag empty. The run tags the branch's commit with v<version from Cargo.toml> and builds that. A tag of that name
-# without a published release (e.g. one pushed on the wrong commit) is moved; a released tag is never moved.
+# whose release has no files yet (e.g. one made on the wrong commit) is moved; a release with files is never touched.
 
 on:
   push:
@@ -60,8 +60,10 @@ jobs:
             echo "::error::CHANGELOG.md has no section '## [$version]'"; exit 1
           fi
           if [ "$NEW_TAG" = true ]; then
-            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-              echo "::error::$tag is already released; bump the version in Cargo.toml for a new release"; exit 1
+            # a release made in the web interface has no files until this workflow uploads them
+            assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length' 2>/dev/null || echo 0)
+            if [ "$assets" -gt 0 ]; then
+              echo "::error::$tag is already released with files; bump the version in Cargo.toml for a new release"; exit 1
             fi
             # a tag pushed with the workflow token starts no other workflow run
             git tag -f "$tag" HEAD
