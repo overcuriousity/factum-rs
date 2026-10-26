@@ -30,7 +30,7 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
       - id: tag
@@ -63,7 +63,7 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, name: factum, exe: .exe }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
@@ -102,7 +102,7 @@ jobs:
       - name: Package
         shell: bash
         run: scripts/package.sh ${{ matrix.target }} target/${{ matrix.target }}/release/factum${{ matrix.exe }} ${{ matrix.name }} dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}-${{ matrix.target }}
           path: dist/*
@@ -113,7 +113,7 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
@@ -127,7 +127,7 @@ jobs:
           cargo vendor --locked vendor > .cargo/config.toml
           cargo build --locked --offline --release --no-default-features --target-dir "$RUNNER_TEMP/check"
           tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/dist/$name.tar.gz" "$name"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: source
           path: dist/*
@@ -142,10 +142,10 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.tag }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -164,7 +164,7 @@ jobs:
           echo "$RELEASE_GPG_KEY" | gpg --batch --import
           gpg --batch --pinentry-mode loopback --passphrase "$RELEASE_GPG_PASSPHRASE" \
               --armor --detach-sign --output dist/SHA256SUMS.asc dist/SHA256SUMS
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
       - name: Release notes

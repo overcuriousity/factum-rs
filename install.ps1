@@ -3,7 +3,7 @@
 #   irm https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.ps1 | iex
 #
 # With options (download first, then run):
-#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v2.1.0
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Version v2.1.1
 #
 # Air-gapped: copy factum-x86_64-pc-windows-msvc.zip and SHA256SUMS to the machine, then
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -Archive .\factum-x86_64-pc-windows-msvc.zip
