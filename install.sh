@@ -2,7 +2,7 @@
 # factum installer for Linux and macOS.
 #
 #   curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.sh | sh -s -- --version v2.1.2
+#   curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.sh | sh -s -- --version v2.1.3
 #
 # Air-gapped: copy a release archive and SHA256SUMS to the machine, then
 #   sh install.sh --archive factum-x86_64-unknown-linux-gnu.tar.gz
