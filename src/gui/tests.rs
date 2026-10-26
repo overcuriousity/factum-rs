@@ -703,3 +703,51 @@ fn a_dialog_does_not_keep_the_size_of_a_taller_one() {
     let ok = harness.get_by_label("OK").rect();
     assert!(ok.min.y - field.max.y < 40.0, "{field:?} {ok:?}");
 }
+
+#[test]
+fn a_long_note_scrolls_inside_the_composer() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    screenshot(&mut harness, "composer");
+    harness.state_mut().composer = (1..=40).map(|i| format!("line {i}\n")).collect();
+    harness.run_ok();
+    screenshot(&mut harness, "composer-long");
+    // the editor keeps the panel's height; the button row stays on screen
+    let button = harness.get_by_label_contains("Add Note").rect();
+    assert!(button.max.y < 820.0, "{button:?}");
+    let height = harness.state().composer_height;
+    assert!((height - DEFAULT_COMPOSER_HEIGHT).abs() < 1.0, "{height}");
+    // dragging the panel's top edge up makes it taller
+    let top = harness.get_by_label_contains("Adding to").rect().min.y - 8.0;
+    let pointer = |harness: &mut Harness<'_, FactumApp>, event: egui::Event| {
+        harness.input_mut().events.push(event);
+        harness.step();
+    };
+    pointer(&mut harness, egui::Event::PointerMoved(egui::pos2(600.0, top)));
+    pointer(
+        &mut harness,
+        egui::Event::PointerButton {
+            pos: egui::pos2(600.0, top),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        },
+    );
+    for y in [top - 50.0, top - 100.0, top - 150.0] {
+        pointer(&mut harness, egui::Event::PointerMoved(egui::pos2(600.0, y)));
+    }
+    pointer(
+        &mut harness,
+        egui::Event::PointerButton {
+            pos: egui::pos2(600.0, top - 150.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        },
+    );
+    harness.run_ok();
+    screenshot(&mut harness, "composer-dragged");
+    let dragged = harness.state().composer_height;
+    assert!(dragged > height + 100.0, "{height} -> {dragged}");
+}

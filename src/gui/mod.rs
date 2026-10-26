@@ -42,8 +42,11 @@ use widgets::{Card, CardAction, CardView, CheckView};
 const THEME_SETTING: &str = "ui_theme";
 const SIDE_PANEL_VISIBLE_SETTING: &str = "ui_side_panel_visible";
 const SIDE_PANEL_WIDTH_SETTING: &str = "ui_side_panel_width";
+const COMPOSER_HEIGHT_SETTING: &str = "ui_composer_height";
 const EXPORT_DIR_SETTING: &str = "export_dir";
 const DEFAULT_SIDE_PANEL_WIDTH: f32 = 340.0;
+const DEFAULT_COMPOSER_HEIGHT: f32 = 170.0;
+const MIN_COMPOSER_HEIGHT: f32 = 130.0;
 const NOTE_PLACEHOLDER: &str = "Write a note. It is time-stamped when added; use #tags to categorize.";
 const ICON: &[u8] = include_bytes!("../../assets/icon.png");
 
@@ -151,6 +154,8 @@ struct FactumApp {
     theme: String,
     side_panel: bool,
     side_width: f32,
+    /// the composer's panel, dragged at its top edge
+    composer_height: f32,
     iocs_open: bool,
     /// the scrolled height of the pinned notes in the last frame, for splitting the side panel
     pinned_height: f32,
@@ -210,6 +215,9 @@ impl FactumApp {
         let side_width = setting(SIDE_PANEL_WIDTH_SETTING)
             .parse()
             .unwrap_or(DEFAULT_SIDE_PANEL_WIDTH);
+        let composer_height = setting(COMPOSER_HEIGHT_SETTING)
+            .parse()
+            .unwrap_or(DEFAULT_COMPOSER_HEIGHT);
         theme::apply(ctx, &theme);
         let data_version = db.data_version().unwrap_or_default();
         // created on first use, by saving its settings: an unconfigured companion leaves no file behind
@@ -244,6 +252,7 @@ impl FactumApp {
             theme,
             side_panel,
             side_width,
+            composer_height,
             iocs_open: false,
             pinned_height: 0.0,
             composer: String::new(),
@@ -1358,6 +1367,9 @@ impl FactumApp {
                 .db
                 .set_setting(SIDE_PANEL_WIDTH_SETTING, &format!("{:.0}", self.side_width));
         }
+        let _ = self
+            .db
+            .set_setting(COMPOSER_HEIGHT_SETTING, &format!("{:.0}", self.composer_height));
     }
 
     fn quit(&mut self) {
@@ -1912,14 +1924,19 @@ impl FactumApp {
         });
         ui.separator();
 
-        // the composer at the bottom, the log above it
-        let composer_height = 170.0;
-        let log_height = (ui.available_height() - composer_height).max(120.0);
+        // the composer at the bottom, resizable at its top edge; the log takes the rest
+        let max_composer = (ui.available_height() - 120.0).max(MIN_COMPOSER_HEIGHT);
+        let composer = egui::Panel::bottom("composer-panel")
+            .resizable(true)
+            .default_size(self.composer_height.clamp(MIN_COMPOSER_HEIGHT, max_composer))
+            .size_range(MIN_COMPOSER_HEIGHT..=max_composer)
+            .frame(egui::Frame::new().inner_margin(Margin { top: 6, ..Margin::ZERO }))
+            .show(ui, |ui| self.composer(ui, ctx));
+        self.composer_height = composer.response.rect.height();
         let now = chrono::Utc::now();
         egui::ScrollArea::vertical()
             .id_salt("notes")
             .auto_shrink([false, false])
-            .max_height(log_height)
             .show(ui, |ui| {
                 ui.add_space(8.0);
                 if let Some(text) = &self.view.empty_text {
@@ -1950,82 +1967,115 @@ impl FactumApp {
         for action in actions {
             self.handle_card_action(action, ctx);
         }
-        self.composer(ui, ctx);
     }
 
+    /// The target line on top, the buttons at the bottom, and the editor filling the height between them.
     fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
-        ui.separator();
         let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Adding to:").size(SMALL_SIZE).color(p.muted));
-            match &self.view.case {
-                None => {
-                    ui.label(
-                        RichText::new("nothing selected. Choose a case or evidence on the left.")
-                            .size(SMALL_SIZE)
-                            .color(p.muted)
-                            .italics(),
-                    );
-                }
-                Some(case) => {
-                    let mut target = case.case_name.clone();
-                    if let Some(evidence) = &self.view.evidence {
-                        target += &format!(" › {}", evidence.description);
-                    }
-                    if archived {
-                        target += "  (archived, read-only)";
-                    }
-                    ui.label(
-                        RichText::new(target)
-                            .size(SMALL_SIZE)
-                            .family(theme::bold())
-                            .color(p.secondary),
-                    );
-                }
-            }
-        });
         let is_open = self.view.case.is_some() && !archived;
+        let row = |panel: egui::Panel| {
+            panel
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+        };
+        row(egui::Panel::top("composer-target")).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Adding to:").size(SMALL_SIZE).color(p.muted));
+                match &self.view.case {
+                    None => {
+                        ui.label(
+                            RichText::new("nothing selected. Choose a case or evidence on the left.")
+                                .size(SMALL_SIZE)
+                                .color(p.muted)
+                                .italics(),
+                        );
+                    }
+                    Some(case) => {
+                        let mut target = case.case_name.clone();
+                        if let Some(evidence) = &self.view.evidence {
+                            target += &format!(" › {}", evidence.description);
+                        }
+                        if archived {
+                            target += "  (archived, read-only)";
+                        }
+                        ui.label(
+                            RichText::new(target)
+                                .size(SMALL_SIZE)
+                                .family(theme::bold())
+                                .color(p.secondary),
+                        );
+                    }
+                }
+            });
+        });
+        row(egui::Panel::bottom("composer-buttons")).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                // the key itself is in the status bar; the composer only warns when notes will not be signed
+                if self.signer.active_key().is_none() {
+                    let warning = if !self.signer.available() {
+                        "⚠ GPG is not installed: notes will not be signed"
+                    } else {
+                        "⚠ No GPG key selected: notes will not be signed (Settings → GPG)"
+                    };
+                    ui.label(RichText::new(warning).size(SMALL_SIZE).color(p.warn));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let button = egui::Button::new(
+                        RichText::new(format!("Add Note   {}", ctx.format_shortcut(&ADD_NOTE)))
+                            .color(p.on_accent)
+                            .family(theme::bold()),
+                    )
+                    .fill(p.accent);
+                    if ui.add_enabled(is_open, button).clicked() {
+                        self.submit_note();
+                    }
+                });
+            });
+            ui.add_space(6.0);
+        });
         let placeholder = if archived {
             "Case archived — reopen to add notes."
         } else {
             NOTE_PLACEHOLDER
         };
-        let editor = ui.add_enabled(
-            is_open,
-            TextEdit::multiline(&mut self.composer)
-                .id(egui::Id::unique("composer"))
-                .hint_text(placeholder)
-                .font(egui::FontId::proportional(theme::NOTE_SIZE))
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
+        // a longer note scrolls inside the frame, which keeps its place
+        let id = egui::Id::unique("composer");
+        let stroke = if ui.memory(|m| m.has_focus(id)) {
+            ui.visuals().selection.stroke
+        } else {
+            ui.visuals().widgets.inactive.bg_stroke
+        };
+        let inner = (ui.available_height() - 2.0 * stroke.width).max(24.0);
+        let editor = egui::Frame::new()
+            .fill(ui.visuals().text_edit_bg_color())
+            .stroke(stroke)
+            .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("composer-scroll")
+                    .auto_shrink([false, false])
+                    .max_height(inner)
+                    .show(ui, |ui| {
+                        ui.add_enabled(
+                            is_open,
+                            TextEdit::multiline(&mut self.composer)
+                                .id(id)
+                                .hint_text(placeholder)
+                                .font(egui::FontId::proportional(theme::NOTE_SIZE))
+                                .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(8, 6)))
+                                .desired_width(f32::INFINITY)
+                                .min_size(egui::vec2(0.0, inner)),
+                        )
+                    })
+                    .inner
+            })
+            .inner;
         if std::mem::take(&mut self.focus_composer) {
             editor.request_focus();
         }
-        ui.horizontal(|ui| {
-            // the key itself is in the status bar; the composer only warns when notes will not be signed
-            if self.signer.active_key().is_none() {
-                let warning = if !self.signer.available() {
-                    "⚠ GPG is not installed: notes will not be signed"
-                } else {
-                    "⚠ No GPG key selected: notes will not be signed (Settings → GPG)"
-                };
-                ui.label(RichText::new(warning).size(SMALL_SIZE).color(p.warn));
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let button = egui::Button::new(
-                    RichText::new(format!("Add Note   {}", ctx.format_shortcut(&ADD_NOTE)))
-                        .color(p.on_accent)
-                        .family(theme::bold()),
-                )
-                .fill(p.accent);
-                if ui.add_enabled(is_open, button).clicked() {
-                    self.submit_note();
-                }
-            });
-        });
-        ui.add_space(6.0);
     }
 
     /// Stacked: pinned notes on top, the companion's questions below, the IoCs collapsed at the bottom. Pinned and
