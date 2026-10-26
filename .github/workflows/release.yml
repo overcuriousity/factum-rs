@@ -6,6 +6,10 @@ name: Release
 #   factum-<version>-vendored-source.tar.gz       source with all dependencies, for offline builds
 #   SHA256SUMS (+ SHA256SUMS.asc when the RELEASE_GPG_KEY secret is set), install.sh, install.ps1
 # Asset names carry no version, so .../releases/latest/download/<asset> always points to the newest release.
+#
+# Releasing from the GitHub web interface: Actions -> Release -> Run workflow, pick the branch (main) and leave the
+# tag empty. The run tags the branch's commit with v<version from Cargo.toml> and builds that. A tag of that name
+# without a published release (e.g. one pushed on the wrong commit) is moved; a released tag is never moved.
 
 on:
   push:
@@ -13,8 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to build again, e.g. v2.0.0
-        required: true
+        description: Empty to release the selected branch as v<version in Cargo.toml>, or an existing tag to build again
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -26,6 +31,8 @@ jobs:
   prepare:
     name: Check version
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # creates the tag when run from the web interface without one
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
@@ -35,15 +42,31 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
       - id: tag
         name: Tag, Cargo.toml and CHANGELOG.md agree
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag == '' }}
         run: |
-          tag="${{ inputs.tag || github.ref_name }}"
-          version="${tag#v}"
           cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$NEW_TAG" = true ]; then
+            tag="v$cargo_version"
+          else
+            tag="${{ inputs.tag || github.ref_name }}"
+          fi
+          version="${tag#v}"
           if [ "$version" != "$cargo_version" ]; then
             echo "::error::tag $tag does not match the version in Cargo.toml ($cargo_version)"; exit 1
           fi
           if ! grep -q "^## \[$version\]" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no section '## [$version]'"; exit 1
+          fi
+          if [ "$NEW_TAG" = true ]; then
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::$tag is already released; bump the version in Cargo.toml for a new release"; exit 1
+            fi
+            # a tag pushed with the workflow token starts no other workflow run
+            git tag -f "$tag" HEAD
+            git push --force origin "refs/tags/$tag"
+            echo "Tagged $(git rev-parse --short HEAD) as $tag"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
