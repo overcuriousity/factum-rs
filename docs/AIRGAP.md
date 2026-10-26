@@ -16,8 +16,8 @@ Download what you need from the [release page](https://github.com/overcuriousity
 Or let the script collect and verify everything — all platforms, or only some:
 
 ```bash
-scripts/airgap-download.sh --version v2.1.1 --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
-# -> factum-v2.1.1-airgap/ and factum-v2.1.1-airgap.tar
+scripts/airgap-download.sh --version v2.1.2 --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
+# -> factum-v2.1.2-airgap/ and factum-v2.1.2-airgap.tar
 ```
 
 Optionally check the build provenance before transfer (needs the GitHub CLI):
@@ -67,8 +67,8 @@ distribution's `rust`/`cargo` packages from a local mirror — and a C compiler 
 Windows) for the bundled SQLite.
 
 ```bash
-tar -xzf factum-2.1.1-vendored-source.tar.gz
-cd factum-2.1.1-vendored-source
+tar -xzf factum-2.1.2-vendored-source.tar.gz
+cd factum-2.1.2-vendored-source
 cargo build --release --offline --locked                         # GUI + CLI
 cargo build --release --offline --locked --no-default-features   # command line only
 sh install.sh --help                                             # or copy target/release/factum yourself

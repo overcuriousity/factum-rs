@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-10-26
+
 ### Changed
 - Companion: the default guideline describes its forensic lens without naming the guide it is drawn from
 - Companion: the `+` / `−` buttons on a question are quieter, and a question rated `+` shows it
@@ -56,7 +58,8 @@ compatible with factum-notes in both directions; the bundled `verify.py` is unch
 - The GUI picks up changes from the command line by polling the database instead of watching its files
 - Signature marks of system entries use ◇ instead of ⚙
 
-[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.1.2...HEAD
+[2.1.2]: https://github.com/overcuriousity/factum-rs/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/overcuriousity/factum-rs/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/overcuriousity/factum-rs/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/overcuriousity/factum-rs/releases/tag/v2.0.0
