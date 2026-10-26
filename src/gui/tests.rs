@@ -751,3 +751,16 @@ fn a_long_note_scrolls_inside_the_composer() {
     let dragged = harness.state().composer_height;
     assert!(dragged > height + 100.0, "{height} -> {dragged}");
 }
+
+#[test]
+fn the_editor_stays_above_the_buttons_at_the_smallest_height() {
+    let fixture = Fixture::new();
+    let height = format!("{MIN_COMPOSER_HEIGHT}");
+    fixture.db().set_setting(COMPOSER_HEIGHT_SETTING, &height).unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    screenshot(&mut harness, "composer-smallest");
+    let editor = harness.get_by_role(egui::accesskit::Role::MultilineTextInput).rect();
+    let button = harness.get_by_label_contains("Add Note").rect();
+    assert!(editor.max.y <= button.min.y, "{editor:?} {button:?}");
+}

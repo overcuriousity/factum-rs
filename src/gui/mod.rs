@@ -46,7 +46,7 @@ const COMPOSER_HEIGHT_SETTING: &str = "ui_composer_height";
 const EXPORT_DIR_SETTING: &str = "export_dir";
 const DEFAULT_SIDE_PANEL_WIDTH: f32 = 340.0;
 const DEFAULT_COMPOSER_HEIGHT: f32 = 170.0;
-const MIN_COMPOSER_HEIGHT: f32 = 130.0;
+const MIN_COMPOSER_HEIGHT: f32 = 150.0;
 const NOTE_PLACEHOLDER: &str = "Write a note. It is time-stamped when added; use #tags to categorize.";
 const ICON: &[u8] = include_bytes!("../../assets/icon.png");
 
@@ -2058,6 +2058,7 @@ impl FactumApp {
                     .id_salt("composer-scroll")
                     .auto_shrink([false, false])
                     .max_height(inner)
+                    .min_scrolled_height(inner) // the default of 64 px would reach into the buttons
                     .show(ui, |ui| {
                         ui.add_enabled(
                             is_open,
@@ -2067,6 +2068,8 @@ impl FactumApp {
                                 .font(egui::FontId::proportional(theme::NOTE_SIZE))
                                 .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(8, 6)))
                                 .desired_width(f32::INFINITY)
+                                // the panel sets the height, not the default of four rows
+                                .desired_rows(1)
                                 .min_size(egui::vec2(0.0, inner)),
                         )
                     })
