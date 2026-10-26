@@ -31,5 +31,10 @@ factum must stay compatible with factum-notes and with bundles already handed ou
 3. `git push origin HEAD vX.Y.Z`. The release workflow builds all platforms, checksums, attestations and the
    vendored source archive, and publishes the GitHub release.
 
+From the GitHub web interface instead: merge a pull request that sets the version in `Cargo.toml` and `Cargo.lock` and
+has a `## [X.Y.Z]` section in `CHANGELOG.md`, then Actions → Release → Run workflow on `main` with the tag left
+empty. The run tags `main` as `vX.Y.Z` and publishes. A tag of that name without a release (e.g. one pushed on the
+wrong commit) is moved; a released version is refused.
+
 To sign `SHA256SUMS`, add the repository secrets `RELEASE_GPG_KEY` (armored secret key) and
 `RELEASE_GPG_PASSPHRASE`.
