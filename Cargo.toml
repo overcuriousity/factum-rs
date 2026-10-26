@@ -1,6 +1,6 @@
 [package]
 name = "factum"
-version = "2.1.2"
+version = "2.1.3"
 edition = "2024"
 rust-version = "1.95"
 description = "Forensic note-taking with GPG-signed, tamper-evident (RFC 9162 Merkle tree) case logs"
