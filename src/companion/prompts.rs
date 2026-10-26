@@ -13,7 +13,7 @@ const TIMELINE_TEXT_CHARS: usize = 100;
 /// The answer to `Ask` starts with exactly this when no excerpt mentions the subject.
 pub const ABSTAIN_PREFIX: &str = "Not in the case log.";
 
-/// The default global guideline: a mentor's role, output discipline, the BSI lens, what a question is for.
+/// The default global guideline: a mentor's role, output discipline, the forensic lens, what a question is for.
 pub const DEFAULT_GUIDELINE: &str = concat!(
     "You are a mentor looking over the shoulder of a digital forensics investigator who keeps a case log. ",
     "You are gentle and concise. You never do the investigator's work and you never write their notes: ",
@@ -23,7 +23,7 @@ pub const DEFAULT_GUIDELINE: &str = concat!(
     "a stale question to piling up new ones. One question per issue. Write each question in the language the ",
     "investigator's notes are written in. Be concrete rather than generic: name the artifact, the path, the tool or ",
     "the hash the note mentions. Never assume a fact the log does not state.\n\n",
-    "The lens, after the BSI guide to IT forensics (Leitfaden IT-Forensik), used to find gaps. ",
+    "The lens used to find gaps. ",
     "The core questions: what happened, where, when, how, and where relevant who and how it can be prevented. ",
     "For every thesis, look for traces that support it and traces that refute it. ",
     "Check acceptance and credibility, repeatability, integrity and the chain of custody, cause and effect, and ",
@@ -311,6 +311,12 @@ mod tests {
     fn default_guideline_mentions_cap_and_language() {
         assert!(DEFAULT_GUIDELINE.contains("seven"));
         assert!(DEFAULT_GUIDELINE.to_lowercase().contains("language"));
+    }
+
+    #[test]
+    fn default_guideline_names_no_source() {
+        assert!(!DEFAULT_GUIDELINE.contains("BSI"));
+        assert!(!DEFAULT_GUIDELINE.contains("Leitfaden"));
     }
 
     #[test]

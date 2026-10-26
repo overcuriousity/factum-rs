@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Companion: the default guideline describes its forensic lens without naming the guide it is drawn from
+
 ## [2.1.1] - 2026-10-26
 
 ### Fixed
