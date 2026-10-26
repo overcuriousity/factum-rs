@@ -203,6 +203,33 @@ fn diff_pass_cut_new_entries_are_covered_next_time() {
 }
 
 #[test]
+fn diff_pass_shortens_fixed_sections_instead_of_refusing() {
+    let e = env();
+    for n in 1..=8 {
+        let text = format!("Pinned finding {n}: {}", "registry run key persistence ".repeat(60));
+        let id = e.f.factum().create_note(&text, None, e.case).unwrap();
+        e.f.factum().pin_note(id).unwrap();
+    }
+    e.cdb.set_last_seen(e.case, newest(&e), 0).unwrap();
+    let long = format!("Long note: {}", "prefetch entry examined ".repeat(80));
+    e.f.factum().create_note(&long, None, e.case).unwrap();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(5000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    script(&e, json!({"new": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).unwrap();
+    assert_eq!(s.entries_to, newest(&e));
+    assert_eq!(
+        e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id,
+        newest(&e)
+    );
+    let body = e.fake.requests().last().unwrap().body.clone();
+    assert!(body.contains("Long note: prefetch entry examined"));
+    assert!(body.contains('…'));
+    assert_eq!(last_status(&e), "ok");
+}
+
+#[test]
 fn invalid_ids_and_duplicates_are_dropped_not_fatal() {
     let e = env();
     script(

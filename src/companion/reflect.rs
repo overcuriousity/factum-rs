@@ -14,7 +14,7 @@ use super::prompts::{
 use super::questions::{PassKind, Question, Rating};
 use super::retrieval::{RetrievalQuery, fts_query, retrieve};
 use super::store::CompanionDb;
-use super::tokens::{BudgetError, CUT_MARKER, Calibration, Cut, Packed, Section, TextKind, budget, pack};
+use super::tokens::{BudgetError, CUT_MARKER, Cut, Packed, Section, TextKind, budget, pack};
 use super::validate::{PassOutput, ValidationContext, parse_pass_output, validate};
 use crate::Factum;
 use crate::cases::Case;
@@ -44,6 +44,13 @@ const K_QUESTION_DIFF: usize = 3;
 const K_QUESTION_FULL: usize = 5;
 /// Entries enriched before a pass, and shown verbatim in a case's first full pass; the rest are timeline lines.
 const RECENT: usize = 20;
+/// The last resort of a prompt that still overflows once the related entries, the examples and all new entries but
+/// the oldest are cut: lines of the fixed sections are shortened to these lengths in characters.
+const PINNED_SHORT: usize = 300;
+const EVIDENCE_SHORT: usize = 120;
+const ENTRY_SHORT: usize = 400;
+const GOAL_SHORT: usize = 600;
+const GUIDELINE_SHORT: usize = 1200;
 
 /// Full when forced, on the first pass of a case and on every `FULL_EVERY`th pass.
 pub fn choose_kind(cdb: &CompanionDb, case_id: i64, forced_full: bool) -> Result<PassKind> {
@@ -103,7 +110,7 @@ impl fmt::Display for PassError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PassError::Llm(e) => write!(f, "{e}"),
-            PassError::Budget(_) => f.write_str("case too large for this model's context"),
+            PassError::Budget(_) => f.write_str("model context too small even for a shortened prompt"),
             PassError::Output(_) => f.write_str("model output unusable"),
             PassError::Db(e) => f.write_str(&e.message),
             PassError::Archived => f.write_str("case is archived"),
@@ -268,16 +275,21 @@ fn reflect(
         open: &open,
     };
     let room = budget(client.window(), OUTPUT_RESERVE);
-    let sections = input.sections()?;
     // the calls recalibrate the client; the retry is packed at the same ratio, so it cuts nothing more
     let calibration = client.calibration();
-    let packed = pack(sections.clone(), room, &calibration)?;
+    let packed = pack(input.sections()?, room, &calibration)?;
     log.prompt_chars = packed.text.chars().count();
     if !packed.cut.is_empty() {
         log::info!("companion pass {pass_id}: lines cut for space: {:?}", packed.cut);
     }
+    if !packed.shortened.is_empty() {
+        log::warn!(
+            "companion pass {pass_id}: lines shortened for space: {:?}",
+            packed.shortened
+        );
+    }
     if kind == PassKind::Diff {
-        log.entries_to = covered_to(&new, &sections, &packed, last_seen, room, &calibration)?;
+        log.entries_to = covered_to(&new, &packed, last_seen);
     }
 
     // the packed prompt is the first user turn of both calls, so a prompt cache can serve the second
@@ -295,8 +307,7 @@ fn reflect(
     let output = match serialize(client, &packed.text, &reasoning.text, log) {
         Err(PassError::Output(reason)) => {
             // the prompt as sent, with half of the related lines it kept; without any, a retry could not be smaller
-            let mut retry = sections;
-            apply_cuts(&mut retry, &packed.cut);
+            let mut retry = packed.sections;
             let related = retry
                 .iter_mut()
                 .find(|s| s.name == RELATED)
@@ -404,64 +415,25 @@ fn reflect(
     })
 }
 
-/// Drops from every section the lines the packing dropped, from the same end; a section left empty keeps saying
-/// that it was cut.
-fn apply_cuts(sections: &mut [Section], cut: &[(&'static str, usize)]) {
-    for section in sections {
-        let Some(&(_, dropped)) = cut.iter().find(|(name, _)| *name == section.name) else {
-            continue;
-        };
-        let dropped = dropped.min(section.lines.len());
-        if matches!(section.cut, Cut::Lines { from_start: true, .. }) {
-            section.lines.drain(..dropped);
-        } else {
-            section.lines.truncate(section.lines.len() - dropped);
-        }
-        if section.lines.is_empty() && dropped > 0 {
-            section.lines.push(CUT_MARKER.to_string());
-        }
-    }
-}
-
 /// The newest entry a diff pass covers: the newest one, or, when the new entries were cut from the newest end, the
-/// newest one before the first cut line (pinned ones are shown in their own section). Nothing left is a budget error,
-/// which names what the prompt needs with the oldest new entry in it.
-fn covered_to(
-    new: &[&Entry],
-    sections: &[Section],
-    packed: &Packed,
-    last_seen: i64,
-    budget: usize,
-    calibration: &Calibration,
-) -> std::result::Result<i64, PassError> {
+/// newest one before the first cut line (pinned ones are shown in their own section). The oldest listed entry is
+/// never cut, at most shortened, so a pass always covers at least one entry and a long one cannot stall the case.
+fn covered_to(new: &[&Entry], packed: &Packed, last_seen: i64) -> i64 {
     let listed: Vec<&Entry> = new.iter().copied().filter(|e| !e.is_pinned).collect();
     let dropped = packed
         .cut
         .iter()
         .find(|(name, _)| *name == NEW_ENTRIES)
         .map_or(0, |&(_, n)| n);
-    if dropped == 0 {
-        return Ok(new.iter().map(|e| e.id).max().unwrap_or(last_seen).max(last_seen));
-    }
-    if dropped >= listed.len() {
-        let first_line = sections
-            .iter()
-            .find(|s| s.name == NEW_ENTRIES)
-            .and_then(|s| s.lines.first())
-            .map_or(0, |line| calibration.estimate(line, TextKind::Dense));
-        return Err(PassError::Budget(BudgetError::Uncuttable {
-            section: NEW_ENTRIES,
-            needed: packed.tokens + first_line,
-            budget,
-        }));
-    }
-    let first_cut = listed[listed.len() - dropped].id;
-    Ok(new
-        .iter()
+    let newest = new.iter().map(|e| e.id).max().unwrap_or(last_seen).max(last_seen);
+    let Some(first_cut) = listed.len().checked_sub(dropped).and_then(|i| listed.get(i)) else {
+        return newest;
+    };
+    new.iter()
         .map(|e| e.id)
-        .filter(|&id| id < first_cut)
+        .filter(|&id| id < first_cut.id)
         .max()
-        .unwrap_or(last_seen))
+        .unwrap_or(last_seen)
 }
 
 /// Call two: the reasoning back to the model, a flat JSON object out. A cut-off, empty or unreadable answer is an
@@ -508,8 +480,29 @@ struct PromptInput<'a> {
     open: &'a [Question],
 }
 
-fn section(name: &'static str, lines: Vec<String>, cut: Cut, kind: TextKind) -> Section {
-    Section { name, lines, cut, kind }
+fn section(name: &'static str, lines: Vec<String>, cuts: Vec<Cut>, kind: TextKind) -> Section {
+    Section {
+        name,
+        lines,
+        cuts,
+        kind,
+    }
+}
+
+fn drop_lines(priority: u8, from_start: bool, keep: usize) -> Cut {
+    Cut::Lines {
+        priority,
+        from_start,
+        keep,
+    }
+}
+
+fn shorten(priority: u8, max_chars: usize, from_start: bool) -> Cut {
+    Cut::Shorten {
+        priority,
+        max_chars,
+        from_start,
+    }
 }
 
 impl PromptInput<'_> {
@@ -589,53 +582,53 @@ impl PromptInput<'_> {
             .collect();
         let instruction = reflect_instruction(full, &archetype_hints(&weights), QUESTION_CAP);
 
-        let never = Cut::Never;
+        let header = case_header(&self.data.case, &self.data.evidence);
+        let header_lines = header.len() - self.data.evidence.len();
+        // spec 4.5: the related entries are cut first, the examples after them, the entries last; a diff pass keeps
+        // its oldest new entry. What still overflows is shortened, then dropped, in the fixed sections: pinned and
+        // evidence lines and the kept entry shortened, evidence lines (entries name their evidence) and pinned notes
+        // dropped, the goal and the guideline shortened. The questions and the instruction are never cut.
         Ok(vec![
-            section("guideline", vec![self.guideline.to_string()], never, TextKind::Prose),
-            section("goal", vec![goal.to_string()], never, TextKind::Prose),
+            section(
+                "guideline",
+                vec![self.guideline.to_string()],
+                vec![shorten(9, GUIDELINE_SHORT, false)],
+                TextKind::Prose,
+            ),
+            section(
+                "goal",
+                vec![goal.to_string()],
+                vec![shorten(8, GOAL_SHORT, false)],
+                TextKind::Prose,
+            ),
             section(
                 "case",
-                case_header(&self.data.case, &self.data.evidence),
-                never,
+                header,
+                vec![shorten(4, EVIDENCE_SHORT, false), drop_lines(6, false, header_lines)],
                 TextKind::Dense,
             ),
             section(
                 "pinned",
                 pinned.iter().map(|e| entry_line(e, label(e))).collect(),
-                never,
+                vec![shorten(3, PINNED_SHORT, true), drop_lines(7, true, 0)],
                 TextKind::Dense,
             ),
-            section("questions", questions, never, TextKind::Dense),
+            section("questions", questions, Vec::new(), TextKind::Dense),
             section(
                 entries_name,
                 entries,
                 // the timeline loses its oldest lines; a diff pass its newest, which the next pass covers
-                Cut::Lines {
-                    priority: 2,
-                    from_start: full,
-                },
+                vec![drop_lines(2, full, usize::from(!full)), shorten(5, ENTRY_SHORT, full)],
                 TextKind::Dense,
             ),
-            // spec 4.5: the related entries are cut first, the examples after them, the entries last
-            section(
-                RELATED,
-                related,
-                Cut::Lines {
-                    priority: 0,
-                    from_start: false,
-                },
-                TextKind::Dense,
-            ),
+            section(RELATED, related, vec![drop_lines(0, false, 0)], TextKind::Dense),
             section(
                 "examples",
                 example_lines(&plus, &minus),
-                Cut::Lines {
-                    priority: 1,
-                    from_start: false,
-                },
+                vec![drop_lines(1, false, 0)],
                 TextKind::Prose,
             ),
-            section("instruction", vec![instruction], never, TextKind::Prose),
+            section("instruction", vec![instruction], Vec::new(), TextKind::Prose),
         ])
     }
 

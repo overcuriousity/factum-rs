@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::tokens::MAX_LINE_CHARS;
+use super::tokens::{MAX_LINE_CHARS, truncate};
 use crate::cases::Case;
 use crate::evidence::Evidence;
 use crate::notes::Entry;
@@ -54,16 +54,6 @@ const ARCHETYPES: [(&str, &str); 7] = [
 
 fn flatten(text: &str) -> String {
     text.replace(['\r', '\n'], " ")
-}
-
-/// At most `max` characters, ending in `…` when cut.
-fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
-    cut.push('…');
-    cut
 }
 
 /// The text of an entry; a system entry shows its payload's `event` instead.
