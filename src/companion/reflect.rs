@@ -14,7 +14,7 @@ use super::prompts::{
 use super::questions::{PassKind, Question, Rating};
 use super::retrieval::{RetrievalQuery, fts_query, retrieve};
 use super::store::CompanionDb;
-use super::tokens::{BudgetError, Cut, Packed, Section, TextKind, budget, pack};
+use super::tokens::{BudgetError, CUT_MARKER, Calibration, Cut, Packed, Section, TextKind, budget, pack};
 use super::validate::{PassOutput, ValidationContext, parse_pass_output, validate};
 use crate::Factum;
 use crate::cases::Case;
@@ -33,8 +33,6 @@ pub const FULL_AFTER_RESOLVED: usize = 3;
 
 const OUTPUT_RESERVE: usize = 1500;
 const TIMEOUT: Duration = Duration::from_secs(180);
-/// The window assumed when neither the settings nor the endpoint listing name one.
-const DEFAULT_CONTEXT_WINDOW: u32 = 16_000;
 const NO_GOAL: &str = "No case goal has been set.";
 const NEW_ENTRIES: &str = "new entries";
 const RELATED: &str = "related";
@@ -269,20 +267,17 @@ fn reflect(
         new: &new,
         open: &open,
     };
-    let window = client
-        .settings()
-        .context_window
-        .or(client.context_window())
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let room = budget(window, OUTPUT_RESERVE);
+    let room = budget(client.window(), OUTPUT_RESERVE);
     let sections = input.sections()?;
-    let packed = pack(sections.clone(), room, &client.calibration())?;
+    // the calls recalibrate the client; the retry is packed at the same ratio, so it cuts nothing more
+    let calibration = client.calibration();
+    let packed = pack(sections.clone(), room, &calibration)?;
     log.prompt_chars = packed.text.chars().count();
     if !packed.cut.is_empty() {
         log::info!("companion pass {pass_id}: lines cut for space: {:?}", packed.cut);
     }
     if kind == PassKind::Diff {
-        log.entries_to = covered_to(&new, &packed, last_seen, room)?;
+        log.entries_to = covered_to(&new, &sections, &packed, last_seen, room, &calibration)?;
     }
 
     // the packed prompt is the first user turn of both calls, so a prompt cache can serve the second
@@ -306,14 +301,17 @@ fn reflect(
                 .iter_mut()
                 .find(|s| s.name == RELATED)
                 .expect("the related section is always built");
-            if related.lines.is_empty() {
+            if related.lines.is_empty() || related.lines == [CUT_MARKER] {
                 return Err(PassError::Output(format!(
                     "{reason}; no related entries to drop for a retry"
                 )));
             }
             related.lines.truncate(related.lines.len() / 2);
+            if related.lines.is_empty() {
+                related.lines.push(CUT_MARKER.to_string());
+            }
             log::warn!("companion pass {pass_id}: {reason}; retrying with half the related entries");
-            let smaller = pack(retry, room, &client.calibration())?;
+            let smaller = pack(retry, room, &calibration)?;
             serialize(client, &smaller.text, &reasoning.text, log)?
         }
         other => other?,
@@ -323,7 +321,7 @@ fn reflect(
     let minus = cdb.minus_examples()?;
     let existing: HashSet<i64> = data.created.keys().copied().collect();
     let new_set: HashSet<i64> = new_ids.iter().copied().filter(|&id| id <= log.entries_to).collect();
-    let validated = validate(
+    let mut validated = validate(
         output,
         &ValidationContext {
             open: &open,
@@ -335,18 +333,49 @@ fn reflect(
             cap: QUESTION_CAP,
         },
     );
-    for reason in &validated.dropped {
-        log::info!("companion pass {pass_id}: dropped {reason}");
-    }
-    cdb.transaction(|_| {
+    let applied = cdb.transaction(|_| {
+        // the investigator may have rated, restored or unlinked questions while the model was busy
+        let open_now: HashMap<i64, Rating> = cdb
+            .open_questions(case_id)?
+            .into_iter()
+            .map(|q| (q.id, q.rating))
+            .collect();
+        let mut applied = (0, 0, 0);
         for &(question, entry) in &validated.answered {
-            cdb.answer_question(question, entry, pass_id)?;
+            if open_now.contains_key(&question) {
+                cdb.answer_question(question, entry, pass_id)?;
+                applied.0 += 1;
+            } else {
+                validated
+                    .dropped
+                    .push(format!("answered: question {question} is no longer open"));
+            }
         }
         for &question in &validated.withdraw {
-            cdb.withdraw_question(question, pass_id)?;
+            match open_now.get(&question) {
+                None => validated
+                    .dropped
+                    .push(format!("withdraw: question {question} is no longer open")),
+                Some(Rating::Plus) => validated
+                    .dropped
+                    .push(format!("withdraw: question {question} is rated plus")),
+                Some(_) => {
+                    cdb.withdraw_question(question, pass_id)?;
+                    applied.1 += 1;
+                }
+            }
         }
-        for question in &validated.new {
-            cdb.insert_question(case_id, Some(pass_id), question)?;
+        let room = QUESTION_CAP.saturating_sub(open_now.len() - applied.0 - applied.1);
+        for (i, question) in validated.new.iter().enumerate() {
+            if i < room {
+                cdb.insert_question(case_id, Some(pass_id), question)?;
+                applied.2 += 1;
+            } else {
+                validated.dropped.push(format!(
+                    "new: \"{}\" exceeds the cap of {QUESTION_CAP} open questions",
+                    question.text
+                ));
+            }
         }
         cdb.set_last_seen(case_id, log.entries_to, pass_id)?;
         cdb.finish_pass(
@@ -357,20 +386,26 @@ fn reflect(
             log.entries_to,
             log.prompt_chars,
             log.output_chars,
-        )
+        )?;
+        Ok(applied)
     })?;
+    for reason in &validated.dropped {
+        log::info!("companion pass {pass_id}: dropped {reason}");
+    }
+    let (answered, withdrawn, created) = applied;
     Ok(PassSummary {
         pass_id,
         kind,
-        answered: validated.answered.len(),
-        withdrawn: validated.withdraw.len(),
-        created: validated.new.len(),
+        answered,
+        withdrawn,
+        created,
         entries_to: log.entries_to,
         dropped: validated.dropped,
     })
 }
 
-/// Drops from every section the lines the packing dropped, from the same end.
+/// Drops from every section the lines the packing dropped, from the same end; a section left empty keeps saying
+/// that it was cut.
 fn apply_cuts(sections: &mut [Section], cut: &[(&'static str, usize)]) {
     for section in sections {
         let Some(&(_, dropped)) = cut.iter().find(|(name, _)| *name == section.name) else {
@@ -382,12 +417,23 @@ fn apply_cuts(sections: &mut [Section], cut: &[(&'static str, usize)]) {
         } else {
             section.lines.truncate(section.lines.len() - dropped);
         }
+        if section.lines.is_empty() && dropped > 0 {
+            section.lines.push(CUT_MARKER.to_string());
+        }
     }
 }
 
 /// The newest entry a diff pass covers: the newest one, or, when the new entries were cut from the newest end, the
-/// newest one before the first cut line (pinned ones are shown in their own section). Nothing left is a budget error.
-fn covered_to(new: &[&Entry], packed: &Packed, last_seen: i64, budget: usize) -> std::result::Result<i64, PassError> {
+/// newest one before the first cut line (pinned ones are shown in their own section). Nothing left is a budget error,
+/// which names what the prompt needs with the oldest new entry in it.
+fn covered_to(
+    new: &[&Entry],
+    sections: &[Section],
+    packed: &Packed,
+    last_seen: i64,
+    budget: usize,
+    calibration: &Calibration,
+) -> std::result::Result<i64, PassError> {
     let listed: Vec<&Entry> = new.iter().copied().filter(|e| !e.is_pinned).collect();
     let dropped = packed
         .cut
@@ -398,9 +444,14 @@ fn covered_to(new: &[&Entry], packed: &Packed, last_seen: i64, budget: usize) ->
         return Ok(new.iter().map(|e| e.id).max().unwrap_or(last_seen).max(last_seen));
     }
     if dropped >= listed.len() {
+        let first_line = sections
+            .iter()
+            .find(|s| s.name == NEW_ENTRIES)
+            .and_then(|s| s.lines.first())
+            .map_or(0, |line| calibration.estimate(line, TextKind::Dense));
         return Err(PassError::Budget(BudgetError::Uncuttable {
             section: NEW_ENTRIES,
-            needed: packed.tokens,
+            needed: packed.tokens + first_line,
             budget,
         }));
     }
@@ -523,7 +574,9 @@ impl PromptInput<'_> {
             .map(|e| entry_line(e, label(e)))
             .collect();
 
-        let query = fts_query(&self.new.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join(" "));
+        // the newest entries' words: the query keeps only its first few hundred distinct tokens
+        let recent = &self.new[self.new.len().saturating_sub(RECENT)..];
+        let query = fts_query(&recent.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join(" "));
         let plus_examples = self.cdb.nearest_examples(Rating::Plus, &query, EXAMPLES)?;
         let minus_examples = self.cdb.nearest_examples(Rating::Minus, &query, EXAMPLES)?;
         let plus: Vec<&str> = plus_examples.iter().map(|x| x.text.as_str()).collect();
@@ -563,11 +616,12 @@ impl PromptInput<'_> {
                 },
                 TextKind::Dense,
             ),
+            // spec 4.5: the related entries are cut first, the examples after them, the entries last
             section(
                 RELATED,
                 related,
                 Cut::Lines {
-                    priority: 1,
+                    priority: 0,
                     from_start: false,
                 },
                 TextKind::Dense,
@@ -576,7 +630,7 @@ impl PromptInput<'_> {
                 "examples",
                 example_lines(&plus, &minus),
                 Cut::Lines {
-                    priority: 0,
+                    priority: 1,
                     from_start: false,
                 },
                 TextKind::Prose,
@@ -590,6 +644,10 @@ impl PromptInput<'_> {
     fn related(&self, new_ids: &HashSet<i64>, pinned: &[&Entry]) -> Result<Vec<&Entry>> {
         let mut exclude = new_ids.clone();
         exclude.extend(pinned.iter().map(|e| e.id));
+        // a case's first pass shows every entry: there is nothing older to retrieve, and a query per entry is costly
+        if self.data.entries.iter().all(|e| exclude.contains(&e.id)) {
+            return Ok(Vec::new());
+        }
         let importance = self.cdb.importance_map(self.case_id)?;
         let newest_created_utc = self.data.entries.last().map_or("", |e| e.created_utc.as_str());
         let per_question = if self.kind == PassKind::Full {

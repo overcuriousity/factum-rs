@@ -5,8 +5,8 @@ mod common;
 use std::time::Duration;
 
 use common::Fixture;
+use common::fake_llm::{FakeLlm, openai_chat};
 use factum::companion::enrich::{ENRICH_BATCH, enrich, index_unindexed};
-use factum::companion::fake_llm::{FakeLlm, openai_chat};
 use factum::companion::llm::Client;
 use factum::companion::retrieval::{bm25, fts_query};
 use factum::companion::{CompanionDb, Protocol, Settings};

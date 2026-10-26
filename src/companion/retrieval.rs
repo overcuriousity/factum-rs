@@ -7,11 +7,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::store::CompanionDb;
 use crate::canonical::utc_now;
-use crate::error::Result;
+use crate::error::{FactumError, Result};
 use crate::notes::Entry;
 
 /// BM25 candidates taken before the boosts are applied.
 const CANDIDATES: usize = 30;
+/// Distinct tokens of a query; a long text's further tokens add little and cost a scan each.
+const MAX_QUERY_TOKENS: usize = 200;
 
 /// The model's reading of one entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,8 +47,8 @@ pub fn normalise_tokens(text: &str) -> String {
     text.split_whitespace()
         .map(|token| {
             token
-                .trim_start_matches(['(', '[', '"', '\''])
-                .trim_end_matches(['.', ',', ':', ';', '!', '?', ')', ']', '"', '\''])
+                .trim_start_matches(['(', '[', '{', '<', '"', '\'', '`'])
+                .trim_end_matches(['.', ',', ':', ';', '!', '?', ')', ']', '}', '>', '"', '\'', '`'])
         })
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>()
@@ -63,21 +65,25 @@ fn body(text: &str, keywords: &[String], context: &str) -> String {
         .join(" ")
 }
 
-/// Replaces the index row of the entry.
+/// Replaces the index row of the entry. The row id is the entry id (entry ids are unique across cases), so the
+/// old row is found without a scan of the index.
 fn write_index(conn: &Connection, case_id: i64, entry: &Entry, keywords: &[String], context: &str) -> Result<()> {
-    conn.execute("DELETE FROM entry_fts WHERE entry_id = ?", [entry.id])?;
+    conn.execute("DELETE FROM entry_fts WHERE rowid = ?", [entry.id])?;
     conn.execute(
-        "INSERT INTO entry_fts (entry_id, case_id, body) VALUES (?, ?, ?)",
+        "INSERT INTO entry_fts (rowid, entry_id, case_id, body) VALUES (?1, ?1, ?2, ?3)",
         params![entry.id, case_id, body(&entry.text, keywords, context)],
     )?;
     Ok(())
 }
 
-/// Normalises the tokens, keeps those of two or more characters and quotes each; empty when nothing is left.
+/// Normalises the tokens, keeps the distinct ones of two or more characters (at most `MAX_QUERY_TOKENS`, case
+/// folded the way the tokenizer folds them) and quotes each; empty when nothing is left.
 pub fn fts_query(text: &str) -> String {
+    let mut seen = HashSet::new();
     normalise_tokens(text)
         .split_whitespace()
-        .filter(|token| token.chars().count() >= 2)
+        .filter(|token| token.chars().count() >= 2 && seen.insert(token.to_lowercase()))
+        .take(MAX_QUERY_TOKENS)
         .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ")
@@ -141,6 +147,22 @@ impl CompanionDb {
         self.transaction(|conn| write_index(conn, case_id, entry, keywords, context))
     }
 
+    /// Gives the entry an index row of its text alone, unless it has one by now (an enrichment written meanwhile by
+    /// another connection is kept). True when a row was added.
+    pub fn index_if_missing(&self, case_id: i64, entry: &Entry) -> Result<bool> {
+        self.transaction(|conn| {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entry_fts WHERE rowid = ?)",
+                [entry.id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                write_index(conn, case_id, entry, &[], "")?;
+            }
+            Ok(!exists)
+        })
+    }
+
     /// The ids of the case's entries that have an index row.
     pub fn indexed_entry_ids(&self, case_id: i64) -> Result<HashSet<i64>> {
         let mut stmt = self.conn.prepare("SELECT entry_id FROM entry_fts WHERE case_id = ?")?;
@@ -148,14 +170,23 @@ impl CompanionDb {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Drops the index row and the enrichment of an entry, e.g. of a version a correction superseded.
     pub fn remove_entry_index(&self, entry_id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM entry_fts WHERE entry_id = ?", [entry_id])?;
-        Ok(())
+        self.transaction(|conn| {
+            conn.execute("DELETE FROM entry_fts WHERE rowid = ?", [entry_id])?;
+            conn.execute("DELETE FROM enrichment WHERE entry_id = ?", [entry_id])?;
+            Ok(())
+        })
     }
 
     /// Stores the enrichment and replaces the entry's index row (text, keywords, context) in one transaction.
     pub fn upsert_enrichment(&self, case_id: i64, entry: &Entry, e: &Enrichment) -> Result<()> {
+        if entry.id != e.entry_id {
+            return Err(FactumError::general(format!(
+                "The enrichment of entry {} was given for entry {}",
+                e.entry_id, entry.id
+            )));
+        }
         let keywords = serde_json::to_string(&e.keywords).expect("a list of strings serialises");
         self.transaction(|conn| {
             conn.execute(
@@ -276,6 +307,7 @@ mod tests {
             "\"wp-config.php\" OR \"in\" OR \"/var/www\""
         );
         assert_eq!(fts_query("a"), "");
+        assert_eq!(fts_query("Shell shell `shell` (/tmp/x)"), "\"Shell\" OR \"/tmp/x\"");
     }
 
     #[test]
@@ -412,5 +444,19 @@ mod tests {
             1,
             "upsert re-indexes"
         );
+        let other = Enrichment {
+            entry_id: 2,
+            keywords: vec![],
+            context: String::new(),
+            importance: 1,
+        };
+        assert!(db.upsert_enrichment(1, &entry(1, "first"), &other).is_err());
+        db.remove_entry_index(1).unwrap();
+        assert_eq!(
+            db.enrichment(1).unwrap(),
+            None,
+            "a superseded version loses its enrichment"
+        );
+        assert!(bm25(&db, 1, &fts_query("alpha"), 10).unwrap().is_empty());
     }
 }

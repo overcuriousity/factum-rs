@@ -145,7 +145,7 @@ factum --set-active case 1              # by ID, file number or name; clears the
 factum --list-evidence                  # evidence of the active case
 factum --set-active evidence none       # notes go to the case itself again
 factum --verify [case] [-v]             # exit code 1 if verification fails
-factum --questions [case]              # open companion questions (read-only)
+factum --questions [case]               # open companion questions (read-only)
 factum --checkpoint [case]              # seal the current state
 factum --sign-unsigned [case]           # sign entries and seals created without a key
 factum --export [case] --format html,pdf,md,bundle --out ./reports
@@ -196,12 +196,12 @@ Optional settings are read from a `.env` file in the user config directory (Linu
 `~/Library/Application Support/factum/.env`, Windows: `%LOCALAPPDATA%\factum\.env`), then from `.env` in the current
 directory; real environment variables override both. See [.env.example](.env.example).
 
-| Variable          | Meaning                                                                                       |
-|-------------------|-----------------------------------------------------------------------------------------------|
-| `LOG_LEVEL`       | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`; `--log-level` overrides it          |
-| `FACTUM_DB`       | Path of the database file                                                                     |
-| `FACTUM_SEAL_DIR` | Folder for external seal copies; must already exist (default: GUI setting, else `seals/` next to the database) |
-| `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                    |
+| Variable                   | Meaning                                                                                       |
+|----------------------------|-----------------------------------------------------------------------------------------------|
+| `LOG_LEVEL`                | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`; `--log-level` overrides it         |
+| `FACTUM_DB`                | Path of the database file                                                                     |
+| `FACTUM_SEAL_DIR`          | Folder for external seal copies; must already exist (default: GUI setting, else `seals/` next to the database) |
+| `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                                 |
 
 A launcher (application menu, Start menu) does not read `.env` from a working directory: put settings in the user
 config directory.

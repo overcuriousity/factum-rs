@@ -366,7 +366,35 @@ fn companion_menu_absent_until_configured_and_settings_dialog_lists_models() {
         settings_dialog(h).models_status == "2 models from the endpoint."
     });
     assert_eq!(settings_dialog(&harness).models_status, "2 models from the endpoint.");
+    assert_eq!(
+        settings_dialog(&harness).draft.model,
+        "",
+        "the listing fills the dropdown, not the field"
+    );
     screenshot(&mut harness, "companion-settings");
+}
+
+#[test]
+fn an_invalid_context_window_keeps_the_dialog_and_saves_nothing() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    type_into(&mut harness, "Endpoint URL", "http://127.0.0.1:1");
+    type_into(&mut harness, "Context window", "lots");
+    harness.get_by_label("Test connection").scroll_to_me();
+    harness.run_ok();
+    harness.get_by_label("Test connection").click();
+    harness.run_ok();
+    assert!(settings_dialog(&harness).probe_worker.is_none());
+    harness.get_by_label("OK").click();
+    harness.run_ok();
+    assert!(
+        harness
+            .query_by_label("The context window is a number of tokens.")
+            .is_some()
+    );
+    settings_dialog(&harness);
+    assert!(!companion_db_path(&fixture.path).exists());
 }
 
 #[test]
@@ -454,6 +482,10 @@ fn questions_section_absent_when_unconfigured() {
     assert!(harness.query_by_label_contains("QUESTIONS").is_none());
     assert!(harness.query_by_label_contains("No goal set").is_none());
     assert!(harness.query_by_label("Companion for this case").is_none());
+    assert!(
+        !companion_db_path(&fixture.path).exists(),
+        "an unconfigured companion leaves no file behind"
+    );
 }
 
 #[test]

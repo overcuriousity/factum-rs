@@ -42,10 +42,7 @@ impl CompanionView {
         for id in questions.iter().flat_map(|q| &q.rests_on) {
             latest_entry.insert(*id, factum.latest_version_id(*id)?);
         }
-        let last_pass = cdb
-            .last_finished_pass(case_id)?
-            .filter(|(_, _, status)| status == "ok")
-            .map(|(_, finished, _)| finished);
+        let last_pass = cdb.last_ok_pass(case_id)?;
         Ok(Self {
             case_id,
             questions,
@@ -103,8 +100,13 @@ pub fn questions_section(
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                // like PINNED and IOCS: no count when there is nothing
+                let heading = match view.questions.len() {
+                    0 => "QUESTIONS".to_string(),
+                    n => format!("QUESTIONS {n}"),
+                };
                 ui.label(
-                    RichText::new(format!("QUESTIONS {}", view.questions.len()))
+                    RichText::new(heading)
                         .size(SMALL_SIZE)
                         .family(theme::bold())
                         .color(p.muted)

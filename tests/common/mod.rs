@@ -1,5 +1,9 @@
 #![allow(dead_code)]
 
+/// The fake model endpoint of the library's unit tests, shared without building it into the library.
+#[path = "../../src/companion/fake_llm.rs"]
+pub mod fake_llm;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

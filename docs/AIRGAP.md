@@ -103,6 +103,11 @@ for example a local inference server. No model files ship with factum, and nothi
 `https://` endpoints TLS uses the system trust store, so install the lab's CA there. Without a configured endpoint
 the companion does nothing.
 
+The companion follows the proxy variables `ALL_PROXY`, `HTTPS_PROXY` and `HTTP_PROXY` (also in lower case): when one
+is set, case content goes to that proxy on its way to the endpoint, unless `NO_PROXY` names the endpoint's host
+(for example `NO_PROXY=10.0.0.5,inference.lab`). The settings dialog says so while such a variable is set. Unset them,
+or list the endpoint in `NO_PROXY`, when the content must not pass through the proxy.
+
 ## 5. Updating
 
 Repeat step 1 with the new release. Databases are kept; factum only refuses databases of an older, incompatible

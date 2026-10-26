@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::prompts;
-use crate::error::{FactumError, Result};
+use crate::error::{ErrorKind, FactumError, Result};
 
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -169,30 +170,33 @@ impl Settings {
         Self::load_with_env(db, std::env::var(ENV_API_KEY).ok())
     }
 
+    /// Every value is trimmed, also one written by `set_setting`.
     fn load_with_env(db: &CompanionDb, env_key: Option<String>) -> Result<Self> {
         let env_key = env_key.map(|key| key.trim().to_string()).filter(|key| !key.is_empty());
-        let enabled = db.get_setting("enabled")?;
+        let get = |key: &str| db.get_setting(key).map(|value| value.trim().to_string());
+        let enabled = get("enabled")?;
         Ok(Self {
-            endpoint_url: db.get_setting("endpoint_url")?,
-            protocol: Protocol::parse(&db.get_setting("protocol")?).unwrap_or(Protocol::OpenAi),
+            endpoint_url: get("endpoint_url")?,
+            protocol: Protocol::parse(&get("protocol")?).unwrap_or(Protocol::OpenAi),
             api_key_from_env: env_key.is_some(),
             api_key: match env_key {
                 Some(key) => key,
-                None => db.get_setting("api_key")?,
+                None => get("api_key")?,
             },
-            user_agent: db.get_setting("user_agent")?,
-            extra_headers: db.get_setting("extra_headers")?,
-            model: db.get_setting("model")?,
-            context_window: db.get_setting("context_window")?.trim().parse().ok(),
-            global_guideline: match db.get_setting("global_guideline")? {
-                stored if stored.trim().is_empty() => prompts::DEFAULT_GUIDELINE.to_string(),
+            user_agent: get("user_agent")?,
+            extra_headers: get("extra_headers")?,
+            model: get("model")?,
+            context_window: get("context_window")?.parse().ok(),
+            global_guideline: match get("global_guideline")? {
+                stored if stored.is_empty() => prompts::DEFAULT_GUIDELINE.to_string(),
                 stored => stored,
             },
             enabled: enabled.is_empty() || enabled == "1",
         })
     }
 
-    /// Trims every string field; the key is not written while it comes from the environment.
+    /// Trims every string field; the key is not written while it comes from the environment. The default guideline
+    /// is stored as empty, so that a later factum with a better default gives it to this database too.
     pub fn save(&self, db: &CompanionDb) -> Result<()> {
         db.transaction(|conn| {
             let put = |key: &str, value: &str| -> Result<()> {
@@ -211,7 +215,11 @@ impl Settings {
             put("extra_headers", &self.extra_headers)?;
             put("model", &self.model)?;
             put("context_window", &self.context_window.map(|n| n.to_string()).unwrap_or_default())?;
-            put("global_guideline", &self.global_guideline)?;
+            let guideline = self.global_guideline.trim();
+            put(
+                "global_guideline",
+                if guideline == prompts::DEFAULT_GUIDELINE.trim() { "" } else { guideline },
+            )?;
             put("enabled", if self.enabled { "1" } else { "0" })?;
             Ok(())
         })
@@ -289,10 +297,12 @@ impl CompanionDb {
     }
 
     /// Runs f in a transaction: committed on Ok, rolled back on Err. Inside another transaction it runs as a
-    /// savepoint, so the outer transaction decides.
+    /// savepoint, so the outer transaction decides. The write lock is taken at the start: the GUI and the companion
+    /// thread write through separate connections, and a transaction that read first could not upgrade (WAL answers
+    /// `SQLITE_BUSY` at once instead of waiting out the busy timeout).
     pub fn transaction<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let (begin, commit, rollback) = if self.conn.is_autocommit() {
-            ("BEGIN", "COMMIT", "ROLLBACK")
+            ("BEGIN IMMEDIATE", "COMMIT", "ROLLBACK")
         } else {
             (
                 "SAVEPOINT nested",
@@ -358,43 +368,65 @@ impl CompanionDb {
     pub fn ensure_case(&self, case_id: i64) -> Result<CaseSettings> {
         self.conn
             .execute("INSERT OR IGNORE INTO case_settings (case_id) VALUES (?)", [case_id])?;
-        Ok(self.case_settings(case_id)?.expect("the row was just inserted"))
+        self.case_settings(case_id)?.ok_or_else(|| {
+            FactumError::new(
+                ErrorKind::Internal,
+                format!("The companion settings of case {case_id} were not created"),
+            )
+        })
+    }
+
+    /// Creates the case's row when needed and updates it, in one transaction.
+    fn update_case(&self, case_id: i64, sql: &str, values: impl rusqlite::Params) -> Result<()> {
+        self.transaction(|conn| {
+            conn.execute("INSERT OR IGNORE INTO case_settings (case_id) VALUES (?)", [case_id])?;
+            conn.execute(sql, values)?;
+            Ok(())
+        })
     }
 
     pub fn set_case_enabled(&self, case_id: i64, enabled: bool) -> Result<()> {
-        self.ensure_case(case_id)?;
-        self.conn.execute(
+        self.update_case(
+            case_id,
             "UPDATE case_settings SET enabled = ? WHERE case_id = ?",
             params![enabled, case_id],
-        )?;
-        Ok(())
+        )
     }
 
     pub fn set_case_goal(&self, case_id: i64, goal: &str) -> Result<()> {
-        self.ensure_case(case_id)?;
-        self.conn.execute(
+        self.update_case(
+            case_id,
             "UPDATE case_settings SET goal = ? WHERE case_id = ?",
             params![goal.trim(), case_id],
-        )?;
-        Ok(())
+        )
     }
 
     /// Records how far a finished pass has read the log.
     pub fn set_last_seen(&self, case_id: i64, entry_id: i64, pass_id: i64) -> Result<()> {
-        self.ensure_case(case_id)?;
-        self.conn.execute(
+        self.update_case(
+            case_id,
             "UPDATE case_settings SET last_seen_entry_id = ?, last_pass_id = ? WHERE case_id = ?",
             params![entry_id, pass_id, case_id],
-        )?;
-        Ok(())
+        )
     }
 
-    /// Removes every companion row of the case (permanent deletion of the case).
+    /// `last_seen_entry_id` of every case that has a row.
+    pub fn last_seen_by_case(&self) -> Result<HashMap<i64, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT case_id, last_seen_entry_id FROM case_settings")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Removes every companion row of the case (permanent deletion of the case); a question's entries and events go
+    /// with it (`ON DELETE CASCADE`). The rated examples are global and stay.
     pub fn delete_case(&self, case_id: i64) -> Result<()> {
         self.transaction(|conn| {
             for sql in [
-                "DELETE FROM question_events WHERE question_id IN (SELECT id FROM questions WHERE case_id = ?1)",
-                "DELETE FROM question_entries WHERE question_id IN (SELECT id FROM questions WHERE case_id = ?1)",
+                // question ids are reused: the kept examples must not be taken for a later question's
+                "UPDATE rated_examples SET source_question_id = NULL \
+                 WHERE source_question_id IN (SELECT id FROM questions WHERE case_id = ?1)",
                 "DELETE FROM questions WHERE case_id = ?1",
                 "DELETE FROM passes WHERE case_id = ?1",
                 "DELETE FROM enrichment WHERE case_id = ?1",
@@ -471,6 +503,15 @@ mod tests {
         assert_eq!(back.endpoint_url, "http://h:8080/v1");
         assert_eq!(back.api_key, "k");
         assert!(back.is_configured());
+        // the untouched default is not frozen into the database; an edited guideline is kept
+        assert_eq!(db.get_setting("global_guideline").unwrap(), "");
+        assert_eq!(back.global_guideline, prompts::DEFAULT_GUIDELINE);
+        let mut edited = back.clone();
+        edited.global_guideline = "Ask about timestamps.".into();
+        edited.save(&db).unwrap();
+        assert_eq!(Settings::load(&db).unwrap().global_guideline, "Ask about timestamps.");
+        db.set_setting("model", " m2 \n").unwrap();
+        assert_eq!(Settings::load(&db).unwrap().model, "m2");
     }
 
     #[test]
@@ -500,6 +541,26 @@ mod tests {
         assert_eq!(db.case_settings(7).unwrap().unwrap().goal, "find the shell");
         db.delete_case(7).unwrap();
         assert_eq!(db.case_settings(7).unwrap(), None);
+    }
+
+    #[test]
+    fn deleting_a_case_keeps_its_examples_apart_from_reused_question_ids() {
+        use crate::companion::{Archetype, NewQuestion, Rating};
+        let (_dir, db) = temp_db();
+        let q = |text: &str| NewQuestion {
+            text: text.into(),
+            archetype: Archetype::Coverage,
+            rests_on: vec![],
+        };
+        let old = db.insert_question(7, None, &q("Old question")).unwrap();
+        db.rate_question(old, Rating::Minus).unwrap();
+        db.delete_case(7).unwrap();
+        let reused = db.insert_question(8, None, &q("New question")).unwrap();
+        assert_eq!(reused, old, "SQLite hands out the freed id again");
+        db.rate_question(reused, Rating::Plus).unwrap();
+        db.rate_question(reused, Rating::Minus).unwrap();
+        let texts: Vec<String> = db.minus_examples().unwrap().into_iter().map(|e| e.text).collect();
+        assert_eq!(texts, ["New question", "Old question"]);
     }
 
     #[test]

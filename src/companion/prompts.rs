@@ -75,7 +75,7 @@ fn entry_text(entry: &Entry) -> String {
             .and_then(|json| serde_json::from_str::<Value>(json).ok())
             .and_then(|payload| payload.get("event").and_then(Value::as_str).map(str::to_string));
         if let Some(event) = event {
-            return event;
+            return flatten(&event);
         }
     }
     flatten(&entry.text)
@@ -140,17 +140,17 @@ pub fn question_line(id: i64, archetype: &str, text: &str, rests_on: &[i64], rat
     format!("Q{id} [{archetype}] {} ({rests_on}rating {rating})", flatten(text))
 }
 
-/// The labelled rated examples, plus first; empty when there are none.
+/// The rated examples, plus first, each line with its own label, so that a cut never leaves a label without its
+/// examples; empty when there are none.
 pub fn example_lines(plus: &[&str], minus: &[&str]) -> Vec<String> {
-    let mut lines = Vec::new();
-    for (label, examples) in [("useful", plus), ("not useful", minus)] {
-        if examples.is_empty() {
-            continue;
-        }
-        lines.push(format!("The investigator found these {label}:"));
-        lines.extend(examples.iter().map(|text| format!("- {}", flatten(text))));
-    }
-    lines
+    [("useful", plus), ("not useful", minus)]
+        .into_iter()
+        .flat_map(|(label, examples)| {
+            examples
+                .iter()
+                .map(move |text| format!("The investigator found this {label}: {}", flatten(text)))
+        })
+        .collect()
 }
 
 /// One line per archetype from `(name, plus_count, minus_count)`: its definition, and a hint when the ratings
@@ -164,7 +164,7 @@ pub fn archetype_hints(weights: &[(&str, i64, i64)]) -> String {
                 .find(|(weight_name, ..)| weight_name == name)
                 .map_or((0, 0), |&(_, plus, minus)| (plus, minus));
             let hint = if minus - plus >= 3 {
-                "; rarely useful here; only when clearly warranted"
+                "; the investigator rarely finds these useful here; only when clearly warranted"
             } else if plus - minus >= 3 {
                 "; the investigator values these"
             } else {
@@ -190,8 +190,8 @@ pub fn reflect_instruction(full: bool, hints: &str, cap: usize) -> String {
          - which open questions are answered now, and by which entry;\n\
          - which open questions the new entries make moot, so that they should be withdrawn;\n\
          - what is missing: what should the investigator be asked next, and why.\n\
-         Cite entry ids as #id for every claim. A question you rated useful may be answered but must not be \
-         withdrawn. Never keep more than {cap} questions open: withdraw stale ones before proposing new ones, and \
+         Cite entry ids as #id for every claim. A question the investigator rated plus may be answered but must \
+         not be withdrawn. Never keep more than {cap} questions open: withdraw stale ones before proposing new ones, and \
          propose nothing when nothing is missing. Do not repeat a question in the \"not useful\" examples.\n\n\
          When you propose a question, give its text, the entry ids it rests on, and the one archetype that fits \
          best:\n{hints}\n\n\
@@ -241,8 +241,8 @@ pub fn ask_system() -> String {
          - Cite the excerpts you rely on as [n].\n\
          - Quote paths, hashes, numbers and commands exactly as they appear.\n\
          - If the excerpts cover only part of the question, answer that part and say what is not covered.\n\
-         - If no excerpt mentions any part of the subject, start your answer with exactly \"{ABSTAIN_PREFIX}\" \
-         and say nothing that is not in the excerpts.\n\
+         - If no excerpt mentions any part of the subject, answer exactly \"{ABSTAIN_PREFIX}\" and nothing \
+         else.\n\
          - Answer in the language of the question. Be brief."
     )
 }
@@ -289,6 +289,8 @@ mod tests {
             entry_line(&system, None),
             "#8 · 2026-10-25T10:00:00Z · case · case_archived"
         );
+        system.payload_json = Some(r#"{"event":"case\nedited"}"#.into());
+        assert!(!entry_line(&system, None).contains('\n'));
     }
 
     #[test]
@@ -304,7 +306,7 @@ mod tests {
         let hints = archetype_hints(&[("phase", 0, 3), ("document", 4, 0)]);
         let phase = hints.lines().find(|l| l.contains("phase")).unwrap();
         let document = hints.lines().find(|l| l.contains("document")).unwrap();
-        assert!(phase.contains("rarely useful"));
+        assert!(phase.contains("rarely finds these useful"));
         assert!(document.contains("values these"));
         assert!(
             !hints

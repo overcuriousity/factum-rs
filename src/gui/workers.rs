@@ -139,7 +139,7 @@ pub fn ask(
     question: String,
 ) -> Worker<AskResult> {
     Worker::spawn(ctx, move || {
-        let db = Db::open(&db_path).map_err(|e| e.to_string())?;
+        let db = crate::companion::open_case_db(&db_path).map_err(|e| e.to_string())?;
         let cdb = CompanionDb::open(&companion_path).map_err(|e| e.to_string())?;
         let client = Client::new(settings);
         crate::companion::ask::ask(&db, &cdb, &client, case_id, &question).map_err(|e| e.to_string())

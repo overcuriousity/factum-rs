@@ -8,29 +8,28 @@ use super::questions::{Archetype, NewQuestion, Question, RatedExample, Rating};
 
 /// Cuts the first JSON object out of a model reply (fences and prose dropped) and repairs trailing commas,
 /// single-quoted or bare keys and a cut-off tail. A `{` in the prose before the object is skipped: the first
-/// candidate whose repair parses wins, else the repair from the first `{`. A candidate inside an earlier one is
-/// not tried, so a broken object never gives way to one of its own items. `None` when there is no `{`.
+/// candidate whose repair parses wins, else the repair from the first `{`. A candidate inside an earlier, closed one
+/// is not tried, so a broken object never gives way to one of its own items; after a `{` that is never closed (a
+/// stray brace in prose, or a cut-off object whose repair fails) the later candidates are tried. `None` when there is
+/// no `{`.
 pub fn repair_json(text: &str) -> Option<String> {
-    repair_first_parsing(text, &['{'])
+    repair_first_parsing(text, &['{'], |_| true)
 }
 
-/// Like `repair_json`, but the document may start with `[` or `{`.
-fn repair_json_or_array(text: &str) -> Option<String> {
-    repair_first_parsing(text, &['{', '['])
-}
-
-fn repair_first_parsing(text: &str, open: &[char]) -> Option<String> {
+fn repair_first_parsing(text: &str, open: &[char], accept: impl Fn(&Value) -> bool) -> Option<String> {
     let mut first = None;
     let mut end = 0;
     for (start, _) in text.match_indices(open) {
         if start < end {
             continue;
         }
-        let (repaired, consumed) = repair_from(text, start);
-        if serde_json::from_str::<Value>(&repaired).is_ok() {
+        let (repaired, consumed, closed) = repair_from(text, start);
+        if serde_json::from_str::<Value>(&repaired).is_ok_and(|value| accept(&value)) {
             return Some(repaired);
         }
-        end = start + text[start..].chars().take(consumed).map(char::len_utf8).sum::<usize>();
+        if closed {
+            end = start + text[start..].chars().take(consumed).map(char::len_utf8).sum::<usize>();
+        }
         first.get_or_insert(repaired);
     }
     first
@@ -48,8 +47,26 @@ fn trim_trailing_comma(out: &mut String) {
     }
 }
 
-/// The repaired document from `start` and the number of characters it consumed.
-fn repair_from(text: &str, start: usize) -> (String, usize) {
+/// `out` ends with a string in the place of an object key: after `{` or `,`.
+fn ends_with_key(out: &str) -> bool {
+    let Some(body) = out.strip_suffix('"') else {
+        return false;
+    };
+    // the opening quote: the last `"` not escaped by an odd number of backslashes
+    let bytes = body.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'"' && bytes[..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 0 {
+            return matches!(body[..i].trim_end().chars().last(), Some('{' | ','));
+        }
+    }
+    false
+}
+
+/// The repaired document from `start`, the number of characters it consumed, and whether its outermost bracket was
+/// closed in the text (rather than by the repair).
+fn repair_from(text: &str, start: usize) -> (String, usize, bool) {
     let chars: Vec<char> = text[start..].chars().collect();
     let mut out = String::new();
     let mut stack: Vec<char> = Vec::new();
@@ -90,7 +107,7 @@ fn repair_from(text: &str, start: usize) -> (String, usize) {
                 // a mismatched closer closes whatever is open
                 out.push(stack.pop().unwrap_or(c));
                 if stack.is_empty() {
-                    return (out, i + 1);
+                    return (out, i + 1, true);
                 }
             }
             c if is_bare(c) => {
@@ -104,6 +121,11 @@ fn repair_from(text: &str, start: usize) -> (String, usize) {
                     out.push('"');
                     out.push_str(&word);
                     out.push('"');
+                } else if i == chars.len()
+                    && let Some(literal) = ["true", "false", "null"].iter().find(|l| l.starts_with(word.as_str()))
+                {
+                    // cut off inside a literal
+                    out.push_str(literal);
                 } else {
                     out.push_str(&word);
                 }
@@ -115,13 +137,16 @@ fn repair_from(text: &str, start: usize) -> (String, usize) {
     }
     // cut-off tail: close what is open, giving a dangling key a null value
     trim_trailing_comma(&mut out);
+    if stack.last() == Some(&'}') && ends_with_key(&out) {
+        out.push(':');
+    }
     if out.ends_with(':') {
         out.push_str("null");
     }
     while let Some(closer) = stack.pop() {
         out.push(closer);
     }
-    (out, chars.len())
+    (out, chars.len(), false)
 }
 
 /// What call two of a pass returns, after parsing.
@@ -138,10 +163,17 @@ fn int_list(v: Option<&Value>) -> Vec<i64> {
         .unwrap_or_default()
 }
 
-/// Repair, then read the three arrays; missing arrays are empty, items with non-integer ids are skipped.
+const PASS_KEYS: [&str; 3] = ["answered", "withdraw", "new"];
+
+/// Repair, then read the three arrays; missing arrays are empty, items with non-integer ids are skipped. An object
+/// with none of the three keys is not the pass output (it may be one item of a broken one).
 pub fn parse_pass_output(text: &str) -> Result<PassOutput, String> {
-    let repaired = repair_json(text).ok_or("no JSON object in the reply")?;
+    let is_output = |value: &Value| PASS_KEYS.iter().any(|key| value.get(key).is_some());
+    let repaired = repair_first_parsing(text, &['{'], is_output).ok_or("no JSON object in the reply")?;
     let value: Value = serde_json::from_str(&repaired).map_err(|e| format!("unreadable JSON: {e}"))?;
+    if !is_output(&value) {
+        return Err("the JSON object has none of answered, withdraw and new".into());
+    }
     let answered = value["answered"]
         .as_array()
         .map(|a| {
@@ -175,20 +207,28 @@ pub fn parse_pass_output(text: &str) -> Result<PassOutput, String> {
 /// (entry id, keywords, context, importance)
 pub type EnrichmentItem = (i64, Vec<String>, String, u8);
 
-/// Reads `[{"id": id, "keywords": [...], "context": "...", "importance": n}]` ("entry" works as well; a wrapping object with one
-/// array field is accepted too). Importance is clamped into `u8`; range checks and unknown ids are the caller's.
+/// The array of enrichment items: the document itself or the first array field of an object.
+fn enrichment_items(value: &Value) -> Option<&Vec<Value>> {
+    match value {
+        Value::Array(a) => Some(a),
+        Value::Object(o) => o.values().find_map(Value::as_array),
+        _ => None,
+    }
+}
+
+/// Reads `{"entries": [{"id": id, "keywords": [...], "context": "...", "importance": n}]}`; a bare array, another
+/// name for the array and `"entry"` for `"id"` are accepted too. Importance is clamped into `u8`; range checks and
+/// unknown ids are the caller's.
 pub fn parse_enrichment_output(text: &str) -> Result<Vec<EnrichmentItem>, String> {
-    let repaired = repair_json_or_array(text).ok_or("no JSON in the reply")?;
+    // a document whose array holds objects, not e.g. the keyword list of one item
+    let is_output = |value: &Value| enrichment_items(value).is_some_and(|items| items.iter().all(Value::is_object));
+    let repaired = repair_first_parsing(text, &['{', '['], is_output).ok_or("no JSON in the reply")?;
     let value: Value = serde_json::from_str(&repaired).map_err(|e| format!("unreadable JSON: {e}"))?;
-    let items = match &value {
-        Value::Array(a) => a,
-        Value::Object(o) => o.values().find_map(Value::as_array).ok_or("no array in the reply")?,
-        _ => return Err("no array in the reply".into()),
-    };
+    let items = enrichment_items(&value).ok_or("no array in the reply")?;
     Ok(items
         .iter()
         .filter_map(|item| {
-            let entry = item["entry"].as_i64().or_else(|| item["id"].as_i64())?;
+            let entry = item["id"].as_i64().or_else(|| item["entry"].as_i64())?;
             let importance = item["importance"].as_i64()?;
             let keywords = item["keywords"]
                 .as_array()
@@ -377,8 +417,42 @@ mod tests {
 
     #[test]
     fn repair_closes_truncated_tail() {
-        let r = repair_json("{\"new\":[{\"text\":\"x\",\"rests_on\":[1,2").unwrap();
-        assert!(serde_json::from_str::<serde_json::Value>(&r).is_ok());
+        for cut in [
+            "{\"new\":[{\"text\":\"x\",\"rests_on\":[1,2",
+            "{\"new\":[{\"text\":\"x\",\"rests_on\"",
+            "{\"answered\":[], \"done\": tr",
+            "{\"new\":[{\"text\":\"a \\\"b\\\"\", \"archetype\"",
+        ] {
+            let r = repair_json(cut).unwrap();
+            assert!(serde_json::from_str::<serde_json::Value>(&r).is_ok(), "{cut} -> {r}");
+        }
+    }
+
+    #[test]
+    fn repair_skips_an_unclosed_brace_in_prose() {
+        assert_eq!(repair_json("Use {x as the id, then:\n{\"a\":1}").unwrap(), "{\"a\":1}");
+    }
+
+    #[test]
+    fn pass_output_is_not_taken_from_an_item_of_a_broken_object() {
+        // the outer object is broken (a missing comma) and cut off; its first item parses on its own
+        let text = "{\"answered\":[{\"question\":1,\"entry\":2}], \"new\":[{\"text\":\"a\" \"rests_on\":[1]";
+        assert!(parse_pass_output(text).is_err());
+        assert!(parse_pass_output("{\"question\":1,\"entry\":2}").is_err());
+    }
+
+    #[test]
+    fn enrichment_prefers_id_and_skips_keyword_arrays() {
+        let items =
+            parse_enrichment_output("{\"entries\":[{\"id\":3,\"entry\":9,\"keywords\":[\"a\"],\"importance\":4}]}")
+                .unwrap();
+        assert_eq!(items, vec![(3, vec!["a".to_string()], String::new(), 4)]);
+        // cut off and broken: no keyword list of an item is taken for the answer
+        assert!(
+            parse_enrichment_output("{\"entries\":[{\"id\":3,\"keywords\":[\"a\" \"b\"]")
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     #[test]

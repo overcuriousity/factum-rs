@@ -6,10 +6,15 @@ use std::fmt;
 /// An entry line is cut at this many characters.
 pub const MAX_LINE_CHARS: usize = 2000;
 
+/// The window assumed when neither the settings nor the endpoint's listing name one, so an unknown endpoint never
+/// overflows.
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 16_000;
+
 const PROSE_CHARS_PER_TOKEN: f64 = 3.0;
 /// Dense text (JSON, identifiers) needs more tokens: the prose ratio times this.
 const DENSE_FACTOR: f64 = 0.8;
-const CUT_MARKER: &str = "(cut for space)";
+/// What a section shows once every line was cut.
+pub const CUT_MARKER: &str = "(cut for space)";
 const EMPTY_MARKER: &str = "(none)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +53,11 @@ impl Calibration {
         if chars > 0 && tokens > 0 {
             self.chars_per_token = (chars as f32 / tokens as f32).clamp(1.5, 5.0);
         }
+    }
+
+    /// The tokens of the text at this ratio, rounded up.
+    pub fn estimate(&self, text: &str, kind: TextKind) -> usize {
+        self.estimate_chars(text.chars().count(), kind)
     }
 
     fn estimate_chars(&self, chars: usize, kind: TextKind) -> usize {
