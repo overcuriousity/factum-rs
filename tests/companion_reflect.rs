@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::Fixture;
-use factum::companion::fake_llm::{FakeLlm, openai_chat};
+use common::fake_llm::{FakeLlm, openai_chat};
 use factum::companion::llm::Client;
 use factum::companion::reflect::{PassError, choose_kind, run_pass};
 use factum::companion::{Archetype, CompanionDb, NewQuestion, PassKind, Protocol, QuestionState, Rating, Settings};
@@ -322,4 +322,42 @@ fn archived_case_is_skipped() {
     assert!(matches!(pass(&e, PassKind::Full), Err(PassError::Archived)));
     assert!(e.fake.requests().is_empty());
     assert_eq!(last_status(&e), "skipped");
+}
+
+#[test]
+fn ratings_made_while_the_model_is_busy_win() {
+    let e = env();
+    let plus_later = question(&e, "Which tool computed the md5 of the image?");
+    let minus_later = question(&e, "Who uploaded the webshell to the server?");
+    let output =
+        json!({"answered": [{"question": minus_later, "entry": e.notes[2]}], "withdraw": [plus_later], "new": []});
+    e.fake.push(200, &ok("[]"));
+    e.fake
+        .push_delayed(200, &ok("Both questions are settled."), Duration::from_millis(500));
+    e.fake.push(200, &ok(&output.to_string()));
+    let path = e.f.db.path.clone();
+    let settings = e.client.settings().clone();
+    let case = e.case;
+    let running = std::thread::spawn(move || {
+        let db = factum::companion::open_case_db(&path).unwrap();
+        let cdb = CompanionDb::open_for(&path).unwrap();
+        let client = Client::with_retry_delay(settings, Duration::ZERO);
+        run_pass(&db, &cdb, &client, case, PassKind::Full).map(|summary| (summary.answered, summary.withdrawn))
+    });
+    // the investigator rates while the model writes its reasoning
+    std::thread::sleep(Duration::from_millis(150));
+    e.cdb.rate_question(plus_later, Rating::Plus).unwrap();
+    e.cdb.rate_question(minus_later, Rating::Minus).unwrap();
+    assert_eq!(running.join().unwrap().unwrap(), (0, 0));
+    assert_eq!(last_status(&e), "ok");
+    let open = e.cdb.open_questions(e.case).unwrap();
+    assert_eq!(
+        open.iter().map(|q| (q.id, q.rating)).collect::<Vec<_>>(),
+        [(plus_later, Rating::Plus)]
+    );
+    let rejected = e.cdb.resolved_questions(e.case).unwrap();
+    assert_eq!(
+        (rejected[0].id, rejected[0].state),
+        (minus_later, QuestionState::Rejected)
+    );
 }

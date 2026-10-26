@@ -181,8 +181,10 @@ struct FactumApp {
     focus_search: bool,
     focus_composer: bool,
     gpg_status: (String, bool),
-    // None when the companion database cannot be opened: the companion is absent
+    // None until the companion is first configured (the file is created on first use), or when it cannot be opened
     companion_db: Option<CompanionDb>,
+    // the companion database exists but cannot be opened: its settings cannot be edited either
+    companion_db_failed: bool,
     companion_settings: Settings,
     // running while the companion is configured
     companion: Option<CompanionHandle>,
@@ -210,9 +212,17 @@ impl FactumApp {
             .unwrap_or(DEFAULT_SIDE_PANEL_WIDTH);
         theme::apply(ctx, &theme);
         let data_version = db.data_version().unwrap_or_default();
-        let companion_db = CompanionDb::open_for(&db.path)
-            .inspect_err(|e| log::error!("The companion database cannot be opened: {e}"))
-            .ok();
+        // created on first use, by saving its settings: an unconfigured companion leaves no file behind
+        let companion_path = companion_db_path(&db.path);
+        let companion_db = companion_path
+            .exists()
+            .then(|| {
+                CompanionDb::open(&companion_path)
+                    .inspect_err(|e| log::error!("The companion database cannot be opened: {e}"))
+                    .ok()
+            })
+            .flatten();
+        let companion_db_failed = companion_path.exists() && companion_db.is_none();
         let companion_settings = companion_db
             .as_ref()
             .and_then(|cdb| {
@@ -260,6 +270,7 @@ impl FactumApp {
             focus_composer: false,
             gpg_status: (String::new(), false),
             companion_db,
+            companion_db_failed,
             companion_settings,
             companion: None,
             companion_status: Status::default(),
@@ -303,8 +314,25 @@ impl FactumApp {
         self.dirty = true;
     }
 
+    /// Opens the companion database once the settings dialog has created it.
+    fn open_companion_db(&mut self) -> bool {
+        if self.companion_db.is_none() && companion_db_path(&self.db.path).exists() {
+            match CompanionDb::open_for(&self.db.path) {
+                Ok(cdb) => self.companion_db = Some(cdb),
+                Err(e) => {
+                    self.companion_db_failed = true;
+                    self.message("Factum", format!("The companion database cannot be opened: {e}"));
+                }
+            }
+        }
+        self.companion_db.is_some()
+    }
+
     /// "Test connection" saves the draft: after Cancel the stored settings may differ from the ones in use.
     fn reload_companion_settings(&mut self, ctx: &egui::Context) {
+        if !self.open_companion_db() {
+            return;
+        }
         let Some(cdb) = &self.companion_db else { return };
         match Settings::load(cdb) {
             Ok(settings) if settings != self.companion_settings => self.apply_companion_settings(ctx, settings),
@@ -402,28 +430,19 @@ impl FactumApp {
         let (Some(handle), Some(cdb)) = (&self.companion, &self.companion_db) else {
             return;
         };
-        let newest = self
-            .db
-            .conn
-            .prepare("SELECT case_id, MAX(id) FROM entries GROUP BY case_id")
-            .and_then(|mut stmt| {
-                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()
-            });
-        let newest = match newest {
+        let newest = match crate::companion::newest_entry_by_case(&self.db) {
             Ok(newest) => newest,
             Err(e) => return log::error!("The newest entries cannot be read: {e}"),
         };
+        let last_seen = match cdb.last_seen_by_case() {
+            Ok(last_seen) => last_seen,
+            Err(e) => return log::error!("The companion settings cannot be read: {e}"),
+        };
         for (case_id, max_id) in newest {
             let told = self.companion_seen.get(&case_id).copied().unwrap_or(0);
-            let seen = match cdb.case_settings(case_id) {
-                Ok(Some(case)) => case.last_seen_entry_id,
-                // not selected since the companion exists: its first pass starts when it is selected
-                Ok(None) => continue,
-                Err(e) => {
-                    log::error!("The companion settings of case {case_id} cannot be read: {e}");
-                    continue;
-                }
+            // a case without a row was not selected since the companion exists: its first pass starts then
+            let Some(&seen) = last_seen.get(&case_id) else {
+                continue;
             };
             if max_id > told && max_id > seen {
                 handle.send(Command::CaseChanged(case_id));
@@ -1098,6 +1117,8 @@ impl FactumApp {
                         log::error!("The companion data of case {case_id} cannot be deleted: {e}");
                     }
                     self.companion_seen.remove(&case_id);
+                    // a pass that was running may write rows again; the thread removes them after it
+                    self.send_companion(Command::CaseDeleted(case_id));
                 }
                 self.select(None, None);
             }
@@ -1133,10 +1154,9 @@ impl FactumApp {
             DialogResult::SealFolder(folder) => {
                 let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
             }
+            // the dialog has saved them (creating the database on first use)
             DialogResult::CompanionSettings(settings) => {
-                let Some(cdb) = &self.companion_db else { return };
-                let saved = settings.save(cdb);
-                if self.run(saved).is_some() {
+                if self.open_companion_db() {
                     self.apply_companion_settings(ctx, settings);
                 }
             }
@@ -1516,7 +1536,7 @@ impl FactumApp {
             });
             ui.menu_button("Companion", |ui| {
                 if ui
-                    .add_enabled(self.companion_db.is_some(), egui::Button::new("Settings…"))
+                    .add_enabled(!self.companion_db_failed, egui::Button::new("Settings…"))
                     .on_disabled_hover_text("The companion database cannot be opened; see the log.")
                     .clicked()
                 {

@@ -22,7 +22,7 @@ pub struct FakeRequest {
 
 #[derive(Default)]
 struct Shared {
-    queue: Mutex<VecDeque<(u16, String)>>,
+    queue: Mutex<VecDeque<(u16, String, Duration)>>,
     requests: Mutex<Vec<FakeRequest>>,
     stop: AtomicBool,
 }
@@ -65,7 +65,16 @@ impl FakeLlm {
     /// Queues the answer to the next request (FIFO). With an empty queue a model listing
     /// answers `GET …/models` and everything else gets a 500.
     pub fn push(&self, status: u16, body: &str) {
-        self.shared.queue.lock().unwrap().push_back((status, body.to_string()));
+        self.push_delayed(status, body, Duration::ZERO);
+    }
+
+    /// Like `push`, the answer sent only after `delay`, like a model that takes its time.
+    pub fn push_delayed(&self, status: u16, body: &str, delay: Duration) {
+        self.shared
+            .queue
+            .lock()
+            .unwrap()
+            .push_back((status, body.to_string(), delay));
     }
 
     pub fn requests(&self) -> Vec<FakeRequest> {
@@ -76,8 +85,11 @@ impl FakeLlm {
 impl Drop for FakeLlm {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr); // unblocks accept
-        if let Some(t) = self.thread.take() {
+        // the connection unblocks accept; without it the thread would never end, so it is left behind
+        let unblocked = TcpStream::connect(self.addr).is_ok();
+        if let Some(t) = self.thread.take()
+            && unblocked
+        {
             let _ = t.join();
         }
     }
@@ -114,13 +126,14 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
         headers,
         body: String::from_utf8_lossy(&body).into_owned(),
     });
-    let (status, body) = shared.queue.lock().unwrap().pop_front().unwrap_or_else(|| {
+    let (status, body, delay) = shared.queue.lock().unwrap().pop_front().unwrap_or_else(|| {
         if listing {
-            (200, openai_models(&["model-a", "model-b"]))
+            (200, openai_models(&["model-a", "model-b"]), Duration::ZERO)
         } else {
-            (500, "{}".to_string())
+            (500, "{}".to_string(), Duration::ZERO)
         }
     });
+    std::thread::sleep(delay);
     write!(
         stream,
         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -134,6 +147,19 @@ pub fn openai_chat(text: &str, finish_reason: &str, prompt_tokens: u32) -> Strin
     json!({
         "choices": [{"message": {"role": "assistant", "content": text}, "finish_reason": finish_reason}],
         "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 3}
+    })
+    .to_string()
+}
+
+/// An OpenAI `chat/completions` answer of a thinking model: `content` may be `null`, the thinking is in
+/// `reasoning_content` (llama.cpp's and DeepSeek's name).
+pub fn openai_chat_thinking(text: Option<&str>, reasoning: &str, finish_reason: &str) -> String {
+    json!({
+        "choices": [{
+            "message": {"role": "assistant", "content": text, "reasoning_content": reasoning},
+            "finish_reason": finish_reason
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 3}
     })
     .to_string()
 }

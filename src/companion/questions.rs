@@ -221,6 +221,28 @@ fn require_state(conn: &Connection, id: i64, allowed: &[QuestionState], action: 
     }
 }
 
+/// Takes back the question's earlier rating: its example goes and its archetype counts one less.
+fn unrate(conn: &Connection, id: i64, archetype: &str, previous: Rating) -> Result<()> {
+    if previous == Rating::None {
+        return Ok(());
+    }
+    let column = if previous == Rating::Plus {
+        "plus_count"
+    } else {
+        "minus_count"
+    };
+    conn.execute(
+        &format!("UPDATE archetype_weights SET {column} = MAX({column} - 1, 0) WHERE archetype = ?"),
+        [archetype],
+    )?;
+    conn.execute(
+        "DELETE FROM rated_fts WHERE example_id IN (SELECT id FROM rated_examples WHERE source_question_id = ?)",
+        [id],
+    )?;
+    conn.execute("DELETE FROM rated_examples WHERE source_question_id = ?", [id])?;
+    Ok(())
+}
+
 impl CompanionDb {
     fn questions_where(&self, filter: &str, order: &str, case_id: i64) -> Result<Vec<Question>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -296,45 +318,24 @@ impl CompanionDb {
         })
     }
 
-    /// Rates the question. A minus rejects it. Either rating is copied to the examples and counted per archetype;
-    /// changing a rating replaces the earlier copy.
+    /// Rates an open question. A minus rejects it. Either rating is copied to the examples and counted per
+    /// archetype; changing a rating replaces the earlier copy.
     pub fn rate_question(&self, id: i64, rating: Rating) -> Result<()> {
         if rating == Rating::None {
             return Err(FactumError::general("A rating is plus or minus"));
         }
         self.transaction(|conn| {
-            let (case_id, text, archetype, previous): (i64, String, String, String) = conn
-                .query_row(
-                    "SELECT case_id, text, archetype, rating FROM questions WHERE id = ?",
-                    [id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?
-                .ok_or_else(|| FactumError::general(format!("Question {id} does not exist")))?;
+            require_state(conn, id, &[QuestionState::Open], "rated")?;
+            let (case_id, text, archetype, previous): (i64, String, String, String) = conn.query_row(
+                "SELECT case_id, text, archetype, rating FROM questions WHERE id = ?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
             let previous = Rating::parse(&previous);
-            if previous == rating {
-                // a restored question keeps its minus: rating it again rejects it again, the example is already there
-                if rating == Rating::Minus && state_of(conn, id)? == QuestionState::Open {
-                    conn.execute(
-                        "UPDATE questions SET state = 'rejected', resolved_utc = ? WHERE id = ?",
-                        params![utc_now(), id],
-                    )?;
-                    add_event(conn, id, "minus", None, None)?;
-                }
+            if previous == rating && rating == Rating::Plus {
                 return Ok(());
             }
-            if previous != Rating::None {
-                let column = if previous == Rating::Plus { "plus_count" } else { "minus_count" };
-                conn.execute(
-                    &format!("UPDATE archetype_weights SET {column} = MAX({column} - 1, 0) WHERE archetype = ?"),
-                    [&archetype],
-                )?;
-                conn.execute(
-                    "DELETE FROM rated_fts WHERE example_id IN (SELECT id FROM rated_examples WHERE source_question_id = ?)",
-                    [id],
-                )?;
-                conn.execute("DELETE FROM rated_examples WHERE source_question_id = ?", [id])?;
-            }
+            unrate(conn, id, &archetype, previous)?;
             let now = utc_now();
             if rating == Rating::Minus {
                 conn.execute(
@@ -353,7 +354,11 @@ impl CompanionDb {
                 "INSERT INTO rated_fts (example_id, body) VALUES (?, ?)",
                 params![conn.last_insert_rowid(), text],
             )?;
-            let column = if rating == Rating::Plus { "plus_count" } else { "minus_count" };
+            let column = if rating == Rating::Plus {
+                "plus_count"
+            } else {
+                "minus_count"
+            };
             conn.execute(
                 &format!(
                     "INSERT INTO archetype_weights (archetype, {column}) VALUES (?, 1) \
@@ -378,15 +383,24 @@ impl CompanionDb {
         })
     }
 
-    /// A withdrawn or rejected question is open again; its rating stays.
+    /// A withdrawn or rejected question is open again. Restoring a rejected question takes back its minus (the
+    /// example and the archetype count with it); a withdrawn question keeps its rating.
     pub fn restore_question(&self, id: i64) -> Result<()> {
         self.transaction(|conn| {
-            require_state(
+            let state = require_state(
                 conn,
                 id,
                 &[QuestionState::Withdrawn, QuestionState::Rejected],
                 "restored",
             )?;
+            if state == QuestionState::Rejected {
+                let (archetype, rating): (String, String) =
+                    conn.query_row("SELECT archetype, rating FROM questions WHERE id = ?", [id], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?;
+                unrate(conn, id, &archetype, Rating::parse(&rating))?;
+                conn.execute("UPDATE questions SET rating = 'none' WHERE id = ?", [id])?;
+            }
             conn.execute(
                 "UPDATE questions SET state = 'open', resolved_pass_id = NULL, resolved_entry_id = NULL, \
                  resolved_utc = NULL WHERE id = ?",
@@ -435,7 +449,7 @@ impl CompanionDb {
         prompt_chars: usize,
         output_chars: usize,
     ) -> Result<()> {
-        self.conn.execute(
+        let updated = self.conn.execute(
             "UPDATE passes SET finished_utc = ?, status = ?, error = ?, entries_from = ?, entries_to = ?, \
              prompt_chars = ?, output_chars = ? WHERE id = ?",
             params![
@@ -449,6 +463,9 @@ impl CompanionDb {
                 pass_id
             ],
         )?;
+        if updated == 0 {
+            return Err(FactumError::general(format!("Pass {pass_id} does not exist")));
+        }
         Ok(())
     }
 
@@ -461,15 +478,15 @@ impl CompanionDb {
         )?)
     }
 
-    /// The latest finished pass of the case: id, finished_utc, status.
-    pub fn last_finished_pass(&self, case_id: i64) -> Result<Option<(i64, String, String)>> {
+    /// When the latest successful pass of the case finished; failed and skipped passes after it do not hide it.
+    pub fn last_ok_pass(&self, case_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, finished_utc, status FROM passes WHERE case_id = ? AND finished_utc IS NOT NULL \
+                "SELECT finished_utc FROM passes WHERE case_id = ? AND status = 'ok' AND finished_utc IS NOT NULL \
                  ORDER BY id DESC LIMIT 1",
                 [case_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| row.get(0),
             )
             .optional()?)
     }
@@ -506,11 +523,6 @@ impl CompanionDb {
     /// Questions the user rejected, newest first.
     pub fn minus_examples(&self) -> Result<Vec<RatedExample>> {
         self.rated_examples(Rating::Minus, None, -1)
-    }
-
-    /// Questions the user found useful, newest first.
-    pub fn plus_examples(&self) -> Result<Vec<RatedExample>> {
-        self.rated_examples(Rating::Plus, None, -1)
     }
 
     /// The `limit` examples of the rating that match the FTS query best; the newest ones when the query is empty or
@@ -605,18 +617,43 @@ mod tests {
     }
 
     #[test]
-    fn restore_reopens_rejected() {
+    fn restore_takes_back_the_minus() {
         let (_dir, db) = temp_db();
-        let a = db.insert_question(1, None, &nq("A")).unwrap();
+        let a = db.insert_question(1, None, &nq_with("A", Archetype::Phase)).unwrap();
         db.rate_question(a, Rating::Minus).unwrap();
         db.restore_question(a).unwrap();
         let open = db.open_questions(1).unwrap();
         assert_eq!(open.len(), 1);
-        assert_eq!(open[0].rating, Rating::Minus);
+        assert_eq!(open[0].rating, Rating::None);
         assert_eq!(open[0].state, QuestionState::Open);
+        assert!(db.minus_examples().unwrap().is_empty());
+        assert!(db.archetype_weights().unwrap().contains(&(Archetype::Phase, 0, 0)));
         db.rate_question(a, Rating::Minus).unwrap();
         assert!(db.open_questions(1).unwrap().is_empty());
         assert_eq!(db.minus_examples().unwrap().len(), 1);
+        assert!(db.archetype_weights().unwrap().contains(&(Archetype::Phase, 0, 1)));
+    }
+
+    #[test]
+    fn restore_of_withdrawn_keeps_plus() {
+        let (_dir, db) = temp_db();
+        let a = db.insert_question(1, None, &nq("A")).unwrap();
+        db.rate_question(a, Rating::Plus).unwrap();
+        db.withdraw_question(a, 1).unwrap();
+        db.restore_question(a).unwrap();
+        assert_eq!(db.open_questions(1).unwrap()[0].rating, Rating::Plus);
+        assert_eq!(db.nearest_examples(Rating::Plus, "", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_open_questions_are_rated() {
+        let (_dir, db) = temp_db();
+        let a = db.insert_question(1, None, &nq("A")).unwrap();
+        db.answer_question(a, 42, 3).unwrap();
+        assert!(db.rate_question(a, Rating::Minus).is_err());
+        let r = db.resolved_questions(1).unwrap();
+        assert_eq!((r[0].state, r[0].rating), (QuestionState::Answered, Rating::None));
+        assert!(db.minus_examples().unwrap().is_empty());
     }
 
     #[test]
@@ -627,9 +664,17 @@ mod tests {
         db.begin_pass(2, PassKind::Diff, "m").unwrap();
         db.finish_pass(p1, "ok", None, 0, 9, 100, 50).unwrap();
         assert_eq!(db.pass_count(1).unwrap(), 1, "only passes finished ok count");
-        let (id, _finished, status) = db.last_finished_pass(1).unwrap().unwrap();
-        assert_eq!((id, status.as_str()), (p1, "ok"));
-        assert_eq!(db.last_finished_pass(2).unwrap(), None);
+        let ok = db.last_ok_pass(1).unwrap();
+        assert!(ok.is_some());
+        let p3 = db.begin_pass(1, PassKind::Diff, "m").unwrap();
+        db.finish_pass(p3, "failed", Some("boom"), 9, 9, 0, 0).unwrap();
+        assert_eq!(
+            db.last_ok_pass(1).unwrap(),
+            ok,
+            "a failed pass does not hide the good one"
+        );
+        assert_eq!(db.last_ok_pass(2).unwrap(), None);
+        assert!(db.finish_pass(999, "ok", None, 0, 0, 0, 0).is_err());
     }
 
     #[test]

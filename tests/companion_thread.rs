@@ -4,8 +4,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use common::fake_llm::{FakeLlm, openai_chat, openai_models};
 use common::{Fixture, add_case_row};
-use factum::companion::fake_llm::{FakeLlm, openai_chat, openai_models};
 use factum::companion::thread::{Command, CompanionHandle, State, Status};
 use factum::companion::{CompanionDb, Protocol, Settings, companion_db_path};
 use serde_json::json;
@@ -51,7 +51,8 @@ fn thread_probes_on_start_and_reports_unreachable() {
     let f = Fixture::new();
     configure(&f, "http://127.0.0.1:1/v1");
     let handle = start(&f);
-    let status = wait_for(&handle, Duration::from_secs(2), |s| s.state == State::Unreachable);
+    // Windows retries a refused connection for about two seconds before it gives up
+    let status = wait_for(&handle, Duration::from_secs(15), |s| s.state == State::Unreachable);
     assert_eq!(status.state, State::Unreachable);
     assert_eq!(status.line(), "companion: endpoint unreachable");
     handle.shutdown();

@@ -1,6 +1,6 @@
 # Analytical companion: design
 
-Date: 2026-10-25. Status: draft for review.
+Date: 2026-10-25. Status: approved (see 6).
 
 ## 1. Intent
 
@@ -180,7 +180,8 @@ unreachable", or "companion: off". Nothing else in the GUI animates for the comp
 
 History window (Companion → History…): a plain list of the case's non-open questions, newest first, with state,
 rating, when, and for `answered` the linked entry id (clickable) and an "Unlink" button that restores the question
-to `open` and records an `unlinked` event. Rejected and withdrawn questions have a "Restore" button. The window is
+to `open` and records an `unlinked` event. Rejected and withdrawn questions have a "Restore" button; restoring a
+rejected question takes back its minus (its example and archetype count go, its rating is none again). The window is
 read from the companion database only.
 
 Ask window (Companion → Ask…): hidden until opened. One text field, an Ask button, the answer below with `[n]`
@@ -318,10 +319,19 @@ The format is described in the instruction; no grammar or JSON schema is sent, s
 measurably hurts small models' accuracy. On the OpenAI protocol call two also sends
 `response_format: {"type":"json_object"}`; if the server answers 400 naming `response_format`, the request is
 repeated without it and the fact is remembered for the session. A 400 naming `max_tokens` repeats the request with
-`max_completion_tokens`, also remembered for the session. On the Anthropic protocol nothing else is sent: assistant
-prefill is
-rejected by current Claude models and `output_config` is not expected from local Anthropic-compatible servers, so
-instruction plus repair and validation is the whole mechanism on both protocols. Cloud Claude models are in scope.
+`max_completion_tokens`, also remembered for the session (both only once the server stops naming the parameter, so
+a 400 about a limit that is too large does not stick). On the Anthropic protocol nothing else is sent: assistant
+prefill is rejected by current Claude models and `output_config` is not expected from local Anthropic-compatible
+servers, so instruction plus repair and validation is the whole mechanism on both protocols. Cloud Claude models are
+in scope.
+
+Thinking models: every server counts a model's thinking against `max_tokens` (OpenAI's `max_completion_tokens`,
+llama.cpp, vLLM), and none offers a per-request way to leave it out. Once a reply carries thinking
+(`reasoning_content` or `reasoning` on OpenAI-compatible servers, thinking blocks on Anthropic), every call of the
+session gets a thinking allowance on top of its own `max_tokens`: what the window leaves after the prompt and that
+allowance, with a tenth of the window spare, at most 8 192 tokens; the call that first shows thinking and was cut off
+is sent again with it. A reply that is still nothing but thinking fails with a reason that says so. The companion
+sends no thinking switch of its own: the server's (llama.cpp `--reasoning-budget`, a `-nothink` variant) decides.
 
 **Validation** (no model involved), applied to call two's output in this order:
 1. `finish_reason == "length"`, `truncated`, or an empty body: the pass fails; retry once with section 7 capped at

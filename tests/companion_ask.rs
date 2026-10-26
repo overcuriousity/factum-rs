@@ -5,9 +5,9 @@ mod common;
 use std::time::Duration;
 
 use common::Fixture;
+use common::fake_llm::{FakeLlm, openai_chat};
 use factum::companion::ask::ask;
 use factum::companion::enrich::index_unindexed;
-use factum::companion::fake_llm::{FakeLlm, openai_chat};
 use factum::companion::llm::Client;
 use factum::companion::{CompanionDb, Protocol, Settings};
 use serde_json::Value;
