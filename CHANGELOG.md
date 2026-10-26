@@ -8,6 +8,10 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - Companion: when all seven questions are open and three diff passes in a row closed none of them, the next pass
   rereads the whole case, so a full list no longer stays stuck until the tenth pass
+## [2.1.4] - 2026-10-26
+
+### Fixed
+- GUI: at a small height the note editor reached into the Add Note button below it
 
 ## [2.1.3] - 2026-10-26
 
@@ -68,7 +72,8 @@ compatible with factum-notes in both directions; the bundled `verify.py` is unch
 - The GUI picks up changes from the command line by polling the database instead of watching its files
 - Signature marks of system entries use ◇ instead of ⚙
 
-[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.1.3...HEAD
+[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.1.4...HEAD
+[2.1.4]: https://github.com/overcuriousity/factum-rs/compare/v2.1.3...v2.1.4
 [2.1.3]: https://github.com/overcuriousity/factum-rs/compare/v2.1.2...v2.1.3
 [2.1.2]: https://github.com/overcuriousity/factum-rs/compare/v2.1.1...v2.1.2
 [2.1.1]: https://github.com/overcuriousity/factum-rs/compare/v2.1.0...v2.1.1
