@@ -30,6 +30,8 @@ pub const QUESTION_CAP: usize = 7;
 pub const FULL_EVERY: i64 = 10;
 /// A pass that resolved this many questions is followed by a full pass.
 pub const FULL_AFTER_RESOLVED: usize = 3;
+/// With every place taken, this many diff passes in a row that closed nothing are followed by a full pass.
+pub const FULL_AFTER_STALLED: usize = 3;
 
 const OUTPUT_RESERVE: usize = 1500;
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -52,14 +54,21 @@ const ENTRY_SHORT: usize = 400;
 const GOAL_SHORT: usize = 600;
 const GUIDELINE_SHORT: usize = 1200;
 
-/// Full when forced, on the first pass of a case and on every `FULL_EVERY`th pass.
+/// Full when forced, on the first pass of a case, on every `FULL_EVERY`th pass, and when the open questions fill the
+/// cap and the last `FULL_AFTER_STALLED` diff passes closed none: a diff pass sees too little of the case to close
+/// them, and new questions find no place.
 pub fn choose_kind(cdb: &CompanionDb, case_id: i64, forced_full: bool) -> Result<PassKind> {
     let count = cdb.pass_count(case_id)?;
-    Ok(if forced_full || count == 0 || (count + 1) % FULL_EVERY == 0 {
-        PassKind::Full
-    } else {
-        PassKind::Diff
-    })
+    let stalled = || -> Result<bool> {
+        Ok(cdb.open_questions(case_id)?.len() >= QUESTION_CAP && cdb.stalled(case_id, FULL_AFTER_STALLED)?)
+    };
+    Ok(
+        if forced_full || count == 0 || (count + 1) % FULL_EVERY == 0 || stalled()? {
+            PassKind::Full
+        } else {
+            PassKind::Diff
+        },
+    )
 }
 
 /// What a finished pass changed.

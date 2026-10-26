@@ -5,6 +5,9 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Companion: when all seven questions are open and three diff passes in a row closed none of them, the next pass
+  rereads the whole case, so a full list no longer stays stuck until the tenth pass
 ## [2.1.4] - 2026-10-26
 
 ### Fixed

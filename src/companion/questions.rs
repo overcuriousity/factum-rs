@@ -478,6 +478,29 @@ impl CompanionDb {
         )?)
     }
 
+    /// The case's latest `n` successful passes are all diff passes and none of them answered or withdrew a
+    /// question. Fewer than `n` passes, or a full pass among them, is not a stall.
+    pub fn stalled(&self, case_id: i64, n: usize) -> Result<bool> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind FROM passes WHERE case_id = ? AND status = 'ok' ORDER BY id DESC LIMIT ?")?;
+        let passes: Vec<(i64, String)> = stmt
+            .query_map(params![case_id, n as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if passes.len() < n || passes.iter().any(|(_, kind)| kind != PassKind::Diff.as_str()) {
+            return Ok(false);
+        }
+        // the events outlive an unlink or a restore, so a resolution the investigator undid still counts
+        let oldest = passes.last().map_or(0, |(id, _)| *id);
+        let closed: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM question_events e JOIN passes p ON p.id = e.pass_id \
+             WHERE p.case_id = ? AND e.pass_id >= ? AND e.kind IN ('linked', 'withdrawn')",
+            params![case_id, oldest],
+            |row| row.get(0),
+        )?;
+        Ok(closed == 0)
+    }
+
     /// When the latest successful pass of the case finished; failed and skipped passes after it do not hide it.
     pub fn last_ok_pass(&self, case_id: i64) -> Result<Option<String>> {
         Ok(self

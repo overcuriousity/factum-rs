@@ -317,6 +317,41 @@ fn choose_kind_rules() {
 }
 
 #[test]
+fn a_full_cap_that_closes_nothing_brings_a_full_pass() {
+    let e = env();
+    let diff = |n: usize| {
+        for _ in 0..n {
+            let id = e.cdb.begin_pass(e.case, PassKind::Diff, "m").unwrap();
+            e.cdb.finish_pass(id, "ok", None, 0, 0, 0, 0).unwrap();
+        }
+    };
+    let questions: Vec<i64> = (0..7)
+        .map(|i| question(&e, &format!("Open question number {i} about the webshell?")))
+        .collect();
+    let full = e.cdb.begin_pass(e.case, PassKind::Full, "m").unwrap();
+    e.cdb.finish_pass(full, "ok", None, 0, 0, 0, 0).unwrap();
+    diff(2);
+    // two stalled diff passes are not enough
+    assert_eq!(choose_kind(&e.cdb, e.case, false).unwrap(), PassKind::Diff);
+    diff(1);
+    assert_eq!(choose_kind(&e.cdb, e.case, false).unwrap(), PassKind::Full);
+
+    // a pass that closed something resets the count
+    let closing = e.cdb.begin_pass(e.case, PassKind::Diff, "m").unwrap();
+    e.cdb.withdraw_question(questions[0], closing).unwrap();
+    e.cdb.finish_pass(closing, "ok", None, 0, 0, 0, 0).unwrap();
+    e.cdb.restore_question(questions[0]).unwrap();
+    diff(2);
+    assert_eq!(choose_kind(&e.cdb, e.case, false).unwrap(), PassKind::Diff);
+    diff(1);
+    assert_eq!(choose_kind(&e.cdb, e.case, false).unwrap(), PassKind::Full);
+
+    // with a place free, stalled passes are fine
+    e.cdb.rate_question(questions[1], Rating::Minus).unwrap();
+    assert_eq!(choose_kind(&e.cdb, e.case, false).unwrap(), PassKind::Diff);
+}
+
+#[test]
 fn cap_of_seven_is_enforced() {
     let e = env();
     for text in [

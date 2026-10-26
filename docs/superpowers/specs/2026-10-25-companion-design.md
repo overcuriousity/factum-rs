@@ -314,7 +314,8 @@ next pass and does not trigger one.
   characters, newest entries complete, oldest first, cut from the oldest end if needed; and widens section 7 to
   the top 5 related entries per open question. It is asked the same thing plus to reconsider every open question
   against the whole case. A full pass runs on the first pass of a case, every tenth pass, after a diff pass that
-  answered or withdrew three or more questions, and on `Rethink`.
+  answered or withdrew three or more questions, when all seven places are taken and the last three passes were
+  diff passes that answered and withdrew nothing, and on `Rethink`.
 
 **Two calls per pass.** Call one is free-form: the model is asked to reason in prose about what changed, what is
 answered, what is missing, and what to ask, with entry ids. Call two sends that reasoning back and asks for a flat
