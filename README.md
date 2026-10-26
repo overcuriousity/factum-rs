@@ -23,10 +23,10 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/insta
 
 The installer picks the build for your system, checks it against the release's `SHA256SUMS`, installs `factum` to
 `~/.local/bin` (`/usr/local/bin` as root) and, on Linux, adds *Factum Notes* to the application menu. Options:
-`--version v2.0.0`, `--dir DIR`, `--cli` (static command-line build without GUI), `--no-desktop`, `--uninstall`:
+`--version v2.1.0`, `--dir DIR`, `--cli` (static command-line build without GUI), `--no-desktop`, `--uninstall`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.sh | sh -s -- --version v2.0.0
+curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.sh | sh -s -- --version v2.1.0
 ```
 
 **Windows** (PowerShell):
