@@ -1,6 +1,6 @@
 # factum
 
-Cryptographically signed forensic logging — a Rust port of [factum-notes](https://git.cc24.dev/mstoeck3/factum-notes).
+Cryptographically signed forensic logging — a Rust port of factum-notes.
 
 [![CI](https://github.com/overcuriousity/factum-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/overcuriousity/factum-rs/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/overcuriousity/factum-rs)](https://github.com/overcuriousity/factum-rs/releases/latest)
