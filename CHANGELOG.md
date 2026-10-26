@@ -7,6 +7,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 - Companion: the default guideline describes its forensic lens without naming the guide it is drawn from
+- Companion: the `+` / `−` buttons on a question are quieter, and a question rated `+` shows it
+
+### Fixed
+- GUI: a dialog opened after a taller one (e.g. Case goal after Companion Settings) kept the taller height, with its
+  buttons floating in the middle
 
 ## [2.1.1] - 2026-10-26
 

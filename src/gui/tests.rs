@@ -494,7 +494,8 @@ fn questions_section_shows_goal_row_and_rows_in_position_order() {
     let cdb = configure_companion(&fixture);
     let (case_id, versions) = first_note_versions(&fixture);
     ask(&cdb, case_id, "Which tool imaged the disk?", vec![versions[1]]);
-    ask(&cdb, case_id, "Who held the disk overnight?", vec![versions[1]]);
+    let rated = ask(&cdb, case_id, "Who held the disk overnight?", vec![versions[1]]);
+    cdb.rate_question(rated, Rating::Plus).unwrap(); // the screenshots show a given rating
     let mut harness = fixture.harness();
     select_case(&mut harness);
     assert!(harness.query_by_label("QUESTIONS 2").is_some());
@@ -679,4 +680,26 @@ fn rethink_sends_command() {
     harness.run_ok();
     questions_menu(&mut harness, "Re-think now");
     assert!(commands.try_iter().any(|cmd| cmd == Command::Rethink(case_id)));
+}
+
+#[test]
+fn a_dialog_does_not_keep_the_size_of_a_taller_one() {
+    let fixture = Fixture::new();
+    configure_companion(&fixture);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    open_companion_settings(&mut harness);
+    harness.get_by_label("Cancel").click();
+    harness.run_ok();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().dialogs.push(Dialog::CaseGoal {
+        case_id,
+        goal: String::new(),
+    });
+    harness.run_ok();
+    screenshot(&mut harness, "case-goal-after-settings");
+    // the buttons sit right under the field, not centred in the settings dialog's height
+    let field = harness.get_by_label("Case goal").rect();
+    let ok = harness.get_by_label("OK").rect();
+    assert!(ok.min.y - field.max.y < 40.0, "{field:?} {ok:?}");
 }

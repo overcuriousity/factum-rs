@@ -165,20 +165,40 @@ pub fn questions_section(
     ui.painter().rect_filled(bar, 0.0, p.accent);
 }
 
+/// A quiet, frameless rating button; a given rating is shown filled in the accent colour.
+fn rate_button(ui: &mut egui::Ui, text: &str, rated: bool) -> egui::Response {
+    let p = *theme::current(ui.ctx());
+    let color = if rated { p.accent } else { p.muted };
+    let button = egui::Button::new(RichText::new(text).size(SMALL_SIZE).color(color)).min_size(egui::vec2(16.0, 16.0));
+    // fill and stroke turn the frame on: an unrated button shows one only under the pointer
+    let button = if rated {
+        button.fill(p.accent_soft).stroke(egui::Stroke::NONE)
+    } else {
+        button.frame_when_inactive(false)
+    };
+    let response = ui.add(button);
+    if response.hovered() && !rated {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
 /// The text, the entries it rests on as `#id` links, and `+` / `−` on the right.
 fn question_row(ui: &mut egui::Ui, view: &CompanionView, question: &Question, actions: &mut Vec<PanelAction>) {
     let p = *theme::current(ui.ctx());
     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-        let minus = ui
-            .small_button("−")
-            .on_hover_text("Not useful: remove it, and ask less like it");
+        let minus = rate_button(ui, "−", false).on_hover_text("Not useful: remove it, and ask less like it");
         if minus.clicked() {
             actions.push(PanelAction::Rate(question.id, Rating::Minus));
         }
-        let plus = ui
-            .small_button("+")
-            .on_hover_text("Useful: keep it, and ask more like it");
-        if plus.clicked() {
+        let rated = question.rating == Rating::Plus;
+        let tip = if rated {
+            "Rated useful: it is kept, and the companion asks more like it"
+        } else {
+            "Useful: keep it, and ask more like it"
+        };
+        let plus = rate_button(ui, "+", rated).on_hover_text(tip);
+        if plus.clicked() && !rated {
             actions.push(PanelAction::Rate(question.id, Rating::Plus));
         }
         ui.with_layout(Layout::top_down(Align::Min), |ui| {

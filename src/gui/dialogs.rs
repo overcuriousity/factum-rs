@@ -167,21 +167,26 @@ pub(super) fn error_line(ui: &mut egui::Ui, error: &Option<String>) {
     }
 }
 
+/// A right-aligned row of buttons, one button high. A plain right-to-left layout would take all the
+/// height left in the dialog and centre the buttons in it, so the dialog could never shrink.
+pub(super) fn button_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.add_space(6.0);
+    let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    ui.allocate_ui_with_layout(size, Layout::right_to_left(Align::Center), add)
+        .inner
+}
+
 /// OK / Cancel buttons, right-aligned; returns (ok, cancel).
 pub(super) fn buttons(ui: &mut egui::Ui, ok: &str, ok_enabled: bool) -> (bool, bool) {
-    let mut result = (false, false);
-    ui.add_space(6.0);
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        result.1 = ui.button("Cancel").clicked();
-        result.0 = ui.add_enabled(ok_enabled, egui::Button::new(ok)).clicked();
-    });
-    result
+    button_row(ui, |ui| {
+        let cancel = ui.button("Cancel").clicked();
+        let ok = ui.add_enabled(ok_enabled, egui::Button::new(ok)).clicked();
+        (ok, cancel)
+    })
 }
 
 fn close_button(ui: &mut egui::Ui, text: &str) -> bool {
-    ui.add_space(6.0);
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.button(text).clicked())
-        .inner
+    button_row(ui, |ui| ui.button(text).clicked())
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, focus: bool) -> egui::Response {
@@ -260,7 +265,8 @@ pub fn gpg_help_text() -> &'static str {
 impl Dialog {
     /// Draws the dialog; Some(result) closes it.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<DialogResult> {
-        let modal = egui::Modal::new(Id::unique("factum-dialog")).show(ctx, |ui| {
+        // one id per kind of dialog: a modal keeps its last size under its id
+        let modal = egui::Modal::new(Id::unique(("factum-dialog", std::mem::discriminant(self)))).show(ctx, |ui| {
             ui.set_width(match self {
                 Dialog::VerifyEntry { .. } => 820.0,
                 Dialog::Correct { .. } | Dialog::Shortcuts { .. } | Dialog::CompanionSettings(_) => 560.0,
@@ -410,8 +416,7 @@ impl Dialog {
                 // user-entered names are shown as plain text
                 ui.label(message.as_str());
                 let mut result = None;
-                ui.add_space(6.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                button_row(ui, |ui| {
                     if ui.button("No").clicked() {
                         result = Some(DialogResult::Cancel);
                     }
@@ -550,8 +555,7 @@ impl Dialog {
                 title(ui, "No GPG key configured");
                 ui.label("No GPG signing key is configured. The seal will be stored unsigned; it can be signed later.\n\nConfigure a key now?");
                 let mut result = None;
-                ui.add_space(6.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                button_row(ui, |ui| {
                     if ui.button("Cancel").clicked() {
                         result = Some(DialogResult::NoGpg(NoGpgChoice::Cancel, then.clone()));
                     }
