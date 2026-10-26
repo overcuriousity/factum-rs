@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-10-26
+
+### Fixed
+- GUI: Ctrl+C, Ctrl+V and the copy buttons use the system clipboard again; the GUI was built without it, so text could
+  only be copied and pasted within factum
+
 ## [2.1.0] - 2026-10-26
 
 ### Added
@@ -42,6 +48,7 @@ compatible with factum-notes in both directions; the bundled `verify.py` is unch
 - The GUI picks up changes from the command line by polling the database instead of watching its files
 - Signature marks of system entries use ◇ instead of ⚙
 
-[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/overcuriousity/factum-rs/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/overcuriousity/factum-rs/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/overcuriousity/factum-rs/releases/tag/v2.0.0
