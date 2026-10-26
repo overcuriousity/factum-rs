@@ -33,8 +33,8 @@ factum must stay compatible with factum-notes and with bundles already handed ou
 
 From the GitHub web interface instead: merge a pull request that sets the version in `Cargo.toml` and `Cargo.lock` and
 has a `## [X.Y.Z]` section in `CHANGELOG.md`, then Actions → Release → Run workflow on `main` with the tag left
-empty. The run tags `main` as `vX.Y.Z` and publishes. A tag of that name without a release (e.g. one pushed on the
-wrong commit) is moved; a released version is refused.
+empty. The run tags `main` as `vX.Y.Z` and publishes. A tag of that name whose release has no files yet (e.g. a
+release drafted in the web interface on the wrong commit) is moved; a release that already has files is refused.
 
 To sign `SHA256SUMS`, add the repository secrets `RELEASE_GPG_KEY` (armored secret key) and
 `RELEASE_GPG_PASSPHRASE`.
