@@ -5,6 +5,10 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- GUI: the note editor at the bottom can be resized by dragging its top edge (the height is remembered), and a longer
+  note scrolls inside it instead of pushing the buttons off screen
+
 ## [2.1.2] - 2026-10-26
 
 ### Changed
