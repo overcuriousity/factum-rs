@@ -1,6 +1,6 @@
 # Analytical companion: design
 
-Date: 2026-10-25. Status: draft for review.
+Date: 2026-10-25. Status: approved (see 6).
 
 ## 1. Intent
 
@@ -180,7 +180,8 @@ unreachable", or "companion: off". Nothing else in the GUI animates for the comp
 
 History window (Companion → History…): a plain list of the case's non-open questions, newest first, with state,
 rating, when, and for `answered` the linked entry id (clickable) and an "Unlink" button that restores the question
-to `open` and records an `unlinked` event. Rejected and withdrawn questions have a "Restore" button. The window is
+to `open` and records an `unlinked` event. Rejected and withdrawn questions have a "Restore" button; restoring a
+rejected question takes back its minus (its example and archetype count go, its rating is none again). The window is
 read from the companion database only.
 
 Ask window (Companion → Ask…): hidden until opened. One text field, an Ask button, the answer below with `[n]`
@@ -222,19 +223,28 @@ for prose, chars/2.4 for JSON and identifier-heavy text; when a response carries
 recalibrated from them for the session. Budget: `0.8 × context_window − output_reserve`, where `context_window` is
 the setting; else, for the Anthropic protocol, the `max_input_tokens` field of the chosen model from the models
 listing; else 16k, so an unknown endpoint never overflows. `output_reserve` is 1 500 tokens for a reflection pass, 800 for enrichment, 1 000 for Ask. A call
-is refused and recorded as a failed pass with the reason `case too large for this model's context` if a section that
-cannot be cut does not fit.
+that still overflows after the cuts below falls back to shortening the fixed sections (last resort, after section 6);
+it is refused and recorded as a failed pass with the reason `model context too small even for a shortened prompt`
+only if the questions, the instruction, the case header's first lines and the shortened goal, guideline and new entry
+still do not fit.
 
 Order and cutting rule for a reflection pass:
-1. Global guideline (never cut).
-2. Case goal, or "No case goal has been set." (never cut).
+1. Global guideline (last resort: cut to 1 200 characters).
+2. Case goal, or "No case goal has been set." (last resort: cut to 600 characters).
 3. Case header: file number, name, description, created; evidence items with id, description, hash, created,
-   deleted flag (never cut).
-4. Pinned notes, verbatim, with timestamps and evidence id (never cut; if they alone overflow, the pass is refused).
+   deleted flag (last resort: evidence lines cut to 120 characters, then dropped from the end; entries name their
+   evidence anyway).
+4. Pinned notes, verbatim, with timestamps and evidence id (last resort: cut to 300 characters, then dropped oldest
+   first).
 5. Open questions: id, archetype, text, entry ids, rating (never cut; the ≤ 7 cap keeps this small).
 6. New entries since the last pass, verbatim, oldest first, each as `#id · timestamp · evidence · text` (cut from the
    newest end second in a diff pass, so `last_seen_entry_id` advances only to the newest entry that stayed in the
-   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end).
+   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end). A diff pass
+   always keeps its oldest new entry, as a last resort cut to 400 characters, so no single entry can stall the case.
+
+Last resort order, once 7, 8 and the cuttable lines of 6 are gone: pinned lines shortened, evidence lines shortened,
+the kept entry shortened, evidence lines dropped, pinned notes dropped, goal shortened, guideline shortened. Each step
+works one line at a time and stops as soon as the prompt fits; the shortened sections are logged at WARN.
 7. Related older entries: retrieved (4.6) for the new entries and for each open question, de-duplicated, with the
    same line format (cut first, lowest rank first).
 8. Rated examples: the three nearest plus and three nearest minus examples to the new entries' text, labelled
@@ -318,10 +328,19 @@ The format is described in the instruction; no grammar or JSON schema is sent, s
 measurably hurts small models' accuracy. On the OpenAI protocol call two also sends
 `response_format: {"type":"json_object"}`; if the server answers 400 naming `response_format`, the request is
 repeated without it and the fact is remembered for the session. A 400 naming `max_tokens` repeats the request with
-`max_completion_tokens`, also remembered for the session. On the Anthropic protocol nothing else is sent: assistant
-prefill is
-rejected by current Claude models and `output_config` is not expected from local Anthropic-compatible servers, so
-instruction plus repair and validation is the whole mechanism on both protocols. Cloud Claude models are in scope.
+`max_completion_tokens`, also remembered for the session (both only once the server stops naming the parameter, so
+a 400 about a limit that is too large does not stick). On the Anthropic protocol nothing else is sent: assistant
+prefill is rejected by current Claude models and `output_config` is not expected from local Anthropic-compatible
+servers, so instruction plus repair and validation is the whole mechanism on both protocols. Cloud Claude models are
+in scope.
+
+Thinking models: every server counts a model's thinking against `max_tokens` (OpenAI's `max_completion_tokens`,
+llama.cpp, vLLM), and none offers a per-request way to leave it out. Once a reply carries thinking
+(`reasoning_content` or `reasoning` on OpenAI-compatible servers, thinking blocks on Anthropic), every call of the
+session gets a thinking allowance on top of its own `max_tokens`: what the window leaves after the prompt and that
+allowance, with a tenth of the window spare, at most 8 192 tokens; the call that first shows thinking and was cut off
+is sent again with it. A reply that is still nothing but thinking fails with a reason that says so. The companion
+sends no thinking switch of its own: the server's (llama.cpp `--reasoning-budget`, a `-nothink` variant) decides.
 
 **Validation** (no model involved), applied to call two's output in this order:
 1. `finish_reason == "length"`, `truncated`, or an empty body: the pass fails; retry once with section 7 capped at
@@ -345,7 +364,7 @@ and a `linked` event; withdrawn get `state=withdrawn`; new questions get the nex
 `question_entries`; the pass row is finished; `last_seen_entry_id` advances to the newest entry included in
 section 6. Call failures retry once after 5 s, and only network errors, timeouts, 408, 409, 429 and 5xx (other 4xx
 fail at once); then the pass fails, the thread goes back to waiting and the status bar shows the reason. A budget
-refusal is recorded with status `failed` and the reason `case too large for this model's context`. For the
+refusal is recorded with status `failed` and the reason `model context too small even for a shortened prompt`. For the
 every-tenth-pass rule `pass_count` counts only successful passes. A pass never leaves the ledger half-applied.
 
 Timeouts: 5 s for probes and model listing, 180 s per model call (setting, builder's default), 60 s for Ask.
@@ -392,7 +411,7 @@ links. The answer is not stored.
 - Configured, probe failed: section shown with "endpoint unreachable"; questions stay as they were; no passes.
 - Pass failure: status shows "last pass failed: <short reason>" until the next successful pass; the pass row holds
   the full error. Questions are never cleared on failure.
-- Budget failure: "case too large for this model's context" in the status; the builder logs which section
+- Budget failure: "model context too small even for a shortened prompt" in the status; the builder logs which section
   overflowed.
 - The companion thread never panics the GUI: every command is wrapped, errors are stored in `passes.error`.
 - Logging through the existing `log` facade at DEBUG for prompts (sizes only, not content), INFO for pass results,

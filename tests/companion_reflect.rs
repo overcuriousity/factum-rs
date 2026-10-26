@@ -5,7 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::Fixture;
-use factum::companion::fake_llm::{FakeLlm, openai_chat};
+use common::fake_llm::{FakeLlm, openai_chat};
 use factum::companion::llm::Client;
 use factum::companion::reflect::{PassError, choose_kind, run_pass};
 use factum::companion::{Archetype, CompanionDb, NewQuestion, PassKind, Protocol, QuestionState, Rating, Settings};
@@ -203,6 +203,33 @@ fn diff_pass_cut_new_entries_are_covered_next_time() {
 }
 
 #[test]
+fn diff_pass_shortens_fixed_sections_instead_of_refusing() {
+    let e = env();
+    for n in 1..=8 {
+        let text = format!("Pinned finding {n}: {}", "registry run key persistence ".repeat(60));
+        let id = e.f.factum().create_note(&text, None, e.case).unwrap();
+        e.f.factum().pin_note(id).unwrap();
+    }
+    e.cdb.set_last_seen(e.case, newest(&e), 0).unwrap();
+    let long = format!("Long note: {}", "prefetch entry examined ".repeat(80));
+    e.f.factum().create_note(&long, None, e.case).unwrap();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(5000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    script(&e, json!({"new": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).unwrap();
+    assert_eq!(s.entries_to, newest(&e));
+    assert_eq!(
+        e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id,
+        newest(&e)
+    );
+    let body = e.fake.requests().last().unwrap().body.clone();
+    assert!(body.contains("Long note: prefetch entry examined"));
+    assert!(body.contains('…'));
+    assert_eq!(last_status(&e), "ok");
+}
+
+#[test]
 fn invalid_ids_and_duplicates_are_dropped_not_fatal() {
     let e = env();
     script(
@@ -322,4 +349,42 @@ fn archived_case_is_skipped() {
     assert!(matches!(pass(&e, PassKind::Full), Err(PassError::Archived)));
     assert!(e.fake.requests().is_empty());
     assert_eq!(last_status(&e), "skipped");
+}
+
+#[test]
+fn ratings_made_while_the_model_is_busy_win() {
+    let e = env();
+    let plus_later = question(&e, "Which tool computed the md5 of the image?");
+    let minus_later = question(&e, "Who uploaded the webshell to the server?");
+    let output =
+        json!({"answered": [{"question": minus_later, "entry": e.notes[2]}], "withdraw": [plus_later], "new": []});
+    e.fake.push(200, &ok("[]"));
+    e.fake
+        .push_delayed(200, &ok("Both questions are settled."), Duration::from_millis(500));
+    e.fake.push(200, &ok(&output.to_string()));
+    let path = e.f.db.path.clone();
+    let settings = e.client.settings().clone();
+    let case = e.case;
+    let running = std::thread::spawn(move || {
+        let db = factum::companion::open_case_db(&path).unwrap();
+        let cdb = CompanionDb::open_for(&path).unwrap();
+        let client = Client::with_retry_delay(settings, Duration::ZERO);
+        run_pass(&db, &cdb, &client, case, PassKind::Full).map(|summary| (summary.answered, summary.withdrawn))
+    });
+    // the investigator rates while the model writes its reasoning
+    std::thread::sleep(Duration::from_millis(150));
+    e.cdb.rate_question(plus_later, Rating::Plus).unwrap();
+    e.cdb.rate_question(minus_later, Rating::Minus).unwrap();
+    assert_eq!(running.join().unwrap().unwrap(), (0, 0));
+    assert_eq!(last_status(&e), "ok");
+    let open = e.cdb.open_questions(e.case).unwrap();
+    assert_eq!(
+        open.iter().map(|q| (q.id, q.rating)).collect::<Vec<_>>(),
+        [(plus_later, Rating::Plus)]
+    );
+    let rejected = e.cdb.resolved_questions(e.case).unwrap();
+    assert_eq!(
+        (rejected[0].id, rejected[0].state),
+        (minus_later, QuestionState::Rejected)
+    );
 }

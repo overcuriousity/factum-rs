@@ -8,11 +8,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::companion::store::{Protocol, Settings};
-use crate::companion::tokens::Calibration;
+use crate::companion::tokens::{Calibration, DEFAULT_CONTEXT_WINDOW, TextKind};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const ERROR_BODY_CHARS: usize = 200;
+/// Most output tokens a thinking model gets on top of a call's own `max_tokens`.
+const MAX_THINKING_ALLOWANCE: usize = 8192;
+const THINKING_ONLY: &str = "the model spent its whole output allowance on thinking: choose a model without \
+     thinking (or with a thinking budget on the server), or a larger context window";
 
 #[derive(Debug)]
 pub enum LlmError {
@@ -71,6 +75,8 @@ pub struct ChatRequest<'a> {
 pub struct ChatResponse {
     pub text: String,
     pub truncated: bool,
+    /// the model returned thinking besides the text (`reasoning_content`, `reasoning`, or thinking blocks)
+    pub reasoning: bool,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
 }
@@ -99,15 +105,19 @@ fn route(settings: &Settings, chat: bool) -> String {
     format!("{base}/{path}")
 }
 
-/// Auth, protocol and user-configured headers; `extra_headers` that are not a JSON object are ignored.
+/// Auth, protocol and user-configured headers; an extra header replaces a built-in one of the same name, and
+/// `extra_headers` that are not a JSON object are ignored.
 fn headers(settings: &Settings) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let key = !settings.api_key.is_empty();
     match settings.protocol {
-        Protocol::OpenAi if !settings.api_key.is_empty() => {
+        Protocol::OpenAi if key => {
             out.push(("Authorization".to_string(), format!("Bearer {}", settings.api_key)));
         }
         Protocol::Anthropic => {
-            out.push(("x-api-key".to_string(), settings.api_key.clone()));
+            if key {
+                out.push(("x-api-key".to_string(), settings.api_key.clone()));
+            }
             out.push(("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()));
         }
         Protocol::OpenAi => {}
@@ -115,6 +125,7 @@ fn headers(settings: &Settings) -> Vec<(String, String)> {
     if let Ok(Value::Object(extra)) = serde_json::from_str(&settings.extra_headers) {
         for (name, value) in extra {
             if let Some(value) = value.as_str() {
+                out.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
                 out.push((name, value.to_string()));
             }
         }
@@ -196,15 +207,39 @@ pub fn probe(settings: &Settings) -> Result<Vec<ModelInfo>, LlmError> {
     list_models(settings)
 }
 
+/// The text of a message `content`: a string, `null` (nothing, e.g. when thinking used up the allowance) or a list
+/// of text parts.
+fn content_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        None | Some(Value::Null) => Some(String::new()),
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect(),
+        ),
+        Some(_) => None,
+    }
+}
+
 fn parse_chat(protocol: Protocol, text: &str) -> Result<ChatResponse, LlmError> {
     let bad = |what: &str| LlmError::BadResponse(what.to_string());
     let v: Value = serde_json::from_str(text).map_err(|e| LlmError::BadResponse(e.to_string()))?;
     let count = |p: &str| v.pointer(p).and_then(Value::as_u64).map(|n| n as u32);
     if protocol == Protocol::OpenAi {
-        let content = v.pointer("/choices/0/message/content").and_then(Value::as_str);
+        let message = v.pointer("/choices/0/message").ok_or_else(|| bad("no message"))?;
+        // llama.cpp and DeepSeek name it reasoning_content, vLLM and OpenRouter reasoning
+        let reasoning = ["reasoning_content", "reasoning"].iter().any(|field| {
+            message
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|r| !r.trim().is_empty())
+        });
         Ok(ChatResponse {
-            text: content.ok_or_else(|| bad("no message content"))?.to_string(),
+            text: content_text(message.get("content")).ok_or_else(|| bad("no message content"))?,
             truncated: v.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length"),
+            reasoning,
             prompt_tokens: count("/usage/prompt_tokens"),
             completion_tokens: count("/usage/completion_tokens"),
         })
@@ -218,9 +253,16 @@ fn parse_chat(protocol: Protocol, text: &str) -> Result<ChatResponse, LlmError> 
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
             .filter_map(|b| b.get("text").and_then(Value::as_str))
             .collect();
+        let reasoning = blocks.iter().any(|b| {
+            matches!(
+                b.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            )
+        });
         Ok(ChatResponse {
             text,
             truncated: v.get("stop_reason").and_then(Value::as_str) == Some("max_tokens"),
+            reasoning,
             prompt_tokens: count("/usage/input_tokens"),
             completion_tokens: count("/usage/output_tokens"),
         })
@@ -236,6 +278,8 @@ pub struct Client {
     completion_param: Cell<bool>,
     /// the model's input window from the endpoint's listing, when known
     context_window: Cell<Option<u32>>,
+    /// the model has returned thinking: its calls get the thinking allowance from the start
+    thinks: Cell<bool>,
 }
 
 impl Client {
@@ -251,6 +295,7 @@ impl Client {
             json_rejected: Cell::new(false),
             completion_param: Cell::new(false),
             context_window: Cell::new(None),
+            thinks: Cell::new(false),
         }
     }
 
@@ -272,6 +317,29 @@ impl Client {
         self.context_window.get()
     }
 
+    /// The window prompts are budgeted for: the setting, else the listing's, else `DEFAULT_CONTEXT_WINDOW`.
+    pub fn window(&self) -> u32 {
+        self.settings
+            .context_window
+            .or(self.context_window.get())
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+    }
+
+    /// The output tokens a thinking model may spend on top of the call's `max_tokens`: what the window leaves after
+    /// the prompt and `max_tokens`, a tenth of the window kept spare, at most `MAX_THINKING_ALLOWANCE`. Thinking
+    /// counts against the output limit on every server; this keeps it from eating the answer's share.
+    fn thinking_allowance(&self, req: &ChatRequest) -> u32 {
+        let calibration = self.calibration.get();
+        let prompt = calibration.estimate(req.system, TextKind::Prose)
+            + req
+                .turns
+                .iter()
+                .map(|(_, text)| calibration.estimate(text, TextKind::Prose))
+                .sum::<usize>();
+        let room = (self.window() as usize * 9 / 10).saturating_sub(prompt + req.max_tokens as usize);
+        room.min(MAX_THINKING_ALLOWANCE) as u32
+    }
+
     /// One retry after the retry delay on a retryable error.
     pub fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         match self.chat_once(req) {
@@ -284,13 +352,38 @@ impl Client {
         }
     }
 
+    /// A thinking model's thinking counts against `max_tokens`. Once a model has thought, its calls get the thinking
+    /// allowance on top; the call on which that is found out and that was cut off is sent again with it. A reply
+    /// that is still nothing but thinking is an error that says so.
+    fn chat_once(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        let allowance = self.thinking_allowance(req);
+        let extra = if self.thinks.get() { allowance } else { 0 };
+        let mut response = self.chat_with(req, req.max_tokens + extra)?;
+        if response.reasoning {
+            self.thinks.set(true);
+            if response.truncated && extra == 0 && allowance > 0 {
+                log::info!("companion: the model thinks; its output allowance is raised by {allowance} tokens");
+                response = self.chat_with(req, req.max_tokens + allowance)?;
+            }
+            if response.text.trim().is_empty() {
+                return Err(LlmError::BadResponse(if response.truncated {
+                    THINKING_ONLY.to_string()
+                } else {
+                    "the model returned thinking but no answer".to_string()
+                }));
+            }
+        }
+        Ok(response)
+    }
+
     /// OpenAI-compatible servers may reject `response_format` or `max_tokens` (reasoning models
     /// want `max_completion_tokens`) with a 400 naming it: resend without or with the other
-    /// name, and remember that for the session.
-    fn chat_once(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+    /// name, and remember that for the session once the server stops naming it.
+    fn chat_with(&self, req: &ChatRequest, max_tokens: u32) -> Result<ChatResponse, LlmError> {
         let mut json_mode = req.json && self.settings.protocol == Protocol::OpenAi && !self.json_rejected.get();
         let mut completion_param = self.completion_param.get();
-        let mut result = self.post_chat(req, json_mode, completion_param);
+        let (mut dropped_json, mut switched_param) = (false, false);
+        let mut result = self.post_chat(req, max_tokens, json_mode, completion_param);
         for _ in 0..2 {
             let Err(LlmError::Http { status: 400, body }) = &result else {
                 break;
@@ -299,20 +392,35 @@ impl Client {
                 break;
             }
             if json_mode && body.contains("response_format") {
-                self.json_rejected.set(true);
                 json_mode = false;
+                dropped_json = true;
             } else if !completion_param && body.contains("max_tokens") {
-                self.completion_param.set(true);
                 completion_param = true;
+                switched_param = true;
             } else {
                 break;
             }
-            result = self.post_chat(req, json_mode, completion_param);
+            result = self.post_chat(req, max_tokens, json_mode, completion_param);
+        }
+        // a 400 that names the limit for another reason (e.g. too large for the context) must not stick
+        if !matches!(result, Err(LlmError::Http { status: 400, .. })) {
+            if dropped_json {
+                self.json_rejected.set(true);
+            }
+            if switched_param {
+                self.completion_param.set(true);
+            }
         }
         result
     }
 
-    fn post_chat(&self, req: &ChatRequest, json_mode: bool, completion_param: bool) -> Result<ChatResponse, LlmError> {
+    fn post_chat(
+        &self,
+        req: &ChatRequest,
+        max_tokens: u32,
+        json_mode: bool,
+        completion_param: bool,
+    ) -> Result<ChatResponse, LlmError> {
         let role = |r: Role| if r == Role::User { "user" } else { "assistant" };
         let turns = req
             .turns
@@ -323,7 +431,7 @@ impl Client {
         } else {
             "max_tokens"
         };
-        let mut body = json!({"model": self.settings.model, limit: req.max_tokens});
+        let mut body = json!({"model": self.settings.model, limit: max_tokens});
         if self.settings.protocol == Protocol::OpenAi {
             // an empty system prompt is left out on both protocols
             let system = (!req.system.is_empty()).then(|| json!({"role": "system", "content": req.system}));
@@ -458,6 +566,75 @@ mod tests {
         let reqs = fake.requests();
         assert!(reqs[1].body.contains("max_completion_tokens"));
         assert!(!reqs[1].body.contains("\"max_tokens\""));
+    }
+
+    #[test]
+    fn extra_headers_replace_built_in_ones_and_no_empty_key_is_sent() {
+        let fake = FakeLlm::start();
+        let mut s = settings(&fake.url, Protocol::Anthropic);
+        s.api_key.clear();
+        s.extra_headers = r#"{"Anthropic-Version":"2024-01-01"}"#.into();
+        list_models(&s).unwrap();
+        let r = &fake.requests()[0];
+        let versions: Vec<_> = r
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("anthropic-version"))
+            .collect();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].1, "2024-01-01");
+        assert!(!r.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-api-key")));
+    }
+
+    #[test]
+    fn a_400_about_the_limit_for_another_reason_is_not_remembered() {
+        let fake = FakeLlm::start();
+        let too_large = r#"{"error":{"message":"'max_tokens' or 'max_completion_tokens' is too large"}}"#;
+        fake.push(400, too_large);
+        fake.push(400, too_large);
+        fake.push(200, &openai_chat("ok", "stop", 1));
+        let c = client(openai(&fake));
+        let turns = [(Role::User, "hi")];
+        assert!(c.chat(&req(&turns, false)).is_err());
+        c.chat(&req(&turns, false)).unwrap();
+        let reqs = fake.requests();
+        assert!(
+            reqs[2].body.contains("\"max_tokens\""),
+            "the switch did not help, so it is not kept"
+        );
+    }
+
+    #[test]
+    fn null_content_with_thinking_is_retried_with_the_thinking_allowance() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_chat_thinking(None, "let me think", "length"));
+        fake.push(200, &openai_chat_thinking(Some("{\"a\":1}"), "thought", "stop"));
+        fake.push(200, &openai_chat("{\"a\":2}", "stop", 1));
+        let mut s = openai(&fake);
+        s.context_window = Some(32_000);
+        let c = client(s);
+        let turns = [(Role::User, "hi")];
+        assert_eq!(c.chat(&req(&turns, true)).unwrap().text, "{\"a\":1}");
+        // the next call gets the allowance from the start
+        c.chat(&req(&turns, true)).unwrap();
+        let limit = |r: &FakeRequest| serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["max_tokens"].clone();
+        let reqs = fake.requests();
+        assert_eq!(limit(&reqs[0]), 100);
+        assert_eq!(limit(&reqs[1]), 100 + 8192);
+        assert_eq!(limit(&reqs[2]), 100 + 8192);
+    }
+
+    #[test]
+    fn thinking_that_never_ends_is_a_clear_error() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_chat_thinking(Some(""), "hmm", "length"));
+        fake.push(200, &openai_chat_thinking(Some(""), "hmm hmm", "length"));
+        let turns = [(Role::User, "hi")];
+        let err = client(openai(&fake)).chat(&req(&turns, false)).unwrap_err();
+        assert!(err.to_string().contains("thinking"), "{err}");
+        // the default 16 000 window leaves more than the cap after this tiny prompt
+        let body: serde_json::Value = serde_json::from_str(&fake.requests()[1].body).unwrap();
+        assert_eq!(body["max_tokens"], 100 + 8192);
     }
 
     #[test]

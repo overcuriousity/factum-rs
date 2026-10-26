@@ -155,9 +155,10 @@ pub enum DialogResult {
     },
 }
 
-pub(super) fn title(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).heading());
+pub(super) fn title(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let heading = ui.label(RichText::new(text).heading());
     ui.add_space(4.0);
+    heading
 }
 
 pub(super) fn error_line(ui: &mut egui::Ui, error: &Option<String>) {
@@ -279,7 +280,7 @@ impl Dialog {
         match self {
             Dialog::CompanionSettings(dialog) => dialog.show(ui, ctx),
             Dialog::CaseGoal { case_id, goal } => {
-                let heading = ui.label(RichText::new("Case goal").heading());
+                let heading = title(ui, "Case goal");
                 ui.label(
                     RichText::new("What this case has to establish; the companion asks its questions toward it.")
                         .size(SMALL_SIZE)

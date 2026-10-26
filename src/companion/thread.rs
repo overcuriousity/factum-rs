@@ -6,19 +6,21 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::enrich::{enrich, index_unindexed};
+use super::llm::LlmError;
 use super::llm::{Client, probe};
 use super::reflect::{PassError, choose_kind, run_pass};
 use super::schedule::Scheduler;
 use super::store::{CompanionDb, Protocol, Settings};
+use super::{newest_entry_by_case, open_case_db};
 use crate::Factum;
 use crate::canonical::utc_now;
 use crate::db::Db;
-use crate::error::Result;
+use crate::error::{FactumError, Result};
 use crate::notes::EntryFilter;
 use crate::signer::GnupgSigner;
 
@@ -39,6 +41,9 @@ pub enum Command {
     GoalChanged(i64),
     /// the case's companion switch was flipped
     CaseToggled(i64),
+    /// the case was deleted permanently: its rows go again once the work in hand is done, in case a pass that was
+    /// running wrote some
+    CaseDeleted(i64),
     SettingsChanged,
     Probe,
     Shutdown,
@@ -140,8 +145,35 @@ impl CompanionHandle {
     }
 }
 
-fn lock(status: &Mutex<Status>) -> MutexGuard<'_, Status> {
-    status.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The companion databases a thread works on: a thread started while a detached one still finishes its pass on
+/// the same database waits for it, so two threads never run passes side by side.
+static RUNNING: (Mutex<Vec<PathBuf>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+
+/// Holds the companion database for one thread until dropped.
+struct Running(PathBuf);
+
+impl Running {
+    fn wait_for(path: PathBuf) -> Running {
+        let (running, released) = &RUNNING;
+        let mut paths = lock(running);
+        while paths.contains(&path) {
+            paths = released.wait(paths).unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        paths.push(path.clone());
+        Running(path)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let (running, released) = &RUNNING;
+        lock(running).retain(|path| *path != self.0);
+        released.notify_all();
+    }
 }
 
 fn run(
@@ -151,7 +183,8 @@ fn run(
     case_db: PathBuf,
     companion_db: PathBuf,
 ) {
-    let opened = Db::open(&case_db).and_then(|db| Ok((db, CompanionDb::open(&companion_db)?)));
+    let _running = Running::wait_for(companion_db.clone());
+    let opened = open_case_db(&case_db).and_then(|db| Ok((db, CompanionDb::open(&companion_db)?)));
     let (db, cdb) = match opened {
         Ok(dbs) => dbs,
         Err(e) => {
@@ -175,6 +208,7 @@ fn run(
         full_next: HashSet::new(),
         retried: HashSet::new(),
         enrich_tried: HashSet::new(),
+        backlog_done: HashSet::new(),
         last_probe: Instant::now(),
         after_indexing: State::Idle,
     };
@@ -213,6 +247,8 @@ struct Companion {
     retried: HashSet<i64>,
     /// entries backlog enrichment has asked for (or given up on), until a successful probe or pass
     enrich_tried: HashSet<i64>,
+    /// cases whose backlog was found empty, so the idle tick does not read them again until they change
+    backlog_done: HashSet<i64>,
     last_probe: Instant,
     /// what the status shows again once indexing ends
     after_indexing: State,
@@ -255,13 +291,32 @@ impl Companion {
         Ok(())
     }
 
+    /// Every case with a row and entries no pass has seen gets a pass in due course, e.g. once the endpoint answers
+    /// again after the changes were given up on.
+    fn pick_up_all_unseen(&mut self) -> Result<()> {
+        let newest = newest_entry_by_case(&self.db)?;
+        for (case_id, seen) in self.cdb.last_seen_by_case()? {
+            if newest.get(&case_id).is_some_and(|&newest| newest > seen)
+                && !self.scheduler.is_pending(case_id)
+                && self.runnable(case_id)?
+            {
+                self.scheduler.changed(case_id, Instant::now());
+            }
+        }
+        Ok(())
+    }
+
     fn handle(&mut self, cmd: Command) {
         match cmd {
             Command::CaseChanged(case_id) => {
                 self.retried.remove(&case_id);
+                self.backlog_done.remove(&case_id);
                 self.scheduler.changed(case_id, Instant::now());
             }
             Command::Selected(case_id) => {
+                if let Some(case_id) = case_id {
+                    self.backlog_done.remove(&case_id);
+                }
                 self.selected = case_id;
                 self.scheduler.select(case_id);
                 if case_id.is_none() {
@@ -274,7 +329,17 @@ impl Companion {
                 }
             }
             Command::Rethink(case_id) | Command::GoalChanged(case_id) => self.scheduler.force(case_id),
+            Command::CaseDeleted(case_id) => {
+                self.scheduler.clear(case_id);
+                self.full_next.remove(&case_id);
+                self.retried.remove(&case_id);
+                lock(&self.status).last_pass_utc.remove(&case_id);
+                if let Err(e) = self.cdb.delete_case(case_id) {
+                    log::warn!("companion: the rows of deleted case {case_id} cannot be removed: {e}");
+                }
+            }
             Command::CaseToggled(case_id) => {
+                self.backlog_done.remove(&case_id);
                 let toggled = match self.cdb.case_settings(case_id) {
                     Ok(Some(case)) if !case.enabled => {
                         self.scheduler.clear(case_id);
@@ -304,8 +369,7 @@ impl Companion {
         }
         let mut status = lock(&self.status);
         if !status.last_pass_utc.contains_key(&case_id)
-            && let Some((_, finished, state)) = self.cdb.last_finished_pass(case_id)?
-            && state == "ok"
+            && let Some(finished) = self.cdb.last_ok_pass(case_id)?
         {
             status.last_pass_utc.insert(case_id, finished);
         }
@@ -336,8 +400,12 @@ impl Companion {
                 }
                 self.client = Some(client);
                 self.enrich_tried.clear();
+                self.backlog_done.clear();
                 lock(&self.status).model = self.settings.model.clone();
                 self.set_state(State::Idle);
+                if let Err(e) = self.pick_up_all_unseen() {
+                    log::warn!("companion: the cases cannot be read: {e}");
+                }
             }
             Err(e) => {
                 log::warn!("companion: the endpoint does not answer: {e}");
@@ -371,7 +439,10 @@ impl Companion {
             return;
         }
         while let Some((case_id, forced)) = self.scheduler.next_due(Instant::now()) {
-            match self.runnable(case_id) {
+            // a panic here would otherwise come back every tick
+            let runnable = catch_unwind(AssertUnwindSafe(|| self.runnable(case_id)))
+                .unwrap_or_else(|_| Err(FactumError::general("internal error")));
+            match runnable {
                 Ok(true) => return self.reflect(case_id, forced),
                 // picked up again on the next change once the condition clears
                 Ok(false) => self.scheduler.clear(case_id),
@@ -413,8 +484,17 @@ impl Companion {
                 }
                 self.retried.remove(&case_id);
                 self.enrich_tried.clear();
+                self.backlog_done.clear();
                 lock(&self.status).last_pass_utc.insert(case_id, utc_now());
                 self.set_state(State::Idle);
+                // a diff pass that cut new entries for space leaves the rest to a pass after the spacing
+                match self.entry_ids(case_id) {
+                    Ok(ids) if ids.first().is_some_and(|&newest| newest > summary.entries_to) => {
+                        self.scheduler.changed(case_id, Instant::now());
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("companion: case {case_id} cannot be read: {e}"),
+                }
             }
             // nothing ran: whatever was shown before stays
             Ok(Err(PassError::NothingNew | PassError::Archived)) => self.set_state(before),
@@ -423,7 +503,14 @@ impl Companion {
                 if matches!(e, PassError::Llm(_)) && self.retried.insert(case_id) {
                     self.scheduler.changed(case_id, Instant::now());
                 }
-                self.set_state(State::Failed(e.to_string()));
+                if matches!(e, PassError::Llm(LlmError::Unreachable(_) | LlmError::Timeout)) {
+                    // gone: probed again every REPROBE, and what is pending runs once it answers
+                    self.client = None;
+                    self.last_probe = Instant::now();
+                    self.set_state(State::Unreachable);
+                } else {
+                    self.set_state(State::Failed(e.to_string()));
+                }
             }
             Err(_) => {
                 log::error!("companion pass on case {case_id} panicked");
@@ -435,6 +522,9 @@ impl Companion {
     /// One batch of the selected case's unenriched entries, newest first.
     fn backlog(&mut self) {
         let Some(case_id) = self.selected else { return };
+        if self.backlog_done.contains(&case_id) {
+            return;
+        }
         let Some(client) = &self.client else { return };
         let read = || -> Result<(Vec<i64>, usize)> {
             let ids = if self.runnable(case_id)? {
@@ -448,6 +538,8 @@ impl Companion {
             Ok(read) => read,
             Err(e) => {
                 log::warn!("companion: the backlog of case {case_id} cannot be read: {e}");
+                self.backlog_done.insert(case_id);
+                self.end_indexing();
                 return;
             }
         };
@@ -457,6 +549,7 @@ impl Companion {
             .filter(|id| !self.enrich_tried.contains(id))
             .collect();
         if pending.is_empty() {
+            self.backlog_done.insert(case_id);
             self.end_indexing();
             return;
         }

@@ -31,8 +31,6 @@ pub struct CompanionSettingsDialog {
     /// Ok(model count) or Err("Unreachable: <reason>")
     pub probe: Option<Result<usize, String>>,
     pub probe_worker: Option<Worker<Result<Vec<ModelInfo>, String>>>,
-    /// the user typed a model name: the listing no longer fills it in
-    pub manual_model: bool,
     /// a key is stored and the field is empty: the stored key is kept
     pub key_stored: bool,
     stored_key: String,
@@ -44,6 +42,20 @@ pub struct CompanionSettingsDialog {
     /// the case database; "Test connection" saves through its companion database
     db_path: PathBuf,
     error: Option<String>,
+}
+
+/// The proxy variable the HTTP client follows, if one is set.
+fn proxy_variable() -> Option<&'static str> {
+    [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ]
+    .into_iter()
+    .find(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
 
 /// The listing's failure reason, without the "Unreachable: " the error's own text starts with.
@@ -70,7 +82,6 @@ impl CompanionSettingsDialog {
             listed_for: None,
             probe: None,
             probe_worker: None,
-            manual_model: false,
             key_stored,
             stored_key: if key_stored {
                 settings.api_key.clone()
@@ -106,11 +117,12 @@ impl CompanionSettingsDialog {
         s
     }
 
-    /// The draft as the listing and the probe send it: without the stored key once URL or protocol differ from
-    /// the saved ones, so a key never reaches an endpoint it was not saved for.
+    /// The draft as the listing and the probe send it: without the stored key (or the one from the environment)
+    /// once URL or protocol differ from the saved ones, so a key never reaches an endpoint it was not saved for
+    /// before it is saved; a typed key goes to the URL it is typed for.
     fn connection_settings(&self) -> Settings {
         let mut s = self.settings();
-        let typed = !self.draft.api_key.trim().is_empty();
+        let typed = !self.draft.api_key_from_env && !self.draft.api_key.trim().is_empty();
         if !typed && (s.endpoint_url != self.saved_url || s.protocol != self.saved_protocol) {
             s.api_key.clear();
         }
@@ -132,18 +144,13 @@ impl CompanionSettingsDialog {
         if let Err(e) = &result {
             log::info!("Listing the companion models failed: {e}");
         }
+        // the listing fills the dropdown, never the field: the first id may be any model
         self.models = result.unwrap_or_default();
         self.models_status = if self.models.is_empty() {
             "The endpoint listed no models. Enter the name by hand.".into()
         } else {
             format!("{} models from the endpoint.", self.models.len())
         };
-        if !self.manual_model
-            && self.draft.model.trim().is_empty()
-            && let Some(first) = self.models.first()
-        {
-            self.draft.model = first.id.clone();
-        }
     }
 
     /// Polls the workers and starts a listing once the connection fields have been left alone for a moment.
@@ -184,15 +191,35 @@ impl CompanionSettingsDialog {
         }
     }
 
-    /// "Test connection": saves the draft, then lists the models whatever the debounce says.
-    fn test_connection(&mut self, ctx: &egui::Context) {
+    /// Checks the draft and saves it, creating the companion database on first use; the error is shown in the
+    /// dialog, which stays open with the draft.
+    fn save(&mut self) -> Option<Settings> {
+        if !self.context_window.trim().is_empty() && self.context_window.trim().parse::<u32>().is_err() {
+            self.error = Some("The context window is a number of tokens.".into());
+            return None;
+        }
         let settings = self.settings();
-        let saved = CompanionDb::open_for(&self.db_path).and_then(|cdb| settings.save(&cdb));
-        if let Err(e) = saved {
+        if let Err(e) = CompanionDb::open_for(&self.db_path).and_then(|cdb| settings.save(&cdb)) {
             self.error = Some(format!("The settings could not be saved: {e}"));
-            return;
+            return None;
         }
         self.error = None;
+        // what is saved now is what the stored key belongs to
+        self.saved_url = settings.endpoint_url.clone();
+        self.saved_protocol = settings.protocol;
+        self.saved_model = settings.model.clone();
+        if !settings.api_key_from_env {
+            self.key_stored = !settings.api_key.is_empty();
+            self.stored_key = settings.api_key.clone();
+        }
+        Some(settings)
+    }
+
+    /// "Test connection": saves the draft, then lists the models whatever the debounce says.
+    fn test_connection(&mut self, ctx: &egui::Context) {
+        if self.save().is_none() {
+            return;
+        }
         self.probe = None;
         self.models_worker = None;
         self.models_status = "Loading models from the endpoint…".into();
@@ -217,11 +244,7 @@ impl CompanionSettingsDialog {
         error_line(ui, &self.error);
         let (ok, cancel) = buttons(ui, "OK", true);
         if ok {
-            if !self.context_window.trim().is_empty() && self.context_window.trim().parse::<u32>().is_err() {
-                self.error = Some("The context window is a number of tokens.".into());
-                return None;
-            }
-            return Some(DialogResult::CompanionSettings(self.settings()));
+            return self.save().map(DialogResult::CompanionSettings);
         }
         cancel.then_some(DialogResult::Cancel)
     }
@@ -302,12 +325,8 @@ impl CompanionSettingsDialog {
 
         let model_label = ui.label("Model");
         ui.horizontal(|ui| {
-            let model = ui
-                .add(TextEdit::singleline(&mut self.draft.model).desired_width(ui.available_width() - 40.0))
+            ui.add(TextEdit::singleline(&mut self.draft.model).desired_width(ui.available_width() - 40.0))
                 .labelled_by(model_label.id);
-            if model.changed() {
-                self.manual_model = true;
-            }
             let mut ids: Vec<&str> = self.models.iter().map(|m| m.id.as_str()).collect();
             if !self.saved_model.is_empty() && !ids.contains(&self.saved_model.as_str()) {
                 ids.push(&self.saved_model);
@@ -341,23 +360,24 @@ impl CompanionSettingsDialog {
             });
             label.id
         });
-        egui::ScrollArea::vertical()
-            .id_salt("companion-guideline")
-            .max_height(100.0)
-            .show(ui, |ui| {
-                ui.add(
-                    TextEdit::multiline(&mut self.draft.global_guideline)
-                        .desired_rows(6)
-                        .desired_width(f32::INFINITY),
-                )
-                .labelled_by(guideline_label.inner);
-            });
+        // the dialog itself scrolls: a scroll area of its own here would catch the mouse wheel
+        ui.add(
+            TextEdit::multiline(&mut self.draft.global_guideline)
+                .desired_rows(6)
+                .desired_width(f32::INFINITY),
+        )
+        .labelled_by(guideline_label.inner);
 
         ui.checkbox(&mut self.draft.enabled, "Enabled");
 
         let url = self.draft.endpoint_url.trim();
         if !url.is_empty() {
             ui.label(format!("Case content is sent to {url}."));
+            if let Some(variable) = proxy_variable() {
+                ui.label(small(&format!(
+                    "{variable} is set: the requests go through that proxy unless NO_PROXY names the host."
+                )));
+            }
         }
 
         ui.horizontal(|ui| {

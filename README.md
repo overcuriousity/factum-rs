@@ -1,6 +1,6 @@
 # factum
 
-Cryptographically signed forensic logging — a Rust port of [factum-notes](https://git.cc24.dev/mstoeck3/factum-notes).
+Cryptographically signed forensic logging — a Rust port of factum-notes.
 
 [![CI](https://github.com/overcuriousity/factum-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/overcuriousity/factum-rs/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/overcuriousity/factum-rs)](https://github.com/overcuriousity/factum-rs/releases/latest)
@@ -23,10 +23,10 @@ curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/insta
 
 The installer picks the build for your system, checks it against the release's `SHA256SUMS`, installs `factum` to
 `~/.local/bin` (`/usr/local/bin` as root) and, on Linux, adds *Factum Notes* to the application menu. Options:
-`--version v2.0.0`, `--dir DIR`, `--cli` (static command-line build without GUI), `--no-desktop`, `--uninstall`:
+`--version v2.1.0`, `--dir DIR`, `--cli` (static command-line build without GUI), `--no-desktop`, `--uninstall`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.sh | sh -s -- --version v2.0.0
+curl -fsSL https://raw.githubusercontent.com/overcuriousity/factum-rs/main/install.sh | sh -s -- --version v2.1.0
 ```
 
 **Windows** (PowerShell):
@@ -145,7 +145,7 @@ factum --set-active case 1              # by ID, file number or name; clears the
 factum --list-evidence                  # evidence of the active case
 factum --set-active evidence none       # notes go to the case itself again
 factum --verify [case] [-v]             # exit code 1 if verification fails
-factum --questions [case]              # open companion questions (read-only)
+factum --questions [case]               # open companion questions (read-only)
 factum --checkpoint [case]              # seal the current state
 factum --sign-unsigned [case]           # sign entries and seals created without a key
 factum --export [case] --format html,pdf,md,bundle --out ./reports
@@ -196,12 +196,12 @@ Optional settings are read from a `.env` file in the user config directory (Linu
 `~/Library/Application Support/factum/.env`, Windows: `%LOCALAPPDATA%\factum\.env`), then from `.env` in the current
 directory; real environment variables override both. See [.env.example](.env.example).
 
-| Variable          | Meaning                                                                                       |
-|-------------------|-----------------------------------------------------------------------------------------------|
-| `LOG_LEVEL`       | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`; `--log-level` overrides it          |
-| `FACTUM_DB`       | Path of the database file                                                                     |
-| `FACTUM_SEAL_DIR` | Folder for external seal copies; must already exist (default: GUI setting, else `seals/` next to the database) |
-| `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                    |
+| Variable                   | Meaning                                                                                       |
+|----------------------------|-----------------------------------------------------------------------------------------------|
+| `LOG_LEVEL`                | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`; `--log-level` overrides it         |
+| `FACTUM_DB`                | Path of the database file                                                                     |
+| `FACTUM_SEAL_DIR`          | Folder for external seal copies; must already exist (default: GUI setting, else `seals/` next to the database) |
+| `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                                 |
 
 A launcher (application menu, Start menu) does not read `.env` from a working directory: put settings in the user
 config directory.

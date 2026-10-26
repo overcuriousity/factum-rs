@@ -16,8 +16,8 @@ Download what you need from the [release page](https://github.com/overcuriousity
 Or let the script collect and verify everything — all platforms, or only some:
 
 ```bash
-scripts/airgap-download.sh --version v2.0.0 --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
-# -> factum-v2.0.0-airgap/ and factum-v2.0.0-airgap.tar
+scripts/airgap-download.sh --version v2.1.0 --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
+# -> factum-v2.1.0-airgap/ and factum-v2.1.0-airgap.tar
 ```
 
 Optionally check the build provenance before transfer (needs the GitHub CLI):
@@ -67,8 +67,8 @@ distribution's `rust`/`cargo` packages from a local mirror — and a C compiler 
 Windows) for the bundled SQLite.
 
 ```bash
-tar -xzf factum-2.0.0-vendored-source.tar.gz
-cd factum-2.0.0-vendored-source
+tar -xzf factum-2.1.0-vendored-source.tar.gz
+cd factum-2.1.0-vendored-source
 cargo build --release --offline --locked                         # GUI + CLI
 cargo build --release --offline --locked --no-default-features   # command line only
 sh install.sh --help                                             # or copy target/release/factum yourself
@@ -102,6 +102,11 @@ The optional analytical companion needs only an OpenAI- or Anthropic-compatible 
 for example a local inference server. No model files ship with factum, and nothing else leaves the machine. For
 `https://` endpoints TLS uses the system trust store, so install the lab's CA there. Without a configured endpoint
 the companion does nothing.
+
+The companion follows the proxy variables `ALL_PROXY`, `HTTPS_PROXY` and `HTTP_PROXY` (also in lower case): when one
+is set, case content goes to that proxy on its way to the endpoint, unless `NO_PROXY` names the endpoint's host
+(for example `NO_PROXY=10.0.0.5,inference.lab`). The settings dialog says so while such a variable is set. Unset them,
+or list the endpoint in `NO_PROXY`, when the content must not pass through the proxy.
 
 ## 5. Updating
 

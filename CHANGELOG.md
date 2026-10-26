@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-26
+
 ### Added
 - Analytical companion: an optional, LLM-backed mentor that keeps a short list of open analytical questions per case
   (Companion → Settings…, per-case switch and case goal in the Case menu, questions in the side panel, Ask and
@@ -40,5 +42,6 @@ compatible with factum-notes in both directions; the bundled `verify.py` is unch
 - The GUI picks up changes from the command line by polling the database instead of watching its files
 - Signature marks of system entries use ◇ instead of ⚙
 
-[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/overcuriousity/factum-rs/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/overcuriousity/factum-rs/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/overcuriousity/factum-rs/releases/tag/v2.0.0

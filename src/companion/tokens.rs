@@ -6,10 +6,15 @@ use std::fmt;
 /// An entry line is cut at this many characters.
 pub const MAX_LINE_CHARS: usize = 2000;
 
+/// The window assumed when neither the settings nor the endpoint's listing name one, so an unknown endpoint never
+/// overflows.
+pub const DEFAULT_CONTEXT_WINDOW: u32 = 16_000;
+
 const PROSE_CHARS_PER_TOKEN: f64 = 3.0;
 /// Dense text (JSON, identifiers) needs more tokens: the prose ratio times this.
 const DENSE_FACTOR: f64 = 0.8;
-const CUT_MARKER: &str = "(cut for space)";
+/// What a section shows once every line was cut.
+pub const CUT_MARKER: &str = "(cut for space)";
 const EMPTY_MARKER: &str = "(none)";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +55,11 @@ impl Calibration {
         }
     }
 
+    /// The tokens of the text at this ratio, rounded up.
+    pub fn estimate(&self, text: &str, kind: TextKind) -> usize {
+        self.estimate_chars(text.chars().count(), kind)
+    }
+
     fn estimate_chars(&self, chars: usize, kind: TextKind) -> usize {
         let prose = f64::from(self.chars_per_token);
         ceil_tokens(
@@ -63,36 +73,56 @@ impl Calibration {
     }
 }
 
-/// How a section may be shortened. A lower priority number is cut first.
+/// One way a section may be shortened. Steps of every section are applied one line at a time, the lowest
+/// priority number first; a section without steps is never cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cut {
-    Never,
-    /// `from_start` drops the oldest (first) lines, otherwise the last ones
+    /// drop lines while more than `keep` are left; `from_start` drops the oldest (first) lines, otherwise the last
     Lines {
         priority: u8,
         from_start: bool,
+        keep: usize,
     },
+    /// cut lines longer than `max_chars` down to it, ending in `…`, beginning at the `from_start` end
+    Shorten {
+        priority: u8,
+        max_chars: usize,
+        from_start: bool,
+    },
+}
+
+impl Cut {
+    fn priority(&self) -> u8 {
+        match *self {
+            Cut::Lines { priority, .. } | Cut::Shorten { priority, .. } => priority,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Section {
     pub name: &'static str,
     pub lines: Vec<String>,
-    pub cut: Cut,
+    pub cuts: Vec<Cut>,
     pub kind: TextKind,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Packed {
     pub text: String,
     /// lines dropped per section, for sections where any were
     pub cut: Vec<(&'static str, usize)>,
+    /// lines shortened per section, for sections where any were
+    pub shortened: Vec<(&'static str, usize)>,
     pub tokens: usize,
+    /// the sections as packed; a section whose every line was dropped holds `CUT_MARKER`
+    pub sections: Vec<Section>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BudgetError {
-    /// `section` is the largest section that cannot be cut; `needed` is the size of the whole prompt after every cut
+    /// every step was taken and the prompt still overflows; `section` is its largest section and `needed` the size
+    /// of the whole prompt after every cut
     Uncuttable {
         section: &'static str,
         needed: usize,
@@ -110,7 +140,8 @@ impl fmt::Display for BudgetError {
             } => {
                 write!(
                     f,
-                    "section \"{section}\" cannot be cut: the prompt needs {needed} tokens, the budget is {budget}"
+                    "after every cut the prompt needs {needed} tokens, the budget is {budget}; the largest section is \
+                     \"{section}\""
                 )
             }
         }
@@ -124,14 +155,25 @@ pub fn budget(context_window: u32, output_reserve: usize) -> usize {
     (context_window as usize * 4 / 5).saturating_sub(output_reserve)
 }
 
+/// At most `max` characters, ending in `…` when cut.
+pub fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
 struct Work {
     name: &'static str,
     lines: VecDeque<String>,
-    cut: Cut,
+    cuts: Vec<Cut>,
     kind: TextKind,
     /// characters of all lines plus one newline between each pair
     body_chars: usize,
     dropped: usize,
+    shortened: usize,
 }
 
 impl Work {
@@ -141,10 +183,11 @@ impl Work {
         Self {
             name: section.name,
             lines: section.lines.into(),
-            cut: section.cut,
+            cuts: section.cuts,
             kind: section.kind,
             body_chars,
             dropped: 0,
+            shortened: 0,
         }
     }
 
@@ -164,6 +207,41 @@ impl Work {
 
     fn tokens(&self, cal: &Calibration) -> usize {
         cal.estimate_chars(self.rendered_chars(), self.kind)
+    }
+
+    /// The line `Shorten` would cut next: the first one too long, counted from its end.
+    fn too_long(&self, max_chars: usize, from_start: bool) -> Option<usize> {
+        let long = |i: &usize| self.lines[*i].chars().count() > max_chars;
+        if from_start {
+            (0..self.lines.len()).find(long)
+        } else {
+            (0..self.lines.len()).rev().find(long)
+        }
+    }
+
+    fn can(&self, cut: &Cut) -> bool {
+        match *cut {
+            Cut::Lines { keep, .. } => self.lines.len() > keep,
+            Cut::Shorten {
+                max_chars, from_start, ..
+            } => self.too_long(max_chars, from_start).is_some(),
+        }
+    }
+
+    fn apply(&mut self, cut: Cut) {
+        match cut {
+            Cut::Lines { from_start, .. } => self.drop_line(from_start),
+            Cut::Shorten {
+                max_chars, from_start, ..
+            } => {
+                if let Some(i) = self.too_long(max_chars, from_start) {
+                    let short = truncate(&self.lines[i], max_chars);
+                    self.body_chars -= self.lines[i].chars().count() - short.chars().count();
+                    self.lines[i] = short;
+                    self.shortened += 1;
+                }
+            }
+        }
     }
 
     fn drop_line(&mut self, from_start: bool) {
@@ -193,30 +271,34 @@ impl Work {
         }
         out.push_str("\n\n");
     }
+
+    fn into_section(self) -> Section {
+        let mut lines: Vec<String> = self.lines.into();
+        if lines.is_empty() && self.dropped > 0 {
+            lines.push(CUT_MARKER.to_string());
+        }
+        Section {
+            name: self.name,
+            lines,
+            cuts: self.cuts,
+            kind: self.kind,
+        }
+    }
 }
 
-/// Joins the sections as `## name\nlines\n\n`, dropping lines one at a time (lowest priority number first, from
-/// the section's chosen end; on equal priority the later section first) until the estimate fits `budget`.
+/// Joins the sections as `## name\nlines\n\n`, taking one step at a time (lowest priority number first; on equal
+/// priority the later section first) until the estimate fits `budget`. Only when no step is left is it refused.
 pub fn pack(sections: Vec<Section>, budget: usize, cal: &Calibration) -> Result<Packed, BudgetError> {
     let mut work: Vec<Work> = sections.into_iter().map(Work::new).collect();
     let mut total: usize = work.iter().map(|w| w.tokens(cal)).sum();
     while total > budget {
-        let victim = work
+        let step = work
             .iter()
             .enumerate()
-            .filter(|(_, w)| !w.lines.is_empty())
-            .filter_map(|(i, w)| match w.cut {
-                Cut::Lines { priority, from_start } => Some((priority, std::cmp::Reverse(i), i, from_start)),
-                Cut::Never => None,
-            })
-            .min();
-        let Some((_, _, index, from_start)) = victim else {
-            let section = work
-                .iter()
-                .filter(|w| w.cut == Cut::Never)
-                .max_by_key(|w| w.tokens(cal))
-                .or_else(|| work.iter().max_by_key(|w| w.tokens(cal)))
-                .map_or("", |w| w.name);
+            .flat_map(|(i, w)| w.cuts.iter().filter(|c| w.can(c)).map(move |&c| (i, c)))
+            .min_by_key(|&(i, c)| (c.priority(), std::cmp::Reverse(i)));
+        let Some((index, cut)) = step else {
+            let section = work.iter().max_by_key(|w| w.tokens(cal)).map_or("", |w| w.name);
             return Err(BudgetError::Uncuttable {
                 section,
                 needed: total,
@@ -224,22 +306,27 @@ pub fn pack(sections: Vec<Section>, budget: usize, cal: &Calibration) -> Result<
             });
         };
         let before = work[index].tokens(cal);
-        work[index].drop_line(from_start);
+        work[index].apply(cut);
         total = total - before + work[index].tokens(cal);
     }
     let mut text = String::new();
     for w in &work {
         w.render(&mut text);
     }
-    let cut = work
-        .iter()
-        .filter(|w| w.dropped > 0)
-        .map(|w| (w.name, w.dropped))
-        .collect();
+    let count = |n: fn(&Work) -> usize| {
+        work.iter()
+            .filter(|w| n(w) > 0)
+            .map(|w| (w.name, n(w)))
+            .collect::<Vec<_>>()
+    };
+    let cut = count(|w| w.dropped);
+    let shortened = count(|w| w.shortened);
     Ok(Packed {
         text,
         cut,
+        shortened,
         tokens: total,
+        sections: work.into_iter().map(Work::into_section).collect(),
     })
 }
 
@@ -255,7 +342,7 @@ mod tests {
         Section {
             name,
             lines: lines(tag, 4),
-            cut,
+            cuts: vec![cut],
             kind: TextKind::Prose,
         }
     }
@@ -281,6 +368,7 @@ mod tests {
                     Cut::Lines {
                         priority: 1,
                         from_start: false,
+                        keep: 0,
                     },
                 ),
                 section(
@@ -289,6 +377,7 @@ mod tests {
                     Cut::Lines {
                         priority: 2,
                         from_start: true,
+                        keep: 0,
                     },
                 ),
             ]
@@ -309,11 +398,11 @@ mod tests {
     }
 
     #[test]
-    fn pack_refuses_when_uncuttable_overflows() {
+    fn pack_refuses_only_when_no_step_is_left() {
         let pinned = Section {
             name: "pinned",
             lines: lines("pin", 20),
-            cut: Cut::Never,
+            cuts: Vec::new(),
             kind: TextKind::Prose,
         };
         let err = pack(vec![pinned], 10, &Calibration::default()).unwrap_err();
@@ -325,5 +414,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn last_resort_steps_shorten_before_they_drop_and_keep_the_floor() {
+        let make = || {
+            vec![
+                Section {
+                    name: "pinned",
+                    lines: vec!["p".repeat(300), "q".repeat(300)],
+                    cuts: vec![
+                        Cut::Shorten {
+                            priority: 3,
+                            max_chars: 60,
+                            from_start: true,
+                        },
+                        Cut::Lines {
+                            priority: 5,
+                            from_start: true,
+                            keep: 0,
+                        },
+                    ],
+                    kind: TextKind::Prose,
+                },
+                Section {
+                    name: "new",
+                    lines: vec!["n".repeat(300), "m".repeat(300)],
+                    cuts: vec![
+                        Cut::Lines {
+                            priority: 2,
+                            from_start: false,
+                            keep: 1,
+                        },
+                        Cut::Shorten {
+                            priority: 4,
+                            max_chars: 30,
+                            from_start: false,
+                        },
+                    ],
+                    kind: TextKind::Prose,
+                },
+            ]
+        };
+        let cal = Calibration::default();
+        let full = pack(make(), usize::MAX, &cal).unwrap();
+
+        // the newest entry goes, the oldest stays whole, the oldest pinned line is shortened
+        let mild = pack(make(), full.tokens - 110, &cal).unwrap();
+        assert_eq!(mild.cut, vec![("new", 1)]);
+        assert_eq!(mild.shortened, vec![("pinned", 1)]);
+        assert!(mild.text.contains(&format!("{}…\n{}", "p".repeat(59), "q".repeat(300))));
+        assert!(mild.text.contains(&"n".repeat(300)));
+
+        // at the floor: one pinned line dropped, the kept entry shortened, never dropped
+        let tight = pack(make(), 25, &cal).unwrap();
+        assert!(tight.tokens <= 25);
+        assert_eq!(tight.cut, vec![("pinned", 2), ("new", 1)]);
+        assert!(tight.text.contains(&format!("## new\n{}…", "n".repeat(29))));
+        assert_eq!(tight.sections[0].lines, vec![CUT_MARKER.to_string()]);
+        assert_eq!(tight.sections[1].lines.len(), 1);
+
+        assert!(pack(make(), 10, &cal).is_err());
     }
 }
