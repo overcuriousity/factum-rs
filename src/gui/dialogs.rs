@@ -2,7 +2,9 @@
 
 use egui::{Align, Id, Layout, RichText, TextEdit};
 
+use super::companion_dialogs::CompanionSettingsDialog;
 use super::theme::{self, MONO_SIZE, SMALL_SIZE};
+use crate::companion::Settings;
 use crate::pystr::{head, splitlines, strip};
 use crate::signer::GpgKey;
 use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, SignatureCheck};
@@ -100,6 +102,11 @@ pub enum Dialog {
         title: String,
         text: String,
     },
+    CompanionSettings(Box<CompanionSettingsDialog>),
+    CaseGoal {
+        case_id: i64,
+        goal: String,
+    },
 }
 
 pub enum DialogResult {
@@ -141,21 +148,27 @@ pub enum DialogResult {
     KeySelected(String),
     NoGpg(NoGpgChoice, Pending),
     SealFolder(String),
+    CompanionSettings(Settings),
+    CaseGoal {
+        case_id: i64,
+        goal: String,
+    },
 }
 
-fn title(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).heading());
+pub(super) fn title(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let heading = ui.label(RichText::new(text).heading());
     ui.add_space(4.0);
+    heading
 }
 
-fn error_line(ui: &mut egui::Ui, error: &Option<String>) {
+pub(super) fn error_line(ui: &mut egui::Ui, error: &Option<String>) {
     if let Some(error) = error {
         ui.label(RichText::new(error).color(theme::current(ui.ctx()).fail));
     }
 }
 
 /// OK / Cancel buttons, right-aligned; returns (ok, cancel).
-fn buttons(ui: &mut egui::Ui, ok: &str, ok_enabled: bool) -> (bool, bool) {
+pub(super) fn buttons(ui: &mut egui::Ui, ok: &str, ok_enabled: bool) -> (bool, bool) {
     let mut result = (false, false);
     ui.add_space(6.0);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -250,10 +263,10 @@ impl Dialog {
         let modal = egui::Modal::new(Id::unique("factum-dialog")).show(ctx, |ui| {
             ui.set_width(match self {
                 Dialog::VerifyEntry { .. } => 820.0,
-                Dialog::Correct { .. } | Dialog::Shortcuts { .. } => 560.0,
+                Dialog::Correct { .. } | Dialog::Shortcuts { .. } | Dialog::CompanionSettings(_) => 560.0,
                 _ => 460.0,
             });
-            self.contents(ui)
+            self.contents(ui, ctx)
         });
         match modal.inner {
             Some(result) => Some(result),
@@ -262,9 +275,28 @@ impl Dialog {
         }
     }
 
-    fn contents(&mut self, ui: &mut egui::Ui) -> Option<DialogResult> {
+    fn contents(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<DialogResult> {
         let p = *theme::current(ui.ctx());
         match self {
+            Dialog::CompanionSettings(dialog) => dialog.show(ui, ctx),
+            Dialog::CaseGoal { case_id, goal } => {
+                let heading = title(ui, "Case goal");
+                ui.label(
+                    RichText::new("What this case has to establish; the companion asks its questions toward it.")
+                        .size(SMALL_SIZE)
+                        .color(p.muted),
+                );
+                ui.add(TextEdit::multiline(goal).desired_rows(4).desired_width(f32::INFINITY))
+                    .labelled_by(heading.id);
+                let (ok, cancel) = buttons(ui, "OK", true);
+                if ok {
+                    return Some(DialogResult::CaseGoal {
+                        case_id: *case_id,
+                        goal: strip(goal).to_string(),
+                    });
+                }
+                cancel.then_some(DialogResult::Cancel)
+            }
             Dialog::NewCase {
                 file,
                 name,

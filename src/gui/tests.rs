@@ -5,6 +5,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use super::*;
+use crate::companion::Rating;
 use crate::signer::FakeSigner;
 
 struct Fixture {
@@ -47,7 +48,8 @@ impl Fixture {
         };
         let mut harness = builder.build_eframe(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
-            FactumApp::new(db, &cc.egui_ctx)
+            // no companion thread: tests have no endpoint; a stub handle is installed where commands matter
+            FactumApp::build(db, &cc.egui_ctx, false)
         });
         harness.run_ok();
         harness
@@ -312,4 +314,369 @@ fn dark_theme_renders() {
     harness.state_mut().set_theme(&ctx, "light");
     harness.run_ok();
     screenshot(&mut harness, "case-light");
+}
+
+fn open_companion_settings(harness: &mut Harness<'_, FactumApp>) {
+    harness.get_by_label("Companion").click();
+    harness.run_ok();
+    harness.get_by_label("Settings…").click();
+    harness.run_ok();
+}
+
+fn settings_dialog<'a>(harness: &'a Harness<'_, FactumApp>) -> &'a CompanionSettingsDialog {
+    match harness.state().dialogs.last() {
+        Some(Dialog::CompanionSettings(dialog)) => dialog,
+        _ => panic!("the companion settings dialog is not open"),
+    }
+}
+
+fn type_into(harness: &mut Harness<'_, FactumApp>, label: &str, text: &str) {
+    harness.get_by_label(label).focus();
+    harness.run_ok();
+    harness.get_by_label(label).type_text(text);
+    harness.run_ok();
+}
+
+/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit).
+fn run_until(harness: &mut Harness<'_, FactumApp>, done: impl Fn(&Harness<'_, FactumApp>) -> bool) {
+    for _ in 0..30 {
+        harness.run_ok();
+        if done(harness) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn companion_menu_absent_until_configured_and_settings_dialog_lists_models() {
+    let fixture = Fixture::new();
+    let llm = crate::companion::fake_llm::FakeLlm::start();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    assert!(harness.query_by_label_contains("QUESTIONS").is_none());
+    assert!(harness.query_by_label_contains("companion:").is_none());
+    open_companion_settings(&mut harness);
+    assert_eq!(
+        settings_dialog(&harness).models_status,
+        "Set the endpoint URL to load the model list."
+    );
+    type_into(&mut harness, "Endpoint URL", &llm.url);
+    run_until(&mut harness, |h| {
+        settings_dialog(h).models_status == "2 models from the endpoint."
+    });
+    assert_eq!(settings_dialog(&harness).models_status, "2 models from the endpoint.");
+    assert_eq!(
+        settings_dialog(&harness).draft.model,
+        "",
+        "the listing fills the dropdown, not the field"
+    );
+    screenshot(&mut harness, "companion-settings");
+}
+
+#[test]
+fn an_invalid_context_window_keeps_the_dialog_and_saves_nothing() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    type_into(&mut harness, "Endpoint URL", "http://127.0.0.1:1");
+    type_into(&mut harness, "Context window", "lots");
+    harness.get_by_label("Test connection").scroll_to_me();
+    harness.run_ok();
+    harness.get_by_label("Test connection").click();
+    harness.run_ok();
+    assert!(settings_dialog(&harness).probe_worker.is_none());
+    harness.get_by_label("OK").click();
+    harness.run_ok();
+    assert!(
+        harness
+            .query_by_label("The context window is a number of tokens.")
+            .is_some()
+    );
+    settings_dialog(&harness);
+    assert!(!companion_db_path(&fixture.path).exists());
+}
+
+#[test]
+fn settings_dialog_saves_trimmed_and_starts_thread() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    type_into(&mut harness, "Endpoint URL", " http://127.0.0.1:1 ");
+    type_into(&mut harness, "Model", " m ");
+    harness.get_by_label("OK").click();
+    harness.run_ok();
+    let cdb = CompanionDb::open_for(&fixture.path).unwrap();
+    let saved = Settings::load(&cdb).unwrap();
+    assert_eq!(saved.model, "m");
+    assert_eq!(saved.endpoint_url, "http://127.0.0.1:1");
+    assert!(harness.state().companion.is_some());
+}
+
+#[test]
+fn test_connection_reports_unreachable() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    type_into(&mut harness, "Endpoint URL", "http://127.0.0.1:1");
+    // the dialog scrolls in a small window
+    harness.get_by_label("Test connection").scroll_to_me();
+    harness.run_ok();
+    harness.get_by_label("Test connection").click();
+    run_until(&mut harness, |h| settings_dialog(h).probe.is_some());
+    let probe = settings_dialog(&harness).probe.clone().unwrap();
+    assert!(probe.unwrap_err().contains("Unreachable"));
+}
+
+/// Saves configured companion settings, so the Questions section exists without a running thread.
+fn configure_companion(fixture: &Fixture) -> CompanionDb {
+    let cdb = CompanionDb::open_for(&fixture.path).unwrap();
+    Settings {
+        endpoint_url: "http://127.0.0.1:1".into(),
+        model: "m".into(),
+        ..Settings::default()
+    }
+    .save(&cdb)
+    .unwrap();
+    cdb
+}
+
+fn first_note_versions(fixture: &Fixture) -> (i64, Vec<i64>) {
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let factum = Factum::with_seal_dir(&db, &signer, None);
+    let case_id = factum.list_cases(false).unwrap()[0];
+    let note = factum.list_entries(case_id, &EntryFilter::notes()).unwrap()[0];
+    (case_id, factum.history(note).unwrap())
+}
+
+fn ask(cdb: &CompanionDb, case_id: i64, text: &str, rests_on: Vec<i64>) -> i64 {
+    let question = crate::companion::NewQuestion {
+        text: text.into(),
+        archetype: crate::companion::Archetype::Document,
+        rests_on,
+    };
+    cdb.insert_question(case_id, None, &question).unwrap()
+}
+
+#[test]
+fn side_panel_is_stacked_pinned_first() {
+    let fixture = Fixture::new();
+    let (_, versions) = first_note_versions(&fixture);
+    let mut harness = fixture.harness();
+    harness.state().factum().set_pinned(versions[1], true).unwrap();
+    select_case(&mut harness);
+    let pinned = harness.get_by_label("PINNED 1").rect();
+    let iocs = harness.get_by_label_contains("IOCS").rect();
+    assert!(pinned.min.y < iocs.min.y, "Pinned is above the IoCs");
+    // both sections are on screen at once (the note in the log and pinned), the IoCs closed
+    assert_eq!(harness.get_all_by_label_contains("first note, corrected").count(), 2);
+    assert!(harness.query_by_label_contains("IP  (1)").is_none());
+}
+
+#[test]
+fn questions_section_absent_when_unconfigured() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    assert!(harness.query_by_label_contains("QUESTIONS").is_none());
+    assert!(harness.query_by_label_contains("No goal set").is_none());
+    assert!(harness.query_by_label("Companion for this case").is_none());
+    assert!(
+        !companion_db_path(&fixture.path).exists(),
+        "an unconfigured companion leaves no file behind"
+    );
+}
+
+#[test]
+fn questions_section_shows_goal_row_and_rows_in_position_order() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let (case_id, versions) = first_note_versions(&fixture);
+    ask(&cdb, case_id, "Which tool imaged the disk?", vec![versions[1]]);
+    ask(&cdb, case_id, "Who held the disk overnight?", vec![versions[1]]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    assert!(harness.query_by_label("QUESTIONS 2").is_some());
+    let goal = harness.get_by_label("No goal set for this case. Set it…").rect();
+    let first = harness.get_by_label("Which tool imaged the disk?").rect();
+    let second = harness.get_by_label("Who held the disk overnight?").rect();
+    assert!(goal.min.y < first.min.y && first.min.y < second.min.y);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().set_theme(&ctx, "light");
+    harness.run_ok();
+    screenshot(&mut harness, "questions-light");
+    harness.state_mut().set_theme(&ctx, "dark");
+    harness.run_ok();
+    screenshot(&mut harness, "questions-dark");
+}
+
+#[test]
+fn minus_removes_row_and_plus_keeps_it() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let (case_id, versions) = first_note_versions(&fixture);
+    let q1 = ask(&cdb, case_id, "Which tool imaged the disk?", vec![versions[1]]);
+    let q2 = ask(&cdb, case_id, "Who held the disk overnight?", vec![versions[1]]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.get_all_by_label("−").next().unwrap().click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Which tool imaged the disk?").is_none());
+    harness.get_by_label("+").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Who held the disk overnight?").is_some());
+    let open = cdb.open_questions(case_id).unwrap();
+    assert_eq!(
+        open.iter().map(|q| (q.id, q.rating)).collect::<Vec<_>>(),
+        [(q2, Rating::Plus)]
+    );
+    assert!(
+        cdb.resolved_questions(case_id)
+            .unwrap()
+            .iter()
+            .any(|q| q.id == q1 && q.rating == Rating::Minus)
+    );
+}
+
+#[test]
+fn entry_link_jumps_to_newest_version() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let (case_id, versions) = first_note_versions(&fixture);
+    ask(&cdb, case_id, "Which tool imaged the disk?", vec![versions[0]]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    assert_eq!(harness.state().focused_card, None);
+    harness.get_by_label(&format!("#{}", versions[0])).click();
+    harness.run_ok();
+    assert_eq!(harness.state().focused_card, Some(versions[1]));
+}
+
+#[test]
+fn case_toggle_hides_section_and_goal_dialog_writes_goal() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let (case_id, _) = first_note_versions(&fixture);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.get_by_label("⋯").click();
+    harness.run_ok();
+    harness.get_by_label("Case goal…").click();
+    harness.run_ok();
+    type_into(&mut harness, "Case goal", "Establish how the disk left the building");
+    harness.get_by_label("OK").click();
+    harness.run_ok();
+    assert_eq!(
+        cdb.case_settings(case_id).unwrap().unwrap().goal,
+        "Establish how the disk left the building"
+    );
+    assert!(harness.query_by_label_contains("No goal set").is_none());
+    assert!(harness.query_by_label_contains("QUESTIONS").is_some());
+    harness.get_by_label("⋯").click();
+    harness.run_ok();
+    harness.get_by_label("Companion for this case").click();
+    harness.run_ok();
+    assert!(!cdb.case_settings(case_id).unwrap().unwrap().enabled);
+    assert!(harness.query_by_label_contains("QUESTIONS").is_none());
+}
+
+#[test]
+fn local_note_sends_case_changed() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    cdb.ensure_case(case_id).unwrap(); // what the thread does when the case is selected
+    let commands = harness.state_mut().install_companion_stub();
+    harness.run_ok();
+    let _: Vec<Command> = commands.try_iter().collect(); // what the first rebuild reports
+    harness.state_mut().composer = "a second note".into();
+    harness.state_mut().submit_note();
+    harness.run_ok();
+    assert!(commands.try_iter().any(|cmd| cmd == Command::CaseChanged(case_id)));
+}
+
+/// Opens an item of the Questions section's ▾ menu.
+fn questions_menu(harness: &mut Harness<'_, FactumApp>, item: &str) {
+    harness.get_by_label("▾").click();
+    harness.run_ok();
+    harness.get_by_label(item).click();
+    harness.run_ok();
+}
+
+#[test]
+fn history_lists_resolved_and_unlink_restores() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let (case_id, versions) = first_note_versions(&fixture);
+    let answered = ask(&cdb, case_id, "Which tool imaged the disk?", vec![versions[1]]);
+    let rejected = ask(&cdb, case_id, "Who held the disk overnight?", vec![versions[1]]);
+    let pass = cdb.begin_pass(case_id, crate::companion::PassKind::Full, "m").unwrap();
+    cdb.answer_question(answered, versions[1], pass).unwrap();
+    cdb.rate_question(rejected, Rating::Minus).unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    questions_menu(&mut harness, "History…");
+    assert!(harness.query_by_label("Which tool imaged the disk?").is_some());
+    assert!(harness.query_by_label("Who held the disk overnight?").is_some());
+    screenshot(&mut harness, "companion-history");
+    harness.get_by_label("Unlink").click();
+    harness.run_ok();
+    harness.get_by_label("Restore").click();
+    harness.run_ok();
+    let open: Vec<i64> = cdb.open_questions(case_id).unwrap().iter().map(|q| q.id).collect();
+    assert_eq!(open, [answered, rejected]);
+    assert!(harness.query_by_label("Unlink").is_none());
+    assert!(harness.query_by_label("No resolved questions.").is_some());
+    assert!(harness.query_by_label("QUESTIONS 2").is_some());
+}
+
+#[test]
+fn ask_window_runs_on_worker_and_shows_references() {
+    let fixture = Fixture::new();
+    let llm = crate::companion::fake_llm::FakeLlm::start();
+    let cdb = CompanionDb::open_for(&fixture.path).unwrap();
+    Settings {
+        endpoint_url: llm.url.clone(),
+        model: "m".into(),
+        ..Settings::default()
+    }
+    .save(&cdb)
+    .unwrap();
+    llm.push(200, &crate::companion::fake_llm::openai_chat("See [1].", "stop", 10));
+    let (_, versions) = first_note_versions(&fixture);
+    let mut harness = fixture.harness();
+    // pinned notes come first: the corrected note is excerpt [1]
+    harness.state().factum().set_pinned(versions[1], true).unwrap();
+    select_case(&mut harness);
+    questions_menu(&mut harness, "Ask…");
+    type_into(&mut harness, "Question", "Which tool imaged the disk?");
+    harness.get_by_label("Ask").click();
+    let link = format!("[1] #{}", versions[1]);
+    run_until(&mut harness, |h| h.query_by_label(&link).is_some());
+    assert!(harness.query_by_label("See [1].").is_some());
+    assert!(
+        harness
+            .query_by_label_contains("not found in the cited entries")
+            .is_none()
+    );
+    screenshot(&mut harness, "companion-ask");
+    harness.get_by_label(&link).click();
+    harness.run_ok();
+    assert_eq!(harness.state().focused_card, Some(versions[1]));
+}
+
+#[test]
+fn rethink_sends_command() {
+    let fixture = Fixture::new();
+    configure_companion(&fixture);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    let commands = harness.state_mut().install_companion_stub();
+    harness.run_ok();
+    questions_menu(&mut harness, "Re-think now");
+    assert!(commands.try_iter().any(|cmd| cmd == Command::Rethink(case_id)));
 }

@@ -1,0 +1,707 @@
+//! A blocking HTTP client for OpenAI-compatible and Anthropic-compatible chat endpoints.
+
+use std::cell::Cell;
+use std::fmt;
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+use crate::companion::store::{Protocol, Settings};
+use crate::companion::tokens::{Calibration, DEFAULT_CONTEXT_WINDOW, TextKind};
+
+const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ERROR_BODY_CHARS: usize = 200;
+/// Most output tokens a thinking model gets on top of a call's own `max_tokens`.
+const MAX_THINKING_ALLOWANCE: usize = 8192;
+const THINKING_ONLY: &str = "the model spent its whole output allowance on thinking: choose a model without \
+     thinking (or with a thinking budget on the server), or a larger context window";
+
+#[derive(Debug)]
+pub enum LlmError {
+    Unreachable(String),
+    Timeout,
+    Http { status: u16, body: String },
+    BadResponse(String),
+}
+
+impl LlmError {
+    /// Worth one more try: the network, the server or its rate limit may recover.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            LlmError::Unreachable(_) | LlmError::Timeout => true,
+            LlmError::Http { status, .. } => matches!(status, 408 | 409 | 429 | 500..=599),
+            LlmError::BadResponse(_) => false,
+        }
+    }
+}
+
+impl fmt::Display for LlmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LlmError::Unreachable(reason) => write!(f, "Unreachable: {reason}"),
+            LlmError::Timeout => write!(f, "Timeout"),
+            LlmError::Http { status, body } => {
+                let body: String = body.chars().take(ERROR_BODY_CHARS).collect();
+                write!(f, "HTTP {status}: {body}")
+            }
+            LlmError::BadResponse(reason) => write!(f, "Bad response: {reason}"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub max_input_tokens: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+pub struct ChatRequest<'a> {
+    pub system: &'a str,
+    pub turns: &'a [(Role, &'a str)],
+    pub max_tokens: u32,
+    pub json: bool,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatResponse {
+    pub text: String,
+    pub truncated: bool,
+    /// the model returned thinking besides the text (`reasoning_content`, `reasoning`, or thinking blocks)
+    pub reasoning: bool,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ModelList {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+    max_input_tokens: Option<u32>,
+}
+
+/// The models or chat route below the base URL, one trailing `/` of the base trimmed.
+fn route(settings: &Settings, chat: bool) -> String {
+    let base = settings.endpoint_url.trim();
+    let base = base.strip_suffix('/').unwrap_or(base);
+    let path = match (settings.protocol, chat) {
+        (Protocol::OpenAi, false) => "models",
+        (Protocol::OpenAi, true) => "chat/completions",
+        (Protocol::Anthropic, false) => "v1/models?limit=1000",
+        (Protocol::Anthropic, true) => "v1/messages",
+    };
+    format!("{base}/{path}")
+}
+
+/// Auth, protocol and user-configured headers; an extra header replaces a built-in one of the same name, and
+/// `extra_headers` that are not a JSON object are ignored.
+fn headers(settings: &Settings) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let key = !settings.api_key.is_empty();
+    match settings.protocol {
+        Protocol::OpenAi if key => {
+            out.push(("Authorization".to_string(), format!("Bearer {}", settings.api_key)));
+        }
+        Protocol::Anthropic => {
+            if key {
+                out.push(("x-api-key".to_string(), settings.api_key.clone()));
+            }
+            out.push(("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()));
+        }
+        Protocol::OpenAi => {}
+    }
+    if let Ok(Value::Object(extra)) = serde_json::from_str(&settings.extra_headers) {
+        for (name, value) in extra {
+            if let Some(value) = value.as_str() {
+                out.retain(|(existing, _)| !existing.eq_ignore_ascii_case(&name));
+                out.push((name, value.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn map_error(e: ureq::Error) -> LlmError {
+    match e {
+        ureq::Error::Timeout(_) => LlmError::Timeout,
+        ureq::Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => LlmError::Timeout,
+        ureq::Error::Protocol(_) | ureq::Error::Http(_) | ureq::Error::BadUri(_) => {
+            LlmError::BadResponse(e.to_string())
+        }
+        other => LlmError::Unreachable(other.to_string()),
+    }
+}
+
+/// One request; `body` makes it a JSON POST. Returns the body of a non-error response.
+fn send(settings: &Settings, url: &str, body: Option<&str>, timeout: Duration) -> Result<String, LlmError> {
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    let mut config = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        // a redirect could carry the API key to another host
+        .max_redirects(0)
+        .tls_config(tls);
+    if !settings.user_agent.is_empty() {
+        config = config.user_agent(settings.user_agent.as_str());
+    }
+    let agent = ureq::Agent::new_with_config(config.build());
+    let headers = headers(settings);
+    let result = match body {
+        None => {
+            let mut r = agent.get(url);
+            for (k, v) in &headers {
+                r = r.header(k, v);
+            }
+            r.call()
+        }
+        Some(body) => {
+            let mut r = agent.post(url).header("Content-Type", "application/json");
+            for (k, v) in &headers {
+                r = r.header(k, v);
+            }
+            r.send(body)
+        }
+    };
+    let mut response = result.map_err(map_error)?;
+    let status = response.status().as_u16();
+    let text = response.body_mut().read_to_string().map_err(map_error)?;
+    // redirects are not followed, so a 3xx is a failure too
+    if status >= 300 {
+        return Err(LlmError::Http { status, body: text });
+    }
+    Ok(text)
+}
+
+pub fn list_models(settings: &Settings) -> Result<Vec<ModelInfo>, LlmError> {
+    let text = send(settings, &route(settings, false), None, LIST_TIMEOUT)?;
+    let list: ModelList = serde_json::from_str(&text).map_err(|e| LlmError::BadResponse(e.to_string()))?;
+    let mut models: Vec<ModelInfo> = list
+        .data
+        .into_iter()
+        .map(|m| ModelInfo {
+            id: m.id,
+            max_input_tokens: m.max_input_tokens,
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    Ok(models)
+}
+
+/// `list_models` under the name the settings dialog uses.
+pub fn probe(settings: &Settings) -> Result<Vec<ModelInfo>, LlmError> {
+    list_models(settings)
+}
+
+/// The text of a message `content`: a string, `null` (nothing, e.g. when thinking used up the allowance) or a list
+/// of text parts.
+fn content_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        None | Some(Value::Null) => Some(String::new()),
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect(),
+        ),
+        Some(_) => None,
+    }
+}
+
+fn parse_chat(protocol: Protocol, text: &str) -> Result<ChatResponse, LlmError> {
+    let bad = |what: &str| LlmError::BadResponse(what.to_string());
+    let v: Value = serde_json::from_str(text).map_err(|e| LlmError::BadResponse(e.to_string()))?;
+    let count = |p: &str| v.pointer(p).and_then(Value::as_u64).map(|n| n as u32);
+    if protocol == Protocol::OpenAi {
+        let message = v.pointer("/choices/0/message").ok_or_else(|| bad("no message"))?;
+        // llama.cpp and DeepSeek name it reasoning_content, vLLM and OpenRouter reasoning
+        let reasoning = ["reasoning_content", "reasoning"].iter().any(|field| {
+            message
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|r| !r.trim().is_empty())
+        });
+        Ok(ChatResponse {
+            text: content_text(message.get("content")).ok_or_else(|| bad("no message content"))?,
+            truncated: v.pointer("/choices/0/finish_reason").and_then(Value::as_str) == Some("length"),
+            reasoning,
+            prompt_tokens: count("/usage/prompt_tokens"),
+            completion_tokens: count("/usage/completion_tokens"),
+        })
+    } else {
+        let blocks = v
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| bad("no content"))?;
+        let text: String = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect();
+        let reasoning = blocks.iter().any(|b| {
+            matches!(
+                b.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            )
+        });
+        Ok(ChatResponse {
+            text,
+            truncated: v.get("stop_reason").and_then(Value::as_str) == Some("max_tokens"),
+            reasoning,
+            prompt_tokens: count("/usage/input_tokens"),
+            completion_tokens: count("/usage/output_tokens"),
+        })
+    }
+}
+
+/// Used from one thread at a time.
+pub struct Client {
+    settings: Settings,
+    retry_delay: Duration,
+    calibration: Cell<Calibration>,
+    json_rejected: Cell<bool>,
+    completion_param: Cell<bool>,
+    /// the model's input window from the endpoint's listing, when known
+    context_window: Cell<Option<u32>>,
+    /// the model has returned thinking: its calls get the thinking allowance from the start
+    thinks: Cell<bool>,
+}
+
+impl Client {
+    pub fn new(settings: Settings) -> Client {
+        Self::with_retry_delay(settings, Duration::from_secs(5))
+    }
+
+    pub fn with_retry_delay(settings: Settings, retry_delay: Duration) -> Client {
+        Client {
+            settings,
+            retry_delay,
+            calibration: Cell::new(Calibration::default()),
+            json_rejected: Cell::new(false),
+            completion_param: Cell::new(false),
+            context_window: Cell::new(None),
+            thinks: Cell::new(false),
+        }
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    pub fn calibration(&self) -> Calibration {
+        self.calibration.get()
+    }
+
+    /// Remembers the model's input window, e.g. Anthropic's `max_input_tokens` from the probe listing.
+    pub fn set_context_window(&self, window: Option<u32>) {
+        self.context_window.set(window);
+    }
+
+    /// The window from the listing; the `context_window` setting takes precedence over it.
+    pub fn context_window(&self) -> Option<u32> {
+        self.context_window.get()
+    }
+
+    /// The window prompts are budgeted for: the setting, else the listing's, else `DEFAULT_CONTEXT_WINDOW`.
+    pub fn window(&self) -> u32 {
+        self.settings
+            .context_window
+            .or(self.context_window.get())
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+    }
+
+    /// The output tokens a thinking model may spend on top of the call's `max_tokens`: what the window leaves after
+    /// the prompt and `max_tokens`, a tenth of the window kept spare, at most `MAX_THINKING_ALLOWANCE`. Thinking
+    /// counts against the output limit on every server; this keeps it from eating the answer's share.
+    fn thinking_allowance(&self, req: &ChatRequest) -> u32 {
+        let calibration = self.calibration.get();
+        let prompt = calibration.estimate(req.system, TextKind::Prose)
+            + req
+                .turns
+                .iter()
+                .map(|(_, text)| calibration.estimate(text, TextKind::Prose))
+                .sum::<usize>();
+        let room = (self.window() as usize * 9 / 10).saturating_sub(prompt + req.max_tokens as usize);
+        room.min(MAX_THINKING_ALLOWANCE) as u32
+    }
+
+    /// One retry after the retry delay on a retryable error.
+    pub fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        match self.chat_once(req) {
+            Err(e) if e.is_retryable() => {
+                log::warn!("companion request failed, retrying once: {e}");
+                std::thread::sleep(self.retry_delay);
+                self.chat_once(req)
+            }
+            other => other,
+        }
+    }
+
+    /// A thinking model's thinking counts against `max_tokens`. Once a model has thought, its calls get the thinking
+    /// allowance on top; the call on which that is found out and that was cut off is sent again with it. A reply
+    /// that is still nothing but thinking is an error that says so.
+    fn chat_once(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        let allowance = self.thinking_allowance(req);
+        let extra = if self.thinks.get() { allowance } else { 0 };
+        let mut response = self.chat_with(req, req.max_tokens + extra)?;
+        if response.reasoning {
+            self.thinks.set(true);
+            if response.truncated && extra == 0 && allowance > 0 {
+                log::info!("companion: the model thinks; its output allowance is raised by {allowance} tokens");
+                response = self.chat_with(req, req.max_tokens + allowance)?;
+            }
+            if response.text.trim().is_empty() {
+                return Err(LlmError::BadResponse(if response.truncated {
+                    THINKING_ONLY.to_string()
+                } else {
+                    "the model returned thinking but no answer".to_string()
+                }));
+            }
+        }
+        Ok(response)
+    }
+
+    /// OpenAI-compatible servers may reject `response_format` or `max_tokens` (reasoning models
+    /// want `max_completion_tokens`) with a 400 naming it: resend without or with the other
+    /// name, and remember that for the session once the server stops naming it.
+    fn chat_with(&self, req: &ChatRequest, max_tokens: u32) -> Result<ChatResponse, LlmError> {
+        let mut json_mode = req.json && self.settings.protocol == Protocol::OpenAi && !self.json_rejected.get();
+        let mut completion_param = self.completion_param.get();
+        let (mut dropped_json, mut switched_param) = (false, false);
+        let mut result = self.post_chat(req, max_tokens, json_mode, completion_param);
+        for _ in 0..2 {
+            let Err(LlmError::Http { status: 400, body }) = &result else {
+                break;
+            };
+            if self.settings.protocol != Protocol::OpenAi {
+                break;
+            }
+            if json_mode && body.contains("response_format") {
+                json_mode = false;
+                dropped_json = true;
+            } else if !completion_param && body.contains("max_tokens") {
+                completion_param = true;
+                switched_param = true;
+            } else {
+                break;
+            }
+            result = self.post_chat(req, max_tokens, json_mode, completion_param);
+        }
+        // a 400 that names the limit for another reason (e.g. too large for the context) must not stick
+        if !matches!(result, Err(LlmError::Http { status: 400, .. })) {
+            if dropped_json {
+                self.json_rejected.set(true);
+            }
+            if switched_param {
+                self.completion_param.set(true);
+            }
+        }
+        result
+    }
+
+    fn post_chat(
+        &self,
+        req: &ChatRequest,
+        max_tokens: u32,
+        json_mode: bool,
+        completion_param: bool,
+    ) -> Result<ChatResponse, LlmError> {
+        let role = |r: Role| if r == Role::User { "user" } else { "assistant" };
+        let turns = req
+            .turns
+            .iter()
+            .map(|&(r, text)| json!({"role": role(r), "content": text}));
+        let limit = if completion_param {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        let mut body = json!({"model": self.settings.model, limit: max_tokens});
+        if self.settings.protocol == Protocol::OpenAi {
+            // an empty system prompt is left out on both protocols
+            let system = (!req.system.is_empty()).then(|| json!({"role": "system", "content": req.system}));
+            body["messages"] = Value::Array(system.into_iter().chain(turns).collect());
+            if json_mode {
+                body["response_format"] = json!({"type": "json_object"});
+            }
+        } else {
+            if !req.system.is_empty() {
+                body["system"] = json!(req.system);
+            }
+            body["messages"] = Value::Array(turns.collect());
+        }
+        let text = send(
+            &self.settings,
+            &route(&self.settings, true),
+            Some(&body.to_string()),
+            req.timeout,
+        )?;
+        let response = parse_chat(self.settings.protocol, &text)?;
+        let chars = req.system.chars().count() + req.turns.iter().map(|(_, t)| t.chars().count()).sum::<usize>();
+        if let Some(tokens) = response.prompt_tokens {
+            let mut calibration = self.calibration.get();
+            calibration.observe(chars, tokens);
+            self.calibration.set(calibration);
+        }
+        Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::companion::fake_llm::*;
+
+    fn settings(url: &str, protocol: Protocol) -> Settings {
+        Settings {
+            endpoint_url: url.to_string(),
+            protocol,
+            api_key: "k".into(),
+            api_key_from_env: false,
+            user_agent: "factum-test".into(),
+            extra_headers: String::new(),
+            model: "m".into(),
+            context_window: None,
+            global_guideline: String::new(),
+            enabled: true,
+        }
+    }
+
+    fn openai(fake: &FakeLlm) -> Settings {
+        settings(&format!("{}/v1", fake.url), Protocol::OpenAi)
+    }
+
+    fn client(s: Settings) -> Client {
+        Client::with_retry_delay(s, Duration::ZERO)
+    }
+
+    fn req<'a>(turns: &'a [(Role, &'a str)], json: bool) -> ChatRequest<'a> {
+        ChatRequest {
+            system: "sys",
+            turns,
+            max_tokens: 100,
+            json,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn has_header(r: &FakeRequest, name: &str, value: &str) -> bool {
+        r.headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case(name) && v == value)
+    }
+
+    #[test]
+    fn list_models_openai_sorts_and_dedups() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_models(&["b", "a", "b"]));
+        let ids: Vec<_> = list_models(&openai(&fake)).unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["a", "b"]);
+        let r = &fake.requests()[0];
+        assert_eq!(r.path, "/v1/models");
+        assert!(has_header(r, "authorization", "Bearer k"));
+    }
+
+    #[test]
+    fn list_models_anthropic_headers_and_window() {
+        let fake = FakeLlm::start();
+        fake.push(200, &anthropic_models(&[("claude-x", 200000)]));
+        let models = list_models(&settings(&fake.url, Protocol::Anthropic)).unwrap();
+        assert_eq!(models[0].max_input_tokens, Some(200000));
+        let r = &fake.requests()[0];
+        assert_eq!(r.path.split('?').next(), Some("/v1/models"));
+        assert!(has_header(r, "x-api-key", "k"));
+        assert!(has_header(r, "anthropic-version", "2023-06-01"));
+    }
+
+    #[test]
+    fn user_agent_and_extra_headers_are_sent() {
+        let fake = FakeLlm::start();
+        let mut s = openai(&fake);
+        s.extra_headers = r#"{"X-Lab":"1"}"#.into();
+        list_models(&s).unwrap();
+        let r = &fake.requests()[0];
+        assert!(has_header(r, "user-agent", "factum-test"));
+        assert!(has_header(r, "x-lab", "1"));
+    }
+
+    #[test]
+    fn chat_openai_json_mode_falls_back_on_400() {
+        let fake = FakeLlm::start();
+        fake.push(400, r#"{"error":{"message":"unknown parameter: response_format"}}"#);
+        fake.push(200, &openai_chat("{\"a\":1}", "stop", 10));
+        fake.push(200, &openai_chat("{\"a\":2}", "stop", 10));
+        let c = client(openai(&fake));
+        let turns = [(Role::User, "hi")];
+        assert_eq!(c.chat(&req(&turns, true)).unwrap().text, "{\"a\":1}");
+        c.chat(&req(&turns, true)).unwrap();
+        let reqs = fake.requests();
+        assert!(reqs[0].body.contains("json_object"));
+        assert!(!reqs[1].body.contains("json_object"));
+        assert!(!reqs[2].body.contains("json_object"));
+    }
+
+    #[test]
+    fn chat_openai_falls_back_to_max_completion_tokens() {
+        let fake = FakeLlm::start();
+        fake.push(400, r#"{"error":{"message":"Unsupported parameter: 'max_tokens'"}}"#);
+        fake.push(200, &openai_chat("ok", "stop", 1));
+        let turns = [(Role::User, "hi")];
+        assert_eq!(client(openai(&fake)).chat(&req(&turns, false)).unwrap().text, "ok");
+        let reqs = fake.requests();
+        assert!(reqs[1].body.contains("max_completion_tokens"));
+        assert!(!reqs[1].body.contains("\"max_tokens\""));
+    }
+
+    #[test]
+    fn extra_headers_replace_built_in_ones_and_no_empty_key_is_sent() {
+        let fake = FakeLlm::start();
+        let mut s = settings(&fake.url, Protocol::Anthropic);
+        s.api_key.clear();
+        s.extra_headers = r#"{"Anthropic-Version":"2024-01-01"}"#.into();
+        list_models(&s).unwrap();
+        let r = &fake.requests()[0];
+        let versions: Vec<_> = r
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("anthropic-version"))
+            .collect();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].1, "2024-01-01");
+        assert!(!r.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("x-api-key")));
+    }
+
+    #[test]
+    fn a_400_about_the_limit_for_another_reason_is_not_remembered() {
+        let fake = FakeLlm::start();
+        let too_large = r#"{"error":{"message":"'max_tokens' or 'max_completion_tokens' is too large"}}"#;
+        fake.push(400, too_large);
+        fake.push(400, too_large);
+        fake.push(200, &openai_chat("ok", "stop", 1));
+        let c = client(openai(&fake));
+        let turns = [(Role::User, "hi")];
+        assert!(c.chat(&req(&turns, false)).is_err());
+        c.chat(&req(&turns, false)).unwrap();
+        let reqs = fake.requests();
+        assert!(
+            reqs[2].body.contains("\"max_tokens\""),
+            "the switch did not help, so it is not kept"
+        );
+    }
+
+    #[test]
+    fn null_content_with_thinking_is_retried_with_the_thinking_allowance() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_chat_thinking(None, "let me think", "length"));
+        fake.push(200, &openai_chat_thinking(Some("{\"a\":1}"), "thought", "stop"));
+        fake.push(200, &openai_chat("{\"a\":2}", "stop", 1));
+        let mut s = openai(&fake);
+        s.context_window = Some(32_000);
+        let c = client(s);
+        let turns = [(Role::User, "hi")];
+        assert_eq!(c.chat(&req(&turns, true)).unwrap().text, "{\"a\":1}");
+        // the next call gets the allowance from the start
+        c.chat(&req(&turns, true)).unwrap();
+        let limit = |r: &FakeRequest| serde_json::from_str::<serde_json::Value>(&r.body).unwrap()["max_tokens"].clone();
+        let reqs = fake.requests();
+        assert_eq!(limit(&reqs[0]), 100);
+        assert_eq!(limit(&reqs[1]), 100 + 8192);
+        assert_eq!(limit(&reqs[2]), 100 + 8192);
+    }
+
+    #[test]
+    fn thinking_that_never_ends_is_a_clear_error() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_chat_thinking(Some(""), "hmm", "length"));
+        fake.push(200, &openai_chat_thinking(Some(""), "hmm hmm", "length"));
+        let turns = [(Role::User, "hi")];
+        let err = client(openai(&fake)).chat(&req(&turns, false)).unwrap_err();
+        assert!(err.to_string().contains("thinking"), "{err}");
+        // the default 16 000 window leaves more than the cap after this tiny prompt
+        let body: serde_json::Value = serde_json::from_str(&fake.requests()[1].body).unwrap();
+        assert_eq!(body["max_tokens"], 100 + 8192);
+    }
+
+    #[test]
+    fn chat_reports_truncation() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_chat("partial", "length", 5));
+        let turns = [(Role::User, "hi")];
+        assert!(client(openai(&fake)).chat(&req(&turns, false)).unwrap().truncated);
+    }
+
+    #[test]
+    fn chat_anthropic_sends_system_and_turns_without_prefill() {
+        let fake = FakeLlm::start();
+        fake.push(200, &anthropic_message("done", "end_turn"));
+        let turns = [(Role::User, "one"), (Role::Assistant, "two"), (Role::User, "three")];
+        let r = client(settings(&fake.url, Protocol::Anthropic))
+            .chat(&req(&turns, true))
+            .unwrap();
+        assert_eq!(r.text, "done");
+        let sent = &fake.requests()[0];
+        assert_eq!(sent.path, "/v1/messages");
+        let body: serde_json::Value = serde_json::from_str(&sent.body).unwrap();
+        assert_eq!(body["system"], "sys");
+        let roles: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+    }
+
+    #[test]
+    fn retryable_error_is_retried_once() {
+        let fake = FakeLlm::start();
+        fake.push(503, "busy");
+        fake.push(200, &openai_chat("ok", "stop", 1));
+        let turns = [(Role::User, "hi")];
+        assert_eq!(client(openai(&fake)).chat(&req(&turns, false)).unwrap().text, "ok");
+    }
+
+    #[test]
+    fn non_retryable_error_is_not_retried() {
+        let fake = FakeLlm::start();
+        fake.push(401, "no");
+        let turns = [(Role::User, "hi")];
+        assert!(matches!(
+            client(openai(&fake)).chat(&req(&turns, false)),
+            Err(LlmError::Http { status: 401, .. })
+        ));
+        assert_eq!(fake.requests().len(), 1);
+    }
+
+    #[test]
+    fn unreachable_host_is_unreachable() {
+        let s = settings("http://127.0.0.1:1/v1", Protocol::OpenAi);
+        assert!(matches!(list_models(&s), Err(LlmError::Unreachable(_))));
+    }
+
+    #[test]
+    fn calibration_updates_from_usage() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_chat("ok", "stop", 100));
+        let c = client(openai(&fake));
+        let prompt = "x".repeat(240 - 3);
+        let turns = [(Role::User, prompt.as_str())];
+        c.chat(&req(&turns, false)).unwrap(); // 237 + 3 chars of system = 240
+        assert!((c.calibration().chars_per_token - 2.4).abs() < 0.01);
+    }
+}

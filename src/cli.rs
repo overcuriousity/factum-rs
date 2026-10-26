@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::companion::{CompanionDb, companion_db_path};
 use crate::db::Db;
 use crate::error::{FactumError, Result};
 use crate::pystr::{head, splitlines, strip};
@@ -57,6 +58,9 @@ pub struct Args {
     /// Verify a case (default: the active case)
     #[arg(long, num_args = 0..=1, default_missing_value = ACTIVE, value_name = "CASE")]
     pub verify: Option<String>,
+    /// List the open questions of the analytical companion (default: the active case)
+    #[arg(long, num_args = 0..=1, default_missing_value = ACTIVE, value_name = "CASE")]
+    pub questions: Option<String>,
     /// With --verify: list every entry
     #[arg(short, long)]
     pub verbose: bool,
@@ -289,12 +293,33 @@ pub fn print_report(report: &CaseReport, verbose: bool, out: &mut dyn Write) -> 
     Ok(())
 }
 
+/// Read-only: a missing companion database is reported, never created.
+fn questions(factum: &Factum, case_id: i64, out: &mut dyn Write) -> Result<()> {
+    if !companion_db_path(&factum.db.path).exists() {
+        writeln!(out, "The companion is not configured.")?;
+        return Ok(());
+    }
+    let open = CompanionDb::open_for(&factum.db.path)?.open_questions(case_id)?;
+    if open.is_empty() {
+        writeln!(out, "No open questions.")?;
+    }
+    for q in open {
+        let mut line = format!("Q{} [{}] {}", q.id, q.archetype.as_str(), q.text);
+        if !q.rests_on.is_empty() {
+            let ids: Vec<String> = q.rests_on.iter().map(|id| format!("#{id}")).collect();
+            line.push_str(&format!("  (rests on {})", ids.join(", ")));
+        }
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
 pub fn usage() -> &'static str {
     "cli usage: factum \"<note text>\"\n       factum --list-cases [--all]\n       factum --list-evidence\n       \
      factum --new-case <file number> [name] [--description <text>]\n       \
      factum --new-evidence <description> [--hash <hash>]\n       \
      factum --list-gpg\n       factum --set-active (case|evidence|gpg) <id|name>\n       factum --set-active evidence none\n       \
-     factum --correct <note id> \"<corrected text>\"\n       factum --verify [case] [-v]\n       factum --checkpoint [case]\n       \
+     factum --correct <note id> \"<corrected text>\"\n       factum --verify [case] [-v]\n       factum --questions [case]\n       factum --checkpoint [case]\n       \
      factum --sign-unsigned [case]\n       factum --export [case] [--format html,pdf,md,bundle] [--out <folder>]\n       \
      factum --gui\n       factum --help"
 }
@@ -336,6 +361,8 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         if report.overall() == Level::Fail {
             return Ok(1);
         }
+    } else if let Some(query) = &args.questions {
+        questions(factum, resolve_case(factum, query)?, out)?;
     } else if let Some(query) = &args.checkpoint {
         let case_id = resolve_case(factum, query)?;
         warn_unsigned(factum.signer);
