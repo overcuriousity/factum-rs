@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-27
+
 ### Added
 - GUI: typing a #tag in the note field suggests the tags and labels already in use, in a short list above the line
   (ranked like Add Label; labels that cannot be written as a #tag are left out): ↑ ↓ choose, Tab or a click completes
