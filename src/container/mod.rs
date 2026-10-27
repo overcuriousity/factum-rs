@@ -3,6 +3,7 @@
 //! case log.
 
 pub mod source;
+pub mod stream;
 pub mod turtle;
 pub mod zip64;
 
