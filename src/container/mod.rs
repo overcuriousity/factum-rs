@@ -2,6 +2,7 @@
 //! (and optionally X.509). This module reads and writes the container file; `crate::containers` ties it to the
 //! case log.
 
+pub mod turtle;
 pub mod zip64;
 
 /// `aff4:` — the AFF4 Standard v1.0 lexicon
