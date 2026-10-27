@@ -26,7 +26,7 @@ use crate::notes::{Entry, EntryFilter};
 use crate::signer::GnupgSigner;
 
 /// Most questions open at once.
-pub const QUESTION_CAP: usize = 7;
+pub const QUESTION_CAP: usize = 3;
 /// Every tenth pass of a case is a full pass.
 pub const FULL_EVERY: i64 = 10;
 

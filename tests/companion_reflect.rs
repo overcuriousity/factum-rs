@@ -330,19 +330,17 @@ fn choose_kind_rules() {
 }
 
 #[test]
-fn a_full_list_makes_room_for_new_questions() {
+fn a_full_list_makes_room_for_new_questions_up_to_the_cap() {
     let e = env();
     let ids: Vec<i64> = [
         "Where did the uploaded webshell come from?",
         "Which hash algorithm verified the disk image?",
         "Was the plaso timeline filtered by date?",
-        "Who administers the Apache server?",
-        "Are there backups older than March?",
-        "Has the firewall export been secured?",
     ]
     .iter()
     .map(|text| question(&e, text))
     .collect();
+    e.cdb.rate_question(ids[0], Rating::Plus).unwrap();
     let mut questions: Vec<serde_json::Value> = ids.iter().map(|id| json!({"id": id})).collect();
     questions.extend([
         json!({"text": "Which user agent sent the POST request?", "rests_on": [e.notes[2]]}),
@@ -351,13 +349,11 @@ fn a_full_list_makes_room_for_new_questions() {
     ]);
     script(&e, json!({ "questions": questions }));
     let s = pass(&e, PassKind::Full).unwrap();
-    assert_eq!((s.created, s.withdrawn), (3, 2));
+    // the two unrated questions make room; the plus one stays, so the third new question does not fit
+    assert_eq!((s.created, s.withdrawn, s.dropped.len()), (2, 2, 1));
     let open = open_ids(&e);
-    assert_eq!(open.len(), 7);
-    assert!(
-        !open.contains(&ids[0]) && !open.contains(&ids[1]),
-        "the oldest two made room"
-    );
+    assert_eq!(open.len(), 3);
+    assert_eq!(open[0], ids[0]);
 }
 
 #[test]

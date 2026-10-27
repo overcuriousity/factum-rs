@@ -604,7 +604,7 @@ mod tests {
 
     #[test]
     fn new_questions_replace_the_oldest_unrated_kept_ones() {
-        // seven open: 1 rated plus, 2 reworded, the rest kept as they are
+        // seven open (the check uses a cap of 7): 1 rated plus, 2 reworded, the rest kept as they are
         let open: Vec<Question> = (1..=7)
             .map(|i| {
                 let rating = if i == 1 { Rating::Plus } else { Rating::None };

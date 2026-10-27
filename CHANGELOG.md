@@ -13,6 +13,8 @@ All notable changes to this project are documented here. The format follows
   plus nor reworded in the pass
 - Companion: a full pass runs on the first pass of a case, every tenth pass and on Re-think; the extra full passes
   after a pass that closed three questions or after three passes that closed none are gone
+- Companion: at most three questions are open at a time (was seven). A case with more is trimmed on its next pass:
+  the oldest ones that are neither rated plus nor reworded are withdrawn
 - GUI: the QUESTIONS heading collapses and expands the questions
 
 ## [2.2.0] - 2026-10-27
