@@ -165,7 +165,8 @@ fn escape(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+            // control characters, and what other tools take for a line break, as \uXXXX
+            c if (c as u32) < 0x20 || matches!(c, '\u{7f}' | '\u{85}' | '\u{2028}' | '\u{2029}') => {
                 let _ = write!(out, "\\u{:04X}", c as u32);
             }
             c => out.push(c),
@@ -747,6 +748,25 @@ mod tests {
             }
         );
         assert_eq!(get("http://x/o"), Term::Iri("http://x/a.b".into()));
+    }
+
+    #[test]
+    fn line_separators_are_escaped() {
+        // characters other tools treat as line breaks never appear raw, so one triple stays one line
+        let mut graph = Graph::default();
+        let value = "in\u{2028}voice\u{2029}x\u{85}y";
+        graph.add(
+            "aff4://s",
+            &format!("{AFF4_NS}p"),
+            Term::Literal {
+                value: value.into(),
+                datatype: None,
+            },
+        );
+        let text = write(&graph, &PREFIXES);
+        assert!(!text.contains(['\u{2028}', '\u{2029}', '\u{85}']), "{text:?}");
+        assert!(text.contains("\\u2028"));
+        assert_eq!(parse(&text).unwrap(), graph);
     }
 
     #[test]

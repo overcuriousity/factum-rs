@@ -902,6 +902,20 @@ mod script {
     }
 
     #[test]
+    fn script_reads_names_with_line_separators() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let odd = s.source.join("Users/x/in\u{2028}voice\u{85}.txt");
+        std::fs::write(&odd, b"odd").unwrap();
+        let id = s.create();
+        s.add(id, &[odd]);
+        let Some((code, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("1 file(s) checked"), "{output}");
+    }
+
+    #[test]
     fn script_passes_clean_container() {
         let home = gpg_or_skip!();
         let dir = tempfile::tempdir().unwrap();

@@ -97,7 +97,9 @@ def parse_turtle(text):
             raise ValueError("unknown prefix " + prefix)
         return prefixes[prefix] + local
 
-    for line in text.splitlines():
+    # only \n ends a line: str.splitlines() would also split at U+2028, U+0085, ...
+    for line in text.split("\n"):
+        line = line.rstrip("\r")
         if not line.strip():
             continue
         match = PREFIX.match(line)
