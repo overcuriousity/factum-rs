@@ -85,6 +85,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   `--new-case`/`--new-evidence`; both are recorded in the log
 - **Edit Case** changes file number, name and description through a signed `case_edited` entry; earlier seals stay
   valid
+- **Edit Description…** on an evidence item changes its description through a signed `evidence_edited` entry; name
+  and hash stay as created
 - **Archive** instead of delete: an archived case is read-only, hidden by default ("Show archived cases",
   `--list-cases --all`) and sealed; it can be reopened. Archived cases can be deleted permanently in the GUI by typing
   the case file number; external seal files are kept

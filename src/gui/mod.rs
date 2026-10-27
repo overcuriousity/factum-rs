@@ -855,9 +855,21 @@ impl FactumApp {
         if let Some(case) = self.view.case.as_ref().filter(|c| !c.is_archived()) {
             self.dialogs.push(Dialog::NewEvidence {
                 case_id: case.id,
-                description: String::new(),
+                name: String::new(),
                 hash: String::new(),
+                details: String::new(),
                 error: None,
+            });
+        }
+    }
+
+    fn open_edit_evidence(&mut self, evidence_id: i64) {
+        if let Ok(Some(evidence)) = self.factum().get_evidence(evidence_id) {
+            self.dialogs.push(Dialog::EditEvidence {
+                evidence_id,
+                name: evidence.description,
+                hash: evidence.evidence_hash,
+                details: evidence.details,
             });
         }
     }
@@ -1094,10 +1106,11 @@ impl FactumApp {
             }
             DialogResult::NewEvidence {
                 case_id,
-                description,
+                name,
                 hash,
+                details,
             } => {
-                let result = self.factum().create_evidence(case_id, &description, &hash, "");
+                let result = self.factum().create_evidence(case_id, &name, &hash, &details);
                 if let Some(evidence_id) = self.run(result) {
                     self.select(None, Some(evidence_id));
                 }
@@ -1109,6 +1122,10 @@ impl FactumApp {
                 description,
             } => {
                 let result = self.factum().update_case(case_id, &file, &name, &description);
+                self.run(result);
+            }
+            DialogResult::EditEvidence { evidence_id, details } => {
+                let result = self.factum().update_evidence_details(evidence_id, &details);
                 self.run(result);
             }
             DialogResult::AddLabel { entry_id, label } => {
@@ -1795,7 +1812,11 @@ impl FactumApp {
                             *count,
                             20.0,
                         )
-                        .on_hover_text(&evidence.description);
+                        .on_hover_text(if evidence.details.is_empty() {
+                            evidence.description.clone()
+                        } else {
+                            format!("{}\n\n{}", evidence.description, evidence.details)
+                        });
                         if response.clicked() {
                             clicked = Some((None, Some(evidence.id)));
                         }
@@ -1804,6 +1825,9 @@ impl FactumApp {
                                 menu_action = Some(TreeAction::CliEvidence(evidence.id));
                             }
                             if !case.is_archived() {
+                                if ui.button("Edit Description…").clicked() {
+                                    menu_action = Some(TreeAction::EditEvidence(evidence.id));
+                                }
                                 ui.separator();
                                 let empty = *count == 0 && !self.factum().has_entries(evidence.id).unwrap_or(true);
                                 let label = if empty {
@@ -1861,8 +1885,9 @@ impl FactumApp {
                 self.select(Some(case_id), None);
                 self.dialogs.push(Dialog::NewEvidence {
                     case_id,
-                    description: String::new(),
+                    name: String::new(),
                     hash: String::new(),
+                    details: String::new(),
                     error: None,
                 });
             }
@@ -1881,6 +1906,7 @@ impl FactumApp {
             TreeAction::DeleteCase(case_id) => self.delete_case(case_id),
             TreeAction::Archive(case_id) => self.archive(case_id),
             TreeAction::DeleteEvidence(evidence_id) => self.delete_evidence(evidence_id),
+            TreeAction::EditEvidence(evidence_id) => self.open_edit_evidence(evidence_id),
         }
     }
 
@@ -2289,6 +2315,7 @@ enum TreeAction {
     DeleteCase(i64),
     Archive(i64),
     DeleteEvidence(i64),
+    EditEvidence(i64),
 }
 
 fn capitalize(text: &str) -> String {

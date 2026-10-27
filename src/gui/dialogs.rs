@@ -45,8 +45,9 @@ pub enum Dialog {
     },
     NewEvidence {
         case_id: i64,
-        description: String,
+        name: String,
         hash: String,
+        details: String,
         error: Option<String>,
     },
     EditCase {
@@ -55,6 +56,12 @@ pub enum Dialog {
         name: String,
         description: String,
         error: Option<String>,
+    },
+    EditEvidence {
+        evidence_id: i64,
+        name: String,
+        hash: String,
+        details: String,
     },
     AddLabel {
         entry_id: i64,
@@ -118,14 +125,19 @@ pub enum DialogResult {
     },
     NewEvidence {
         case_id: i64,
-        description: String,
+        name: String,
         hash: String,
+        details: String,
     },
     EditCase {
         case_id: i64,
         file: String,
         name: String,
         description: String,
+    },
+    EditEvidence {
+        evidence_id: i64,
+        details: String,
     },
     AddLabel {
         entry_id: i64,
@@ -190,12 +202,26 @@ fn close_button(ui: &mut egui::Ui, text: &str) -> bool {
 }
 
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, focus: bool) -> egui::Response {
-    ui.label(label);
-    let response = ui.add(TextEdit::singleline(value).hint_text(hint).desired_width(f32::INFINITY));
+    let label = ui.label(label);
+    let response = ui
+        .add(TextEdit::singleline(value).hint_text(hint).desired_width(f32::INFINITY))
+        .labelled_by(label.id);
     if focus && ui.memory(|m| m.focused().is_none()) {
         response.request_focus();
     }
     response
+}
+
+/// A multiline "Description" under its label.
+fn description_field(ui: &mut egui::Ui, value: &mut String, hint: &str) {
+    let label = ui.label("Description");
+    ui.add(
+        TextEdit::multiline(value)
+            .hint_text(hint)
+            .desired_rows(3)
+            .desired_width(f32::INFINITY),
+    )
+    .labelled_by(label.id);
 }
 
 fn enter_pressed(ui: &egui::Ui) -> bool {
@@ -337,25 +363,58 @@ impl Dialog {
             }
             Dialog::NewEvidence {
                 case_id,
-                description,
+                name,
                 hash,
+                details,
                 error,
             } => {
                 title(ui, "Create New Evidence");
-                let first = field(ui, "Description", description, "Evidence description", true);
+                let first = field(ui, "Name", name, "Evidence name", true);
                 error_line(ui, error);
                 let second = field(ui, "Hash", hash, "Evidence hash (optional)", false);
+                description_field(ui, details, "Description (optional)");
                 let (ok, cancel) = buttons(ui, "Create", true);
                 if ok || (enter_pressed(ui) && (first.lost_focus() || second.lost_focus())) {
-                    if strip(description).is_empty() {
-                        *error = Some("Evidence description is required.".into());
+                    if strip(name).is_empty() {
+                        *error = Some("Evidence name is required.".into());
                         first.request_focus();
                         return None;
                     }
                     return Some(DialogResult::NewEvidence {
                         case_id: *case_id,
-                        description: strip(description).to_string(),
+                        name: strip(name).to_string(),
                         hash: strip(hash).to_string(),
+                        details: details.clone(),
+                    });
+                }
+                cancel.then_some(DialogResult::Cancel)
+            }
+            Dialog::EditEvidence {
+                evidence_id,
+                name,
+                hash,
+                details,
+            } => {
+                title(ui, "Edit Evidence Description");
+                ui.label(
+                    RichText::new("The change is recorded as a signed entry in the case log; the earlier description stays in the log.")
+                        .size(SMALL_SIZE)
+                        .color(p.muted),
+                );
+                egui::Grid::new("evidence-fixed").num_columns(2).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.label(name.as_str());
+                    ui.end_row();
+                    ui.label("Hash");
+                    ui.label(if hash.is_empty() { "—" } else { hash.as_str() });
+                    ui.end_row();
+                });
+                description_field(ui, details, "");
+                let (ok, cancel) = buttons(ui, "Save", true);
+                if ok {
+                    return Some(DialogResult::EditEvidence {
+                        evidence_id: *evidence_id,
+                        details: details.clone(),
                     });
                 }
                 cancel.then_some(DialogResult::Cancel)

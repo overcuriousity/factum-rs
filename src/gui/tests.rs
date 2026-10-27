@@ -303,6 +303,46 @@ fn dialogs_validate_their_input() {
     screenshot(&mut harness, "new-case");
 }
 
+fn evidence_named(harness: &Harness<'_, FactumApp>, name: &str) -> crate::evidence::Evidence {
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    factum
+        .list_evidence_for_case(case_id, false)
+        .unwrap()
+        .into_iter()
+        .filter_map(|id| factum.get_evidence(id).unwrap())
+        .find(|e| e.description == name)
+        .unwrap()
+}
+
+#[test]
+fn new_evidence_dialog_saves_description() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.state_mut().open_new_evidence();
+    harness.run_ok();
+    type_into(&mut harness, "Name", "laptop");
+    type_into(&mut harness, "Description", "seized at desk 4");
+    click_label(&mut harness, "Create");
+    assert_eq!(evidence_named(&harness, "laptop").details, "seized at desk 4");
+}
+
+#[test]
+fn edit_evidence_saves_description() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let disk = evidence_named(&harness, "disk");
+    let ctx = harness.ctx.clone();
+    harness.state_mut().tree_action(TreeAction::EditEvidence(disk.id), &ctx);
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::EditEvidence { name, .. }) if name == "disk"));
+    type_into(&mut harness, "Description", "imaged with FTK");
+    click_label(&mut harness, "Save");
+    assert_eq!(evidence_named(&harness, "disk").details, "imaged with FTK");
+    assert!(harness.state().dialogs.is_empty());
+}
+
 #[test]
 fn dark_theme_renders() {
     let fixture = Fixture::new();
