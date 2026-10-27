@@ -57,6 +57,20 @@ fn timeline_shows_newest_version_at_the_original_position() {
 }
 
 #[test]
+fn reports_show_the_evidence_description() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = model_case(&factum);
+    let evidence_id = factum.list_evidence_for_case(case_id, false).unwrap()[0];
+    factum.update_evidence_details(evidence_id, "seized at desk 4").unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    for text in [render_html(&model, false), render_markdown(&model)] {
+        assert!(text.contains("disk — seized at desk 4"), "{text}");
+    }
+}
+
+#[test]
 fn short_line() {
     let f = Fixture::new();
     let model = model(&f);

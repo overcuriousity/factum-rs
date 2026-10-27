@@ -77,11 +77,15 @@ fn appendix_html(item: &ReportEntry, print_variant: bool) -> String {
     )
 }
 
-/// The evidence table cells: id, description, hash, added, deleted.
+/// The evidence table cells: id, name (with the description after a dash), hash, added, deleted.
 pub fn evidence_cells(item: &super::model::EvidenceRow) -> [String; 5] {
     [
         item.id.to_string(),
-        item.description.clone(),
+        if item.details.is_empty() {
+            item.description.clone()
+        } else {
+            format!("{} — {}", item.description, item.details)
+        },
         if item.evidence_hash.is_empty() {
             "—".into()
         } else {

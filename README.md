@@ -81,7 +81,7 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Entries and seals created without a key can be **signed later**; they are then shown as "signed later on <date>"
 
 ### Cases and evidence
-- Create cases (file number, name, description) and evidence items (description, hash), in the GUI or with
+- Create cases (file number, name, description) and evidence items (name, hash, description), in the GUI or with
   `--new-case`/`--new-evidence`; both are recorded in the log
 - **Edit Case** changes file number, name and description through a signed `case_edited` entry; earlier seals stay
   valid
@@ -119,8 +119,6 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   to answer
 - The questions sit in the side panel; **+** and **−** rate them, which shapes later questions. The questions menu has
   **Ask…** (a question answered only from the case log, with cited entries) and **History**
-- `factum --questions [CASE]` prints the open questions and never creates anything; it says so when the companion is
-  not configured
 - It keeps its state in a second SQLite file next to the case database (`factum.companion.db`). That file holds the
   API key and content derived from the case, so treat it as exactly as sensitive as the case database. Deleting it
   loses ratings and settings, no evidence. `FACTUM_COMPANION_API_KEY` overrides the stored key and is never saved
@@ -136,8 +134,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 
 ```bash
 factum --new-case 2026/041 "Ransomware Müller GmbH" --description "file server FS01"   # becomes the active case
-factum --new-evidence "FS01 disk image" --hash e3b0c442…                               # in the active case
-factum --set-active evidence 1          # by ID or description, must belong to the active case
+factum --new-evidence "FS01 disk image" --hash e3b0c442… --description "seized in rack 3"   # in the active case
+factum --set-active evidence 1          # by ID or name, must belong to the active case
 factum "Checked disk image, found suspicious binary at /tmp/.hidden #malware"
 factum --correct 42 "Binary was at /tmp/.cache, not /tmp/.hidden #malware"
 factum --list-cases [--all]
@@ -145,7 +143,6 @@ factum --set-active case 1              # by ID, file number or name; clears the
 factum --list-evidence                  # evidence of the active case
 factum --set-active evidence none       # notes go to the case itself again
 factum --verify [case] [-v]             # exit code 1 if verification fails
-factum --questions [case]               # open companion questions (read-only)
 factum --checkpoint [case]              # seal the current state
 factum --sign-unsigned [case]           # sign entries and seals created without a key
 factum --export [case] --format html,pdf,md,bundle --out ./reports
