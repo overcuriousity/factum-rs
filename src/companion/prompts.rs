@@ -92,7 +92,7 @@ pub fn timeline_line(entry: &Entry, evidence: Option<&str>) -> String {
     line_with(entry, evidence, TIMELINE_TEXT_CHARS)
 }
 
-/// File number, name, description, creation time and every evidence item, deleted ones marked.
+/// File number, name, description, creation time and every evidence item with its description, deleted ones marked.
 pub fn case_header(case: &Case, evidence: &[Evidence]) -> Vec<String> {
     let mut lines = vec![
         format!("Case {}: {}", flatten(&case.case_file), flatten(&case.case_name)),
@@ -114,6 +114,9 @@ pub fn case_header(case: &Case, evidence: &[Evidence]) -> Vec<String> {
             line.push_str(&format!(" · deleted {deleted}"));
         }
         lines.push(line);
+        if !item.details.is_empty() {
+            lines.push(format!("  Description: {}", flatten(&item.details)));
+        }
     }
     lines
 }
@@ -281,6 +284,34 @@ mod tests {
         );
         system.payload_json = Some(r#"{"event":"case\nedited"}"#.into());
         assert!(!entry_line(&system, None).contains('\n'));
+    }
+
+    #[test]
+    fn case_header_lists_evidence_description() {
+        let case = Case {
+            id: 1,
+            case_file: "C-1".into(),
+            case_name: "Case".into(),
+            description: String::new(),
+            created_utc: "t".into(),
+            is_active: false,
+            archived_utc: None,
+        };
+        let evidence = |id: i64, details: &str| Evidence {
+            id,
+            case_id: 1,
+            description: format!("item {id}"),
+            evidence_hash: String::new(),
+            created_utc: "t".into(),
+            is_active: false,
+            deleted_utc: None,
+            details: details.into(),
+        };
+        let lines = case_header(&case, &[evidence(1, "line one\nline two"), evidence(2, "")]);
+        let first = lines.iter().position(|l| l.starts_with("Evidence 1:")).unwrap();
+        assert_eq!(lines[first + 1], "  Description: line one line two");
+        assert!(lines[first + 2].starts_with("Evidence 2:"));
+        assert_eq!(lines.len(), first + 3);
     }
 
     #[test]
