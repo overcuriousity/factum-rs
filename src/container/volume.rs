@@ -851,10 +851,11 @@ impl Volume {
 
     /// Drops a staged (or finalized but not logged) Add operation: the file is cut back to the state before it.
     pub fn discard(&mut self, staged: Staged) -> Result<()> {
-        self.reset_to(staged.start)
+        self.rollback_to(staged.start)
     }
 
-    fn reset_to(&mut self, end: u64) -> Result<()> {
+    /// Cuts the file back to an earlier state that ended at `end` and reloads it.
+    pub fn rollback_to(&mut self, end: u64) -> Result<()> {
         let path = self.path.clone();
         let app = self.app.take().expect("the volume is open");
         let mut file = app.into_file();

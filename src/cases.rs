@@ -179,6 +179,15 @@ impl Factum<'_> {
                 "Case #{case_id} is already archived."
             )));
         }
+        let open = self.open_containers(case_id)?;
+        if !open.is_empty() {
+            let names: Vec<String> = open.iter().map(|c| format!("#{} \"{}\"", c.id, c.name)).collect();
+            return Err(FactumError::general(format!(
+                "The case '{}' has open containers: {}. Close them first.",
+                case.case_name,
+                names.join(", ")
+            )));
+        }
         let archived_utc = utc_now();
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
             conn.execute(
