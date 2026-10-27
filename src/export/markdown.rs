@@ -126,6 +126,33 @@ pub fn render_markdown(model: &ReportModel) -> String {
             lines.push(format!("| {} |", cells.join(" | ")));
         }
     }
+    if !model.containers.is_empty() {
+        lines.extend([String::new(), "## Containers".to_string()]);
+        for container in &model.containers {
+            lines.extend([
+                String::new(),
+                format!("### #{} {}", container.id, inline(&container.name)),
+                String::new(),
+            ]);
+            lines.extend(
+                container
+                    .rows()
+                    .iter()
+                    .map(|(label, value)| format!("- **{label}:** {}", inline(value))),
+            );
+            lines.push(String::new());
+            if container.files.is_empty() {
+                lines.push("No files.".into());
+                continue;
+            }
+            lines.push("| Path | Size | SHA-256 |".into());
+            lines.push("|---|---|---|".into());
+            for cells in container.file_cells() {
+                let cells: Vec<String> = cells.iter().map(|cell| inline(cell)).collect();
+                lines.push(format!("| {} |", cells.join(" | ")));
+            }
+        }
+    }
     lines.extend([String::new(), "## Case activity".to_string(), String::new()]);
     for item in model.activity() {
         let flag = if item.status == Level::Fail {

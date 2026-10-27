@@ -611,3 +611,130 @@ fn verify_py_accepts_seals_made_before_a_rename() {
     };
     assert_eq!(code, 0, "{output}");
 }
+
+// --- evidence containers
+
+/// A case with a closed container of two files; returns the case, the container's UUID and the files' SHA-256.
+fn container_case(factum: &Factum, dir: &Path) -> (i64, String, Vec<(String, String)>) {
+    use factum::container::volume::{AddOptions, AddProgress};
+    let case_id = factum.create_case("C-7", "Containers", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "").unwrap();
+    let source = dir.join("mnt");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("evil.exe"), b"MZ").unwrap();
+    std::fs::write(source.join("notes.txt"), b"notes").unwrap();
+    let id = factum
+        .create_container(
+            case_id,
+            "FS01 preserved",
+            Some(evidence_id),
+            &dir.join("fs01.aff4l"),
+            &source.display().to_string(),
+        )
+        .unwrap();
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    let options = AddOptions {
+        base: source.clone(),
+        keep_path: true,
+        metadata_only: false,
+        excerpt: None,
+    };
+    let staged = volume
+        .stage_add(
+            &[source.join("evil.exe"), source.join("notes.txt")],
+            &options,
+            &AddProgress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+    let files = staged
+        .records
+        .iter()
+        .map(|r| (r.path.clone(), r.sha256.clone()))
+        .collect();
+    factum.commit_container_add(id, &mut volume, staged).unwrap();
+    drop(volume);
+    factum.close_container(id).unwrap();
+    (case_id, factum.container(id).unwrap().summary.uuid, files)
+}
+
+#[test]
+fn reports_list_containers() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, uuid, files) = container_case(&factum, f.path());
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    assert_eq!(model.containers.len(), 1);
+    assert_eq!(model.containers[0].state, "closed");
+    assert_eq!(model.containers[0].evidence.as_deref(), Some("Evidence #1 disk"));
+    assert!(
+        model.containers[0].signatures.starts_with("GPG "),
+        "{}",
+        model.containers[0].signatures
+    );
+    let mut texts = vec![render_html(&model, false), render_markdown(&model)];
+    if which::which("pdftotext").is_ok() {
+        let pdf = f.path().join("report.pdf");
+        std::fs::write(&pdf, factum::export::pdf::render_pdf(&model)).unwrap();
+        let output = Command::new("pdftotext")
+            .args(["-layout"])
+            .arg(&pdf)
+            .arg("-")
+            .output()
+            .unwrap();
+        texts.push(String::from_utf8_lossy(&output.stdout).replace('\n', " "));
+    }
+    for text in texts {
+        assert!(text.contains("Containers"), "{text}");
+        for needle in ["FS01 preserved", "fs01.aff4l", uuid.as_str(), "closed"] {
+            assert!(text.contains(needle), "{needle} in {text}");
+        }
+        for (path, sha256) in &files {
+            assert!(text.contains(path.as_str()), "{path}");
+            // the PDF may break a long hash across lines: its first half is enough there
+            assert!(text.contains(&sha256[..32]), "{sha256}");
+        }
+    }
+}
+
+#[test]
+fn reports_without_containers_have_no_section() {
+    let f = Fixture::new();
+    let model = model(&f);
+    assert!(model.containers.is_empty());
+    assert!(!render_html(&model, false).contains("<h2>Containers"));
+    assert!(!render_markdown(&model).contains("## Containers"));
+}
+
+#[test]
+fn bundle_with_container_events_verifies() {
+    let home = require_gpg!("Factum Test <test@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &home);
+    let factum = Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    let (case_id, _, _) = container_case(&factum, f.path());
+    let [bundle] = factum
+        .export(case_id, &["bundle"], &f.path().join("out"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let files = read_zip(&bundle);
+    assert!(!files.keys().any(|name| name.ends_with(".aff4l")));
+    let data = case_json(&bundle);
+    let events: Vec<&str> = data["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["payload"]["event"].as_str())
+        .filter(|e| e.starts_with("container_"))
+        .collect();
+    assert_eq!(
+        events,
+        vec!["container_created", "container_files_added", "container_closed"]
+    );
+    let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+}
