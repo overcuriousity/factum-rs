@@ -44,10 +44,11 @@ impl Evidence {
     }
 }
 
-// intentionally no update_evidence method, as evidence should be immutable after creation
+// name and hash are immutable after creation; only the description can be edited, through a logged entry
 impl Factum<'_> {
-    pub fn create_evidence(&self, case_id: i64, description: &str, evidence_hash: &str) -> Result<i64> {
-        let (description, evidence_hash) = (strip(description), strip(evidence_hash));
+    /// `name` is stored in the `description` column; `details` is the free-text description.
+    pub fn create_evidence(&self, case_id: i64, name: &str, evidence_hash: &str, details: &str) -> Result<i64> {
+        let (description, evidence_hash, details) = (strip(name), strip(evidence_hash), strip(details));
         if description.is_empty() {
             return Err(FactumError::general("An evidence description is required."));
         }
@@ -55,13 +56,14 @@ impl Factum<'_> {
         let created_utc = utc_now();
         let evidence_id = self.db.transaction(|conn| {
             conn.execute(
-                "INSERT INTO evidence (case_id, description, evidence_hash, created_utc) VALUES (?, ?, ?, ?)",
-                params![case_id, description, evidence_hash, created_utc],
+                "INSERT INTO evidence (case_id, description, evidence_hash, created_utc, details) VALUES (?, ?, ?, ?, ?)",
+                params![case_id, description, evidence_hash, created_utc, details],
             )?;
             Ok(conn.last_insert_rowid())
         })?;
         let payload = json!({"event": "evidence_created", "evidence_id": evidence_id, "case_id": case_id,
-                             "description": description, "evidence_hash": evidence_hash, "created_utc": created_utc});
+                             "description": description, "evidence_hash": evidence_hash, "created_utc": created_utc,
+                             "details": details});
         let mut text = format!("Evidence #{evidence_id} created: {description}");
         if !evidence_hash.is_empty() {
             text += &format!(" · {evidence_hash}");
@@ -80,6 +82,38 @@ impl Factum<'_> {
             return Err(e);
         }
         Ok(evidence_id)
+    }
+
+    /// Changes the description of an evidence item; an unchanged text writes nothing.
+    pub fn update_evidence_details(&self, evidence_id: i64, details: &str) -> Result<()> {
+        let evidence = match self.get_evidence(evidence_id)? {
+            Some(evidence) if !evidence.is_deleted() => evidence,
+            _ => {
+                return Err(FactumError::general(format!("Evidence #{evidence_id} does not exist.")));
+            }
+        };
+        let details = strip(details);
+        if details == evidence.details {
+            return Ok(());
+        }
+        let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
+            conn.execute(
+                "UPDATE evidence SET details = ? WHERE id = ?",
+                params![details, evidence_id],
+            )?;
+            Ok(())
+        };
+        self.append(
+            evidence.case_id,
+            KIND_SYSTEM,
+            &format!("Evidence #{evidence_id} description edited: {}", evidence.description),
+            Append {
+                payload: Some(json!({"event": "evidence_edited", "evidence_id": evidence_id, "details": details})),
+                on_commit: Some(&apply),
+                ..Default::default()
+            },
+        )?;
+        Ok(())
     }
 
     pub fn get_evidence(&self, evidence_id: i64) -> Result<Option<Evidence>> {

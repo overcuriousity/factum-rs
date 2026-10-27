@@ -51,7 +51,7 @@ fn notes_go_to_the_active_evidence() {
     let f = Fixture::new();
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "").unwrap();
     run(&f, &f.signer, &["--set-active", "case", "C-1"]);
     let (code, out) = run(&f, &f.signer, &["--set-active", "evidence", "disk"]);
     assert_eq!(

@@ -22,14 +22,14 @@ impl Fixture {
         let signer = FakeSigner::new(false);
         let factum = Factum::with_seal_dir(&db, &signer, None);
         let case_id = factum.create_case("C-1", "Case", "").unwrap();
-        let evidence_id = factum.create_evidence(case_id, "disk", "").unwrap();
+        let evidence_id = factum.create_evidence(case_id, "disk", "", "").unwrap();
         let note = factum
             .create_note("first note #tag 10.0.0.1", Some(evidence_id), case_id)
             .unwrap();
         factum
             .correct_note(note, "first note, corrected #tag 10.0.0.1")
             .unwrap();
-        factum.create_evidence(case_id, "usb stick", "").unwrap();
+        factum.create_evidence(case_id, "usb stick", "", "").unwrap();
         Self { _dir: dir, path }
     }
 

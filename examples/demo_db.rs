@@ -17,8 +17,9 @@ fn main() -> factum::Result<()> {
         case_id,
         "FS01 system disk image",
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "Seized from the server room rack 3; imaged with a hardware write blocker.",
     )?;
-    let memory = factum.create_evidence(case_id, "FS01 memory dump", "")?;
+    let memory = factum.create_evidence(case_id, "FS01 memory dump", "", "")?;
     factum.create_note(
         "Arrived on site, FS01 isolated from the network by the customer at 08:12 local time. #timeline",
         None,

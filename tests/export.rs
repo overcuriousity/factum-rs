@@ -21,7 +21,7 @@ const EXPORTED: &str = "2026-10-05T12:00:00.000Z";
 
 fn model_case(factum: &Factum) -> i64 {
     let case_id = factum.create_case("C-1", "Case <b>", "desc").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "abc", "").unwrap();
     let first = factum.create_note("first", Some(evidence_id), case_id).unwrap();
     factum.create_note(TRICKY, None, case_id).unwrap();
     factum.correct_note(first, "first, corrected").unwrap();
@@ -320,7 +320,7 @@ const REPORTS: [(&str, &[u8]); 3] = [
 fn make_bundle(db: &factum::Db, signer: &dyn Signer, seal_dir: &Path, out_dir: &Path, case_file: &str) -> PathBuf {
     let factum = Factum::with_seal_dir(db, signer, Some(seal_dir.to_path_buf()));
     let case_id = factum.create_case(case_file, "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "abc", "").unwrap();
     let first = factum
         .create_note("Müller ✓ 🦊\r\nzweite Zeile  ", Some(evidence_id), case_id)
         .unwrap();

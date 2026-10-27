@@ -340,7 +340,7 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         let case_id = factum
             .get_active_case_id()?
             .ok_or_else(|| FactumError::general("No active case. Set an active case before adding evidence."))?;
-        let evidence_id = factum.create_evidence(case_id, description, &args.hash)?;
+        let evidence_id = factum.create_evidence(case_id, description, &args.hash, "")?;
         writeln!(
             out,
             "Evidence #{evidence_id} created in case #{case_id}. Make it the note target with 'factum --set-active evidence {evidence_id}'."

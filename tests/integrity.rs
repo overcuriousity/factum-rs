@@ -211,7 +211,7 @@ fn seal_file_keeps_gpg_line_endings() {
 /// A case with evidence and three notes on it: five entries.
 fn verifier_case(factum: &Factum) -> (i64, i64, Vec<i64>) {
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "abc", "").unwrap();
     let notes = (0..3)
         .map(|n| {
             factum

@@ -1097,7 +1097,7 @@ impl FactumApp {
                 description,
                 hash,
             } => {
-                let result = self.factum().create_evidence(case_id, &description, &hash);
+                let result = self.factum().create_evidence(case_id, &description, &hash, "");
                 if let Some(evidence_id) = self.run(result) {
                     self.select(None, Some(evidence_id));
                 }
