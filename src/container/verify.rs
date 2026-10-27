@@ -312,28 +312,40 @@ fn hash_map(
         })
         .collect();
     ranges.sort();
-    let size = number(graph, map, "size").unwrap_or_else(|| ranges.last().map_or(0, |r| r.0 + r.1));
+    let damaged = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{map}: damaged map ({why})"));
+    let mut end_of_ranges = 0u64;
+    for (mapped, length, _, _) in &ranges {
+        end_of_ranges = end_of_ranges.max(mapped.checked_add(*length).ok_or_else(|| damaged("offsets overflow"))?);
+    }
+    let size = number(graph, map, "size").unwrap_or(end_of_ranges);
+    if end_of_ranges > size {
+        return Err(damaged("ranges beyond its size"));
+    }
     let mut hasher = stream::Hasher::new();
     let mut position = 0u64;
     let zeros = vec![0u8; 1 << 16];
-    let fill = |hasher: &mut stream::Hasher, mut count: u64, byte: u8| {
+    let fill = |hasher: &mut stream::Hasher, mut count: u64, byte: u8| -> io::Result<()> {
         let block = if byte == 0 {
             zeros.clone()
         } else {
             vec![byte; zeros.len()]
         };
         while count > 0 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
             let take = count.min(block.len() as u64) as usize;
             hasher.update(&block[..take]);
             count -= take as u64;
         }
+        Ok(())
     };
     for (mapped, length, target_offset, target) in ranges {
         if cancel.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
         if mapped > position {
-            fill(&mut hasher, mapped - position, 0);
+            fill(&mut hasher, mapped - position, 0)?;
         }
         let target = targets.get(target as usize).ok_or_else(|| {
             io::Error::new(
@@ -342,12 +354,12 @@ fn hash_map(
             )
         })?;
         if target == &format!("{AFF4_NS}Zero") {
-            fill(&mut hasher, length, 0);
+            fill(&mut hasher, length, 0)?;
         } else if let Some(byte) = target
             .strip_prefix(&format!("{AFF4_NS}SymbolicStream"))
             .and_then(|hex| u8::from_str_radix(hex, 16).ok())
         {
-            fill(&mut hasher, length, byte);
+            fill(&mut hasher, length, byte)?;
         } else if target.starts_with(AFF4_NS) {
             return Ok(Content::NotChecked(format!("its map uses {target}")));
         } else if graph.has_type(target, &format!("{AFF4_NS}ImageStream")) {
@@ -386,7 +398,7 @@ fn hash_map(
         progress(position);
     }
     if size > position {
-        fill(&mut hasher, size - position, 0);
+        fill(&mut hasher, size - position, 0)?;
     }
     Ok(Content::Hashed(size.max(position), hasher.finish()))
 }
@@ -865,34 +877,33 @@ pub fn verify_file(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
-    use crate::container::stream::{CHUNK_SIZE, CHUNKS_PER_SEGMENT, ZLIB, store_image_stream};
+    use crate::container::stream::{CHUNK_SIZE, CHUNKS_PER_SEGMENT};
     use crate::container::volume::hashes_bytes;
     use crate::container::zip64::Appender;
     use crate::container::{AFF4L_NS, RDF_NS, XSD_NS};
     use crate::signer::FakeSigner;
-    use base64::Engine;
 
-    const VOLUME: &str = "7cbb47d0-b04c-42bc-8c04-87b7782739ad";
+    pub const VOLUME: &str = "7cbb47d0-b04c-42bc-8c04-87b7782739ad";
 
-    fn aff4(local: &str) -> String {
+    pub fn aff4(local: &str) -> String {
         format!("{AFF4_NS}{local}")
     }
 
-    fn typed(value: impl ToString, datatype: &str) -> Term {
+    pub fn typed(value: impl ToString, datatype: &str) -> Term {
         Term::Literal {
             value: value.to_string(),
             datatype: Some(datatype.to_string()),
         }
     }
 
-    fn a(graph: &mut Graph, subject: &str, class: &str) {
+    pub fn a(graph: &mut Graph, subject: &str, class: &str) {
         graph.add(subject, &format!("{RDF_NS}type"), Term::Iri(class.to_string()));
     }
 
     /// A container another tool could have written: version 2.1, `tool=other`, the graph and extra members.
-    fn foreign(
+    pub fn foreign(
         dir: &tempfile::TempDir,
         graph: &Graph,
         extra: &mut dyn FnMut(&mut Appender),
@@ -920,7 +931,7 @@ mod tests {
         path
     }
 
-    fn check(path: &Path) -> ContainerReport {
+    pub fn check(path: &Path) -> ContainerReport {
         verify_file(
             path,
             &FakeSigner::new(false),
@@ -931,7 +942,7 @@ mod tests {
         .unwrap()
     }
 
-    fn codes(report: &ContainerReport, level: Level) -> Vec<&'static str> {
+    pub fn codes(report: &ContainerReport, level: Level) -> Vec<&'static str> {
         report
             .findings
             .iter()
@@ -940,7 +951,28 @@ mod tests {
             .collect()
     }
 
-    const V21: Option<&str> = Some("major=2\nminor=1\ntool=other 1.0\n");
+    pub const V21: Option<&str> = Some("major=2\nminor=1\ntool=other 1.0\n");
+
+    pub fn image_stream(graph: &mut Graph, arn: &str, size: usize, compression: &str) {
+        a(graph, arn, &aff4("ImageStream"));
+        graph.add(arn, &aff4("size"), typed(size, &format!("{XSD_NS}long")));
+        graph.add(arn, &aff4("chunkSize"), typed(CHUNK_SIZE, &format!("{XSD_NS}int")));
+        graph.add(
+            arn,
+            &aff4("chunksInSegment"),
+            typed(CHUNKS_PER_SEGMENT, &format!("{XSD_NS}int")),
+        );
+        graph.add(arn, &aff4("compressionMethod"), Term::Iri(compression.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
+    use crate::container::stream::{CHUNKS_PER_SEGMENT, ZLIB, store_image_stream};
+    use crate::container::{AFF4L_NS, XSD_NS};
+    use base64::Engine;
 
     fn in_metadata(graph: &mut Graph, arn: &str, property: &str, content: &[u8], sha1: &str) {
         a(graph, arn, &aff4("FileImage"));
@@ -967,18 +999,6 @@ mod tests {
         in_metadata(&mut graph, "aff4://a", "dataStream", b"hello world!", sha1);
         let report = check(&foreign(&dir, &graph, &mut |_| {}, V21));
         assert_eq!(codes(&report, Level::Fail), vec!["stream_hash"]);
-    }
-
-    fn image_stream(graph: &mut Graph, arn: &str, size: usize, compression: &str) {
-        a(graph, arn, &aff4("ImageStream"));
-        graph.add(arn, &aff4("size"), typed(size, &format!("{XSD_NS}long")));
-        graph.add(arn, &aff4("chunkSize"), typed(CHUNK_SIZE, &format!("{XSD_NS}int")));
-        graph.add(
-            arn,
-            &aff4("chunksInSegment"),
-            typed(CHUNKS_PER_SEGMENT, &format!("{XSD_NS}int")),
-        );
-        graph.add(arn, &aff4("compressionMethod"), Term::Iri(compression.to_string()));
     }
 
     #[test]
@@ -1138,6 +1158,103 @@ mod tests {
         assert_eq!(
             (report.format, codes(&report, Level::Fail)),
             (ContainerFormat::NotAff4, vec!["not_aff4"])
+        );
+    }
+}
+
+#[cfg(test)]
+mod crafted {
+    //! Containers built to break a reader: Verify must report them, not crash or run out of memory.
+    use super::tests_support::*;
+    use super::*;
+    use crate::container::XSD_NS;
+    use crate::container::stream::ZLIB;
+    use std::io::Write;
+
+    #[test]
+    fn implausible_chunk_size_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = Graph::default();
+        image_stream(&mut graph, "aff4://s", 10, ZLIB);
+        graph.add(
+            "aff4://s",
+            &aff4("chunkSize"),
+            typed("99999999999999", &format!("{XSD_NS}int")),
+        );
+        a(&mut graph, "aff4://s", &aff4("FileImage"));
+        graph.add("aff4://s", &aff4("hash"), typed("00", &aff4("SHA1")));
+        let path = foreign(
+            &dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes("aff4://s/00000000", 0, b"x").unwrap();
+                app.add_bytes("aff4://s/00000000.index", 0, &[0; 12]).unwrap();
+            },
+            V21,
+        );
+        let report = check(&path);
+        assert!(!codes(&report, Level::Fail).is_empty() || !codes(&report, Level::Warn).is_empty());
+    }
+
+    #[test]
+    fn a_chunk_that_inflates_beyond_its_size_is_damaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bomb = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        bomb.write_all(&vec![0u8; 8 << 20]).unwrap();
+        let bomb = bomb.finish().unwrap();
+        let mut index = 0u64.to_le_bytes().to_vec();
+        index.extend((bomb.len() as u32).to_le_bytes());
+        let mut graph = Graph::default();
+        image_stream(&mut graph, "aff4://s", 1000, ZLIB);
+        a(&mut graph, "aff4://s", &aff4("FileImage"));
+        graph.add("aff4://s", &aff4("hash"), typed("00", &aff4("SHA1")));
+        let path = foreign(
+            &dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes("aff4://s/00000000", 0, &bomb).unwrap();
+                app.add_bytes("aff4://s/00000000.index", 0, &index).unwrap();
+            },
+            V21,
+        );
+        let report = check(&path);
+        let fail = report
+            .findings
+            .iter()
+            .find(|f| f.code == "stream_hash")
+            .expect("a failure");
+        assert!(fail.message.contains("damaged"), "{}", fail.message);
+    }
+
+    #[test]
+    fn map_offsets_that_overflow_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = Graph::default();
+        let file = "aff4://file";
+        a(&mut graph, file, &aff4("FileImage"));
+        a(&mut graph, file, &aff4("Map"));
+        graph.add(file, &aff4("size"), typed(100, &format!("{XSD_NS}long")));
+        graph.add(file, &aff4("hash"), typed("00", &aff4("SHA1")));
+        let mut map = Vec::new();
+        map.extend((u64::MAX - 5).to_le_bytes());
+        map.extend(10u64.to_le_bytes());
+        map.extend(0u64.to_le_bytes());
+        map.extend(0u32.to_le_bytes());
+        let path = foreign(
+            &dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes("aff4://file/map", 0, &map).unwrap();
+                app.add_bytes("aff4://file/idx", 0, format!("{AFF4_NS}Zero\n").as_bytes())
+                    .unwrap();
+            },
+            V21,
+        );
+        let report = check(&path);
+        assert!(
+            codes(&report, Level::Fail).contains(&"stream_hash"),
+            "{:?}",
+            report.findings
         );
     }
 }

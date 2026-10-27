@@ -260,7 +260,8 @@ pub fn member_reader<'f>(file: &'f mut File, entry: &CdEntry) -> io::Result<Box<
     let raw = Read::take(file, entry.compressed_size);
     match entry.method {
         0 => Ok(Box::new(raw)),
-        8 => Ok(Box::new(flate2::read::DeflateDecoder::new(raw))),
+        // no more than the size the directory gives, whatever the data inflates to
+        8 => Ok(Box::new(flate2::read::DeflateDecoder::new(raw).take(entry.size))),
         other => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("compression method {other} of {}", entry.name_lossy()),

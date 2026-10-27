@@ -19,6 +19,9 @@ const STORED: [&str; 2] = [
     "http://aff4.org/Schema#NullCompressor",
 ];
 const BUFFER: usize = 1 << 20;
+/// limits for ImageStreams written by other tools (factum writes 32 KiB and 2048)
+const MAX_CHUNK_SIZE: u64 = 64 << 20;
+const MAX_CHUNKS_PER_SEGMENT: u64 = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Digests {
@@ -274,10 +277,11 @@ pub fn open_image_stream<'f>(
             format!("compression {compression}"),
         ));
     };
-    if chunk_size == 0 || chunks_per_segment == 0 {
+    // values from a container's metadata: implausible ones are refused before anything is allocated for them
+    if !(1..=MAX_CHUNK_SIZE).contains(&chunk_size) || !(1..=MAX_CHUNKS_PER_SEGMENT).contains(&chunks_per_segment) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "chunk size or chunks per segment is 0",
+            format!("implausible chunk size {chunk_size} or chunks per segment {chunks_per_segment}"),
         ));
     }
     Ok(ImageStreamReader {
@@ -355,10 +359,15 @@ impl ImageStreamReader<'_> {
             .get(offset as usize..offset as usize + length as usize)
             .ok_or_else(bad)?;
         self.chunk = if self.zlib && u64::from(length) != self.chunk_size {
+            // never more than one chunk, whatever the compressed data inflates to
             let mut out = Vec::with_capacity(self.chunk_size as usize);
             flate2::read::ZlibDecoder::new(stored)
+                .take(self.chunk_size + 1)
                 .read_to_end(&mut out)
                 .map_err(|_| bad())?;
+            if out.len() as u64 > self.chunk_size {
+                return Err(bad());
+            }
             out
         } else {
             stored.to_vec()
