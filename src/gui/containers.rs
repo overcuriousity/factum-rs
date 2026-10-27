@@ -70,6 +70,12 @@ pub fn add_status(progress: &AddProgress, name: &str) -> String {
     )
 }
 
+/// An xsd:dateTime as the view shows it: 2026-10-27 21:10:04 UTC.
+pub fn short_time(xsd: &str) -> String {
+    let seconds = xsd.trim_end_matches('Z').split('.').next().unwrap_or(xsd);
+    format!("{} UTC", seconds.replace('T', " "))
+}
+
 /// The tree row's text: the name, and that it is open.
 pub fn tree_label(summary: &ContainerSummary) -> String {
     if summary.open {
@@ -127,6 +133,7 @@ fn history_row(ui: &mut egui::Ui, utc: &str, entry_id: i64, text: &str, actions:
 pub fn container_view(
     ui: &mut egui::Ui,
     detail: &ContainerDetail,
+    times: &std::collections::HashMap<String, String>,
     evidence: Option<&str>,
     archived: bool,
     actions: &mut Vec<ContainerAction>,
@@ -249,7 +256,7 @@ pub fn container_view(
                     } else if let Some(target) = &file.link {
                         path += &format!("  → {target}");
                     }
-                    ui.allocate_ui(egui::vec2(width * 0.55, row_height), |ui| {
+                    ui.allocate_ui(egui::vec2(width * 0.42, row_height), |ui| {
                         ui.add(egui::Label::new(RichText::new(&path).color(p.text)).truncate())
                             .on_hover_text(&path);
                     });
@@ -257,6 +264,10 @@ pub fn container_view(
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             ui.label(small(human_size(file.size), p.secondary));
                         });
+                    });
+                    ui.allocate_ui(egui::vec2(width * 0.2, row_height), |ui| {
+                        let modified = times.get(&file.arn).map(|t| short_time(t)).unwrap_or_default();
+                        ui.label(small(modified, p.muted)).on_hover_text("Last written");
                     });
                     if !file.sha256.is_empty() {
                         let short = format!("{}…", &file.sha256[..16.min(file.sha256.len())]);

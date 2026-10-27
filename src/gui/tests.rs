@@ -1842,3 +1842,17 @@ fn not_now_leaves_x509_unchanged() {
     click_label(&mut harness, "Finish");
     assert_eq!(fixture.db().get_setting(X509_CERT_SETTING).unwrap(), "ABC");
 }
+
+#[test]
+fn container_view_shows_modified_times() {
+    let (fixture, id, _) = Fixture::with_container();
+    let source = fixture._dir.path().join("mnt/evil.exe");
+    let modified = crate::container::source::xsd_time(std::fs::metadata(&source).unwrap().modified().unwrap());
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.run_ok();
+    assert_eq!(harness.state().view.container_times.len(), 2);
+    let shown = containers::short_time(&modified);
+    assert!(shown.ends_with(" UTC") && shown.as_bytes()[10] == b' ', "{shown}");
+    assert!(harness.query_all_by_label(&shown).next().is_some(), "{shown}");
+}

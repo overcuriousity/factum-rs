@@ -156,7 +156,12 @@ struct View {
     companion: Option<CompanionView>,
     /// the selected container, shown in place of the log
     container: Option<crate::containers::ContainerDetail>,
+    /// its files' last-written times, by ARN, from the container file
+    container_times: HashMap<String, String>,
 }
+
+/// A container file's times as last read: (file, its length then, last-written time by ARN).
+type TimesCache = (PathBuf, u64, HashMap<String, String>);
 
 /// Files being added to a container, on a worker thread.
 struct AddJob {
@@ -219,6 +224,8 @@ struct FactumApp {
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
     add_job: Option<AddJob>,
+    /// the selected container's file times: (file, its length when read, times)
+    container_times_cache: std::cell::RefCell<Option<TimesCache>>,
     container_verify_job: Option<ContainerVerifyJob>,
     container_verify_windows: Vec<containers::ContainerVerifyWindow>,
     /// each case's last verification in this session: outcome, time and the tree size it covered
@@ -325,6 +332,7 @@ impl FactumApp {
             signature_check_pending: false,
             verify_job: None,
             add_job: None,
+            container_times_cache: std::cell::RefCell::new(None),
             container_verify_job: None,
             container_verify_windows: Vec::new(),
             verified: HashMap::new(),
@@ -797,6 +805,12 @@ impl FactumApp {
                 .ok(),
             None => None,
         };
+        view.container_times = view
+            .container
+            .as_ref()
+            .and_then(|detail| detail.summary.path.clone().filter(|_| !detail.summary.missing))
+            .map(|path| self.container_times(&path))
+            .unwrap_or_default();
         view.companion = match (&self.companion_db, &view.case) {
             (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
                 CompanionView::read(&factum, cdb, case.id)
@@ -1036,6 +1050,24 @@ impl FactumApp {
             }
         });
         self.run(result);
+    }
+
+    /// The container's file times, read from the file only when it changed since the last read.
+    fn container_times(&self, path: &std::path::Path) -> HashMap<String, String> {
+        let length = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let mut cache = self.container_times_cache.borrow_mut();
+        if let Some((cached, cached_length, times)) = cache.as_ref()
+            && cached == path
+            && *cached_length == length
+        {
+            return times.clone();
+        }
+        let times = crate::container::volume::read_graph(path)
+            .map(|graph| crate::container::volume::modified_times(&graph))
+            .inspect_err(|e| log::warn!("{e}"))
+            .unwrap_or_default();
+        *cache = Some((path.to_path_buf(), length, times.clone()));
+        times
     }
 
     fn locate_container(&mut self, id: i64, path: &std::path::Path) {
@@ -2548,7 +2580,16 @@ impl FactumApp {
                     .map(|(e, _)| e.description.clone())
             });
             let mut container_actions = Vec::new();
-            containers::container_view(ui, &detail, evidence.as_deref(), archived, &mut container_actions);
+            let times = std::mem::take(&mut self.view.container_times);
+            containers::container_view(
+                ui,
+                &detail,
+                &times,
+                evidence.as_deref(),
+                archived,
+                &mut container_actions,
+            );
+            self.view.container_times = times;
             for action in container_actions {
                 self.container_action(action, ctx);
             }

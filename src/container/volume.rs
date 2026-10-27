@@ -232,6 +232,37 @@ fn io_error(path: &Path, e: io::Error) -> FactumError {
     FactumError::general(format!("The container {} could not be written: {e}", path.display()))
 }
 
+/// The metadata of a container file's newest complete state, read without changing the file.
+pub fn read_graph(path: &Path) -> Result<Graph> {
+    let not_container = |why: String| FactumError::general(format!("{} cannot be read: {why}", path.display()));
+    let mut file = File::open(path).map_err(|e| not_container(e.to_string()))?;
+    let end = find_last_end(&mut file, None)
+        .map_err(|e| not_container(e.to_string()))?
+        .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
+    let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
+    let entry = archive
+        .get(TURTLE)
+        .ok_or_else(|| not_container("information.turtle is missing".into()))?;
+    let mut text = String::new();
+    member_reader(&mut file, entry)
+        .and_then(|mut r| r.read_to_string(&mut text))
+        .map_err(|e| not_container(e.to_string()))?;
+    turtle::parse(&text).map_err(not_container)
+}
+
+/// When each file of a graph was last written, by ARN.
+pub fn modified_times(graph: &Graph) -> std::collections::HashMap<String, String> {
+    graph
+        .subjects_of_type(&aff4("FileImage"))
+        .filter_map(|arn| {
+            Some((
+                arn.to_string(),
+                graph.first_value(arn, &aff4l("lastWritten"))?.to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// The files a graph lists, in order, as the log records them.
 pub fn file_records(graph: &Graph) -> Vec<FileRecord> {
     graph
