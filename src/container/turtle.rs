@@ -51,10 +51,20 @@ pub struct Triple {
     pub object: Term,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Triples in the order they were added, with an index by subject (lookups stay fast in graphs of many files).
+#[derive(Debug, Clone, Default)]
 pub struct Graph {
-    pub triples: Vec<Triple>,
+    triples: Vec<Triple>,
+    by_subject: HashMap<String, Vec<usize>>,
 }
+
+impl PartialEq for Graph {
+    fn eq(&self, other: &Self) -> bool {
+        self.triples == other.triples
+    }
+}
+
+impl Eq for Graph {}
 
 /// The IRI and its synonyms: a term of the aff4 lexicon may be written in the aff4 or the aff4l namespace (AFF4-L
 /// v1.0, 4.1), and the aff4l namespace with http or https.
@@ -72,6 +82,10 @@ fn synonyms(iri: &str) -> Vec<String> {
 
 impl Graph {
     pub fn add(&mut self, subject: &str, predicate: &str, object: Term) {
+        self.by_subject
+            .entry(subject.to_string())
+            .or_default()
+            .push(self.triples.len());
         self.triples.push(Triple {
             subject: subject.into(),
             predicate: predicate.into(),
@@ -80,16 +94,25 @@ impl Graph {
     }
 
     pub fn extend(&mut self, other: Graph) {
-        self.triples.extend(other.triples);
+        for triple in other.triples {
+            self.add(&triple.subject, &triple.predicate, triple.object);
+        }
+    }
+
+    pub fn triples(&self) -> &[Triple] {
+        &self.triples
     }
 
     /// The objects of `subject`'s `predicate` (or a synonym of it), in order.
     pub fn objects<'g>(&'g self, subject: &str, predicate: &str) -> impl Iterator<Item = &'g Term> {
         let predicates = synonyms(predicate);
-        let subject = subject.to_string();
-        self.triples
+        self.by_subject
+            .get(subject)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
             .iter()
-            .filter(move |t| t.subject == subject && predicates.contains(&t.predicate))
+            .map(|&index| &self.triples[index])
+            .filter(move |t| predicates.contains(&t.predicate))
             .map(|t| &t.object)
     }
 

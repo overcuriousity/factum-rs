@@ -286,6 +286,12 @@ impl Appender {
         self.position
     }
 
+    /// The file, for reading members; the next write seeks back to where the appender is.
+    pub fn file_mut(&mut self) -> io::Result<&mut File> {
+        self.out.flush()?;
+        Ok(self.out.get_mut())
+    }
+
     /// Adds a member; `observe` sees the uncompressed bytes as they are read.
     pub fn add_member(
         &mut self,
@@ -301,6 +307,7 @@ impl Appender {
             ));
         }
         let header_offset = self.position;
+        self.out.seek(SeekFrom::Start(header_offset))?;
         let (time, date) = dos_now();
         let name_bytes = name.as_bytes();
         let mut header = Vec::with_capacity(30 + name_bytes.len() + 20);
@@ -417,6 +424,7 @@ impl Appender {
             .collect();
         let (time, date) = dos_now();
         let cd_offset = self.position;
+        self.out.seek(SeekFrom::Start(cd_offset))?;
         let mut directory = Vec::new();
         for entry in &entries {
             directory.extend(CENTRAL_SIG.to_le_bytes());
