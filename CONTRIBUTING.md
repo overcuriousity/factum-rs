@@ -6,7 +6,8 @@
 cargo test                                   # everything; gpg and python3 tests run when they are installed
 cargo test --no-default-features             # without the GUI
 cargo clippy --all-targets && cargo fmt      # CI fails on warnings and unformatted code
-FACTUM_SCREENSHOTS=/tmp/shots cargo test --lib gui::   # renders GUI screenshots (needs a GPU or Mesa lavapipe)
+FACTUM_SCREENSHOTS=/tmp/shots cargo test --lib gui:: -- --test-threads=1   # renders GUI screenshots (needs a GPU or Mesa lavapipe; several render threads at once can crash the Vulkan loader)
+scripts/subset-icons.sh path/to/Phosphor.ttf   # after adding an icon to src/gui/icons.rs (needs fonttools)
 FACTUM_DB=/tmp/demo.db cargo run --example demo_db && FACTUM_DB=/tmp/demo.db cargo run -- --gui
 ```
 

@@ -8,6 +8,8 @@
 //! - body and secondary text ≥ 7:1 contrast, metadata ≥ 4.5:1 in both themes
 //! - Atkinson Hyperlegible Next for text (letter differentiation: Il1, O0), JetBrains Mono for hashes,
 //!   timestamps, key ids and IoCs; 16 px note text, about 70 characters per line
+//! - actions are small Phosphor icons with a tooltip naming them (and their shortcut); row actions only show while
+//!   the row is hovered or focused, so the log itself stays quiet
 //! - the log is a flat list separated by hairlines, not a stack of boxed cards: spacing carries the grouping (the
 //!   gap inside a note is smaller than the gap between notes, Gestalt proximity; grouping matters more than
 //!   whitespace, Tullis 1983), so more entries fit on screen; corners are square or 2 px, a style choice without
@@ -34,7 +36,6 @@ pub struct Palette {
     pub on_accent: Color32,
     pub ok: Color32,
     pub warn: Color32,
-    pub warn_soft: Color32,
     pub fail: Color32,
     pub tag: Color32,
     pub tag_soft: Color32,
@@ -57,7 +58,6 @@ pub const LIGHT: Palette = Palette {
     on_accent: hex(0xffffff),
     ok: hex(0x00704f),
     warn: hex(0x8a5a00),
-    warn_soft: hex(0xf8eed9),
     fail: hex(0xb03a0c),
     tag: hex(0x7b3f8f),
     tag_soft: hex(0xf1e7f4),
@@ -76,7 +76,6 @@ pub const DARK: Palette = Palette {
     on_accent: hex(0x17191d),
     ok: hex(0x4fc59e),
     warn: hex(0xe3b04b),
-    warn_soft: hex(0x3a2f19),
     fail: hex(0xff8c6b),
     tag: hex(0xd3a1d0),
     tag_soft: hex(0x352736),
@@ -90,6 +89,7 @@ pub const NOTE_SIZE: f32 = 16.0;
 pub const BODY_SIZE: f32 = 14.5;
 pub const SMALL_SIZE: f32 = 12.5;
 pub const MONO_SIZE: f32 = 12.5;
+pub const ICON_SIZE: f32 = 15.0;
 /// note cards stop growing at about 70 characters per line
 pub const MAX_CARD_WIDTH: f32 = 760.0;
 
@@ -124,14 +124,18 @@ pub fn install_fonts(ctx: &egui::Context) {
         "jetbrains",
         include_bytes!("../../assets/fonts/JetBrainsMono-Regular.ttf"),
     );
-    // egui's own fonts stay as fallbacks (emoji, symbols)
+    add(
+        "phosphor",
+        include_bytes!("../../assets/fonts/Phosphor-Regular-subset.ttf"),
+    );
+    // the icons sit in the private use area, before egui's own fonts (emoji, symbols), which use it too
     let defaults = fonts
         .families
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
     let with_fallbacks = |first: &str| {
-        let mut list = vec![first.to_string(), "jetbrains".to_string()];
+        let mut list = vec![first.to_string(), "phosphor".to_string(), "jetbrains".to_string()];
         list.extend(defaults.iter().cloned());
         list
     };
@@ -140,7 +144,7 @@ pub fn install_fonts(ctx: &egui::Context) {
         .insert(FontFamily::Proportional, with_fallbacks("atkinson"));
     fonts.families.insert(bold(), with_fallbacks("atkinson-bold"));
     fonts.families.insert(italic(), with_fallbacks("atkinson-italic"));
-    let mut mono = vec!["jetbrains".to_string()];
+    let mut mono = vec!["jetbrains".to_string(), "phosphor".to_string()];
     mono.extend(fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default());
     mono.push("atkinson".into());
     fonts.families.insert(FontFamily::Monospace, mono);
@@ -220,6 +224,11 @@ pub fn apply(ctx: &egui::Context, theme: &str) {
     });
 }
 
+/// The frame of dialogs and report windows: the window colours with room around the content.
+pub fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::same(18))
+}
+
 pub fn is_dark(ctx: &egui::Context) -> bool {
     ctx.theme() == Theme::Dark
 }
@@ -259,7 +268,6 @@ mod tests {
                     assert!(contrast(color, background) >= 4.5, "{color:?} on {background:?}");
                 }
             }
-            assert!(contrast(p.warn, p.warn_soft) >= 4.5);
             assert!(contrast(p.tag, p.tag_soft) >= 4.5 && contrast(p.text, p.accent_soft) >= 7.0);
             assert!(contrast(p.on_accent, p.accent) >= 4.5);
         }

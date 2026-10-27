@@ -7,6 +7,7 @@ use egui_kittest::kittest::Queryable;
 use super::*;
 use crate::companion::{Preset, Rating};
 use crate::signer::FakeSigner;
+use companion_dialogs::BUILTIN_GUIDELINE;
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -99,11 +100,7 @@ fn case_view_shows_system_rows_and_newest_versions() {
     assert_eq!(systems, 3);
     assert_eq!(cards.len(), 1);
     assert_eq!(cards[0].history.len(), 1);
-    assert!(
-        harness
-            .query_by_label_contains("Show history (1 earlier version)")
-            .is_some()
-    );
+    assert!(harness.query_by_label("Show 1 earlier version").is_some());
     assert_eq!(app.view.note_count, "1 note · 3 system");
     harness.state_mut().show_system = false;
     harness.state_mut().dirty = true;
@@ -123,6 +120,7 @@ fn archived_case_disables_note_input() {
     harness.run_ok();
     assert!(harness.query_by_label_contains("(archived, read-only)").is_some());
     assert!(harness.state().view.case.as_ref().unwrap().is_archived());
+    screenshot(&mut harness, "archived");
 }
 
 #[test]
@@ -240,8 +238,8 @@ fn cli_target_is_shown_when_set() {
     let case_id = harness.state().factum().list_cases(false).unwrap()[0];
     harness.state_mut().set_cli_active_case(case_id);
     harness.run_ok();
-    assert_eq!(harness.state().view.cli_active, "Case: Case");
-    assert!(harness.query_by_label("CLI active:").is_some());
+    assert_eq!(harness.state().view.cli_active, "Case");
+    assert!(harness.query_by_label("CLI target").is_some());
 }
 
 #[test]
@@ -295,7 +293,7 @@ fn verification_runs_in_the_background_and_opens_a_report() {
     }
     harness.run_ok();
     assert_eq!(harness.state().verify_windows.len(), 1);
-    assert!(harness.query_by_label_contains("Failures (").is_some());
+    assert!(harness.query_by_label_contains("Failures ").is_some());
     screenshot(&mut harness, "verify");
 }
 
@@ -365,9 +363,9 @@ fn dark_theme_renders() {
 }
 
 fn open_companion_settings(harness: &mut Harness<'_, FactumApp>) {
-    harness.get_by_label("Companion").click();
+    harness.get_by_label("Settings").click();
     harness.run_ok();
-    harness.get_by_label("Settings…").click();
+    harness.get_by_label("Companion…").click();
     harness.run_ok();
 }
 
@@ -474,7 +472,22 @@ fn preset_choice_shows_builtin_read_only() {
     open_companion_settings(&mut harness);
     click_label(&mut harness, "OSINT research");
     assert_eq!(settings_dialog(&harness).draft.preset, Preset::Osint);
-    type_into(&mut harness, "Guideline", "X");
+    // a built-in guideline is behind its heading, and typing into it changes nothing
+    let field = |h: &Harness<'_, FactumApp>| {
+        h.query_by_role_and_label(egui::accesskit::Role::MultilineTextInput, BUILTIN_GUIDELINE)
+            .is_some()
+    };
+    assert!(!field(&harness));
+    click_label(&mut harness, "Guideline");
+    assert!(field(&harness));
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, BUILTIN_GUIDELINE)
+        .focus();
+    harness.run_ok();
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, BUILTIN_GUIDELINE)
+        .type_text("X");
+    harness.run_ok();
     assert_eq!(settings_dialog(&harness).draft.global_guideline, "");
 }
 
@@ -557,7 +570,7 @@ fn side_panel_is_stacked_pinned_first() {
     assert!(pinned.min.y < iocs.min.y, "Pinned is above the IoCs");
     // both sections are on screen at once (the note in the log and pinned), the IoCs closed
     assert_eq!(harness.get_all_by_label_contains("first note, corrected").count(), 2);
-    assert!(harness.query_by_label_contains("IP  (1)").is_none());
+    assert!(harness.query_by_label("IP 1").is_none());
 }
 
 #[test]
@@ -566,7 +579,7 @@ fn questions_section_absent_when_unconfigured() {
     let mut harness = fixture.harness();
     select_case(&mut harness);
     assert!(harness.query_by_label_contains("QUESTIONS").is_none());
-    assert!(harness.query_by_label_contains("No goal set").is_none());
+    assert!(harness.query_by_label_contains("Set a goal").is_none());
     assert!(harness.query_by_label("Companion for this case").is_none());
     assert!(
         !companion_db_path(&fixture.path).exists(),
@@ -585,7 +598,7 @@ fn questions_section_shows_goal_row_and_rows_in_position_order() {
     let mut harness = fixture.harness();
     select_case(&mut harness);
     assert!(harness.query_by_label("▾ QUESTIONS 2").is_some());
-    let goal = harness.get_by_label("No goal set for this case. Set it…").rect();
+    let goal = harness.get_by_label("Set a goal for this case…").rect();
     let first = harness.get_by_label("Which tool imaged the disk?").rect();
     let second = harness.get_by_label("Who held the disk overnight?").rect();
     assert!(goal.min.y < first.min.y && first.min.y < second.min.y);
@@ -614,10 +627,10 @@ fn minus_removes_row_and_plus_keeps_it() {
     let q2 = ask(&cdb, case_id, "Who held the disk overnight?", vec![versions[1]]);
     let mut harness = fixture.harness();
     select_case(&mut harness);
-    harness.get_all_by_label("−").next().unwrap().click();
+    harness.get_all_by_label("Not useful").next().unwrap().click();
     harness.run_ok();
     assert!(harness.query_by_label("Which tool imaged the disk?").is_none());
-    harness.get_by_label("+").click();
+    harness.get_by_label("Useful").click();
     harness.run_ok();
     assert!(harness.query_by_label("Who held the disk overnight?").is_some());
     let open = cdb.open_questions(case_id).unwrap();
@@ -654,7 +667,7 @@ fn case_toggle_hides_section_and_goal_dialog_writes_goal() {
     let (case_id, _) = first_note_versions(&fixture);
     let mut harness = fixture.harness();
     select_case(&mut harness);
-    harness.get_by_label("⋯").click();
+    harness.get_by_label("Case actions").click();
     harness.run_ok();
     harness.get_by_label("Case goal…").click();
     harness.run_ok();
@@ -665,9 +678,9 @@ fn case_toggle_hides_section_and_goal_dialog_writes_goal() {
         cdb.case_settings(case_id).unwrap().unwrap().goal,
         "Establish how the disk left the building"
     );
-    assert!(harness.query_by_label_contains("No goal set").is_none());
+    assert!(harness.query_by_label_contains("Set a goal").is_none());
     assert!(harness.query_by_label_contains("QUESTIONS").is_some());
-    harness.get_by_label("⋯").click();
+    harness.get_by_label("Case actions").click();
     harness.run_ok();
     harness.get_by_label("Companion for this case").click();
     harness.run_ok();
@@ -692,9 +705,9 @@ fn local_note_sends_case_changed() {
     assert!(commands.try_iter().any(|cmd| cmd == Command::CaseChanged(case_id)));
 }
 
-/// Opens an item of the Questions section's ▾ menu.
+/// Opens an item of the Questions section's menu.
 fn questions_menu(harness: &mut Harness<'_, FactumApp>, item: &str) {
-    harness.get_by_label("▾").click();
+    harness.get_by_label("Companion").click();
     harness.run_ok();
     harness.get_by_label(item).click();
     harness.run_ok();
@@ -807,12 +820,18 @@ fn a_long_note_scrolls_inside_the_composer() {
     harness.run_ok();
     screenshot(&mut harness, "composer-long");
     // the editor keeps the panel's height; the button row stays on screen
-    let button = harness.get_by_label_contains("Add Note").rect();
+    let button = harness.get_by_label("Add").rect();
     assert!(button.max.y < 820.0, "{button:?}");
     let height = harness.state().composer_height;
     assert!((height - DEFAULT_COMPOSER_HEIGHT).abs() < 1.0, "{height}");
     // dragging the panel's top edge up makes it taller
-    let top = harness.get_by_label_contains("Adding to").rect().min.y - 8.0;
+    // the panel's top edge, just above the editor
+    let top = harness
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .rect()
+        .min
+        .y
+        - 6.0;
     let pointer = |harness: &mut Harness<'_, FactumApp>, event: egui::Event| {
         harness.input_mut().events.push(event);
         harness.step();
@@ -854,7 +873,7 @@ fn the_editor_stays_above_the_buttons_at_the_smallest_height() {
     select_case(&mut harness);
     screenshot(&mut harness, "composer-smallest");
     let editor = harness.get_by_role(egui::accesskit::Role::MultilineTextInput).rect();
-    let button = harness.get_by_label_contains("Add Note").rect();
+    let button = harness.get_by_label("Add").rect();
     assert!(editor.max.y <= button.min.y, "{editor:?} {button:?}");
 }
 
@@ -938,6 +957,10 @@ fn finish_writes_choices() {
     type_into(&mut harness, "Model", "m");
     click_label(&mut harness, "OSINT research");
     wizard_to(&mut harness, "Next", Step::SealFolder);
+    // the field starts with the folder in use
+    if let Some(Dialog::Wizard(wizard)) = harness.state_mut().dialogs.last_mut() {
+        wizard.seal_folder.clear();
+    }
     type_into(&mut harness, "Seal folder", &seals.path().display().to_string());
     wizard_to(&mut harness, "Next", Step::Appearance);
     click_label(&mut harness, "Dark");
@@ -1040,7 +1063,249 @@ fn clearing_the_seal_folder_in_the_wizard_clears_the_setting() {
         wizard.seal_folder.clear();
     }
     wizard_to(&mut harness, "Next", Step::Summary);
-    assert!(harness.query_by_label("next to the database").is_some());
+    assert!(harness.query_by_label_contains("(next to the database)").is_some());
     click_label(&mut harness, "Finish");
     assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
+}
+
+#[test]
+fn the_note_header_wraps_instead_of_overlapping_at_the_smallest_window() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.set_size(egui::vec2(900.0, 560.0)); // the window's minimum size
+    select_case(&mut harness);
+    let note = harness
+        .state()
+        .view
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Note(c) => Some(c.entry.id),
+            _ => None,
+        })
+        .unwrap();
+    harness.state_mut().focused_card = Some(note); // its actions show
+    harness.run_ok();
+    screenshot(&mut harness, "smallest-window");
+    // the left part of each header (timestamps, chip) never runs under the right part (mark, actions)
+    let left: Vec<egui::Rect> = harness
+        .query_all_by_label_contains(" UTC")
+        .chain(harness.query_all_by_label_contains("2026-"))
+        .chain(harness.query_all_by_label("Show 1 earlier version"))
+        .map(|node| node.rect())
+        .collect();
+    assert!(left.len() >= 3);
+    let right_side = harness
+        .query_all_by_label("Not signed")
+        .chain(harness.query_all_by_label("More"))
+        .chain(harness.query_all_by_label("Correct"))
+        .chain(harness.query_all_by_label("Pin"));
+    for node in right_side {
+        for rect in &left {
+            assert!(!node.rect().intersects(*rect), "{:?} overlaps {rect:?}", node.rect());
+        }
+    }
+}
+
+#[test]
+fn the_log_is_a_centred_column_on_a_wide_screen() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.set_size(egui::vec2(1920.0, 1080.0));
+    select_case(&mut harness);
+    harness.run_ok();
+    screenshot(&mut harness, "wide-window");
+    let editor = harness.get_by_role(egui::accesskit::Role::MultilineTextInput).rect();
+    let app = harness.state();
+    let middle = (app.tree_width + (1920.0 - app.side_width)) / 2.0;
+    assert!(editor.width() <= theme::MAX_CARD_WIDTH + 1.0, "{editor:?}");
+    assert!((editor.center().x - middle).abs() < 20.0, "{editor:?} {middle}");
+}
+
+#[test]
+fn a_database_without_cases_shows_how_to_create_one() {
+    let fixture = Fixture::empty();
+    fixture.db().set_setting(ONBOARDING_SETTING, "1").unwrap();
+    let mut harness = fixture.harness();
+    screenshot(&mut harness, "no-cases");
+    // no note input without a case
+    assert!(
+        harness
+            .query_by_role(egui::accesskit::Role::MultilineTextInput)
+            .is_none()
+    );
+    harness.get_by_label(&format!("{}  New case", icons::PLUS)).click();
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::NewCase { .. })));
+}
+
+#[test]
+fn a_notes_actions_show_under_the_pointer() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.get_by_label("first note, corrected #tag 10.0.0.1").hover();
+    harness.run_ok();
+    screenshot(&mut harness, "note-hovered");
+    harness.get_by_label("Correct").click();
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Correct { .. })));
+}
+
+#[test]
+fn a_label_is_completed_from_the_tags_in_use() {
+    let fixture = Fixture::new();
+    let (case_id, versions) = first_note_versions(&fixture);
+    {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        Factum::with_seal_dir(&db, &signer, None)
+            .create_note("second note #malware", None, case_id)
+            .unwrap();
+    }
+    let note = versions[1];
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::AddLabel(note), &ctx);
+    harness.run_ok();
+    // the note's own #tag is not offered
+    assert!(
+        matches!(harness.state().dialogs.last(), Some(Dialog::AddLabel { known, .. })
+        if known.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>() == ["malware"])
+    );
+    // a typo still finds it; ↓ and Enter take it
+    type_into(&mut harness, "Label", "mlaware");
+    let option = egui::accesskit::Role::ListBoxOption;
+    assert!(harness.query_by_role_and_label(option, "malware").is_some());
+    screenshot(&mut harness, "label-suggestions");
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_ok();
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+    let tags = crate::tags::get_tags_for_entry(&fixture.db().conn, note).unwrap();
+    assert!(tags.contains(&("malware".to_string(), "label".to_string())), "{tags:?}");
+}
+
+#[test]
+fn a_clicked_suggestion_is_added() {
+    let fixture = Fixture::new();
+    let (case_id, versions) = first_note_versions(&fixture);
+    {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        Factum::with_seal_dir(&db, &signer, None)
+            .create_note("second note #review", None, case_id)
+            .unwrap();
+    }
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::AddLabel(versions[1]), &ctx);
+    harness.run_ok();
+    type_into(&mut harness, "Label", "rev");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ListBoxOption, "review")
+        .click();
+    harness.run_ok();
+    let tags = crate::tags::get_tags_for_entry(&fixture.db().conn, versions[1]).unwrap();
+    assert!(tags.contains(&("review".to_string(), "label".to_string())), "{tags:?}");
+}
+
+#[test]
+fn enter_creates_the_case() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().open_new_case();
+    harness.run_ok();
+    type_into(&mut harness, "File number", "C-2");
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+    assert_eq!(harness.state().factum().list_cases(false).unwrap().len(), 2);
+}
+
+#[test]
+fn a_key_is_chosen_by_clicking_its_row() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let key = |n: u8, name: &str, validity: &str| crate::signer::GpgKey {
+        keyid: format!("{:016X}", 0xA1B2_C3D4_0000_0000u64 + n as u64),
+        fingerprint: format!("{:040X}", 0x1234_5678_9ABC_DEF0u64 + n as u64),
+        uids: vec![format!(
+            "{name} <{}@example.org>",
+            name.to_lowercase().replace(' ', ".")
+        )],
+        cap: "scSC".into(),
+        algorithm: "ed25519".into(),
+        created: "2025-03-01".into(),
+        expires: if validity == "e" {
+            "2026-01-01".into()
+        } else {
+            String::new()
+        },
+        validity: validity.into(),
+    };
+    let keys = vec![
+        key(1, "Ana Analyst", "u"),
+        key(2, "Lab Signing", "u"),
+        key(3, "Old Key", "e"),
+        key(4, "Field Team", "u"),
+        key(5, "Backup", "u"),
+    ];
+    let first = keys[0].keyid.clone();
+    harness.state_mut().dialogs.push(Dialog::GpgKeys {
+        keys,
+        selected: Some(first),
+    });
+    harness.run_ok();
+    screenshot(&mut harness, "signing-keys");
+    let row = egui::accesskit::Role::RadioButton;
+    harness
+        .get_by_role_and_label(row, "Lab Signing <lab.signing@example.org>")
+        .click();
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::GpgKeys { selected, .. }) => assert_eq!(selected.as_deref(), Some("A1B2C3D400000002")),
+        _ => panic!("the key dialog closed"),
+    }
+}
+
+#[test]
+fn the_wizard_shows_the_seal_folder_in_use() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().open_wizard();
+    harness.run_ok();
+    wizard_to(&mut harness, "Next", Step::SealFolder);
+    let default = harness.state().factum().default_seal_dir().display().to_string();
+    assert_eq!(wizard(&harness).seal_folder, default);
+    screenshot(&mut harness, "wizard-seal-folder");
+    // the default may not exist yet, and leaving it writes no setting
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
+}
+
+#[test]
+fn without_signing_the_wizard_leaves_out_key_and_seal_folder() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    screenshot(&mut harness, "wizard-welcome");
+    click_label(&mut harness, "Not now: skip signing and seals");
+    assert!(harness.query_by_label_contains("Signing key").is_none());
+    click_label(&mut harness, "Next");
+    assert_eq!(wizard(&harness).step, Step::Companion);
+    wizard_to(&mut harness, "Next", Step::Appearance);
+    click_label(&mut harness, "Back");
+    assert_eq!(wizard(&harness).step, Step::Companion);
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    let db = fixture.db();
+    assert_eq!(db.get_setting(ACTIVE_KEY_SETTING).unwrap(), "");
+    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
 }

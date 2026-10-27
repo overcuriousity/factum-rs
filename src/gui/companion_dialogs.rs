@@ -6,13 +6,16 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use egui::{RichText, TextEdit};
+use egui::{Align, Layout, RichText, TextEdit};
 
 use super::dialogs::{DialogResult, buttons, error_line, title};
 use super::theme::{self, SMALL_SIZE};
 use super::workers::Worker;
 use crate::companion::llm::{self, LlmError, ModelInfo};
 use crate::companion::{CompanionDb, Preset, Protocol, Settings};
+
+/// Names a built-in preset's guideline, which is shown read-only.
+pub const BUILTIN_GUIDELINE: &str = "Built in. Choose Custom to write your own.";
 
 /// The model list is loaded this long after the last edit of URL, key, protocol or headers.
 const DEBOUNCE: Duration = Duration::from_millis(600);
@@ -239,7 +242,12 @@ impl CompanionSettingsDialog {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<DialogResult> {
-        title(ui, "Companion Settings");
+        ui.horizontal(|ui| {
+            title(ui, "Companion");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.checkbox(&mut self.draft.enabled, "Enabled");
+            });
+        });
         // OK and Cancel stay on screen in a small window
         egui::ScrollArea::vertical()
             .id_salt("companion-settings")
@@ -255,9 +263,6 @@ impl CompanionSettingsDialog {
 
     fn fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.connection_fields(ui, ctx);
-        self.preset_fields(ui, ctx);
-        ui.checkbox(&mut self.draft.enabled, "Enabled");
-        self.endpoint_note(ui, ctx);
         let p = *theme::current(ctx);
         ui.horizontal(|ui| {
             let testing = self.probe_worker.is_some();
@@ -272,18 +277,22 @@ impl CompanionSettingsDialog {
                     ui.label(RichText::new("✓ Reachable").color(p.ok));
                 }
                 Some(Err(line)) => {
-                    ui.label(RichText::new(format!("✗ {line}")).color(p.fail));
+                    ui.add(egui::Label::new(RichText::new(format!("✗ {line}")).color(p.fail)).wrap());
                 }
                 None => {}
             }
         });
+        self.endpoint_note(ui, ctx);
+        self.preset_fields(ui, ctx);
     }
 
-    /// Endpoint, protocol, key, headers, context window and model, with the model list.
+    /// Endpoint, protocol, key and model with the model list, the context window, and under Advanced the
+    /// User-Agent and extra headers.
     pub fn connection_fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
         let small = |text: &str| RichText::new(text).size(SMALL_SIZE).color(p.muted);
         let mut connection_edited = false;
+        section(ui, "Connection");
 
         let url = Self::labelled(ui, "Endpoint URL", |ui| {
             ui.add(
@@ -322,24 +331,69 @@ impl CompanionSettingsDialog {
                 connection_edited = true;
             }
             ui.label(small(
-                "The key is stored as entered in the companion database: keep the database folder private.",
+                "Stored as entered in the companion database: keep its folder private.",
             ));
         }
 
-        Self::labelled(ui, "User-Agent", |ui| {
-            ui.add(TextEdit::singleline(&mut self.draft.user_agent).desired_width(f32::INFINITY))
-        });
+        let mut headers_edited = false;
+        egui::CollapsingHeader::new(RichText::new("Advanced").size(SMALL_SIZE).color(p.secondary))
+            .id_salt("companion-advanced")
+            .default_open(!self.draft.user_agent.trim().is_empty() || !self.draft.extra_headers.trim().is_empty())
+            .show(ui, |ui| {
+                Self::labelled(ui, "User-Agent", |ui| {
+                    ui.add(TextEdit::singleline(&mut self.draft.user_agent).desired_width(f32::INFINITY))
+                });
+                let headers = Self::labelled(ui, "Extra headers", |ui| {
+                    ui.add(
+                        TextEdit::multiline(&mut self.draft.extra_headers)
+                            .code_editor()
+                            .hint_text(r#"{"X-Header": "value"}"#)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    )
+                });
+                headers_edited = headers.changed();
+            });
+        connection_edited |= headers_edited;
 
-        let headers = Self::labelled(ui, "Extra headers", |ui| {
-            ui.add(
-                TextEdit::multiline(&mut self.draft.extra_headers)
-                    .code_editor()
-                    .hint_text(r#"{"X-Header": "value"}"#)
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY),
-            )
+        if connection_edited {
+            self.last_edit = Some(Instant::now());
+        }
+        self.update_models(ctx);
+
+        section(ui, "Model");
+        let model_label = ui.label("Model");
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let mut ids: Vec<&str> = self.models.iter().map(|m| m.id.as_str()).collect();
+                if !self.saved_model.is_empty() && !ids.contains(&self.saved_model.as_str()) {
+                    ids.push(&self.saved_model);
+                }
+                let mut chosen = None;
+                let combo = egui::ComboBox::from_id_salt("companion-model")
+                    .selected_text("")
+                    .width(20.0)
+                    .show_ui(ui, |ui| {
+                        for id in ids {
+                            if ui.selectable_label(self.draft.model == id, id).clicked() {
+                                chosen = Some(id.to_string());
+                            }
+                        }
+                    });
+                combo
+                    .response
+                    .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Models from the endpoint"));
+                if let Some(id) = chosen {
+                    self.draft.model = id;
+                }
+                // the field takes the width the list button leaves
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(TextEdit::singleline(&mut self.draft.model).desired_width(f32::INFINITY))
+                        .labelled_by(model_label.id);
+                });
+            });
         });
-        connection_edited |= headers.changed();
+        ui.label(small(&self.models_status));
 
         Self::labelled(ui, "Context window", |ui| {
             ui.add(
@@ -348,72 +402,53 @@ impl CompanionSettingsDialog {
                     .desired_width(f32::INFINITY),
             )
         });
-
-        if connection_edited {
-            self.last_edit = Some(Instant::now());
-        }
-        self.update_models(ctx);
-
-        let model_label = ui.label("Model");
-        ui.horizontal(|ui| {
-            ui.add(TextEdit::singleline(&mut self.draft.model).desired_width(ui.available_width() - 40.0))
-                .labelled_by(model_label.id);
-            let mut ids: Vec<&str> = self.models.iter().map(|m| m.id.as_str()).collect();
-            if !self.saved_model.is_empty() && !ids.contains(&self.saved_model.as_str()) {
-                ids.push(&self.saved_model);
-            }
-            let mut chosen = None;
-            let combo = egui::ComboBox::from_id_salt("companion-model")
-                .selected_text("")
-                .width(28.0)
-                .show_ui(ui, |ui| {
-                    for id in ids {
-                        if ui.selectable_label(self.draft.model == id, id).clicked() {
-                            chosen = Some(id.to_string());
-                        }
-                    }
-                });
-            combo
-                .response
-                .widget_info(|| egui::WidgetInfo::labeled(egui::Role::ComboBox, true, "Models from the endpoint"));
-            if let Some(id) = chosen {
-                self.draft.model = id;
-            }
-        });
-        ui.label(small(&self.models_status));
     }
 
-    /// The preset choice and its guideline; a built-in guideline is shown read-only.
+    /// The preset choice, what the chosen one is for, and its guideline: a built-in one read-only behind a closed
+    /// heading, a custom one open for editing.
     pub fn preset_fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
         let small = |text: &str| RichText::new(text).size(SMALL_SIZE).color(p.muted);
-        ui.label("Companion preset");
-        for preset in Preset::ALL {
-            let before = self.draft.preset;
-            if ui.radio_value(&mut self.draft.preset, preset, preset.label()).changed()
-                && preset == Preset::Custom
-                && self.draft.global_guideline.trim().is_empty()
-            {
-                // a custom text starts from the guideline chosen before
-                self.draft.global_guideline = before.builtin_guideline().unwrap_or_default().to_string();
+        section(ui, "Preset");
+        ui.horizontal_wrapped(|ui| {
+            for preset in Preset::ALL {
+                let before = self.draft.preset;
+                if ui.radio_value(&mut self.draft.preset, preset, preset.label()).changed()
+                    && preset == Preset::Custom
+                    && self.draft.global_guideline.trim().is_empty()
+                {
+                    // a custom text starts from the guideline chosen before
+                    self.draft.global_guideline = before.builtin_guideline().unwrap_or_default().to_string();
+                }
             }
-            ui.label(small(preset.blurb()));
-        }
-        let guideline_label = ui.label("Guideline");
+        });
+        ui.add(egui::Label::new(small(self.draft.preset.blurb())).wrap());
         // the dialog itself scrolls: a scroll area of its own here would catch the mouse wheel
         match self.draft.preset.builtin_guideline() {
-            Some(text) => ui.add(
-                TextEdit::multiline(&mut { text })
-                    .desired_rows(6)
-                    .desired_width(f32::INFINITY),
-            ),
-            None => ui.add(
-                TextEdit::multiline(&mut self.draft.global_guideline)
-                    .desired_rows(6)
-                    .desired_width(f32::INFINITY),
-            ),
+            Some(text) => {
+                egui::CollapsingHeader::new("Guideline")
+                    .id_salt("companion-guideline")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let note = ui.label(small(BUILTIN_GUIDELINE));
+                        ui.add(
+                            TextEdit::multiline(&mut { text })
+                                .desired_rows(6)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .labelled_by(note.id);
+                    });
+            }
+            None => {
+                let label = ui.label("Guideline");
+                ui.add(
+                    TextEdit::multiline(&mut self.draft.global_guideline)
+                        .desired_rows(6)
+                        .desired_width(f32::INFINITY),
+                )
+                .labelled_by(label.id);
+            }
         }
-        .labelled_by(guideline_label.id);
     }
 
     /// Where case content goes, and through which proxy.
@@ -422,7 +457,7 @@ impl CompanionSettingsDialog {
         let small = |text: &str| RichText::new(text).size(SMALL_SIZE).color(p.muted);
         let url = self.draft.endpoint_url.trim();
         if !url.is_empty() {
-            ui.label(format!("Case content is sent to {url}."));
+            ui.label(small(&format!("Case content is sent to {url}.")));
             if let Some(variable) = proxy_variable() {
                 ui.label(small(&format!(
                     "{variable} is set: the requests go through that proxy unless NO_PROXY names the host."
@@ -430,4 +465,18 @@ impl CompanionSettingsDialog {
             }
         }
     }
+}
+
+/// A group heading inside the settings, in the style of the panel headings.
+fn section(ui: &mut egui::Ui, text: &str) {
+    let p = theme::current(ui.ctx());
+    ui.add_space(10.0);
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .size(SMALL_SIZE)
+            .family(theme::bold())
+            .color(p.muted)
+            .extra_letter_spacing(1.2),
+    );
+    ui.add_space(2.0);
 }

@@ -16,6 +16,47 @@ pub struct GpgKey {
     pub fingerprint: String,
     pub uids: Vec<String>,
     pub cap: String,
+    /// e.g. ed25519 or rsa4096
+    pub algorithm: String,
+    /// YYYY-MM-DD; empty when gpg does not say
+    pub created: String,
+    /// YYYY-MM-DD; empty for a key that does not expire
+    pub expires: String,
+    /// gpg's validity: e expired, r revoked, ...
+    pub validity: String,
+}
+
+impl GpgKey {
+    pub fn expired(&self) -> bool {
+        self.validity == "e"
+    }
+
+    pub fn revoked(&self) -> bool {
+        self.validity == "r"
+    }
+}
+
+/// A Unix time from a --with-colons field as YYYY-MM-DD.
+fn colon_date(field: &str) -> String {
+    field
+        .parse::<i64>()
+        .ok()
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// The key's algorithm from the public key algorithm (field 4), key length (field 3) and curve name (field 17).
+fn colon_algorithm(algorithm: &str, length: &str, curve: &str) -> String {
+    if !curve.is_empty() {
+        return curve.to_string();
+    }
+    match algorithm {
+        "1" | "2" | "3" => format!("rsa{length}"),
+        "17" => format!("dsa{length}"),
+        "16" | "20" => format!("elgamal{length}"),
+        other => format!("algorithm {other}"),
+    }
 }
 
 /// The outcome of checking one clearsigned block.
@@ -156,6 +197,10 @@ pub fn parse_key_listing(listing: &str) -> Vec<GpgKey> {
                 keys.push(GpgKey {
                     keyid: field(4).into(),
                     cap: field(11).into(),
+                    algorithm: colon_algorithm(field(3), field(2), field(16)),
+                    created: colon_date(field(5)),
+                    expires: colon_date(field(6)),
+                    validity: field(1).into(),
                     ..Default::default()
                 });
                 in_primary = true;
@@ -588,7 +633,7 @@ mod tests {
 
     #[test]
     fn key_listing_is_parsed() {
-        let listing = "sec:u:255:22:AAAABBBBCCCCDDDD:1700000000:::u:::scESC:::+:::ed25519:::0:\n\
+        let listing = "sec:u:255:22:AAAABBBBCCCCDDDD:1700000000:1900000000::u:::scESC:::+::ed25519:::0:\n\
                        fpr:::::::::0123456789ABCDEF0123456789ABCDEFAAAABBBB:\n\
                        grp:::::::::XYZ:\n\
                        uid:u::::1700000000::HASH::J\\xc3\\xbcrgen \\x3a <j@x.invalid>::::::::::0:\n\
@@ -600,6 +645,18 @@ mod tests {
         assert_eq!(keys[0].fingerprint, "0123456789ABCDEF0123456789ABCDEFAAAABBBB");
         assert_eq!(keys[0].uids, vec!["Jürgen : <j@x.invalid>"]);
         assert!(keys[0].cap.contains('s'));
+        assert_eq!(
+            (
+                keys[0].algorithm.as_str(),
+                keys[0].created.as_str(),
+                keys[0].expires.as_str()
+            ),
+            ("ed25519", "2023-11-14", "2030-03-17")
+        );
+        assert!(!keys[0].expired() && !keys[0].revoked());
+        let rsa = parse_key_listing("sec:e:4096:1:AAAABBBBCCCCDDDD:1700000000:::u:::scSC:::+:::::0:\n");
+        assert_eq!((rsa[0].algorithm.as_str(), rsa[0].expires.as_str()), ("rsa4096", ""));
+        assert!(rsa[0].expired());
     }
 
     #[test]

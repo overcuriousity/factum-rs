@@ -3,7 +3,8 @@
 use chrono::{DateTime, Utc};
 use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, UiBuilder};
 
-use super::theme::{self, MAX_CARD_WIDTH, NOTE_SIZE, Palette, SMALL_SIZE};
+use super::icons;
+use super::theme::{self, ICON_SIZE, MAX_CARD_WIDTH, NOTE_SIZE, Palette, SMALL_SIZE};
 use crate::notes::Entry;
 use crate::verifier::SignatureCheck;
 
@@ -31,8 +32,70 @@ pub fn relative_time(utc: &str, now: DateTime<Utc>) -> String {
     unreachable!("seconds >= 60 always matches a unit")
 }
 
-pub const ENTRY_NUMBER_TIP: &str = "Entry number in the case log. System entries (case created, evidence added, ...) are \
-                                    numbered too, so the numbers of the notes shown here can have gaps.";
+pub const ENTRY_NUMBER_TIP: &str = "Entry number in the case log (system entries are numbered too)";
+
+/// A small icon button, framed only under the pointer. `name` is its tooltip, with the shortcut if it has one, and
+/// what screen readers read.
+pub struct IconButton<'a> {
+    icon: &'a str,
+    name: &'a str,
+    shortcut: Option<String>,
+    color: Option<Color32>,
+    selected: bool,
+}
+
+impl<'a> IconButton<'a> {
+    pub fn new(icon: &'a str, name: &'a str) -> Self {
+        Self {
+            icon,
+            name,
+            shortcut: None,
+            color: None,
+            selected: false,
+        }
+    }
+
+    pub fn shortcut(mut self, shortcut: impl Into<String>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+
+    pub fn color(mut self, color: Color32) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    /// A toggle that is on: drawn filled in the accent colour.
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    pub fn show(self, ui: &mut egui::Ui) -> egui::Response {
+        let p = *theme::current(ui.ctx());
+        let color = self.color.unwrap_or(if self.selected { p.accent } else { p.secondary });
+        let mut button = egui::Button::new(RichText::new(self.icon).size(ICON_SIZE).color(color))
+            .min_size(egui::vec2(24.0, 22.0))
+            .frame_when_inactive(self.selected);
+        if self.selected {
+            button = button.fill(p.accent_soft).stroke(Stroke::NONE);
+        }
+        let response = ui.add(button);
+        let enabled = ui.is_enabled();
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, self.name));
+        let tip = match &self.shortcut {
+            Some(shortcut) => format!("{} ({shortcut})", self.name),
+            None => self.name.to_string(),
+        };
+        response.on_hover_text(tip)
+    }
+
+    /// The button opening a menu below it; true while the menu is open.
+    pub fn menu(self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) -> bool {
+        let response = self.show(ui);
+        egui::Popup::menu(&response).show(add_contents).is_some()
+    }
+}
 
 /// What is known about the signature of an entry on screen.
 #[derive(Debug, Clone, Copy)]
@@ -63,104 +126,64 @@ impl Tone {
     }
 }
 
-/// Text, tone and tooltip of an entry's signature state. A ✓ only follows a successful check; until then a
+/// Text, tone and details of an entry's signature state. A ✓ only follows a successful check; until then a
 /// stored signature shows as being checked.
 pub fn signature_display(entry: &Entry, check: CheckView) -> (String, Tone, String) {
     if !entry.is_signed() {
-        return (
-            "○ Not signed".into(),
-            Tone::Plain,
-            "No GPG signature yet. Right-click → Sign Now, or select a key under Settings → GPG.".into(),
-        );
+        return ("○ Not signed".into(), Tone::Plain, String::new());
     }
     let check = match check {
-        CheckView::Pending => {
-            return (
-                "… Checking".into(),
-                Tone::Plain,
-                "The GPG signature is being checked.".into(),
-            );
-        }
-        CheckView::Unchecked => {
-            return (
-                "? Not checked".into(),
-                Tone::Plain,
-                "GPG is not available, so the stored signature cannot be checked.".into(),
-            );
-        }
+        CheckView::Pending => return ("… Checking".into(), Tone::Plain, String::new()),
+        CheckView::Unchecked => return ("? Not checked".into(), Tone::Plain, "GPG is not installed".into()),
         CheckView::Done(check) => check,
     };
-    let details = "\nRight-click → Verify for details.";
-    let none = |value: &Option<String>| value.clone().unwrap_or_else(|| "None".into());
+    let none = |value: &Option<String>| value.clone().unwrap_or_else(|| "none".into());
     if !check.valid {
         if check.status.contains("no public key") {
             return (
                 "⚠ Key missing".into(),
                 Tone::Warn,
-                format!(
-                    "The signing key {} is not in your keyring, so the signature cannot be checked.{details}",
-                    none(&check.key_id)
-                ),
+                format!("{} is not in the keyring", none(&check.key_id)),
             );
         }
-        return (
-            "✗ Invalid".into(),
-            Tone::Bad,
-            format!("The GPG signature is invalid ({}).{details}", check.status),
-        );
+        return ("✗ Invalid".into(), Tone::Bad, check.status.clone());
     }
     if !check.covers_payload {
         return (
             "✗ Wrong data".into(),
             Tone::Bad,
-            format!(
-                "The signature is valid but was made over different data: the entry or the log before it was changed.{details}"
-            ),
+            "Signed over different data: the entry or the log before it changed".into(),
         );
     }
     if !check.trusted {
         return (
             "⚠ Untrusted key".into(),
             Tone::Warn,
-            format!(
-                "Valid signature by {}, but the key is not trusted ({}).{details}",
-                none(&check.fingerprint),
-                none(&check.trust)
-            ),
+            format!("{} · trust {}", none(&check.fingerprint), none(&check.trust)),
         );
     }
-    let who = format!(
-        "\nSigned by {}.",
-        check.username.clone().or(check.fingerprint.clone()).unwrap_or_default()
-    );
+    let who = check.username.clone().or(check.fingerprint.clone()).unwrap_or_default();
     if check.late {
         let signed = entry
             .late_signature
             .as_ref()
             .map(|late| display_time(&late.signed_utc))
             .unwrap_or_default();
-        return (
-            "✓ Signed later".into(),
-            Tone::Ok,
-            format!(
-                "GPG signature verified. It was made later, on {signed}, not when the entry was written (no signing key \
-                 was active then).\nThe entry's own timestamp is protected by the case log's hash chain.{who}"
-            ),
-        );
+        return ("✓ Signed later".into(), Tone::Ok, format!("on {signed} · {who}"));
     }
-    (
-        "✓ Verified".into(),
-        Tone::Ok,
-        format!("GPG signature verified: made when the entry was written.{who}"),
-    )
+    ("✓ Verified".into(), Tone::Ok, who)
 }
 
-/// Only the mark fits in the narrow pinned panel; the tooltip has the rest.
-pub fn compact_signature(text: &str, tooltip: &str) -> (String, String) {
+/// Only the mark is shown; the tooltip says the rest.
+pub fn compact_signature(text: &str, details: &str) -> (String, String) {
     let mut chars = text.chars();
     let mark = chars.next().map(String::from).unwrap_or_default();
     let rest: String = chars.skip(1).collect();
-    (mark, format!("{rest}\n{tooltip}"))
+    if details.is_empty() {
+        (mark, rest)
+    } else {
+        (mark, format!("{rest}\n{details}"))
+    }
 }
 
 /// A note as shown on screen.
@@ -213,21 +236,23 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: Color32, fill: Color32, stroke: Strok
         .inner
 }
 
-fn signature_label(ui: &mut egui::Ui, entry: &Entry, check: CheckView, compact: bool) {
+/// The signature mark, always on screen; the tooltip names the state.
+fn signature_mark(ui: &mut egui::Ui, entry: &Entry, check: CheckView) {
     let p = theme::current(ui.ctx());
-    let (mut text, tone, mut tooltip) = signature_display(entry, check);
-    if compact {
-        (text, tooltip) = compact_signature(&text, &tooltip);
-    }
-    ui.label(RichText::new(text).size(SMALL_SIZE).color(tone.color(p)))
+    let (text, tone, details) = signature_display(entry, check);
+    let (mark, tooltip) = compact_signature(&text, &details);
+    let response = ui
+        .add(egui::Label::new(RichText::new(mark).size(NOTE_SIZE).color(tone.color(p))).selectable(false))
         .on_hover_text(tooltip);
+    let name = text.chars().skip(2).collect::<String>();
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &name));
 }
 
 fn card_menu(ui: &mut egui::Ui, card: &Card, actions: &mut Vec<CardAction>) {
     let id = card.entry.id;
     if !card.archived {
         let pin = if card.entry.is_pinned { "Unpin Note" } else { "Pin Note" };
-        if ui.button(pin).clicked() {
+        if ui.add(egui::Button::new(pin).shortcut_text("P")).clicked() {
             actions.push(CardAction::TogglePin(id));
         }
         if ui.button("Correct Note…").clicked() {
@@ -246,7 +271,7 @@ fn card_menu(ui: &mut egui::Ui, card: &Card, actions: &mut Vec<CardAction>) {
                 }
             })
             .response
-            .on_disabled_hover_text("This note has no labels. Tags written in the note text cannot be removed.");
+            .on_disabled_hover_text("No labels (tags in the text stay)");
         });
         ui.separator();
     }
@@ -269,22 +294,22 @@ fn signature_menu(ui: &mut egui::Ui, entry: &Entry, actions: &mut Vec<CardAction
 /// Options of [`note_card`].
 pub struct CardView<'a> {
     pub check: CheckView<'a>,
-    /// the narrow pinned panel: only the signature mark, the pin only on hover
+    /// the narrow pinned panel: the pin only under the pointer
     pub compact: bool,
     pub focused: bool,
     pub history_open: bool,
     pub now: DateTime<Utc>,
 }
 
-/// Inner margin of log rows: notes and system entries start their text at the same x.
+/// Inner margin of log rows: notes and system entries start their timestamps at the same x.
 const ROW_MARGIN: Margin = Margin {
     left: 12,
-    right: 10,
+    right: 6,
     top: 8,
     bottom: 8,
 };
 
-/// The hairline under each log row, and a bar on the left edge for the focused or pinned note.
+/// The hairline under each log row, and a bar on the left edge of the focused note.
 fn row_rules(ui: &egui::Ui, rect: egui::Rect, bar: Option<Color32>) {
     let p = theme::current(ui.ctx());
     ui.painter()
@@ -298,19 +323,67 @@ fn row_rules(ui: &egui::Ui, rect: egui::Rect, bar: Option<Color32>) {
     }
 }
 
+/// A header line: `right` from the right edge (signature mark, actions), then `left` in the width that is left,
+/// wrapping onto a second line rather than running under the right side.
+fn header_line<R>(ui: &mut egui::Ui, right: impl FnOnce(&mut egui::Ui), left: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            right(ui);
+            ui.add_space(6.0);
+            ui.with_layout(Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                left(ui)
+            })
+            .inner
+        })
+        .inner
+    })
+    .inner
+}
+
+/// Draws `add` in place; while hidden it keeps its space and takes no input.
+pub(super) fn visible_ui(ui: &mut egui::Ui, visible: bool, add: impl FnOnce(&mut egui::Ui)) {
+    let builder = if visible {
+        UiBuilder::new()
+    } else {
+        UiBuilder::new().invisible()
+    };
+    ui.scope_builder(builder, add);
+}
+
+/// The full timestamp of a row in two parts, date and time: in a narrow column the time goes onto the next line
+/// instead of running under the row's actions. Returns the time's response.
+fn timestamp(ui: &mut egui::Ui, utc: &str, color: Color32) -> egui::Response {
+    let shown = display_time(utc);
+    let (date, time) = shown.split_once(' ').unwrap_or((shown.as_str(), ""));
+    // the gap after a widget is the spacing set when it is added: none after the date, the usual after the time
+    let spacing = std::mem::replace(&mut ui.spacing_mut().item_spacing.x, 0.0);
+    ui.add(egui::Label::new(mono(format!("{date} "), SMALL_SIZE, color)).extend());
+    ui.spacing_mut().item_spacing.x = spacing;
+    ui.add(egui::Label::new(mono(time, SMALL_SIZE, color)).extend())
+}
+
+/// Whether a row's actions show: under the pointer (last frame), focused, or while its menu is open.
+pub(super) fn actions_shown(ui: &egui::Ui, id: egui::Id) -> bool {
+    ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false)
+}
+
+/// Remembers for the next frame whether the row's actions show; repaints when that changes.
+pub(super) fn remember_shown(ui: &egui::Ui, id: egui::Id, shown: bool) {
+    if shown != actions_shown(ui, id) {
+        ui.data_mut(|d| d.insert_temp(id, shown));
+        ui.ctx().request_repaint();
+    }
+}
+
 /// Draws a note as a row of the log; returns the response of the row itself (for scrolling to it).
 pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut Vec<CardAction>) -> egui::Response {
     let p = *theme::current(ui.ctx());
     let entry = &card.entry;
     let id = ui.scope_id().with(("card", entry.id, view.compact));
-    let hovered_before = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
-    let bar = if view.focused {
-        Some(p.accent)
-    } else if entry.is_pinned && !view.compact {
-        Some(p.warn)
-    } else {
-        None
-    };
+    let shown = actions_shown(ui, id) || view.focused;
+    let mut menu_open = false;
     let width = ui.available_width().min(MAX_CARD_WIDTH);
     let response = ui
         .scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
@@ -320,55 +393,62 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                 .inner_margin(ROW_MARGIN)
                 .show(ui, |ui| {
                     ui.set_width(width - ROW_MARGIN.sum().x);
-                    // header: timestamp, entry id, age, version; signature and pin on the right
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(mono(display_time(&entry.created_utc), SMALL_SIZE, p.secondary));
-                        ui.label(mono(format!("#{}", entry.id), SMALL_SIZE, p.muted))
-                            .on_hover_text(ENTRY_NUMBER_TIP);
-                        if !view.compact {
-                            ui.label(
-                                RichText::new(format!("· {}", relative_time(&entry.created_utc, view.now)))
-                                    .size(SMALL_SIZE)
-                                    .color(p.muted),
-                            );
-                        }
-                        if !card.history.is_empty() {
-                            chip(
-                                ui,
-                                &format!("corrected · v{}", card.history.len() + 1),
-                                p.warn,
-                                p.warn_soft,
-                                Stroke::NONE,
-                            );
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            signature_label(ui, entry, view.check, view.compact);
-                            if !card.archived {
-                                let show = hovered_before || view.focused || (entry.is_pinned && !view.compact);
-                                let text = if entry.is_pinned { "Pinned" } else { "Pin" };
-                                let button =
-                                    egui::Button::new(RichText::new(text).size(SMALL_SIZE).color(if entry.is_pinned {
-                                        p.warn
-                                    } else {
-                                        p.secondary
-                                    }))
-                                    .small();
-                                let tip = if entry.is_pinned {
-                                    "Unpin (P)"
-                                } else {
-                                    "Pin to the side panel (P)"
-                                };
-                                if (view.compact && !show) || (!view.compact && !show) {
-                                    if !view.compact {
-                                        ui.add_visible(false, button); // the header keeps its height and layout
+                    let toggle_history = header_line(
+                        ui,
+                        |ui| {
+                            signature_mark(ui, entry, view.check);
+                            visible_ui(ui, shown, |ui| {
+                                menu_open =
+                                    IconButton::new(icons::MORE, "More").menu(ui, |ui| card_menu(ui, card, actions));
+                            });
+                            if card.archived {
+                                return;
+                            }
+                            // the narrow pinned panel has Correct in the menu only
+                            if !view.compact {
+                                visible_ui(ui, shown, |ui| {
+                                    if IconButton::new(icons::CORRECT, "Correct").show(ui).clicked() {
+                                        actions.push(CardAction::Correct(entry.id));
                                     }
-                                } else if ui.add(button).on_hover_text(tip).clicked() {
+                                });
+                            }
+                            // a pinned note in the log keeps its pin in sight
+                            let pin_shown = shown || (entry.is_pinned && !view.compact);
+                            visible_ui(ui, pin_shown, |ui| {
+                                let (name, color) = if entry.is_pinned {
+                                    ("Unpin", p.accent)
+                                } else {
+                                    ("Pin", p.secondary)
+                                };
+                                if IconButton::new(icons::PIN, name)
+                                    .shortcut("P")
+                                    .color(color)
+                                    .show(ui)
+                                    .clicked()
+                                {
                                     actions.push(CardAction::TogglePin(entry.id));
                                 }
+                            });
+                        },
+                        |ui| {
+                            timestamp(ui, &entry.created_utc, p.secondary)
+                                .on_hover_text(relative_time(&entry.created_utc, view.now));
+                            ui.label(mono(format!("#{}", entry.id), SMALL_SIZE, p.muted))
+                                .on_hover_text(ENTRY_NUMBER_TIP);
+                            // the evidence, only where the view does not already say it
+                            if let Some(evidence) = &card.evidence {
+                                ui.add(
+                                    egui::Label::new(RichText::new(evidence).size(SMALL_SIZE).color(p.secondary))
+                                        .truncate(),
+                                )
+                                .on_hover_text(format!("Evidence: {evidence}"));
                             }
-                        });
-                    });
+                            !card.history.is_empty() && versions_chip(ui, card, view.history_open)
+                        },
+                    );
+                    if toggle_history {
+                        actions.push(CardAction::ToggleHistory(entry.id));
+                    }
                     // notes are evidence: shown as plain text, never interpreted
                     let text = ui.add(
                         egui::Label::new(RichText::new(&entry.text).size(NOTE_SIZE).color(p.text))
@@ -393,56 +473,14 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                             }
                         });
                     }
-                    if !card.history.is_empty() {
-                        let count = card.history.len();
-                        let label = if view.history_open {
-                            "Hide history".to_string()
-                        } else {
-                            format!(
-                                "Show history ({count} earlier version{})",
-                                if count > 1 { "s" } else { "" }
-                            )
-                        };
-                        if ui.link(RichText::new(label).size(SMALL_SIZE).color(p.accent)).clicked() {
-                            actions.push(CardAction::ToggleHistory(entry.id));
-                        }
-                        if view.history_open {
-                            Frame::new()
-                                .inner_margin(Margin {
-                                    left: 8,
-                                    ..Margin::ZERO
-                                })
-                                .stroke(Stroke::NONE)
-                                .show(ui, |ui| {
-                                    for old in &card.history {
-                                        ui.label(mono(
-                                            format!("#{} · {}", old.id, display_time(&old.created_utc)),
-                                            SMALL_SIZE,
-                                            p.muted,
-                                        ));
-                                        ui.add(
-                                            egui::Label::new(RichText::new(&old.text).color(p.secondary))
-                                                .selectable(true)
-                                                .wrap(),
-                                        );
-                                    }
-                                });
-                        }
-                    }
-                    // the evidence, only where the view does not already say it
-                    if let Some(evidence) = &card.evidence {
-                        ui.add(egui::Label::new(RichText::new(evidence).size(SMALL_SIZE).color(p.muted)).truncate())
-                            .on_hover_text(evidence);
+                    if view.history_open {
+                        earlier_versions(ui, card);
                     }
                 });
-            row_rules(ui, frame.response.rect, bar);
+            row_rules(ui, frame.response.rect, view.focused.then_some(p.accent));
         })
         .response;
-    let hovered = response.contains_pointer();
-    ui.data_mut(|d| d.insert_temp(id, hovered));
-    if hovered != hovered_before {
-        ui.ctx().request_repaint();
-    }
+    remember_shown(ui, id, response.contains_pointer() || menu_open);
     if response.clicked() {
         actions.push(CardAction::Focus(entry.id));
     }
@@ -450,9 +488,66 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
     response
 }
 
-/// A compact, greyed-out row for system entries (case created, evidence deleted, archived, ...).
+/// `v2` for a corrected note; true when clicked, which shows or hides the earlier versions.
+fn versions_chip(ui: &mut egui::Ui, card: &Card, open: bool) -> bool {
+    let p = *theme::current(ui.ctx());
+    let count = card.history.len();
+    let name = if open {
+        "Hide earlier versions".to_string()
+    } else {
+        format!("Show {count} earlier version{}", if count > 1 { "s" } else { "" })
+    };
+    let text = RichText::new(format!("{}  v{}", icons::HISTORY, count + 1))
+        .size(SMALL_SIZE)
+        .color(p.secondary);
+    let button = egui::Button::new(text)
+        .small()
+        .fill(if open { p.accent_soft } else { p.panel })
+        .stroke(Stroke::NONE);
+    let response = ui.add(button);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &name));
+    response
+        .on_hover_text(format!("Corrected · {}", name.to_lowercase()))
+        .clicked()
+}
+
+/// The earlier versions of a corrected note, oldest first, set off by a rule on the left.
+fn earlier_versions(ui: &mut egui::Ui, card: &Card) {
+    let p = *theme::current(ui.ctx());
+    ui.add_space(2.0);
+    let block = Frame::new()
+        .inner_margin(Margin {
+            left: 10,
+            top: 2,
+            bottom: 2,
+            ..Margin::ZERO
+        })
+        .show(ui, |ui| {
+            for old in &card.history {
+                ui.label(mono(
+                    format!("{} · #{}", display_time(&old.created_utc), old.id),
+                    SMALL_SIZE,
+                    p.muted,
+                ));
+                ui.add(
+                    egui::Label::new(RichText::new(&old.text).color(p.secondary))
+                        .selectable(true)
+                        .wrap(),
+                );
+            }
+        });
+    let rect = block.response.rect;
+    ui.painter()
+        .vline(rect.left() + 1.0, rect.y_range(), Stroke::new(2.0, p.border));
+}
+
+/// A quiet row for system entries (case created, evidence deleted, archived, ...), its timestamp in line with the
+/// notes' timestamps.
 pub fn system_row(ui: &mut egui::Ui, entry: &Entry, check: CheckView, actions: &mut Vec<CardAction>) -> egui::Response {
     let p = *theme::current(ui.ctx());
+    let id = ui.scope_id().with(("system", entry.id));
+    let shown = actions_shown(ui, id);
+    let mut menu_open = false;
     let width = ui.available_width().min(MAX_CARD_WIDTH);
     let menu = |ui: &mut egui::Ui, actions: &mut Vec<CardAction>| {
         if ui.button("Verify Entry").clicked() {
@@ -470,29 +565,31 @@ pub fn system_row(ui: &mut egui::Ui, entry: &Entry, check: CheckView, actions: &
             };
             let frame = Frame::new().inner_margin(margin).show(ui, |ui| {
                 ui.set_width(width - margin.sum().x);
-                ui.horizontal(|ui| {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        signature_label(ui, entry, check, false);
-                        let text = format!(
-                            "◇ #{} · {} · {}",
-                            entry.id,
-                            display_time(&entry.created_utc),
-                            entry.text
-                        );
-                        let label = ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            ui.add(
-                                egui::Label::new(RichText::new(text).size(SMALL_SIZE).color(p.muted))
-                                    .selectable(true)
-                                    .wrap(),
-                            )
+                let text = header_line(
+                    ui,
+                    |ui| {
+                        signature_mark(ui, entry, check);
+                        visible_ui(ui, shown, |ui| {
+                            menu_open = IconButton::new(icons::MORE, "More").menu(ui, |ui| menu(ui, actions));
                         });
-                        label.inner.context_menu(|ui| menu(ui, actions));
-                    });
-                });
+                    },
+                    |ui| {
+                        timestamp(ui, &entry.created_utc, p.muted);
+                        ui.label(mono(format!("#{}", entry.id), SMALL_SIZE, p.muted))
+                            .on_hover_text(ENTRY_NUMBER_TIP);
+                        ui.add(
+                            egui::Label::new(RichText::new(&entry.text).size(SMALL_SIZE).color(p.muted))
+                                .selectable(true)
+                                .wrap(),
+                        )
+                    },
+                );
+                text.context_menu(|ui| menu(ui, actions));
             });
             row_rules(ui, frame.response.rect, None);
         })
         .response;
+    remember_shown(ui, id, response.contains_pointer() || menu_open);
     response.context_menu(|ui| menu(ui, actions));
     response
 }

@@ -3,6 +3,55 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- GUI: Add Label suggests the tags and labels already in use as you type, in a list under the field: matches at the
+  start first, then anywhere in the name, then names a typo or two away (a swapped pair of letters counts as one);
+  ↑ ↓ choose, Tab completes, Enter or a click adds
+
+### Changed
+- GUI: the case log is one centred column (search, log and note input share its width), so lines keep their length
+  on wide screens; every entry, system entries included, starts with its full timestamp in one column and ends with
+  its signature mark (✓ ⚠ ✗ ○), the state in its tooltip
+- GUI: note actions (pin, correct, more) are small icons that show under the pointer; a corrected note's version chip
+  (v2) shows and hides the earlier versions; the evidence name sits in the note's header line
+- GUI: icons (Phosphor, embedded) with short tooltips naming them and their shortcut replace text buttons: + for a new
+  case above the case list and for new evidence on a case row, ⋯ menus, the side panel toggle, copy, folder pickers
+- GUI: the case list has no buttons below it; archived cases are behind "n archived" at its end; a database without
+  cases shows a New case button in the log area; the case list can be resized
+- GUI: the note input names its target under the editor, warns with ⚠ when notes will go unsigned and adds with
+  Add; an archived case shows a read-only line with Reopen instead
+- GUI: the status bar shows the selected case's size, its newest seal and the outcome of its last verification, and
+  the signing key
+- GUI: the Companion menu moved into Settings (Companion…), the GPG submenu became Signing Key… and Clear Signing Key;
+  Case → Edit Evidence… added
+- GUI: dialogs have more room, their main action on the right in the accent colour (destructive ones in red) and
+  named confirmations (Archive, Delete) instead of Yes/No; Verify Case, Ask and History open centred with a close button
+- GUI: Verify Case leads with a verdict line counting failures and warnings, then the entry count, tree size and root
+  hash (with copy); rows show and sign through icons
+- GUI: companion questions are rated with thumbs up and down; the companion settings are grouped (Connection,
+  Model, Preset) with User-Agent and extra headers under Advanced; the setup wizard shows all its steps
+- GUI: shorter tooltips throughout
+- GUI: the signing key list (setup wizard, Settings → Signing Key…) has one clickable row per key with a radio mark,
+  the key's algorithm, creation and expiry date (expired and revoked keys marked), its fingerprint and all user IDs in
+  the tooltip; it scrolls when there are more keys than fit
+- Setup wizard: less text on each step; the companion presets show only the chosen one's description, and a
+  built-in guideline is folded away
+- Setup wizard and Settings → Seal Folder…: they explain what a seal is, and the field starts with the folder the
+  seals go to now (the default one next to the database included); choosing the default stores no setting, so it
+  keeps following the database
+- Setup wizard: it starts by asking whether notes have to be provable (who wrote them, nothing changed or removed);
+  "Not now" leaves out the signing key and seal folder steps, both stay under Settings
+
+### Fixed
+- GUI: in a narrow window a note's header ran under its signature state; it now wraps
+- GUI: Verify Case said "0 WARN" above a list of six warnings (it counted entries, the list findings)
+- GUI: the model list button in the companion settings stuck out past the other fields
+- GUI: the text field of Correct Note had no accessible name
+- GUI: Enter in New Case, New Evidence and Add Label did not submit: the field took the keyboard back in the same frame
+- GUI: Verify Case, Ask and History moved while their content grew
+
 ## [2.3.1] - 2026-10-27
 
 ### Changed
