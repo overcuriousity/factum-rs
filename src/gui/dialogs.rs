@@ -1,5 +1,7 @@
 //! Dialogs: each one is a state that is drawn every frame until it returns a result.
 
+use std::path::{Path, PathBuf};
+
 use egui::{Align, Id, Layout, RichText, TextEdit};
 
 use super::companion_dialogs::CompanionSettingsDialog;
@@ -8,6 +10,7 @@ use super::theme::{self, MONO_SIZE, SMALL_SIZE};
 use super::widgets::{IconButton, actions_shown, remember_shown, visible_ui};
 use super::wizard::{SEAL_EXPLAINED, SEAL_FOLDER_EXPLAINED, Wizard, WizardChoices};
 use crate::companion::Settings;
+use crate::container::volume::AddOptions;
 use crate::pystr::{head, splitlines, strip};
 use crate::signer::GpgKey;
 use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, SignatureCheck};
@@ -16,6 +19,8 @@ use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, Signa
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pending {
     Archive(i64),
+    /// close the case's open containers, then archive it
+    CloseContainersAndArchive(i64),
     DeleteEvidence(i64),
     Seal(i64),
     Export {
@@ -122,6 +127,28 @@ pub enum Dialog {
         case_id: i64,
         goal: String,
     },
+    NewContainer {
+        case_id: i64,
+        name: String,
+        evidence: Option<i64>,
+        /// (id, name) of the case's evidence
+        evidence_choices: Vec<(i64, String)>,
+        folder: String,
+        /// empty: the name, made safe, with .aff4l
+        file_name: String,
+        base: String,
+        error: Option<String>,
+    },
+    AddToContainer {
+        container_id: i64,
+        sources: Vec<PathBuf>,
+        base: String,
+        keep_path: bool,
+        metadata_only: bool,
+        excerpt_from: String,
+        excerpt_to: String,
+        error: Option<String>,
+    },
 }
 
 pub enum DialogResult {
@@ -152,6 +179,18 @@ pub enum DialogResult {
         label: String,
     },
     Confirmed(Pending),
+    NewContainer {
+        case_id: i64,
+        name: String,
+        evidence: Option<i64>,
+        path: PathBuf,
+        base: String,
+    },
+    AddToContainer {
+        container_id: i64,
+        sources: Vec<PathBuf>,
+        options: AddOptions,
+    },
     TypedConfirmed {
         case_id: i64,
         typed: String,
@@ -625,6 +664,148 @@ impl Dialog {
                 }
                 cancel.then_some(DialogResult::Cancel)
             }
+            Dialog::NewContainer {
+                case_id,
+                name,
+                evidence,
+                evidence_choices,
+                folder,
+                file_name,
+                base,
+                error,
+            } => {
+                title(ui, "New Container");
+                note(
+                    ui,
+                    "An AFF4-L evidence container for files preserved from this case; every addition, close and \
+                     reopen is a signed entry in the case log.",
+                );
+                ui.add_space(4.0);
+                let first = field(ui, "Name", name, "e.g. FS01 preserved", true);
+                let chosen = evidence
+                    .and_then(|id| evidence_choices.iter().find(|(e, _)| *e == id))
+                    .map_or("None".to_string(), |(_, n)| n.clone());
+                egui::ComboBox::from_label("From evidence")
+                    .selected_text(chosen)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(evidence, None, "None");
+                        for (id, label) in evidence_choices.iter() {
+                            ui.selectable_value(evidence, Some(*id), label);
+                        }
+                    });
+                let folder_label = ui.label("Folder");
+                folder_field(ui, folder, Some(folder_label.id));
+                let default_name = format!("{}.aff4l", crate::seals::safe_filename(strip(name)));
+                field(ui, "File name", file_name, &default_name, false);
+                let base_label = ui.label("Base path");
+                folder_field(ui, base, Some(base_label.id));
+                note(
+                    ui,
+                    "Removed from the sources' paths, e.g. the mount point of the image.",
+                );
+                error_line(ui, error);
+                let (ok, cancel) = buttons(ui, "Create", true);
+                if ok || (enter_pressed(ui) && first.lost_focus()) {
+                    let file = if strip(file_name).is_empty() {
+                        default_name
+                    } else {
+                        strip(file_name).to_string()
+                    };
+                    let path = Path::new(strip(folder)).join(&file);
+                    *error = if strip(name).is_empty() {
+                        Some("A container name is required.".into())
+                    } else if !Path::new(strip(folder)).is_dir() {
+                        Some(format!("The folder {} does not exist.", strip(folder)))
+                    } else if path.exists() {
+                        Some(format!("{} exists already.", path.display()))
+                    } else if !Path::new(strip(base)).is_dir() {
+                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into())
+                    } else {
+                        None
+                    };
+                    if error.is_some() {
+                        return None;
+                    }
+                    return Some(DialogResult::NewContainer {
+                        case_id: *case_id,
+                        name: strip(name).to_string(),
+                        evidence: *evidence,
+                        path,
+                        base: strip(base).to_string(),
+                    });
+                }
+                cancel.then_some(DialogResult::Cancel)
+            }
+            Dialog::AddToContainer {
+                container_id,
+                sources,
+                base,
+                keep_path,
+                metadata_only,
+                excerpt_from,
+                excerpt_to,
+                error,
+            } => {
+                title(ui, "Add to Container");
+                let shown: Vec<String> = sources.iter().take(4).map(|s| s.display().to_string()).collect();
+                let mut listed = shown.join("\n");
+                if sources.len() > shown.len() {
+                    listed += &format!("\n… and {} more", sources.len() - shown.len());
+                }
+                ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE)).wrap());
+                ui.add_space(4.0);
+                let base_label = ui.label("Base path");
+                folder_field(ui, base, Some(base_label.id));
+                ui.checkbox(keep_path, "Keep the path below the base path");
+                ui.checkbox(metadata_only, "Metadata only (hash the content, do not store it)");
+                let single_file = sources.len() == 1 && sources[0].is_file();
+                if single_file && !*metadata_only {
+                    ui.horizontal(|ui| {
+                        ui.label("Excerpt: from byte");
+                        ui.add(TextEdit::singleline(excerpt_from).desired_width(90.0));
+                        ui.label("to");
+                        ui.add(TextEdit::singleline(excerpt_to).desired_width(90.0));
+                    });
+                    note(ui, "Empty: the whole file.");
+                }
+                error_line(ui, error);
+                let (ok, cancel) = buttons(ui, "Add", !sources.is_empty());
+                if ok {
+                    let base_path = PathBuf::from(strip(base));
+                    let outside = sources.iter().find(|s| !s.starts_with(&base_path));
+                    let number = |text: &str| strip(text).parse::<u64>().ok();
+                    let excerpt = match (strip(excerpt_from), strip(excerpt_to)) {
+                        ("", "") => Ok(None),
+                        (from, to) => match (number(from), number(to)) {
+                            (Some(from), Some(to)) if from < to => Ok(Some((from, to))),
+                            _ => Err("The excerpt needs two byte offsets, the end after the start."),
+                        },
+                    };
+                    *error = match (&excerpt, outside) {
+                        (_, Some(outside)) => Some(format!(
+                            "{} is not below the base path {}.",
+                            outside.display(),
+                            base_path.display()
+                        )),
+                        (Err(message), _) => Some(message.to_string()),
+                        _ => None,
+                    };
+                    if error.is_some() {
+                        return None;
+                    }
+                    return Some(DialogResult::AddToContainer {
+                        container_id: *container_id,
+                        sources: sources.clone(),
+                        options: AddOptions {
+                            base: base_path,
+                            keep_path: *keep_path,
+                            metadata_only: *metadata_only,
+                            excerpt: excerpt.ok().flatten().filter(|_| single_file && !*metadata_only),
+                        },
+                    });
+                }
+                cancel.then_some(DialogResult::Cancel)
+            }
             Dialog::NewCase {
                 file,
                 name,
@@ -820,6 +1001,7 @@ impl Dialog {
             Dialog::Confirm { message, then } => {
                 let (heading, verb) = match then {
                     Pending::Archive(_) => ("Archive Case?", "Archive"),
+                    Pending::CloseContainersAndArchive(_) => ("Archive Case?", "Close and Archive"),
                     Pending::DeleteEvidence(_) => ("Delete Evidence?", "Delete"),
                     Pending::Seal(_) => ("Seal Case?", "Seal"),
                     Pending::Export { .. } => ("Export Case?", "Export"),

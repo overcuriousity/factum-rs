@@ -3,13 +3,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use crate::companion::ask::Answer;
 use crate::companion::llm::Client;
 use crate::companion::{CompanionDb, Settings};
+use crate::container::volume::{AddOptions, AddProgress, Staged, Volume};
 use crate::db::Db;
 use crate::services::Factum;
 use crate::signer::GnupgSigner;
@@ -144,4 +145,27 @@ pub fn ask(
         let client = Client::new(settings);
         crate::companion::ask::ask(&db, &cdb, &client, case_id, &question).map_err(|e| e.to_string())
     })
+}
+
+pub type AddResult = Result<(Volume, Staged), String>;
+
+/// Copies and hashes sources into a container on a thread of its own; the open, locked volume comes back with the
+/// staged addition, to be logged and listed on the GUI thread. Cancelled or failed, nothing stays in the file.
+pub fn add_to_container(
+    ctx: &egui::Context,
+    volume: Volume,
+    sources: Vec<PathBuf>,
+    options: AddOptions,
+    cancel: Arc<AtomicBool>,
+) -> (Worker<AddResult>, Arc<AddProgress>) {
+    let progress = Arc::new(AddProgress::default());
+    let shared = progress.clone();
+    let worker = Worker::spawn(ctx, move || {
+        let mut volume = volume;
+        match volume.stage_add(&sources, &options, &shared, &cancel) {
+            Ok(staged) => Ok((volume, staged)),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    (worker, progress)
 }

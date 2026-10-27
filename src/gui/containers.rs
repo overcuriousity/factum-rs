@@ -7,6 +7,7 @@ use egui::{Align, Layout, RichText};
 use super::icons;
 use super::theme::{self, MONO_SIZE, SMALL_SIZE};
 use super::widgets::{self, IconButton};
+use crate::container::volume::AddProgress;
 use crate::containers::{ContainerDetail, ContainerSummary, human_size};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +52,18 @@ pub fn menu(ui: &mut egui::Ui, summary: &ContainerSummary, archived: bool, actio
             actions.push(action);
         }
     }
+}
+
+/// The status bar while files are added: how far it got.
+pub fn add_status(progress: &AddProgress, name: &str) -> String {
+    let load = |value: &std::sync::atomic::AtomicU64| value.load(std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "Adding to \"{name}\": {} / {} files · {} / {}",
+        load(&progress.files),
+        load(&progress.total_files),
+        human_size(load(&progress.bytes)),
+        human_size(load(&progress.total_bytes))
+    )
 }
 
 /// The tree row's text: the name, and that it is open.
