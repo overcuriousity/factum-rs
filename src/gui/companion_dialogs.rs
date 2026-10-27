@@ -192,6 +192,11 @@ impl CompanionSettingsDialog {
 
     /// Checks the draft and saves it, creating the companion database on first use; the error is shown in the
     /// dialog, which stays open with the draft.
+    /// Why the last save failed.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     pub fn save(&mut self) -> Option<Settings> {
         if !self.context_window.trim().is_empty() && self.context_window.trim().parse::<u32>().is_err() {
             self.error = Some("The context window is a number of tokens.".into());

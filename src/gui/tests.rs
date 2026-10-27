@@ -33,6 +33,14 @@ impl Fixture {
         Self { _dir: dir, path }
     }
 
+    /// A database without cases: what a first start sees.
+    fn empty() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("factum.db");
+        drop(Db::open(&path).unwrap());
+        Self { _dir: dir, path }
+    }
+
     fn db(&self) -> Db {
         Db::open(&self.path).unwrap()
     }
@@ -841,4 +849,170 @@ fn the_editor_stays_above_the_buttons_at_the_smallest_height() {
     let editor = harness.get_by_role(egui::accesskit::Role::MultilineTextInput).rect();
     let button = harness.get_by_label_contains("Add Note").rect();
     assert!(editor.max.y <= button.min.y, "{editor:?} {button:?}");
+}
+
+fn wizard_open(harness: &Harness<'_, FactumApp>) -> bool {
+    matches!(harness.state().dialogs.last(), Some(Dialog::Wizard(_)))
+}
+
+fn wizard<'a>(harness: &'a Harness<'_, FactumApp>) -> &'a Wizard {
+    match harness.state().dialogs.last() {
+        Some(Dialog::Wizard(wizard)) => wizard,
+        _ => panic!("the setup wizard is not open"),
+    }
+}
+
+/// Clicks Next (or Skip) until the wizard shows `step`.
+fn wizard_to(harness: &mut Harness<'_, FactumApp>, button: &str, step: Step) {
+    for _ in 0..6 {
+        if wizard(harness).step == step {
+            return;
+        }
+        click_label(harness, button);
+    }
+    assert_eq!(wizard(harness).step, step);
+}
+
+#[test]
+fn wizard_auto_starts_on_fresh_database_only() {
+    let fresh = Fixture::empty();
+    assert!(wizard_open(&fresh.harness()));
+    assert!(!wizard_open(&Fixture::new().harness()));
+    let done = Fixture::empty();
+    done.db().set_setting(ONBOARDING_SETTING, "1").unwrap();
+    assert!(!wizard_open(&done.harness()));
+}
+
+#[test]
+fn skipping_everything_writes_only_the_flag() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    wizard_to(&mut harness, "Skip", Step::Summary);
+    click_label(&mut harness, "Finish");
+    assert!(harness.state().dialogs.is_empty());
+    let db = fixture.db();
+    assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
+    assert_eq!(db.get_setting(ACTIVE_KEY_SETTING).unwrap(), "");
+    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(db.get_setting(THEME_SETTING).unwrap(), "");
+    assert!(!companion_db_path(&fixture.path).exists());
+}
+
+#[test]
+fn cancel_restores_theme_and_sets_flag() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    wizard_to(&mut harness, "Skip", Step::Appearance);
+    click_label(&mut harness, "Dark");
+    assert_eq!(harness.ctx.options(|o| o.theme_preference), egui::ThemePreference::Dark);
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().dialogs.is_empty());
+    assert_eq!(
+        harness.ctx.options(|o| o.theme_preference),
+        egui::ThemePreference::System
+    );
+    assert_eq!(harness.state().theme, "system");
+    let db = fixture.db();
+    assert_eq!(db.get_setting(THEME_SETTING).unwrap(), "");
+    assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
+}
+
+#[test]
+fn finish_writes_choices() {
+    let fixture = Fixture::empty();
+    let seals = tempfile::tempdir().unwrap();
+    let mut harness = fixture.harness();
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    wizard_to(&mut harness, "Skip", Step::Companion);
+    click_label(&mut harness, "Use the AI companion");
+    type_into(&mut harness, "Endpoint URL", "http://127.0.0.1:9/v1");
+    type_into(&mut harness, "Model", "m");
+    click_label(&mut harness, "OSINT research");
+    wizard_to(&mut harness, "Next", Step::SealFolder);
+    type_into(&mut harness, "Seal folder", &seals.path().display().to_string());
+    wizard_to(&mut harness, "Next", Step::Appearance);
+    click_label(&mut harness, "Dark");
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    assert!(harness.state().dialogs.is_empty());
+    let db = fixture.db();
+    assert_eq!(db.get_setting(THEME_SETTING).unwrap(), "dark");
+    assert_eq!(
+        db.get_setting(SEAL_DIR_SETTING).unwrap(),
+        seals.path().display().to_string()
+    );
+    assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
+    let saved = Settings::load(&CompanionDb::open_for(&fixture.path).unwrap()).unwrap();
+    assert_eq!((saved.preset, saved.model.as_str()), (Preset::Osint, "m"));
+    assert!(saved.is_configured());
+}
+
+#[test]
+fn wizard_requires_endpoint_and_model_for_the_companion() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    wizard_to(&mut harness, "Skip", Step::Companion);
+    click_label(&mut harness, "Use the AI companion");
+    click_label(&mut harness, "Next");
+    assert_eq!(wizard(&harness).step, Step::Companion);
+    assert!(
+        harness
+            .query_by_label("Set the endpoint URL and the model, or don't use the companion.")
+            .is_some()
+    );
+}
+
+#[test]
+fn wizard_prefills_and_keeps_companion_settings() {
+    let fixture = Fixture::new();
+    let cdb = CompanionDb::open_for(&fixture.path).unwrap();
+    let before = Settings {
+        endpoint_url: "http://127.0.0.1:1".into(),
+        model: "m".into(),
+        api_key: "secret".into(),
+        preset: Preset::SourceCriticism,
+        ..Settings::default()
+    };
+    before.save(&cdb).unwrap();
+    let expected = Settings::load(&cdb).unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().open_wizard();
+    harness.run_ok();
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    let after = Settings::load(&cdb).unwrap();
+    assert_eq!(after, expected);
+    assert_eq!(
+        (after.api_key.as_str(), after.preset),
+        ("secret", Preset::SourceCriticism)
+    );
+}
+
+#[test]
+fn declining_the_companion_disables_an_existing_one() {
+    let fixture = Fixture::new();
+    let cdb = configure_companion(&fixture);
+    let mut harness = fixture.harness();
+    harness.state_mut().open_wizard();
+    harness.run_ok();
+    wizard_to(&mut harness, "Next", Step::Companion);
+    click_label(&mut harness, "Don't use the AI companion");
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    assert!(!Settings::load(&cdb).unwrap().enabled);
+}
+
+#[test]
+fn menu_opens_wizard() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.get_by_label("Settings").click();
+    harness.run_ok();
+    harness.get_by_label("Setup Wizard…").click();
+    harness.run_ok();
+    assert!(wizard_open(&harness));
+    screenshot(&mut harness, "wizard");
 }

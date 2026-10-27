@@ -8,6 +8,7 @@ mod companion_windows;
 mod dialogs;
 mod theme;
 mod widgets;
+mod wizard;
 mod workers;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -37,6 +38,9 @@ use companion_windows::{CompanionWindow, WindowAction};
 use dialogs::{Dialog, DialogResult, NoGpgChoice, Pending, VerifyAction, VerifyWindow};
 use theme::{SMALL_SIZE, THEMES};
 use widgets::{Card, CardAction, CardView, CheckView};
+#[cfg(test)]
+use wizard::Step;
+use wizard::{Wizard, WizardChoices, WizardStart};
 
 // GUI preferences, stored next to the other settings in the database
 const THEME_SETTING: &str = "ui_theme";
@@ -44,6 +48,8 @@ const SIDE_PANEL_VISIBLE_SETTING: &str = "ui_side_panel_visible";
 const SIDE_PANEL_WIDTH_SETTING: &str = "ui_side_panel_width";
 const COMPOSER_HEIGHT_SETTING: &str = "ui_composer_height";
 const EXPORT_DIR_SETTING: &str = "export_dir";
+/// "1" once the setup wizard was finished or cancelled
+const ONBOARDING_SETTING: &str = "onboarding_done";
 const DEFAULT_SIDE_PANEL_WIDTH: f32 = 340.0;
 const DEFAULT_COMPOSER_HEIGHT: f32 = 170.0;
 const MIN_COMPOSER_HEIGHT: f32 = 150.0;
@@ -296,7 +302,67 @@ impl FactumApp {
         if start_companion && app.companion_db.is_some() && app.companion_settings.is_configured() {
             app.start_companion(ctx);
         }
+        if app.should_auto_start_wizard() {
+            app.open_wizard();
+        }
         app
+    }
+
+    /// A first start: the wizard never ran on this database, which has no cases and no signing key yet.
+    fn should_auto_start_wizard(&self) -> bool {
+        self.db.get_setting(ONBOARDING_SETTING).unwrap_or_default().is_empty()
+            && self.factum().list_cases(true).is_ok_and(|cases| cases.is_empty())
+            && self.signer.active_key().is_none()
+    }
+
+    fn open_wizard(&mut self) {
+        let wizard = Wizard::new(WizardStart {
+            gpg_home: self.signer.gpg_home(),
+            current_key: self.signer.active_key(),
+            companion: self.companion_settings.clone(),
+            db_path: self.db.path.clone(),
+            seal_folder: self.db.get_setting(SEAL_DIR_SETTING).unwrap_or_default(),
+            seal_env: self.env_seal_dir.clone(),
+            theme: self.theme.clone(),
+        });
+        self.dialogs.push(Dialog::Wizard(Box::new(wizard)));
+    }
+
+    /// Applies what the wizard collected, in the order of its steps.
+    fn finish_wizard(&mut self, ctx: &egui::Context, choices: WizardChoices) {
+        if let Some(key) = choices.key
+            && self.signer.set_active_key(&self.db, &key)
+        {
+            self.update_gpg_status();
+        }
+        if let Some(folder) = choices.seal_folder {
+            let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
+        }
+        match choices.theme {
+            Some(theme) => self.set_theme(ctx, &theme),
+            None => theme::apply(ctx, &self.theme),
+        }
+        if let Some(mut dialog) = choices.companion {
+            match dialog.save() {
+                Some(settings) if self.open_companion_db() => self.apply_companion_settings(ctx, settings),
+                Some(_) => {}
+                None => {
+                    let error = dialog.error().unwrap_or_default().to_string();
+                    self.message("Companion", error);
+                }
+            }
+        }
+        if choices.companion_off
+            && let Some(cdb) = &self.companion_db
+        {
+            let mut settings = self.companion_settings.clone();
+            settings.enabled = false;
+            let saved = settings.save(cdb);
+            if self.run(saved).is_some() {
+                self.apply_companion_settings(ctx, settings);
+            }
+        }
+        let _ = self.db.set_setting(ONBOARDING_SETTING, "1");
     }
 
     fn start_companion(&mut self, ctx: &egui::Context) {
@@ -1180,6 +1246,11 @@ impl FactumApp {
             DialogResult::SealFolder(folder) => {
                 let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
             }
+            DialogResult::WizardFinished(choices) => self.finish_wizard(ctx, *choices),
+            DialogResult::WizardCancelled { theme } => {
+                theme::apply(ctx, &theme);
+                let _ = self.db.set_setting(ONBOARDING_SETTING, "1");
+            }
             // the dialog has saved them (creating the database on first use)
             DialogResult::CompanionSettings(settings) => {
                 if self.open_companion_db() {
@@ -1549,6 +1620,10 @@ impl FactumApp {
                 });
             });
             ui.menu_button("Settings", |ui| {
+                if ui.button("Setup Wizard…").clicked() {
+                    self.open_wizard();
+                }
+                ui.separator();
                 ui.menu_button("GPG", |ui| {
                     if ui.button("Select Signing Key…").clicked() {
                         self.open_gpg_keys();

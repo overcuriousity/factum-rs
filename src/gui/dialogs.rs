@@ -4,6 +4,7 @@ use egui::{Align, Id, Layout, RichText, TextEdit};
 
 use super::companion_dialogs::CompanionSettingsDialog;
 use super::theme::{self, MONO_SIZE, SMALL_SIZE};
+use super::wizard::{Wizard, WizardChoices};
 use crate::companion::Settings;
 use crate::pystr::{head, splitlines, strip};
 use crate::signer::GpgKey;
@@ -110,6 +111,7 @@ pub enum Dialog {
         text: String,
     },
     CompanionSettings(Box<CompanionSettingsDialog>),
+    Wizard(Box<Wizard>),
     CaseGoal {
         case_id: i64,
         goal: String,
@@ -161,6 +163,10 @@ pub enum DialogResult {
     NoGpg(NoGpgChoice, Pending),
     SealFolder(String),
     CompanionSettings(Settings),
+    WizardFinished(Box<WizardChoices>),
+    WizardCancelled {
+        theme: String,
+    },
     CaseGoal {
         case_id: i64,
         goal: String,
@@ -210,6 +216,26 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, focus: 
         response.request_focus();
     }
     response
+}
+
+/// The signing keys to choose from, the chosen one highlighted.
+pub fn key_list(ui: &mut egui::Ui, keys: &[GpgKey], selected: &mut Option<String>) {
+    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+        egui::Grid::new("gpg-keys").striped(true).num_columns(2).show(ui, |ui| {
+            for key in keys {
+                let uid = key.uids.first().map(String::as_str).unwrap_or("(no UID)");
+                let chosen = selected.as_deref() == Some(key.keyid.as_str());
+                if ui
+                    .selectable_label(chosen, RichText::new(&key.keyid).monospace())
+                    .clicked()
+                {
+                    *selected = Some(key.keyid.clone());
+                }
+                ui.label(uid);
+                ui.end_row();
+            }
+        });
+    });
 }
 
 /// A multiline "Description" under its label.
@@ -295,14 +321,20 @@ impl Dialog {
         let modal = egui::Modal::new(Id::unique(("factum-dialog", std::mem::discriminant(self)))).show(ctx, |ui| {
             ui.set_width(match self {
                 Dialog::VerifyEntry { .. } => 820.0,
-                Dialog::Correct { .. } | Dialog::Shortcuts { .. } | Dialog::CompanionSettings(_) => 560.0,
+                Dialog::Correct { .. }
+                | Dialog::Shortcuts { .. }
+                | Dialog::CompanionSettings(_)
+                | Dialog::Wizard(_) => 560.0,
                 _ => 460.0,
             });
             self.contents(ui, ctx)
         });
         match modal.inner {
             Some(result) => Some(result),
-            None if modal.should_close() => Some(DialogResult::Cancel),
+            None if modal.should_close() => Some(match self {
+                Dialog::Wizard(wizard) => wizard.cancelled(),
+                _ => DialogResult::Cancel,
+            }),
             None => None,
         }
     }
@@ -311,6 +343,7 @@ impl Dialog {
         let p = *theme::current(ui.ctx());
         match self {
             Dialog::CompanionSettings(dialog) => dialog.show(ui, ctx),
+            Dialog::Wizard(wizard) => wizard.show(ui, ctx),
             Dialog::CaseGoal { case_id, goal } => {
                 let heading = title(ui, "Case goal");
                 ui.label(
@@ -588,22 +621,7 @@ impl Dialog {
                 if keys.is_empty() {
                     ui.label(RichText::new("No secret keys with signing capability found.").color(p.warn));
                 }
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    egui::Grid::new("gpg-keys").striped(true).num_columns(2).show(ui, |ui| {
-                        for key in keys.iter() {
-                            let uid = key.uids.first().map(String::as_str).unwrap_or("(no UID)");
-                            let chosen = selected.as_deref() == Some(key.keyid.as_str());
-                            if ui
-                                .selectable_label(chosen, RichText::new(&key.keyid).monospace())
-                                .clicked()
-                            {
-                                *selected = Some(key.keyid.clone());
-                            }
-                            ui.label(uid);
-                            ui.end_row();
-                        }
-                    });
-                });
+                key_list(ui, keys, selected);
                 let (ok, cancel) = buttons(ui, "Use this key", selected.is_some());
                 if ok {
                     return selected.clone().map(DialogResult::KeySelected);
