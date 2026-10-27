@@ -316,7 +316,7 @@ enum Content {
 }
 
 /// The bytes of `information.turtle.hashes` for a turtle (AFF4-L v1.0, 10.1).
-fn hashes_bytes(uuid: &str, turtle: &[u8]) -> Vec<u8> {
+pub(crate) fn hashes_bytes(uuid: &str, turtle: &[u8]) -> Vec<u8> {
     let mut graph = Graph::default();
     let subject = format!("aff4://{uuid}/{TURTLE}");
     for (name, value) in [

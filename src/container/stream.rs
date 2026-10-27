@@ -243,6 +243,27 @@ pub fn image_stream_reader<'f>(
     chunks_per_segment: u64,
     compression: &str,
 ) -> io::Result<Box<dyn Read + 'f>> {
+    Ok(Box::new(open_image_stream(
+        file,
+        archive,
+        arn,
+        size,
+        chunk_size,
+        chunks_per_segment,
+        compression,
+    )?))
+}
+
+/// An ImageStream that can also seek (for the ranges a Map takes from it).
+pub fn open_image_stream<'f>(
+    file: &'f mut File,
+    archive: &Archive,
+    arn: &str,
+    size: u64,
+    chunk_size: u64,
+    chunks_per_segment: u64,
+    compression: &str,
+) -> io::Result<ImageStreamReader<'f>> {
     let zlib = if compression == ZLIB {
         true
     } else if STORED.contains(&compression) {
@@ -259,7 +280,7 @@ pub fn image_stream_reader<'f>(
             "chunk size or chunks per segment is 0",
         ));
     }
-    Ok(Box::new(ImageStreamReader {
+    Ok(ImageStreamReader {
         file,
         archive: archive.clone(),
         arn: arn.to_string(),
@@ -271,13 +292,13 @@ pub fn image_stream_reader<'f>(
         bevy: None,
         chunk: Vec::new(),
         chunk_at: 0,
-    }))
+    })
 }
 
 /// A loaded bevy: its number, its data and its index of (offset, length).
 type Bevy = (u64, Vec<u8>, Vec<(u64, u32)>);
 
-struct ImageStreamReader<'f> {
+pub struct ImageStreamReader<'f> {
     file: &'f mut File,
     archive: Archive,
     arn: String,
@@ -350,6 +371,24 @@ impl ImageStreamReader<'_> {
     }
 }
 
+impl io::Seek for ImageStreamReader<'_> {
+    fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+        let target = match to {
+            io::SeekFrom::Start(at) => at as i128,
+            io::SeekFrom::End(delta) => self.size as i128 + delta as i128,
+            io::SeekFrom::Current(delta) => self.position as i128 + delta as i128,
+        };
+        if target < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before the start"));
+        }
+        self.position = target as u64;
+        // the chunk is loaded again at the new position
+        self.chunk.clear();
+        self.chunk_at = 0;
+        Ok(self.position)
+    }
+}
+
 impl Read for ImageStreamReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.position >= self.size || buf.is_empty() {
@@ -357,7 +396,8 @@ impl Read for ImageStreamReader<'_> {
         }
         if self.chunk_at >= self.chunk.len() {
             self.load_chunk(self.position / self.chunk_size)?;
-            if self.chunk.is_empty() {
+            self.chunk_at = (self.position % self.chunk_size) as usize;
+            if self.chunk_at >= self.chunk.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!("{} ends early", self.arn),
