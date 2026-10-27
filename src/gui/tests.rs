@@ -1911,3 +1911,18 @@ fn verify_container_can_be_cancelled() {
     assert!(harness.state().container_verify_windows.is_empty());
     assert!(harness.query_by_label("Verification cancelled.").is_some());
 }
+
+#[test]
+fn add_dialog_needs_a_base_path() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let source = fixture._dir.path().join("mnt/evil.exe");
+    harness.state_mut().open_add_to_container(id, vec![source]);
+    if let Some(Dialog::AddToContainer { base, .. }) = harness.state_mut().dialogs.last_mut() {
+        base.clear();
+    }
+    harness.run_ok();
+    click_label(&mut harness, "Add");
+    assert!(harness.state().add_job.is_none());
+    assert!(harness.query_by_label_contains("Choose the base path").is_some());
+}

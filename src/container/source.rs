@@ -172,7 +172,7 @@ pub fn stored_path(path: &Path, base: &Path, keep_path: bool) -> Result<Vec<u8>,
 
 /// Every source and, for folders, everything below them: depth-first, a folder before its contents, the entries
 /// of a folder sorted by name. Links are listed, not followed; a path reached twice is listed once.
-pub fn walk(roots: &[PathBuf]) -> Vec<io::Result<(PathBuf, SourceMeta)>> {
+pub fn walk(roots: &[PathBuf]) -> Vec<Walked> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for root in roots {
@@ -181,14 +181,17 @@ pub fn walk(roots: &[PathBuf]) -> Vec<io::Result<(PathBuf, SourceMeta)>> {
     out
 }
 
-fn walk_one(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<io::Result<(PathBuf, SourceMeta)>>) {
+/// A source with its metadata, or the path that could not be read and why.
+pub type Walked = Result<(PathBuf, SourceMeta), (PathBuf, io::Error)>;
+
+fn walk_one(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Walked>) {
     if !seen.insert(path.to_path_buf()) {
         return;
     }
     let meta = match read_meta(path) {
         Ok(meta) => meta,
         Err(e) => {
-            out.push(Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))));
+            out.push(Err((path.to_path_buf(), e)));
             return;
         }
     };
@@ -200,7 +203,7 @@ fn walk_one(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<io::Result<(
     let mut children: Vec<PathBuf> = match std::fs::read_dir(path) {
         Ok(entries) => entries.filter_map(|e| e.ok().map(|e| e.path())).collect(),
         Err(e) => {
-            out.push(Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))));
+            out.push(Err((path.to_path_buf(), e)));
             return;
         }
     };

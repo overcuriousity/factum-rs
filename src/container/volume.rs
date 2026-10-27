@@ -716,11 +716,7 @@ impl Volume {
         for walked in source::walk(sources) {
             match walked {
                 Ok(item) => items.push(item),
-                Err(e) => {
-                    let message = e.to_string();
-                    let (path, reason) = message.rsplit_once(": ").unwrap_or(("", &message));
-                    errors.push((path.to_string(), reason.to_string()));
-                }
+                Err((path, e)) => errors.push((path.display().to_string(), e.to_string())),
             }
         }
         // everything is checked before anything is written
@@ -1418,6 +1414,33 @@ mod tests {
         assert_eq!(staged.records.len(), 1);
         assert_eq!(staged.records[0].link.as_deref(), Some("Users/x/evil.exe"));
         assert_eq!((staged.records[0].size, staged.records[0].sha256.as_str()), (0, ""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_folder_is_an_error_with_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let setup = Setup::new();
+        let locked = setup.source.join("a: locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            return; // running as root: nothing is unreadable
+        }
+        let mut volume = setup.create();
+        let staged = volume
+            .stage_add(
+                &[locked.clone(), setup.source.join("Users/x/notes.txt")],
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(staged.errors.len(), 1, "{:?}", staged.errors);
+        assert_eq!(staged.errors[0].0, locked.display().to_string());
+        assert!(!staged.errors[0].1.contains("locked"), "{}", staged.errors[0].1);
+        assert_eq!(staged.records.len(), 1);
     }
 
     #[test]

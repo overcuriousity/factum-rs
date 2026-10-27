@@ -871,16 +871,21 @@ impl Dialog {
                 let single_file = sources.len() == 1 && sources[0].is_file();
                 if single_file && !*metadata_only {
                     ui.horizontal(|ui| {
-                        ui.label("Excerpt: from byte");
-                        ui.add(TextEdit::singleline(excerpt_from).desired_width(90.0));
-                        ui.label("to");
-                        ui.add(TextEdit::singleline(excerpt_to).desired_width(90.0));
+                        let from = ui.label("Excerpt: from byte");
+                        ui.add(TextEdit::singleline(excerpt_from).desired_width(90.0))
+                            .labelled_by(from.id);
+                        let to = ui.label("to");
+                        ui.add(TextEdit::singleline(excerpt_to).desired_width(90.0))
+                            .labelled_by(to.id);
                     });
                     note(ui, "Empty: the whole file.");
                 }
                 error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Add", !sources.is_empty());
-                if ok {
+                if ok && strip(base).is_empty() {
+                    *error =
+                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into());
+                } else if ok {
                     let base_path = PathBuf::from(strip(base));
                     let outside = sources.iter().find(|s| !s.starts_with(&base_path));
                     let number = |text: &str| strip(text).parse::<u64>().ok();
