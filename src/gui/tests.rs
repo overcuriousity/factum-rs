@@ -1500,7 +1500,7 @@ fn missing_file_is_marked_and_locate_enabled() {
     let summary = harness.state().view.tree[0].containers[0].clone();
     assert!(summary.missing);
     assert!(harness.query_by_label("File missing").is_some());
-    let items = containers::menu_items(&summary, false);
+    let items = containers::menu_items(&summary, false, false);
     let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
     assert!(enabled("Locate…"));
     assert!(!enabled("Add Files…") && !enabled("Show in Folder") && !enabled("Verify Container…"));
@@ -1512,7 +1512,7 @@ fn add_disabled_while_closed() {
     let (fixture, id, _) = Fixture::with_container();
     let mut harness = fixture.harness();
     let summary = harness.state().view.tree[0].containers[0].clone();
-    let items = containers::menu_items(&summary, false);
+    let items = containers::menu_items(&summary, false, false);
     let enabled =
         |items: &[(&str, ContainerAction, bool)], label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
     assert!(enabled(&items, "Add Files…") && enabled(&items, "Close Container"));
@@ -1521,11 +1521,11 @@ fn add_disabled_while_closed() {
     harness.state_mut().dirty = true;
     harness.run_ok();
     let summary = harness.state().view.tree[0].containers[0].clone();
-    let items = containers::menu_items(&summary, false);
+    let items = containers::menu_items(&summary, false, false);
     assert!(!enabled(&items, "Add Files…") && !enabled(&items, "Add Folder…") && !enabled(&items, "Close Container"));
     assert!(enabled(&items, "Reopen Container"));
     // an archived case takes nothing and reopens nothing
-    let items = containers::menu_items(&summary, true);
+    let items = containers::menu_items(&summary, true, false);
     assert!(!enabled(&items, "Reopen Container") && enabled(&items, "Verify Container…"));
 }
 
@@ -1855,4 +1855,47 @@ fn container_view_shows_modified_times() {
     let shown = containers::short_time(&modified);
     assert!(shown.ends_with(" UTC") && shown.as_bytes()[10] == b' ', "{shown}");
     assert!(harness.query_all_by_label(&shown).next().is_some(), "{shown}");
+}
+
+/// An addition to container `id` that is still running (its worker waits).
+fn running_add_job(harness: &mut Harness<'_, FactumApp>, id: i64) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wait = release.clone();
+    let ctx = harness.ctx.clone();
+    let worker = workers::Worker::spawn(&ctx, move || {
+        while !wait.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err("cancelled — nothing was added".to_string())
+    });
+    harness.state_mut().add_job = Some(AddJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress: Default::default(),
+        cancel: Default::default(),
+    });
+    release
+}
+
+#[test]
+fn a_running_addition_blocks_its_container() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    let items = containers::menu_items(&summary, false, true);
+    let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(!enabled("Add Files…") && !enabled("Close Container") && !enabled("Reopen Container"));
+    assert!(enabled("Verify Container…"));
+    let release = running_add_job(&mut harness, id);
+    let ctx = harness.ctx.clone();
+    let started = std::time::Instant::now();
+    harness.state_mut().container_action(ContainerAction::Close(id), &ctx);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().archive(case_id);
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("being added").is_some());
+    release.store(true, std::sync::atomic::Ordering::Relaxed);
 }

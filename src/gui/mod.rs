@@ -1190,6 +1190,22 @@ impl FactumApp {
 
     fn container_action(&mut self, action: ContainerAction, _ctx: &egui::Context) {
         let summary = |app: &Self, id: i64| app.factum().container(id).ok().map(|d| d.summary);
+        // a running addition holds the container's lock: changing it has to wait
+        let changes = matches!(
+            action,
+            ContainerAction::AddFiles(_)
+                | ContainerAction::AddFolder(_)
+                | ContainerAction::Close(_)
+                | ContainerAction::Reopen(_)
+        );
+        if let Some(job) = self.add_job.as_ref().filter(|_| changes) {
+            let message = format!(
+                "Files are being added to \"{}\". Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
         match action {
             ContainerAction::ShowEntry(entry_id) => self.jump_to_entry(entry_id),
             ContainerAction::Locate(id) => {
@@ -1401,6 +1417,18 @@ impl FactumApp {
             return;
         };
         let open = self.factum().open_containers(case_id).unwrap_or_default();
+        if let Some(job) = self
+            .add_job
+            .as_ref()
+            .filter(|job| open.iter().any(|c| c.id == job.container_id))
+        {
+            let message = format!(
+                "Files are being added to \"{}\" in this case. Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
         if !open.is_empty() {
             let names: Vec<String> = open.iter().map(|c| format!("#{} \"{}\"", c.id, c.name)).collect();
             self.dialogs.push(Dialog::Confirm {
@@ -2456,7 +2484,8 @@ impl FactumApp {
                     }
                     response.context_menu(|ui| {
                         let mut actions = Vec::new();
-                        containers::menu(ui, summary, case.is_archived(), &mut actions);
+                        let busy = self.add_job.as_ref().is_some_and(|job| job.container_id == summary.id);
+                        containers::menu(ui, summary, case.is_archived(), busy, &mut actions);
                         if let Some(action) = actions.pop() {
                             menu_action = Some(TreeAction::Container(action));
                         }
@@ -2581,12 +2610,16 @@ impl FactumApp {
             });
             let mut container_actions = Vec::new();
             let times = std::mem::take(&mut self.view.container_times);
+            let busy = self
+                .add_job
+                .as_ref()
+                .is_some_and(|job| job.container_id == detail.summary.id);
             containers::container_view(
                 ui,
                 &detail,
                 &times,
                 evidence.as_deref(),
-                archived,
+                (archived, busy),
                 &mut container_actions,
             );
             self.view.container_times = times;

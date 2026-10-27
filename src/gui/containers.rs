@@ -27,10 +27,14 @@ pub enum ContainerAction {
     ShowEntry(i64),
 }
 
-/// The container's menu: (label, action, enabled), with None between groups.
-pub fn menu_items(summary: &ContainerSummary, archived: bool) -> Vec<(&'static str, ContainerAction, bool)> {
+/// The container's menu: (label, action, enabled). `busy`: files are being added to it right now.
+pub fn menu_items(
+    summary: &ContainerSummary,
+    archived: bool,
+    busy: bool,
+) -> Vec<(&'static str, ContainerAction, bool)> {
     let id = summary.id;
-    let writable = summary.open && !archived && !summary.missing;
+    let writable = summary.open && !archived && !summary.missing && !busy;
     vec![
         ("Add Files…", ContainerAction::AddFiles(id), writable),
         ("Add Folder…", ContainerAction::AddFolder(id), writable),
@@ -38,7 +42,7 @@ pub fn menu_items(summary: &ContainerSummary, archived: bool) -> Vec<(&'static s
         (
             "Reopen Container",
             ContainerAction::Reopen(id),
-            !summary.open && !archived,
+            !summary.open && !archived && !busy,
         ),
         ("Verify Container…", ContainerAction::Verify(id), !summary.missing),
         ("Locate…", ContainerAction::Locate(id), summary.missing),
@@ -47,8 +51,14 @@ pub fn menu_items(summary: &ContainerSummary, archived: bool) -> Vec<(&'static s
 }
 
 /// The menu as the tree's context menu and the view's ⋯ button show it.
-pub fn menu(ui: &mut egui::Ui, summary: &ContainerSummary, archived: bool, actions: &mut Vec<ContainerAction>) {
-    for (index, (label, action, enabled)) in menu_items(summary, archived).into_iter().enumerate() {
+pub fn menu(
+    ui: &mut egui::Ui,
+    summary: &ContainerSummary,
+    archived: bool,
+    busy: bool,
+    actions: &mut Vec<ContainerAction>,
+) {
+    for (index, (label, action, enabled)) in menu_items(summary, archived, busy).into_iter().enumerate() {
         if index == 4 || index == 5 {
             ui.separator();
         }
@@ -135,7 +145,7 @@ pub fn container_view(
     detail: &ContainerDetail,
     times: &std::collections::HashMap<String, String>,
     evidence: Option<&str>,
-    archived: bool,
+    (archived, busy): (bool, bool),
     actions: &mut Vec<ContainerAction>,
 ) {
     let p = *theme::current(ui.ctx());
@@ -150,7 +160,7 @@ pub fn container_view(
         );
         ui.label(small(if summary.open { "open" } else { "closed" }, p.muted));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            IconButton::new(icons::MORE, "Container actions").menu(ui, |ui| menu(ui, summary, archived, actions));
+            IconButton::new(icons::MORE, "Container actions").menu(ui, |ui| menu(ui, summary, archived, busy, actions));
         });
     });
     ui.add_space(4.0);
