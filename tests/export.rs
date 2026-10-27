@@ -452,6 +452,34 @@ fn verify_py_reports_references_to_unknown_evidence() {
     );
 }
 
+#[test]
+fn bundle_carries_evidence_details_and_verify_py_checks_them() {
+    let f = Fixture::new();
+    let factum = Factum::with_seal_dir(&f.db, &f.signer, Some(f.seal_dir.clone()));
+    let case_id = factum.create_case("C-9", "Case", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "seized").unwrap();
+    factum.update_evidence_details(evidence_id, "seized at desk 4").unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    let reports: Vec<(&str, Vec<u8>)> = REPORTS.iter().map(|(n, c)| (*n, c.to_vec())).collect();
+    let bundle = factum
+        .build_bundle(&model, &reports, &f.path().join("C-9.zip"))
+        .unwrap();
+    let mut data = case_json(&bundle);
+    assert_eq!(data["evidence"][0]["details"], "seized at desk 4");
+    let Some((_, output)) = run_verify(&bundle, None, &[]) else {
+        return;
+    };
+    assert!(!output.contains("field 'details'"), "{output}");
+    data["evidence"][0]["details"] = "forged".into();
+    rewrite_zip(&bundle, &[("case.json", serde_json::to_vec(&data).unwrap())]);
+    let (_, output) = run_verify(&bundle, None, &[]).unwrap();
+    assert!(
+        output.contains("Evidence #1 field 'details' differs from the log"),
+        "{output}"
+    );
+}
+
 fn gpg_signer(db: &factum::Db, home: &common::GpgHome) -> GnupgSigner {
     let signer = GnupgSigner::new(db, Some(home.path()));
     let key = signer.list_keys()[0].keyid.clone();

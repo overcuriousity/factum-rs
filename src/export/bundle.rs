@@ -65,8 +65,9 @@ case file number at the time of sealing (stored with the seal in `case.json`). A
 first `tree_size` leaves; a seal larger than the log means entries were removed.
 
 System entries (`kind = "system"`) record case and evidence changes in `payload` (events `case_created`,
-`case_edited`, `case_archived`, `case_reopened`, `evidence_created`, `evidence_deleted`). The case and evidence rows
-in `case.json` must match the newest event for them.
+`case_edited`, `case_archived`, `case_reopened`, `evidence_created`, `evidence_edited`, `evidence_deleted`). The case
+and evidence rows in `case.json` must match the newest event for them; an evidence `details` field missing from an
+event counts as empty.
 
 A correction is a note whose `corrects_id` points to an earlier note of the same case.
 "#;
@@ -149,7 +150,7 @@ impl Factum<'_> {
             .iter()
             .map(|e| {
                 json!({"id": e.id, "case_id": e.case_id, "description": e.description, "evidence_hash": e.evidence_hash,
-                       "created_utc": e.created_utc, "deleted_utc": optional(&e.deleted_utc)})
+                       "created_utc": e.created_utc, "deleted_utc": optional(&e.deleted_utc), "details": e.details})
             })
             .collect();
         let data = json!({

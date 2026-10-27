@@ -29,6 +29,8 @@ pub struct EvidenceRow {
     pub evidence_hash: String,
     pub created_utc: String,
     pub deleted_utc: Option<String>,
+    /// the evidence description
+    pub details: String,
 }
 
 #[derive(Debug, Clone)]
@@ -208,7 +210,7 @@ pub fn verification_summary(report: &CaseReport) -> String {
 impl Factum<'_> {
     pub fn evidence_rows(&self, case_id: i64) -> Result<Vec<EvidenceRow>> {
         let mut statement = self.db.conn.prepare(
-            "SELECT id, case_id, description, evidence_hash, created_utc, deleted_utc FROM evidence WHERE case_id = ? ORDER BY id",
+            "SELECT id, case_id, description, evidence_hash, created_utc, deleted_utc, details FROM evidence WHERE case_id = ? ORDER BY id",
         )?;
         let rows = statement.query_map([case_id], |row| {
             Ok(EvidenceRow {
@@ -218,6 +220,7 @@ impl Factum<'_> {
                 evidence_hash: row.get(3)?,
                 created_utc: row.get(4)?,
                 deleted_utc: row.get(5)?,
+                details: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
