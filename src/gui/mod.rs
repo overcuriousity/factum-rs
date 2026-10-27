@@ -7,6 +7,7 @@ mod companion_panel;
 mod companion_windows;
 mod dialogs;
 mod icons;
+mod tag_completion;
 mod theme;
 mod widgets;
 mod wizard;
@@ -181,6 +182,7 @@ struct FactumApp {
     /// the scrolled height of the pinned notes in the last frame, for splitting the side panel
     pinned_height: f32,
     composer: String,
+    tag_completion: tag_completion::TagCompletion,
     view: View,
     dirty: bool,
     focused_card: Option<i64>,
@@ -282,6 +284,7 @@ impl FactumApp {
             questions_open: true,
             pinned_height: 0.0,
             composer: String::new(),
+            tag_completion: Default::default(),
             view: View::default(),
             dirty: true,
             focused_card: None,
@@ -2300,17 +2303,15 @@ impl FactumApp {
                     .max_height(inner)
                     .min_scrolled_height(inner) // the default of 64 px would reach into the buttons
                     .show(ui, |ui| {
-                        ui.add(
-                            TextEdit::multiline(&mut self.composer)
-                                .id(id)
-                                .hint_text(NOTE_PLACEHOLDER)
-                                .font(egui::FontId::proportional(theme::NOTE_SIZE))
-                                .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(8, 6)))
-                                .desired_width(f32::INFINITY)
-                                // the panel sets the height, not the default of four rows
-                                .desired_rows(1)
-                                .min_size(egui::vec2(0.0, inner)),
-                        )
+                        let field = TextEdit::multiline(&mut self.composer)
+                            .hint_text(NOTE_PLACEHOLDER)
+                            .font(egui::FontId::proportional(theme::NOTE_SIZE))
+                            .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(8, 6)))
+                            .desired_width(f32::INFINITY)
+                            // the panel sets the height, not the default of four rows
+                            .desired_rows(1)
+                            .min_size(egui::vec2(0.0, inner));
+                        self.tag_completion.show(ui, &self.db, field, id)
                     })
                     .inner
             })

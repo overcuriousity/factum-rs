@@ -243,16 +243,21 @@ pub(super) fn folder_field(ui: &mut egui::Ui, folder: &mut String, label: Option
     });
 }
 
+/// Anything to offer beyond what was typed?
+pub(super) fn suggestions_shown(suggestions: &[(&str, usize, crate::tags::Match)]) -> bool {
+    !suggestions.is_empty() && !(suggestions.len() == 1 && suggestions[0].2 == crate::tags::Match::Exact)
+}
+
 /// The suggestions under a text field, like a dropdown attached to it: the typed part of each name in bold, how
 /// many entries carry it on the right. Returns the clicked one.
-fn suggestion_list(
+pub(super) fn suggestion_list(
     ui: &mut egui::Ui,
     typed: &str,
     suggestions: &[(&str, usize, crate::tags::Match)],
     highlighted: Option<usize>,
 ) -> Option<String> {
     use crate::tags::Match;
-    if suggestions.is_empty() || (suggestions.len() == 1 && suggestions[0].2 == Match::Exact) {
+    if !suggestions_shown(suggestions) {
         return None;
     }
     let p = *theme::current(ui.ctx());

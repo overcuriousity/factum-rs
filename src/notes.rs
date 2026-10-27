@@ -189,14 +189,15 @@ impl Factum<'_> {
         };
         // versions never branch: a correction always attaches to the newest version of the line
         let newest = self.latest_version_id(note_id)?;
-        let move_pin = |conn: &rusqlite::Connection, new_id: i64| -> Result<()> {
+        // the pin and the labels follow the newest version
+        let move_pin_and_labels = |conn: &rusqlite::Connection, new_id: i64| -> Result<()> {
             let pinned: i64 =
                 conn.query_row("SELECT is_pinned FROM entries WHERE id = ?", [newest], |row| row.get(0))?;
             if pinned != 0 {
                 conn.execute("UPDATE entries SET is_pinned = 0 WHERE id = ?", [newest])?;
                 conn.execute("UPDATE entries SET is_pinned = 1 WHERE id = ?", [new_id])?;
             }
-            Ok(())
+            crate::tags::move_labels(conn, newest, new_id)
         };
         self.append(
             entry.case_id,
@@ -205,7 +206,7 @@ impl Factum<'_> {
             Append {
                 evidence_id: entry.evidence_id,
                 corrects_id: Some(newest),
-                on_commit: Some(&move_pin),
+                on_commit: Some(&move_pin_and_labels),
                 ..Default::default()
             },
         )

@@ -1215,6 +1215,93 @@ fn a_clicked_suggestion_is_added() {
     assert!(tags.contains(&("review".to_string(), "label".to_string())), "{tags:?}");
 }
 
+/// The fixture plus #malware on two notes, #mailbox on one, and a label that cannot be written as a #tag.
+fn tagged_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    let (case_id, _) = first_note_versions(&fixture);
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let factum = Factum::with_seal_dir(&db, &signer, None);
+    factum.create_note("#malware #mailbox", None, case_id).unwrap();
+    factum.create_note("#malware", None, case_id).unwrap();
+    let labelled = factum.create_note("plain", None, case_id).unwrap();
+    crate::tags::add_label(&db, labelled, "mal-report").unwrap();
+    fixture
+}
+
+fn type_into_composer(harness: &mut Harness<'_, FactumApp>, text: &str) {
+    let input = egui::accesskit::Role::MultilineTextInput;
+    harness.get_by_role(input).focus();
+    harness.run_ok();
+    harness.get_by_role(input).type_text(text);
+    harness.run_ok();
+}
+
+#[test]
+fn a_tag_is_completed_in_the_composer() {
+    let fixture = tagged_fixture();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    type_into_composer(&mut harness, "found #ma");
+    let option = egui::accesskit::Role::ListBoxOption;
+    assert!(harness.query_by_role_and_label(option, "malware").is_some());
+    assert!(harness.query_by_role_and_label(option, "mailbox").is_some());
+    // "mal-report" would be read as #mal
+    assert!(harness.query_by_role_and_label(option, "mal-report").is_none());
+    screenshot(&mut harness, "tag-suggestions");
+    // the most used is on top; ↓ moves to the next, Tab takes it and the note field keeps the focus
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_ok();
+    harness.key_press(egui::Key::Tab);
+    harness.run_ok();
+    assert_eq!(harness.state().composer, "found #mailbox ");
+    assert!(harness.query_by_role_and_label(option, "malware").is_none());
+    assert!(
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .is_focused()
+    );
+}
+
+#[test]
+fn escape_closes_the_tag_list_and_enter_still_breaks_the_line() {
+    let fixture = tagged_fixture();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    type_into_composer(&mut harness, "#ma");
+    let option = egui::accesskit::Role::ListBoxOption;
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(harness.query_by_role_and_label(option, "malware").is_none());
+    // the field keeps the focus; typing on brings the list back
+    harness
+        .get_by_role(egui::accesskit::Role::MultilineTextInput)
+        .type_text("l");
+    harness.run_ok();
+    assert!(harness.query_by_role_and_label(option, "malware").is_some());
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert_eq!(harness.state().composer, "#mal\n");
+}
+
+#[test]
+fn a_clicked_tag_is_completed() {
+    let fixture = tagged_fixture();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    type_into_composer(&mut harness, "#mai");
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ListBoxOption, "mailbox")
+        .click();
+    harness.run_ok();
+    assert_eq!(harness.state().composer, "#mailbox ");
+    assert!(
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .is_focused()
+    );
+}
+
 #[test]
 fn enter_creates_the_case() {
     let fixture = Fixture::new();

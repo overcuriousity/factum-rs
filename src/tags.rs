@@ -10,6 +10,9 @@ use crate::db::{Db, ensure_entry_case_open};
 use crate::error::Result;
 
 static TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#(\w+)").unwrap()); // words prefixed with #
+static TAG_AT_END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#(\w*)$").unwrap());
+static WORD_AT_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w").unwrap());
+static TAG_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w+$").unwrap());
 
 pub const SOURCE_TEXT: &str = "text";
 pub const SOURCE_LABEL: &str = "label";
@@ -37,6 +40,36 @@ pub fn parse_tags(text: &str) -> Vec<&str> {
         .captures_iter(text)
         .map(|c| c.get(1).unwrap().as_str())
         .collect()
+}
+
+/// Can `name` be written as a #tag? A label like "for-report" cannot: only "#for" would be read.
+pub fn is_tag_name(name: &str) -> bool {
+    TAG_NAME.is_match(name)
+}
+
+fn byte_index(text: &str, chars: usize) -> usize {
+    text.char_indices().nth(chars).map_or(text.len(), |(at, _)| at)
+}
+
+/// The #tag being typed: the char range of its name (empty right after the #) when `cursor`, a char index, is at
+/// its end.
+pub fn tag_before(text: &str, cursor: usize) -> Option<std::ops::Range<usize>> {
+    let (before, after) = text.split_at(byte_index(text, cursor));
+    if WORD_AT_START.is_match(after) {
+        return None;
+    }
+    let name = TAG_AT_END.captures(before)?.get(1)?;
+    Some(before[..name.start()].chars().count()..cursor)
+}
+
+/// Replaces the typed part of a #tag (`range`, from [`tag_before`]) with `name` and a space, unless whitespace
+/// follows already. Returns the cursor after it.
+pub fn complete_tag(text: &mut String, range: std::ops::Range<usize>, name: &str) -> usize {
+    let (start, end) = (byte_index(text, range.start), byte_index(text, range.end));
+    let spaced = text[end..].starts_with(char::is_whitespace);
+    let insert = if spaced { name.to_string() } else { format!("{name} ") };
+    text.replace_range(start..end, &insert);
+    range.start + insert.chars().count()
 }
 
 pub fn parse_tags_from_note(conn: &Connection, entry_id: i64, note_text: &str) -> Result<Vec<i64>> {
@@ -91,6 +124,20 @@ pub fn remove_label(db: &Db, entry_id: i64, label: &str) -> Result<usize> {
         Ok(removed)
     })
     .inspect_err(|e| log::error!("Failed to remove label '{label}' from entry {entry_id}: {e}"))
+}
+
+/// Moves the labels of `from` to `to` (a correction of it); a label the new text already tags is dropped.
+pub fn move_labels(conn: &Connection, from: i64, to: i64) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO entry_tag_map (entry_id, tag_id, source) \
+         SELECT ?, tag_id, source FROM entry_tag_map WHERE entry_id = ? AND source = 'label'",
+        params![to, from],
+    )?;
+    conn.execute(
+        "DELETE FROM entry_tag_map WHERE entry_id = ? AND source = 'label'",
+        [from],
+    )?;
+    Ok(())
 }
 
 /// Every tag and label in use, with the number of entries that carry it; the most used first.
@@ -250,6 +297,46 @@ mod tests {
         assert_eq!(d("malwre", "malware"), 1);
         assert_eq!(d("kitten", "sitting"), 3);
         assert_eq!(d("", "abc"), 3);
+    }
+
+    #[test]
+    fn the_tag_being_typed_ends_at_the_cursor() {
+        // char ranges of the name after the #, the cursor a char index
+        assert_eq!(tag_before("found #mal", 10), Some(7..10));
+        assert_eq!(tag_before("found #", 7), Some(7..7));
+        assert_eq!(tag_before("#Persistenz_ü", 13), Some(1..13));
+        assert_eq!(tag_before("ä #ö", 4), Some(3..4));
+        // parse_tags finds #b in a#b, so it is completed too
+        assert_eq!(tag_before("a#b", 3), Some(2..3));
+        // in the middle of a name, after a space, or without #
+        assert_eq!(tag_before("#malware", 4), None);
+        assert_eq!(tag_before("#mal ", 5), None);
+        assert_eq!(tag_before("mal", 3), None);
+        assert_eq!(tag_before("#x-y", 4), None);
+        assert_eq!(tag_before("", 0), None);
+    }
+
+    #[test]
+    fn completing_replaces_the_typed_part_and_adds_a_space() {
+        let complete = |text: &str, range, name| {
+            let mut text = text.to_string();
+            let cursor = complete_tag(&mut text, range, name);
+            (text, cursor)
+        };
+        assert_eq!(complete("found #MAL", 7..10, "malware"), ("found #malware ".into(), 15));
+        assert_eq!(complete("#", 1..1, "ioc"), ("#ioc ".into(), 5));
+        // whitespace already there is not doubled
+        assert_eq!(complete("#ma and", 1..3, "malware"), ("#malware and".into(), 8));
+        assert_eq!(complete("ü #a\nnext", 3..4, "ärger"), ("ü #ärger\nnext".into(), 8));
+    }
+
+    #[test]
+    fn only_words_complete_as_tags() {
+        assert!(is_tag_name("malware"));
+        assert!(is_tag_name("Persistenz_ü"));
+        assert!(!is_tag_name("for-report"));
+        assert!(!is_tag_name("two words"));
+        assert!(!is_tag_name(""));
     }
 
     #[test]

@@ -711,6 +711,38 @@ fn pin_moves_to_the_correction() {
 }
 
 #[test]
+fn labels_move_to_the_correction() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _) = case_with_evidence(&factum);
+    let note = factum.create_note("x #malware", None, case_id).unwrap();
+    tags::add_label(&f.db, note, "review").unwrap();
+    tags::add_label(&f.db, note, "persistence").unwrap();
+    // the correction's own #persistence wins over the label of the same name
+    let correction = factum.correct_note(note, "y #persistence").unwrap();
+    assert_eq!(
+        tags::get_tags_for_entry(&f.db.conn, correction).unwrap(),
+        vec![("persistence".into(), "text".into()), ("review".into(), "label".into())]
+    );
+    assert_eq!(
+        tags::get_tags_for_entry(&f.db.conn, note).unwrap(),
+        vec![("malware".into(), "text".into())]
+    );
+    let by_tag = |tag| {
+        factum
+            .list_entries(
+                case_id,
+                &EntryFilter {
+                    tag: Some(tag),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(by_tag("review"), vec![correction]);
+}
+
+#[test]
 fn pinning_is_refused_on_archived_cases() {
     let f = Fixture::new();
     let factum = f.factum();
