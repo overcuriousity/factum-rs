@@ -12,11 +12,14 @@ use crate::services::Factum;
 pub struct Evidence {
     pub id: i64,
     pub case_id: i64,
+    /// the evidence name (the column keeps its historical name)
     pub description: String,
     pub evidence_hash: String,
     pub created_utc: String,
     pub is_active: bool,
     pub deleted_utc: Option<String>,
+    /// the free-text description, editable through a logged entry
+    pub details: String,
 }
 
 impl Evidence {
@@ -24,7 +27,8 @@ impl Evidence {
         self.deleted_utc.is_some()
     }
 
-    pub const COLUMNS: &'static str = "id, case_id, description, evidence_hash, created_utc, is_active, deleted_utc";
+    pub const COLUMNS: &'static str =
+        "id, case_id, description, evidence_hash, created_utc, is_active, deleted_utc, details";
 
     pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -35,6 +39,7 @@ impl Evidence {
             created_utc: row.get(4)?,
             is_active: row.get::<_, i64>(5)? != 0,
             deleted_utc: row.get(6)?,
+            details: row.get(7)?,
         })
     }
 }
