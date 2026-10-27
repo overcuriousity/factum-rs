@@ -1899,3 +1899,15 @@ fn a_running_addition_blocks_its_container() {
     assert!(harness.query_by_label_contains("being added").is_some());
     release.store(true, std::sync::atomic::Ordering::Relaxed);
 }
+
+#[test]
+fn verify_container_can_be_cancelled() {
+    let (fixture, _, path) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    harness.state_mut().start_container_verification(path, cancel);
+    run_until(&mut harness, |h| h.state().container_verify_job.is_none());
+    harness.run_ok();
+    assert!(harness.state().container_verify_windows.is_empty());
+    assert!(harness.query_by_label("Verification cancelled.").is_some());
+}

@@ -177,6 +177,7 @@ struct ContainerVerifyJob {
     worker: workers::Worker<workers::ContainerVerifyResult>,
     progress: Arc<workers::Progress>,
     started: Instant,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct VerifyJob {
@@ -897,6 +898,7 @@ impl FactumApp {
                         open: true,
                     });
                 }
+                Err(message) if message.contains("cancelled") => self.message("Factum", "Verification cancelled."),
                 Err(message) => self.message("Factum", format!("Verification failed: {message}")),
             }
         }
@@ -1003,6 +1005,11 @@ impl FactumApp {
 
     /// Verifies a container file in the background; the result opens in a window.
     fn verify_container_file(&mut self, path: PathBuf) {
+        self.start_container_verification(path, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    }
+
+    /// `cancel` stops it (the progress dialog's Cancel sets it).
+    fn start_container_verification(&mut self, path: PathBuf, cancel: Arc<std::sync::atomic::AtomicBool>) {
         if self
             .container_verify_job
             .as_ref()
@@ -1012,11 +1019,13 @@ impl FactumApp {
             return;
         }
         let ctx = self.egui_ctx.clone();
-        let (worker, progress) = workers::verify_container(&ctx, self.db.path.clone(), self.signer.gpg_home(), path);
+        let (worker, progress) =
+            workers::verify_container(&ctx, self.db.path.clone(), self.signer.gpg_home(), path, cancel.clone());
         self.container_verify_job = Some(ContainerVerifyJob {
             worker,
             progress,
             started: Instant::now(),
+            cancel,
         });
     }
 
@@ -3088,9 +3097,14 @@ impl FactumApp {
     }
 
     fn verification_progress(&mut self, ctx: &egui::Context) {
-        let (started, progress, text) = match (&self.verify_job, &self.container_verify_job) {
-            (Some(job), _) => (job.started, job.progress.clone(), "Verifying case…"),
-            (None, Some(job)) => (job.started, job.progress.clone(), "Verifying container…"),
+        let (started, progress, text, cancel) = match (&self.verify_job, &self.container_verify_job) {
+            (Some(job), _) => (job.started, job.progress.clone(), "Verifying case…", None),
+            (None, Some(job)) => (
+                job.started,
+                job.progress.clone(),
+                "Verifying container…",
+                Some(job.cancel.clone()),
+            ),
             (None, None) => return,
         };
         if started.elapsed() < Duration::from_millis(300) {
@@ -3113,6 +3127,11 @@ impl FactumApp {
                 ui.label(text);
                 let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
                 ui.add(egui::ProgressBar::new(fraction).text(counted));
+                if let Some(cancel) = &cancel
+                    && ui.button("Cancel").clicked()
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
             });
     }
 }
