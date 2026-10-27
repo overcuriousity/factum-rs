@@ -679,3 +679,231 @@ mod verify {
         assert!(fail.message.contains(&home.root_fingerprint), "{}", fail.message);
     }
 }
+
+// --- verify_container.py, as a recipient runs it
+
+mod script {
+    use super::*;
+    use factum::container::volume::VERIFY_CONTAINER_PY;
+    use factum::container::x509::{Gpgsm, X509_CERT_SETTING};
+    use factum::container::zip64::{Appender, read_archive};
+    use factum::signer::{GnupgSigner, Signer as _};
+    use factum::{Db, Factum};
+    use std::process::Command;
+
+    /// Extracts verify_container.py from the container and runs it there; None without python3.
+    fn run(container: &Path, flags: &[&str], gnupg_home: Option<&Path>) -> Option<(i32, String)> {
+        let python = which::which("python3").ok()?;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("verify_container.py");
+        std::fs::write(&script, member(container, "verify_container.py").unwrap()).unwrap();
+        let mut command = Command::new(python);
+        command.arg("-I").arg(&script).arg(container).args(flags);
+        if let Some(home) = gnupg_home {
+            command.env("GNUPGHOME", home);
+        }
+        let output = command.output().unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some((output.status.code().unwrap_or(-1), text))
+    }
+
+    /// A container signed with a real gpg key: two closes, one file stored as an ImageStream.
+    fn signed_container(dir: &tempfile::TempDir, home: &common::GpgHome) -> PathBuf {
+        let db = Db::open(&dir.path().join("factum.db")).unwrap();
+        let signer = GnupgSigner::new(&db, Some(home.path()));
+        let key = signer.list_keys()[0].keyid.clone();
+        assert!(signer.set_active_key(&db, &key));
+        let factum = Factum::with_seal_dir(&db, &signer, Some(dir.path().to_path_buf()));
+        let case_id = factum.create_case("C-1", "Case", "").unwrap();
+        let source = dir.path().join("mnt");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("small.txt"), b"small").unwrap();
+        std::fs::write(
+            source.join("big.bin"),
+            (0..200_000u32).map(|i| (i % 249) as u8).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let path = dir.path().join("c.aff4l");
+        let id = factum
+            .create_container(case_id, "C", None, &path, &source.display().to_string())
+            .unwrap();
+        let options = AddOptions {
+            base: source.clone(),
+            keep_path: true,
+            metadata_only: false,
+            excerpt: None,
+        };
+        for (index, name) in ["small.txt", "big.bin"].iter().enumerate() {
+            if index > 0 {
+                factum.reopen_container(id).unwrap();
+            }
+            let mut volume = factum.open_container_for_add(id).unwrap();
+            volume.segment_limit = 100_000;
+            let staged = volume
+                .stage_add(
+                    &[source.join(name)],
+                    &options,
+                    &AddProgress::default(),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            factum.commit_container_add(id, &mut volume, staged).unwrap();
+            drop(volume);
+            factum.close_container(id).unwrap();
+        }
+        path
+    }
+
+    macro_rules! gpg_or_skip {
+        () => {
+            match common::GpgHome::new("Factum Test <test@factum.invalid>") {
+                Some(home) => home,
+                None => {
+                    eprintln!("skipped: gpg is not installed");
+                    return;
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn script_runs_from_the_container() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        assert_eq!(
+            member(&s.container_path(), "verify_container.py").unwrap(),
+            VERIFY_CONTAINER_PY
+        );
+        let Some((code, output)) = run(&s.container_path(), &[], None) else {
+            eprintln!("skipped: python3 is not installed");
+            return;
+        };
+        // open and never closed: nothing has to be signed yet
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("\u{2713} 1 file(s) checked"), "{output}");
+    }
+
+    #[test]
+    fn script_passes_clean_container() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        let Some((code, output)) = run(&path, &[], Some(&home.path())) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("Close 1") && output.contains("Close 2 (current)"),
+            "{output}"
+        );
+        assert!(output.contains("2 file(s) checked"), "{output}");
+        assert!(!output.contains('\u{2717}'), "{output}");
+        // with the key the container carries, in a keyring of its own
+        let empty = tempfile::tempdir().unwrap();
+        let Some((code, output)) = run(&path, &["--use-carried-key"], Some(empty.path())) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("Compare them with a trusted source"), "{output}");
+    }
+
+    #[test]
+    fn script_fails_tampered_content() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let archive = read_archive(&mut file, bytes.len() as u64).unwrap();
+        let bevy = archive
+            .entries
+            .iter()
+            .find(|e| e.name_lossy().ends_with("/00000000"))
+            .unwrap();
+        bytes[bevy.header_offset as usize + 30 + bevy.name.len() + 20 + 5] ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+        let Some((code, output)) = run(&path, &[], Some(&home.path())) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains('\u{2717}'), "{output}");
+    }
+
+    #[test]
+    fn script_fails_tampered_history() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        let history = "factum/history/1/information.turtle";
+        let edited = String::from_utf8(member(&path, history).unwrap())
+            .unwrap()
+            .replace("small", "large");
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let mut app = Appender::new(file, len, archive.entries).unwrap();
+        app.add_bytes(history, 0, edited.as_bytes()).unwrap();
+        app.finish(&[], &archive.comment).unwrap();
+        let Some((code, output)) = run(&path, &[], Some(&home.path())) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("\u{2717} close 1"), "{output}");
+    }
+
+    #[test]
+    fn script_x509_with_and_without_ca() {
+        let Some(home) = common::GpgsmHome::new() else {
+            eprintln!("skipped: gpgsm or openssl is not installed");
+            return;
+        };
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        home.trusted();
+        s.f.db.set_setting(X509_CERT_SETTING, &home.leaf_fingerprint).unwrap();
+        let close =
+            s.f.factum()
+                .close_container_with(id, &Gpgsm::new(Some(home.path())))
+                .unwrap();
+        assert!(close.x509.is_some(), "{:?}", close.x509_refused);
+        let root = home.file("root.pem");
+        let Some((code, output)) = run(&s.container_path(), &["--ca", root.to_str().unwrap()], None) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("X.509 signature good, chain ends at your root"),
+            "{output}"
+        );
+        let Some((code, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("\u{26a0} close 1 (current): root not checked against a trusted certificate"),
+            "{output}"
+        );
+        // a root that is not the chain's own fails
+        let other = tempfile::tempdir().unwrap();
+        let other_root = other.path().join("other.pem");
+        let made = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+            .arg(other.path().join("k"))
+            .arg("-out")
+            .arg(&other_root)
+            .args(["-days", "1", "-subj", "/CN=Other Root"])
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        let Some((code, output)) = run(&s.container_path(), &["--ca", other_root.to_str().unwrap()], None) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+    }
+}

@@ -19,6 +19,8 @@ Verifying without factum (Python 3, no other packages)
   python3 verify_container.py <container>.aff4l
   python3 verify_container.py <container>.aff4l --ca ROOT.pem   (checks the X.509 chain against your root)
 
-GPG signatures are checked with the system's gpg when it is installed; import the examiner's public key first
-(gpg --import), or check the fingerprint printed by the script against one you received separately.
+GPG signatures are checked with the system's gpg when it is installed, against your keyring: import the
+examiner's public key first (gpg --import). Or add --use-carried-key: the script then uses the key the container
+carries (information.turtle.pubkey.asc) in a temporary keyring and prints its fingerprint; compare it with one you
+received separately.
 The script prints one line per check (✓ passed, ⚠ warning, ✗ failed) and exits with 0 only if nothing failed.
