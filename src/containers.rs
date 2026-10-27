@@ -223,8 +223,8 @@ impl Factum<'_> {
     fn container_events(&self, case_id: i64, uuid: Option<&str>) -> Result<Vec<Event>> {
         let mut statement = self.db.conn.prepare_cached(
             "SELECT id, created_utc, payload_json FROM entries WHERE case_id = ? AND kind = 'system' \
-             AND json_extract(payload_json, '$.event') LIKE 'container\\_%' ESCAPE '\\' \
-             AND (?2 IS NULL OR json_extract(payload_json, '$.container_id') = ?2) ORDER BY leaf_index",
+             AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END) LIKE 'container\\_%' ESCAPE '\\' \
+             AND (?2 IS NULL OR (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.container_id') END) = ?2) ORDER BY leaf_index",
         )?;
         let rows = statement.query_map(rusqlite::params![case_id, uuid], |row| {
             Ok((
@@ -274,10 +274,10 @@ impl Factum<'_> {
     /// The containers of a case, read from the log without its file lists.
     pub fn list_containers(&self, case_id: i64) -> Result<Vec<ContainerSummary>> {
         let mut statement = self.db.conn.prepare_cached(
-            "SELECT id, json_extract(payload_json, '$.event'), json_extract(payload_json, '$.container_id'), \
-             json_extract(payload_json, '$.name'), json_array_length(payload_json, '$.files') \
+            "SELECT id, (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END), (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.container_id') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END), (CASE WHEN json_valid(payload_json) THEN json_array_length(payload_json, '$.files') END) \
              FROM entries WHERE case_id = ? AND kind = 'system' \
-             AND json_extract(payload_json, '$.event') LIKE 'container\\_%' ESCAPE '\\' ORDER BY leaf_index",
+             AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END) LIKE 'container\\_%' ESCAPE '\\' ORDER BY leaf_index",
         )?;
         let rows = statement.query_map([case_id], |row| {
             Ok((
@@ -322,8 +322,8 @@ impl Factum<'_> {
             .conn
             .query_row(
                 "SELECT id FROM entries WHERE kind = 'system' \
-                 AND json_extract(payload_json, '$.event') = 'container_created' \
-                 AND json_extract(payload_json, '$.container_id') = ? ORDER BY id LIMIT 1",
+                 AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END) = 'container_created' \
+                 AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.container_id') END) = ? ORDER BY id LIMIT 1",
                 [uuid],
                 |row| row.get(0),
             )
