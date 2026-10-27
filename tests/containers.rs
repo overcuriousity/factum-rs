@@ -103,7 +103,7 @@ impl Setup {
 }
 
 fn member(path: &Path, name: &str) -> Option<Vec<u8>> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).ok()?;
     let mut file = archive.by_name(name).ok()?;
     let mut data = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut data).unwrap();
@@ -1002,7 +1002,9 @@ mod script {
         let python = which::which("python3").ok()?;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("verify_container.py");
-        std::fs::write(&script, member(container, "verify_container.py").unwrap()).unwrap();
+        // from the container, as recipients do; from this build when the ZIP cannot be read (a damaged tail)
+        let carried = member(container, "verify_container.py").unwrap_or_else(|| VERIFY_CONTAINER_PY.to_vec());
+        std::fs::write(&script, carried).unwrap();
         let mut command = Command::new(python);
         command.arg("-I").arg(&script).arg(container).args(flags);
         if let Some(home) = gnupg_home {
@@ -1107,6 +1109,66 @@ mod script {
         };
         assert_eq!(code, 0, "{output}");
         assert!(output.contains("1 file(s) checked"), "{output}");
+    }
+
+    #[test]
+    fn script_warns_about_a_long_interrupted_tail() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let mut bytes = std::fs::read(s.container_path()).unwrap();
+        bytes.extend(vec![3u8; 100_000]);
+        std::fs::write(s.container_path(), bytes).unwrap();
+        let Some((code, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output.contains("\u{26a0} 100000 bytes after the last complete state"),
+            "{output}"
+        );
+        assert!(output.contains("1 file(s) checked"), "{output}");
+    }
+
+    #[test]
+    fn script_reports_an_image_stream_without_size() {
+        use factum::container::AFF4_NS;
+        use factum::container::turtle::{self, Graph};
+        use factum::container::zip64::{Appender, read_archive};
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let big = s.source.join("big.bin");
+        std::fs::write(&big, vec![7u8; 50_000]).unwrap();
+        let id = s.create();
+        let factum = s.f.factum();
+        let mut volume = factum.open_container_for_add(id).unwrap();
+        volume.segment_limit = 1000;
+        let staged = volume
+            .stage_add(&[big], &s.options(), &AddProgress::default(), &AtomicBool::new(false))
+            .unwrap();
+        let arn = staged.records[0].arn.clone();
+        factum.commit_container_add(id, &mut volume, staged).unwrap();
+        drop(volume);
+        let path = s.container_path();
+        let old = turtle::parse(&String::from_utf8(member(&path, TURTLE).unwrap()).unwrap()).unwrap();
+        let mut graph = Graph::default();
+        for t in old.triples() {
+            if !(t.subject == arn && t.predicate == format!("{AFF4_NS}size")) {
+                graph.add(&t.subject, &t.predicate, t.object.clone());
+            }
+        }
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let mut app = Appender::new(file, len, archive.entries).unwrap();
+        app.add_bytes(TURTLE, 8, turtle::write(&graph, &turtle::factum_prefixes()).as_bytes())
+            .unwrap();
+        app.finish(&[], &archive.comment).unwrap();
+        let Some((code, output)) = run(&path, &[], None) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(!output.contains("Traceback"), "{output}");
+        assert!(output.contains("aff4:size"), "{output}");
     }
 
     #[test]

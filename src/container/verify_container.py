@@ -168,6 +168,8 @@ def display(graph, arn):
 # --- content
 
 def image_stream(archive, graph, arn):
+    if first(graph, arn, "size") is None:
+        raise ValueError("it has no aff4:size")
     size = int(first(graph, arn, "size"))
     chunk_size = int(first(graph, arn, "chunkSize") or 32768)
     per_bevy = int(first(graph, arn, "chunksInSegment") or 2048)
@@ -239,6 +241,67 @@ def check_files(archive, graph):
         else:
             checked += 1
     return checked
+
+
+# --- an interrupted addition: bytes after the last complete state
+
+class Prefix(io.RawIOBase):
+    """The first `length` bytes of a file, as a file: the container as it was before an interrupted addition."""
+
+    def __init__(self, handle, length):
+        self.handle, self.length, self.position = handle, length, 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.position
+
+    def seek(self, offset, whence=0):
+        base = {0: 0, 1: self.position, 2: self.length}[whence]
+        self.position = max(0, min(self.length, base + offset))
+        return self.position
+
+    def readinto(self, buffer):
+        count = min(len(buffer), self.length - self.position)
+        self.handle.seek(self.position)
+        data = self.handle.read(count)
+        buffer[:len(data)] = data
+        self.position += len(data)
+        return len(data)
+
+
+def open_container(path):
+    """The ZIP of the last complete state; and how many bytes follow it (an interrupted addition)."""
+    try:
+        return zipfile.ZipFile(path), 0
+    except zipfile.BadZipFile:
+        pass
+    handle = open(path, "rb")
+    size = os.path.getsize(path)
+    end = size
+    block = 1 << 20
+    while end > 0:
+        start = max(0, end - block)
+        handle.seek(start)
+        data = handle.read(end - start + 3)
+        at = data.rfind(b"PK\x05\x06")
+        while at >= 0:
+            candidate = start + at
+            comment = struct.unpack_from("<H", data, at + 20)[0] if at + 22 <= len(data) else None
+            if comment is not None and candidate + 22 + comment <= size:
+                try:
+                    view = Prefix(handle, candidate + 22 + comment)
+                    archive = zipfile.ZipFile(io.BufferedReader(view))
+                    return archive, size - (candidate + 22 + comment)
+                except zipfile.BadZipFile:
+                    pass
+            at = data.rfind(b"PK\x05\x06", 0, at)
+        end = start
+    raise zipfile.BadZipFile("no complete ZIP directory")
 
 
 # --- signatures
@@ -383,10 +446,13 @@ def main(argv=None):
                              "keyring; compare the printed fingerprint with one you received separately")
     args = parser.parse_args(argv)
     try:
-        archive = zipfile.ZipFile(args.container)
+        archive, tail = open_container(args.container)
     except (OSError, zipfile.BadZipFile) as e:
         fail("%s is not a readable container (%s)." % (args.container, e))
         return 1
+    if tail:
+        warn("%d bytes after the last complete state (an interrupted addition); the last complete state was checked."
+             % tail)
     counts = collections.Counter(archive.namelist())
     for name in sorted(n for n, count in counts.items() if count > 1):
         fail("listed more than once: %s (ZIP tools may read a different copy than this check)." % name)
