@@ -738,3 +738,48 @@ fn bundle_with_container_events_verifies() {
     };
     assert_eq!(code, 0, "{output}");
 }
+
+#[test]
+fn reports_mark_files_whose_content_is_not_stored() {
+    use factum::container::volume::{AddOptions, AddProgress};
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-8", "Marks", "").unwrap();
+    let source = f.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("huge.img"), b"only hashed").unwrap();
+    std::fs::write(source.join("part.bin"), b"0123456789").unwrap();
+    let id = factum
+        .create_container(
+            case_id,
+            "Marks",
+            None,
+            &f.path().join("m.aff4l"),
+            &source.display().to_string(),
+        )
+        .unwrap();
+    for (name, metadata_only, excerpt) in [("huge.img", true, None), ("part.bin", false, Some((2, 5)))] {
+        let mut volume = factum.open_container_for_add(id).unwrap();
+        let options = AddOptions {
+            base: source.clone(),
+            keep_path: true,
+            metadata_only,
+            excerpt,
+        };
+        let staged = volume
+            .stage_add(
+                &[source.join(name)],
+                &options,
+                &AddProgress::default(),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+        factum.commit_container_add(id, &mut volume, staged).unwrap();
+    }
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    for text in [render_html(&model, false), render_markdown(&model)] {
+        assert!(text.contains("huge.img (metadata only, not stored)"), "{text}");
+        assert!(text.contains("part.bin (excerpt, bytes 2–5)"), "{text}");
+    }
+}

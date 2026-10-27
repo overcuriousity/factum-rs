@@ -308,7 +308,7 @@ impl Factum<'_> {
                 signatures,
                 files: detail
                     .files()
-                    .map(|(_, f)| (f.path.clone(), f.size, f.sha256.clone()))
+                    .map(|(_, f)| (report_path(f), f.size, f.sha256.clone()))
                     .collect(),
             });
         }
@@ -415,6 +415,19 @@ impl Factum<'_> {
             timeline,
             appendix,
         })
+    }
+}
+
+/// A container file's path as reports show it: marked when its content is not (fully) stored.
+fn report_path(file: &crate::container::volume::FileRecord) -> String {
+    if file.metadata_only {
+        format!("{} (metadata only, not stored)", file.path)
+    } else if let Some((from, to)) = file.excerpt {
+        format!("{} (excerpt, bytes {from}–{to})", file.path)
+    } else if let Some(target) = &file.link {
+        format!("{} (link to {target})", file.path)
+    } else {
+        file.path.clone()
     }
 }
 
