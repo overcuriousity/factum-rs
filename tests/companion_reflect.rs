@@ -330,9 +330,9 @@ fn choose_kind_rules() {
 }
 
 #[test]
-fn cap_of_seven_is_enforced() {
+fn a_full_list_makes_room_for_new_questions() {
     let e = env();
-    let open: Vec<serde_json::Value> = [
+    let ids: Vec<i64> = [
         "Where did the uploaded webshell come from?",
         "Which hash algorithm verified the disk image?",
         "Was the plaso timeline filtered by date?",
@@ -341,9 +341,9 @@ fn cap_of_seven_is_enforced() {
         "Has the firewall export been secured?",
     ]
     .iter()
-    .map(|text| json!({"id": question(&e, text)}))
+    .map(|text| question(&e, text))
     .collect();
-    let mut questions = open.clone();
+    let mut questions: Vec<serde_json::Value> = ids.iter().map(|id| json!({"id": id})).collect();
     questions.extend([
         json!({"text": "Which user agent sent the POST request?", "rests_on": [e.notes[2]]}),
         json!({"text": "Is 203.0.113.5 seen in other cases?", "rests_on": [e.notes[4]]}),
@@ -351,8 +351,13 @@ fn cap_of_seven_is_enforced() {
     ]);
     script(&e, json!({ "questions": questions }));
     let s = pass(&e, PassKind::Full).unwrap();
-    assert_eq!(s.created, 1);
-    assert_eq!(open_ids(&e).len(), 7);
+    assert_eq!((s.created, s.withdrawn), (3, 2));
+    let open = open_ids(&e);
+    assert_eq!(open.len(), 7);
+    assert!(
+        !open.contains(&ids[0]) && !open.contains(&ids[1]),
+        "the oldest two made room"
+    );
 }
 
 #[test]

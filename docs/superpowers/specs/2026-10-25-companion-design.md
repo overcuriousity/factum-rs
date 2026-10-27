@@ -359,7 +359,9 @@ sends no thinking switch of its own: the server's (llama.cpp `--reasoning-budget
    or with any minus-rated example anywhere, is reached. Minus examples are compared against globally. The nearest
    minus examples are also in the prompt (4.8), so the model is told what not to resurrect before the mechanical
    check runs.
-6. The cap: if more than seven would be open, the newest `new` items beyond the cap are dropped.
+6. The cap: if more than seven would be open, new questions replace the oldest kept questions that are neither
+   rated plus nor reworded in this pass, so a full list does not freeze; what still does not fit is dropped, newest
+   first.
 7. An open question the output leaves out is withdrawn, unless it is rated plus.
 
 Surviving changes are applied in one transaction: answered questions get `state=answered`, `resolved_entry_id`,

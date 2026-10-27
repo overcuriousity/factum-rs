@@ -253,7 +253,7 @@ pub struct Validated {
 }
 
 /// Spec 4.7 steps 3 to 7. The output lists the questions open after the pass: an open question it leaves out is
-/// withdrawn, unless the investigator rated it plus. Archetypes were already normalised by `Archetype::parse`.
+/// withdrawn, unless the investigator rated it plus; beyond the cap, new questions replace the oldest kept ones. Archetypes were already normalised by `Archetype::parse`.
 pub fn validate(out: Vec<OutputQuestion>, ctx: &ValidationContext) -> Validated {
     let entry_exists = |id: &i64| ctx.existing_entry_ids.contains(id) || ctx.new_entry_ids.contains(id);
     let known: Vec<&str> = ctx
@@ -326,8 +326,19 @@ pub fn validate(out: Vec<OutputQuestion>, ctx: &ValidationContext) -> Validated 
         .filter(|q| !listed.contains(&q.id) && q.rating != Rating::Plus)
         .map(|q| q.id)
         .collect();
-    let open_after = ctx.open.len() - v.answered.len() - v.withdraw.len();
-    let room = ctx.cap.saturating_sub(open_after);
+    // a full list does not freeze: new questions replace the oldest unrated ones the output kept without rewording
+    let mut over = (ctx.open.len() - v.answered.len() - v.withdraw.len() + v.new.len()).saturating_sub(ctx.cap);
+    for q in ctx.open {
+        let replaceable = q.rating != Rating::Plus
+            && !v.withdraw.contains(&q.id)
+            && !v.answered.iter().any(|(a, _)| *a == q.id)
+            && !v.rephrased.iter().any(|(r, ..)| *r == q.id);
+        if over > 0 && replaceable {
+            v.withdraw.push(q.id);
+            over -= 1;
+        }
+    }
+    let room = v.new.len().saturating_sub(over);
     for q in v.new.split_off(room.min(v.new.len())) {
         v.dropped.push(format!(
             "new: \"{}\" exceeds the cap of {} open questions",
@@ -592,19 +603,33 @@ mod tests {
     }
 
     #[test]
-    fn cap_drops_the_newest() {
-        let open: Vec<Question> = (1..=6)
-            .map(|i| open_question(i, &format!("Unrelated open question number{i} alpha{i}"), Rating::None))
+    fn new_questions_replace_the_oldest_unrated_kept_ones() {
+        // seven open: 1 rated plus, 2 reworded, the rest kept as they are
+        let open: Vec<Question> = (1..=7)
+            .map(|i| {
+                let rating = if i == 1 { Rating::Plus } else { Rating::None };
+                open_question(i, &format!("Unrelated open question number{i} alpha{i}"), rating)
+            })
             .collect();
-        let mut out: Vec<OutputQuestion> = (1..=6).map(|i| kept(i, "", None)).collect();
+        let mut out: Vec<OutputQuestion> = (1..=7).map(|i| kept(i, "", None)).collect();
+        out[1].text = "Reworded question two beta".into();
         out.extend([
             new_item("First fresh topic gamma", &[10]),
             new_item("Second distinct subject delta", &[10]),
-            new_item("Third separate matter epsilon", &[10]),
         ]);
         let v = check(&open, &[], out);
-        assert_eq!(v.new.len(), 1);
-        assert_eq!(v.new[0].text, "First fresh topic gamma");
-        assert_eq!(v.dropped.len(), 2);
+        assert_eq!(v.withdraw, vec![3, 4], "the oldest unrated ones not reworded make room");
+        assert_eq!(v.new.len(), 2);
+        assert!(v.dropped.is_empty());
+    }
+
+    #[test]
+    fn cap_drops_the_newest_when_nothing_can_make_room() {
+        let open: Vec<Question> = (1..=7)
+            .map(|i| open_question(i, &format!("Unrelated open question number{i} alpha{i}"), Rating::Plus))
+            .collect();
+        let v = check(&open, &[], vec![new_item("First fresh topic gamma", &[10])]);
+        assert!(v.withdraw.is_empty() && v.new.is_empty());
+        assert_eq!(v.dropped.len(), 1);
     }
 }

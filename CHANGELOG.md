@@ -9,6 +9,8 @@ All notable changes to this project are documented here. The format follows
 - Companion: every pass restates the open questions. A question whose context changed is reworded in place (it
   keeps its place, rating and history); one the pass leaves out is withdrawn, unless rated plus. The model answers
   with one `questions` list instead of separate answered, withdraw and new lists
+- Companion: a full question list no longer freezes: a new question replaces the oldest one that is neither rated
+  plus nor reworded in the pass
 - Companion: a full pass runs on the first pass of a case, every tenth pass and on Re-think; the extra full passes
   after a pass that closed three questions or after three passes that closed none are gone
 - GUI: the QUESTIONS heading collapses and expands the questions
