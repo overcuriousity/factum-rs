@@ -16,7 +16,7 @@ use super::questions::{PassKind, Question, Rating};
 use super::retrieval::{RetrievalQuery, fts_query, retrieve};
 use super::store::CompanionDb;
 use super::tokens::{BudgetError, CUT_MARKER, Cut, Packed, Section, TextKind, budget, pack};
-use super::validate::{PassOutput, ValidationContext, parse_pass_output, validate};
+use super::validate::{OutputQuestion, ValidationContext, parse_pass_output, validate};
 use crate::Factum;
 use crate::cases::Case;
 use crate::db::Db;
@@ -29,10 +29,6 @@ use crate::signer::GnupgSigner;
 pub const QUESTION_CAP: usize = 7;
 /// Every tenth pass of a case is a full pass.
 pub const FULL_EVERY: i64 = 10;
-/// A pass that resolved this many questions is followed by a full pass.
-pub const FULL_AFTER_RESOLVED: usize = 3;
-/// With every place taken, this many diff passes in a row that closed nothing are followed by a full pass.
-pub const FULL_AFTER_STALLED: usize = 3;
 
 const OUTPUT_RESERVE: usize = 1500;
 const TIMEOUT: Duration = Duration::from_secs(180);
@@ -55,21 +51,14 @@ const ENTRY_SHORT: usize = 400;
 const GOAL_SHORT: usize = 600;
 const GUIDELINE_SHORT: usize = 1200;
 
-/// Full when forced, on the first pass of a case, on every `FULL_EVERY`th pass, and when the open questions fill the
-/// cap and the last `FULL_AFTER_STALLED` diff passes closed none: a diff pass sees too little of the case to close
-/// them, and new questions find no place.
+/// Full when forced, on the first pass of a case and on every `FULL_EVERY`th pass.
 pub fn choose_kind(cdb: &CompanionDb, case_id: i64, forced_full: bool) -> Result<PassKind> {
     let count = cdb.pass_count(case_id)?;
-    let stalled = || -> Result<bool> {
-        Ok(cdb.open_questions(case_id)?.len() >= QUESTION_CAP && cdb.stalled(case_id, FULL_AFTER_STALLED)?)
-    };
-    Ok(
-        if forced_full || count == 0 || (count + 1) % FULL_EVERY == 0 || stalled()? {
-            PassKind::Full
-        } else {
-            PassKind::Diff
-        },
-    )
+    Ok(if forced_full || count == 0 || (count + 1) % FULL_EVERY == 0 {
+        PassKind::Full
+    } else {
+        PassKind::Diff
+    })
 }
 
 /// What a finished pass changed.
@@ -79,18 +68,12 @@ pub struct PassSummary {
     pub kind: PassKind,
     pub answered: usize,
     pub withdrawn: usize,
+    pub rephrased: usize,
     pub created: usize,
     /// the newest entry the pass has read
     pub entries_to: i64,
     /// one reason per item validation discarded
     pub dropped: Vec<String>,
-}
-
-impl PassSummary {
-    /// The next pass should be a full one.
-    pub fn wants_full(&self) -> bool {
-        self.answered + self.withdrawn >= FULL_AFTER_RESOLVED
-    }
 }
 
 #[derive(Debug)]
@@ -340,61 +323,36 @@ fn reflect(
     let minus = cdb.minus_examples()?;
     let existing: HashSet<i64> = data.created.keys().copied().collect();
     let new_set: HashSet<i64> = new_ids.iter().copied().filter(|&id| id <= log.entries_to).collect();
-    let mut validated = validate(
-        output,
-        &ValidationContext {
-            open: &open,
-            existing_entry_ids: &existing,
-            new_entry_ids: &new_set,
-            entry_created: &data.created,
-            resolved: &resolved,
-            minus_examples: &minus,
-            cap: QUESTION_CAP,
-        },
-    );
-    let applied = cdb.transaction(|_| {
-        // the investigator may have rated, restored or unlinked questions while the model was busy
-        let open_now: HashMap<i64, Rating> = cdb
+    let validated = cdb.transaction(|_| {
+        // the investigator may have rated, restored or unlinked questions while the model was busy: the output is
+        // checked against the questions open now, and only those the model saw can be left out and withdrawn
+        let (seen, unseen): (Vec<Question>, Vec<Question>) = cdb
             .open_questions(case_id)?
             .into_iter()
-            .map(|q| (q.id, q.rating))
-            .collect();
-        let mut applied = (0, 0, 0);
+            .partition(|q| open.iter().any(|o| o.id == q.id));
+        let validated = validate(
+            output,
+            &ValidationContext {
+                open: &seen,
+                existing_entry_ids: &existing,
+                new_entry_ids: &new_set,
+                entry_created: &data.created,
+                resolved: &resolved,
+                minus_examples: &minus,
+                cap: QUESTION_CAP.saturating_sub(unseen.len()),
+            },
+        );
         for &(question, entry) in &validated.answered {
-            if open_now.contains_key(&question) {
-                cdb.answer_question(question, entry, pass_id)?;
-                applied.0 += 1;
-            } else {
-                validated
-                    .dropped
-                    .push(format!("answered: question {question} is no longer open"));
-            }
+            cdb.answer_question(question, entry, pass_id)?;
         }
         for &question in &validated.withdraw {
-            match open_now.get(&question) {
-                None => validated
-                    .dropped
-                    .push(format!("withdraw: question {question} is no longer open")),
-                Some(Rating::Plus) => validated
-                    .dropped
-                    .push(format!("withdraw: question {question} is rated plus")),
-                Some(_) => {
-                    cdb.withdraw_question(question, pass_id)?;
-                    applied.1 += 1;
-                }
-            }
+            cdb.withdraw_question(question, pass_id)?;
         }
-        let room = QUESTION_CAP.saturating_sub(open_now.len() - applied.0 - applied.1);
-        for (i, question) in validated.new.iter().enumerate() {
-            if i < room {
-                cdb.insert_question(case_id, Some(pass_id), question)?;
-                applied.2 += 1;
-            } else {
-                validated.dropped.push(format!(
-                    "new: \"{}\" exceeds the cap of {QUESTION_CAP} open questions",
-                    question.text
-                ));
-            }
+        for (question, text, rests_on) in &validated.rephrased {
+            cdb.rephrase_question(*question, text, rests_on)?;
+        }
+        for question in &validated.new {
+            cdb.insert_question(case_id, Some(pass_id), question)?;
         }
         cdb.set_last_seen(case_id, log.entries_to, pass_id)?;
         cdb.finish_pass(
@@ -406,18 +364,18 @@ fn reflect(
             log.prompt_chars,
             log.output_chars,
         )?;
-        Ok(applied)
+        Ok(validated)
     })?;
     for reason in &validated.dropped {
         log::info!("companion pass {pass_id}: dropped {reason}");
     }
-    let (answered, withdrawn, created) = applied;
     Ok(PassSummary {
         pass_id,
         kind,
-        answered,
-        withdrawn,
-        created,
+        answered: validated.answered.len(),
+        withdrawn: validated.withdraw.len(),
+        rephrased: validated.rephrased.len(),
+        created: validated.new.len(),
         entries_to: log.entries_to,
         dropped: validated.dropped,
     })
@@ -451,7 +409,7 @@ fn serialize(
     packed: &str,
     reasoning: &str,
     log: &mut PassLog,
-) -> std::result::Result<PassOutput, PassError> {
+) -> std::result::Result<Vec<OutputQuestion>, PassError> {
     let instruction = serialize_instruction();
     let response = client.chat(&ChatRequest {
         system: "",

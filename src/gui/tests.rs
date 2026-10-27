@@ -584,7 +584,7 @@ fn questions_section_shows_goal_row_and_rows_in_position_order() {
     cdb.rate_question(rated, Rating::Plus).unwrap(); // the screenshots show a given rating
     let mut harness = fixture.harness();
     select_case(&mut harness);
-    assert!(harness.query_by_label("QUESTIONS 2").is_some());
+    assert!(harness.query_by_label("▾ QUESTIONS 2").is_some());
     let goal = harness.get_by_label("No goal set for this case. Set it…").rect();
     let first = harness.get_by_label("Which tool imaged the disk?").rect();
     let second = harness.get_by_label("Who held the disk overnight?").rect();
@@ -596,6 +596,13 @@ fn questions_section_shows_goal_row_and_rows_in_position_order() {
     harness.state_mut().set_theme(&ctx, "dark");
     harness.run_ok();
     screenshot(&mut harness, "questions-dark");
+    // the heading hides and shows the rows
+    harness.get_by_label("▾ QUESTIONS 2").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Which tool imaged the disk?").is_none());
+    harness.get_by_label("▸ QUESTIONS 2").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Which tool imaged the disk?").is_some());
 }
 
 #[test]
@@ -717,7 +724,7 @@ fn history_lists_resolved_and_unlink_restores() {
     assert_eq!(open, [answered, rejected]);
     assert!(harness.query_by_label("Unlink").is_none());
     assert!(harness.query_by_label("No resolved questions.").is_some());
-    assert!(harness.query_by_label("QUESTIONS 2").is_some());
+    assert!(harness.query_by_label("▾ QUESTIONS 2").is_some());
 }
 
 #[test]

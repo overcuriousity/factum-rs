@@ -307,22 +307,21 @@ case and runs a full pass right away (decided with the user). A change to the gl
 next pass and does not trigger one.
 
 **Pass kinds.**
-- A *diff pass* sees sections 1 to 9 as in 4.5 and is asked to: mark open questions answered by a new entry (with
-  that entry's id), withdraw questions the new entries make moot, and propose new questions, keeping the open count
-  at most seven. A plus-rated question may be answered but not withdrawn.
+- A *diff pass* sees sections 1 to 9 as in 4.5 and is asked to restate the open questions: each one is answered
+  (with the entry's id), reworded for what the log says now, kept as it is, or left out, which withdraws it; and to
+  propose new questions, keeping the open count at most seven. A plus-rated question may be answered or reworded but
+  is not withdrawn.
 - A *full pass* replaces section 6 with a compact timeline: one line per entry, text truncated to about 100
   characters, newest entries complete, oldest first, cut from the oldest end if needed; and widens section 7 to
   the top 5 related entries per open question. It is asked the same thing plus to reconsider every open question
-  against the whole case. A full pass runs on the first pass of a case, every tenth pass, after a diff pass that
-  answered or withdrew three or more questions, when all seven places are taken and the last three passes were
-  diff passes that answered and withdrew nothing, and on `Rethink`.
+  against the whole case. A full pass runs on the first pass of a case, every tenth pass, and on `Rethink`.
 
 **Two calls per pass.** Call one is free-form: the model is asked to reason in prose about what changed, what is
 answered, what is missing, and what to ask, with entry ids. Call two sends that reasoning back and asks for a flat
 JSON object only:
 
 ```
-{"answered":[{"question":12,"entry":381}], "withdraw":[9], "new":[{"text":"…","archetype":"document","rests_on":[380,381]}]}
+{"questions":[{"id":12,"answered_by":381}, {"id":9,"text":"…","rests_on":[380]}, {"text":"…","archetype":"document","rests_on":[380,381]}]}
 ```
 
 The format is described in the instruction; no grammar or JSON schema is sent, since constrained decoding
@@ -347,21 +346,25 @@ sends no thinking switch of its own: the server's (llama.cpp `--reasoning-budget
 1. `finish_reason == "length"`, `truncated`, or an empty body: the pass fails; retry once with section 7 capped at
    half the lines the first packing kept (no retry when it kept none), then give up (status "failed", logged with the
    error, questions unchanged).
-2. Syntactic repair of the JSON (unquoted keys, trailing commas, a missing closing brace); if repair fails, as 1.
+2. Syntactic repair of the JSON (unquoted keys, trailing commas, a missing closing brace); if repair fails or the
+   object has no `questions` array, as 1.
 3. Every question id must be open in this case; every entry id must exist in this case and, for `answered`, be one
    of the new entries or an entry newer than the question; every `rests_on` id must exist in this case. Items that
-   fail are dropped individually; a `new` item without any valid `rests_on` is dropped.
+   fail are dropped individually; a refused answer keeps the question open; a new item (no `id`) without any valid
+   `rests_on` is dropped. A reworded question without valid `rests_on` keeps its old ones.
 4. `archetype` must be one of the fixed set (4.8); unknown values become `coverage`.
-5. Duplicate suppression: a new question is dropped when its normalized token-set overlap (Jaccard ≥ 0.6 on
-   lowercased tokens longer than three characters) with any open, `answered` or `withdrawn` question of the case,
+5. Duplicate suppression: a new question that matches an open one counts as keeping that one; otherwise it is
+   dropped when its normalized token-set overlap (Jaccard ≥ 0.6 on
+   lowercased tokens longer than three characters) with any `answered` or `withdrawn` question of the case,
    or with any minus-rated example anywhere, is reached. Minus examples are compared against globally. The nearest
    minus examples are also in the prompt (4.8), so the model is told what not to resurrect before the mechanical
    check runs.
 6. The cap: if more than seven would be open, the newest `new` items beyond the cap are dropped.
-7. A withdraw of a plus-rated question is ignored.
+7. An open question the output leaves out is withdrawn, unless it is rated plus.
 
 Surviving changes are applied in one transaction: answered questions get `state=answered`, `resolved_entry_id`,
-and a `linked` event; withdrawn get `state=withdrawn`; new questions get the next `position` and their
+and a `linked` event; withdrawn get `state=withdrawn`; reworded ones get their new text and `question_entries` in
+place, keeping position, rating and history; new questions get the next `position` and their
 `question_entries`; the pass row is finished; `last_seen_entry_id` advances to the newest entry included in
 section 6. Call failures retry once after 5 s, and only network errors, timeouts, 408, 409, 429 and 5xx (other 4xx
 fail at once); then the pass fails, the thread goes back to waiting and the status bar shows the reason. A budget
