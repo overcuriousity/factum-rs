@@ -21,8 +21,9 @@ factum must stay compatible with factum-notes and with bundles already handed ou
 - Never change `canonical.rs`, `merkle.rs`, `leaf_data`, `entry_signed_payload` or `seal_payload` output. The tests
   pin them byte for byte.
 - `src/export/verify.py` is the verifier shipped in every bundle. Change it only together with factum-notes.
-- A schema change needs a new `SCHEMA_VERSION`, and databases of the old version must be refused, not migrated
-  silently.
+- A schema change needs a new `SCHEMA_VERSION` and a migration step from the previous version in
+  `Db::initialize_schema`, with a test that opens a database of the previous version. Databases older than that are
+  refused, not migrated. Schema 4 (evidence description) is the first version factum-notes cannot open.
 
 ## Releases
 

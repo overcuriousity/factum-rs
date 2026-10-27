@@ -10,8 +10,9 @@ case or evidence details is a leaf in a Merkle tree (RFC 9162), timestamped (UTC
 with the tree head it produces. Seals (signed tree heads) are copied to an external folder, and a case can be exported
 as a self-contained bundle that anyone can verify without factum.
 
-factum is a single binary with a command line and a desktop GUI. It is compatible with factum-notes: both use the
-same database (schema 3), seal files and bundle format, so either can verify and continue what the other wrote.
+factum is a single binary with a command line and a desktop GUI. It shares the seal files and bundle format with
+factum-notes. Since 2.2 its database (schema 4, which adds the evidence description) is no longer one factum-notes can
+open; factum upgrades a factum-notes database (schema 3) when it first opens it.
 
 ## Install
 
@@ -117,6 +118,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   without it. Case content is sent to the endpoint you configure, nowhere else
 - **Companion → Settings…**: endpoint URL, protocol (OpenAI- or Anthropic-compatible), API key and model; a local
   server on the lab network works. Until it is configured, no companion section, status item or Case-menu item appears
+- A preset sets the lens it asks through, for all cases: **Forensics** (the default), **Generic investigator**, **OSINT
+  research**, **Source criticism**, or **Custom** with a guideline of your own
+- Evidence descriptions are part of what it reads
 - **Case menu**: "Companion for this case" switches it per case, "Case goal…" gives it the question the case is meant
   to answer
 - The questions sit in the side panel; **+** and **−** rate them, which shapes later questions. The questions menu has
@@ -124,6 +128,11 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - It keeps its state in a second SQLite file next to the case database (`factum.companion.db`). That file holds the
   API key and content derived from the case, so treat it as exactly as sensitive as the case database. Deleting it
   loses ratings and settings, no evidence. `FACTUM_COMPANION_API_KEY` overrides the stored key and is never saved
+
+### Setup wizard
+- On the first start with a new database, a wizard walks through the signing key, the companion (optional, with its
+  preset), the folder for seal copies and the theme. Every step can be skipped; **Settings → Setup Wizard…** runs it
+  again
 
 ### GPG
 - Select a signing key from your secret keys; the choice is remembered (shared by CLI and GUI)
@@ -185,9 +194,10 @@ SQLite database in WAL mode for concurrent CLI and GUI access. The location does
 | macOS   | `~/Library/Application Support/factum/factum.db`               |
 | Windows | `%LOCALAPPDATA%\factum\factum.db`                               |
 
-Set `FACTUM_DB` to use a different file, e.g. one database per engagement or on an encrypted volume. Databases of the
-current factum-notes (schema 3, the tamper-evident log) open unchanged; databases of older factum versions are refused
-and never modified — set `FACTUM_DB` to a new file.
+Set `FACTUM_DB` to use a different file, e.g. one database per engagement or on an encrypted volume. Databases of
+schema 3 (factum up to 2.1 and the current factum-notes) are upgraded in place to schema 4 on first open (it adds the
+evidence description); factum-notes cannot open them afterwards. Databases of older factum versions are refused and
+never modified — set `FACTUM_DB` to a new file.
 
 ## Configuration
 

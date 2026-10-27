@@ -3,6 +3,28 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-10-27
+
+### Added
+- Setup wizard: on the first start with a new database (no cases, no signing key) it guides through the GPG signing
+  key, the AI companion (optional), the folder for seal copies and the theme; every step can be skipped, nothing is
+  saved before Finish, and **Settings → Setup Wizard…** runs it again
+- Companion presets, an app-wide choice of the guideline the companion asks through: Forensics (the previous
+  default, unchanged), Generic investigator, OSINT research, Source criticism, and Custom (an own guideline). A
+  database with an edited guideline keeps it as Custom
+- Evidence description: a free-text description beside the evidence name, set on creation (GUI, or
+  `--new-evidence <name> --description <text>`) and editable later through a signed `evidence_edited` entry. It is
+  checked by verification and by the bundled `verify.py`, shown in the reports and the bundle, and read by the
+  companion
+
+### Changed
+- Database schema 4: a schema 3 database is upgraded in place on first open (adds the evidence description);
+  factum-notes (Python) cannot open it afterwards
+- GUI: the evidence dialog names the first field "Name"
+
+### Removed
+- `factum --questions`: the companion has no command-line surface any more; its questions are in the GUI
+
 ## [2.1.5] - 2026-10-26
 
 ### Changed
