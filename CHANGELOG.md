@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [2.5.0] - 2026-10-27
+
+### Added
+- GUI: typing a #tag in the note field suggests the tags and labels already in use, in a short list above the line
+  (ranked like Add Label; labels that cannot be written as a #tag are left out): ↑ ↓ choose, Tab or a click completes
+  it, Escape closes the list; Enter still starts a new line
+
+### Fixed
+- Labels follow a corrected note to its new version, like its pin; before, they stayed on the earlier version, out of
+  view and out of the label filter. A label the corrected text already carries as a #tag is dropped
+
 ## [2.4.0] - 2026-10-27
 
 ### Added

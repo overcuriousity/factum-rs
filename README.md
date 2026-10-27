@@ -95,9 +95,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 
 ### Notes
 - Notes are never edited. **Correct Note** adds a new, signed version; only the newest version is shown, earlier ones
-  behind its version chip (v2, v3, …). Tags, IOCs and pins follow the newest version
+  behind its version chip (v2, v3, …). Tags, IOCs, labels and pins follow the newest version
 - `#tags` in the note text are covered by the signature; **labels** added by hand are not signed and look different.
-  Add Label suggests the tags and labels in use, tolerating a typo
+  Typing a `#tag` and Add Label suggest the tags and labels in use, tolerating a typo
 - Pin/unpin notes, filter by tag or label (substring match)
 - Entry IDs are never reused
 
