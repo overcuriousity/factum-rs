@@ -472,16 +472,13 @@ impl Companion {
         match result {
             Ok(Ok(summary)) => {
                 log::info!(
-                    "companion pass on case {case_id}: {} answered, {} withdrawn, {} new",
+                    "companion pass on case {case_id}: {} answered, {} withdrawn, {} rephrased, {} new",
                     summary.answered,
                     summary.withdrawn,
+                    summary.rephrased,
                     summary.created
                 );
-                if summary.wants_full() {
-                    self.full_next.insert(case_id);
-                } else {
-                    self.full_next.remove(&case_id);
-                }
+                self.full_next.remove(&case_id);
                 self.retried.remove(&case_id);
                 self.enrich_tried.clear();
                 self.backlog_done.clear();

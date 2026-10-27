@@ -75,7 +75,7 @@ fn rethink_runs_a_full_pass_and_updates_status() {
     fake.push(200, &openai_models(&["m"]));
     fake.push(200, &openai_chat("[]", "stop", 100));
     fake.push(200, &openai_chat("I would ask about the hashing tool.", "stop", 100));
-    let output = json!({"answered": [], "withdraw": [], "new": [
+    let output = json!({"questions": [
         {"text": "Which tool and version computed the md5 of the image?", "archetype": "repeatability",
          "rests_on": [note]}
     ]});

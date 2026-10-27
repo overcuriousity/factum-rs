@@ -150,11 +150,16 @@ fn repair_from(text: &str, start: usize) -> (String, usize, bool) {
 }
 
 /// What call two of a pass returns, after parsing.
-pub struct PassOutput {
-    /// (question id, entry id)
-    pub answered: Vec<(i64, i64)>,
-    pub withdraw: Vec<i64>,
-    pub new: Vec<(String, Archetype, Vec<i64>)>,
+/// One item of the pass output: an open question by its id, or a new question without one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutputQuestion {
+    pub id: Option<i64>,
+    /// empty keeps an open question's wording
+    pub text: String,
+    pub archetype: Archetype,
+    pub rests_on: Vec<i64>,
+    /// the entry that answers an open question
+    pub answered_by: Option<i64>,
 }
 
 fn int_list(v: Option<&Value>) -> Vec<i64> {
@@ -163,45 +168,26 @@ fn int_list(v: Option<&Value>) -> Vec<i64> {
         .unwrap_or_default()
 }
 
-const PASS_KEYS: [&str; 3] = ["answered", "withdraw", "new"];
-
-/// Repair, then read the three arrays; missing arrays are empty, items with non-integer ids are skipped. An object
-/// with none of the three keys is not the pass output (it may be one item of a broken one).
-pub fn parse_pass_output(text: &str) -> Result<PassOutput, String> {
-    let is_output = |value: &Value| PASS_KEYS.iter().any(|key| value.get(key).is_some());
+/// Repair, then read the `questions` array; items that are not objects are skipped. An object without the array is
+/// not the pass output (it may be one item of a broken one), so a reply cannot drop every question by leaving it out.
+pub fn parse_pass_output(text: &str) -> Result<Vec<OutputQuestion>, String> {
+    let is_output = |value: &Value| value["questions"].is_array();
     let repaired = repair_first_parsing(text, &['{'], is_output).ok_or("no JSON object in the reply")?;
     let value: Value = serde_json::from_str(&repaired).map_err(|e| format!("unreadable JSON: {e}"))?;
-    if !is_output(&value) {
-        return Err("the JSON object has none of answered, withdraw and new".into());
-    }
-    let answered = value["answered"]
+    let items = value["questions"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|item| Some((item["question"].as_i64()?, item["entry"].as_i64()?)))
-                .collect()
+        .ok_or("the JSON object has no questions array")?;
+    Ok(items
+        .iter()
+        .filter(|item| item.is_object())
+        .map(|item| OutputQuestion {
+            id: item["id"].as_i64(),
+            text: item["text"].as_str().unwrap_or("").trim().to_string(),
+            archetype: Archetype::parse(item["archetype"].as_str().unwrap_or("")),
+            rests_on: int_list(item.get("rests_on")),
+            answered_by: item["answered_by"].as_i64(),
         })
-        .unwrap_or_default();
-    let new = value["new"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|item| {
-                    let text = item["text"].as_str()?.trim();
-                    if text.is_empty() {
-                        return None;
-                    }
-                    let archetype = Archetype::parse(item["archetype"].as_str().unwrap_or(""));
-                    Some((text.to_string(), archetype, int_list(item.get("rests_on"))))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(PassOutput {
-        answered,
-        withdraw: int_list(value.get("withdraw")),
-        new,
-    })
+        .collect())
 }
 
 /// (entry id, keywords, context, importance)
@@ -255,91 +241,100 @@ pub struct ValidationContext<'a> {
     pub cap: usize,
 }
 
+#[derive(Default)]
 pub struct Validated {
     pub answered: Vec<(i64, i64)>,
     pub withdraw: Vec<i64>,
+    /// (question id, new wording, the entries it rests on now)
+    pub rephrased: Vec<(i64, String, Vec<i64>)>,
     pub new: Vec<NewQuestion>,
     /// one short reason per discarded item, for the pass log
     pub dropped: Vec<String>,
 }
 
-/// Spec 4.7 steps 3 to 7. Archetypes were already normalised by `Archetype::parse`.
-pub fn validate(out: PassOutput, ctx: &ValidationContext) -> Validated {
+/// Spec 4.7 steps 3 to 7. The output lists the questions open after the pass: an open question it leaves out is
+/// withdrawn, unless the investigator rated it plus. Archetypes were already normalised by `Archetype::parse`.
+pub fn validate(out: Vec<OutputQuestion>, ctx: &ValidationContext) -> Validated {
     let entry_exists = |id: &i64| ctx.existing_entry_ids.contains(id) || ctx.new_entry_ids.contains(id);
-    let mut dropped = Vec::new();
-    let mut answered: Vec<(i64, i64)> = Vec::new();
-    for (qid, eid) in out.answered {
-        let Some(q) = ctx.open.iter().find(|q| q.id == qid) else {
-            dropped.push(format!("answered: question {qid} is not open"));
-            continue;
-        };
-        if answered.iter().any(|(a, _)| *a == qid) {
-            dropped.push(format!("answered: question {qid} listed twice"));
-        } else if !entry_exists(&eid) {
-            dropped.push(format!("answered: question {qid} cites unknown entry {eid}"));
-        } else if !ctx.new_entry_ids.contains(&eid) && ctx.entry_created.get(&eid).is_none_or(|c| *c <= q.created_utc) {
-            dropped.push(format!("answered: entry {eid} is not newer than question {qid}"));
-        } else {
-            answered.push((qid, eid));
-        }
-    }
-    let mut withdraw: Vec<i64> = Vec::new();
-    for qid in out.withdraw {
-        let Some(q) = ctx.open.iter().find(|q| q.id == qid) else {
-            dropped.push(format!("withdraw: question {qid} is not open"));
-            continue;
-        };
-        if q.rating == Rating::Plus {
-            dropped.push(format!("withdraw: question {qid} is rated plus"));
-        } else if answered.iter().any(|(a, _)| *a == qid) || withdraw.contains(&qid) {
-            dropped.push(format!("withdraw: question {qid} is already handled in this pass"));
-        } else {
-            withdraw.push(qid);
-        }
-    }
-
     let known: Vec<&str> = ctx
-        .open
+        .resolved
         .iter()
-        .chain(ctx.resolved)
         .map(|q| q.text.as_str())
         .chain(ctx.minus_examples.iter().map(|e| e.text.as_str()))
         .collect();
-    let mut accepted: Vec<NewQuestion> = Vec::new();
-    for (text, archetype, rests_on) in out.new {
-        let mut valid: Vec<i64> = Vec::new();
-        for id in rests_on {
-            if entry_exists(&id) && !valid.contains(&id) {
-                valid.push(id);
+    let mut v = Validated::default();
+    let mut listed: HashSet<i64> = HashSet::new();
+    for item in out {
+        let mut rests_on: Vec<i64> = Vec::new();
+        for id in item.rests_on {
+            if entry_exists(&id) && !rests_on.contains(&id) {
+                rests_on.push(id);
             }
         }
-        if valid.is_empty() {
-            dropped.push(format!("new: \"{text}\" rests on no known entry"));
-        } else if known.iter().any(|k| is_duplicate(&text, k)) || accepted.iter().any(|q| is_duplicate(&text, &q.text))
-        {
-            dropped.push(format!("new: \"{text}\" duplicates an existing or earlier question"));
-        } else {
-            accepted.push(NewQuestion {
-                text,
-                archetype,
-                rests_on: valid,
-            });
+        let text = item.text;
+        let Some(qid) = item.id else {
+            // an open question restated without its id is kept as it is
+            if let Some(q) = ctx.open.iter().find(|q| is_duplicate(&text, &q.text)) {
+                listed.insert(q.id);
+            } else if text.is_empty() {
+                v.dropped.push("new: a question without text".into());
+            } else if rests_on.is_empty() {
+                v.dropped.push(format!("new: \"{text}\" rests on no known entry"));
+            } else if known.iter().any(|k| is_duplicate(&text, k)) || v.new.iter().any(|q| is_duplicate(&text, &q.text))
+            {
+                v.dropped
+                    .push(format!("new: \"{text}\" duplicates an existing or earlier question"));
+            } else {
+                v.new.push(NewQuestion {
+                    text,
+                    archetype: item.archetype,
+                    rests_on,
+                });
+            }
+            continue;
+        };
+        let Some(q) = ctx.open.iter().find(|q| q.id == qid) else {
+            v.dropped.push(format!("question {qid} is not open"));
+            continue;
+        };
+        if !listed.insert(qid) {
+            v.dropped.push(format!("question {qid} listed twice"));
+        } else if let Some(eid) = item.answered_by {
+            if !entry_exists(&eid) {
+                v.dropped
+                    .push(format!("answered: question {qid} cites unknown entry {eid}"));
+            } else if !ctx.new_entry_ids.contains(&eid)
+                && ctx.entry_created.get(&eid).is_none_or(|c| *c <= q.created_utc)
+            {
+                v.dropped
+                    .push(format!("answered: entry {eid} is not newer than question {qid}"));
+            } else {
+                v.answered.push((qid, eid));
+            }
+        } else if !text.is_empty() && text != q.text {
+            let rests_on = if rests_on.is_empty() {
+                q.rests_on.clone()
+            } else {
+                rests_on
+            };
+            v.rephrased.push((qid, text, rests_on));
         }
     }
-    let open_after = ctx.open.len().saturating_sub(answered.len() + withdraw.len());
+    v.withdraw = ctx
+        .open
+        .iter()
+        .filter(|q| !listed.contains(&q.id) && q.rating != Rating::Plus)
+        .map(|q| q.id)
+        .collect();
+    let open_after = ctx.open.len() - v.answered.len() - v.withdraw.len();
     let room = ctx.cap.saturating_sub(open_after);
-    for q in accepted.split_off(room.min(accepted.len())) {
-        dropped.push(format!(
+    for q in v.new.split_off(room.min(v.new.len())) {
+        v.dropped.push(format!(
             "new: \"{}\" exceeds the cap of {} open questions",
             q.text, ctx.cap
         ));
     }
-    Validated {
-        answered,
-        withdraw,
-        new: accepted,
-        dropped,
-    }
+    v
 }
 
 /// Token overlap high enough to count as the same question.
@@ -391,16 +386,49 @@ mod tests {
         v.iter().copied().collect()
     }
 
-    fn new_item(text: &str, rests_on: &[i64]) -> (String, Archetype, Vec<i64>) {
-        (text.into(), Archetype::Document, rests_on.to_vec())
+    /// A new question of the output.
+    fn new_item(text: &str, rests_on: &[i64]) -> OutputQuestion {
+        OutputQuestion {
+            id: None,
+            text: text.into(),
+            archetype: Archetype::Document,
+            rests_on: rests_on.to_vec(),
+            answered_by: None,
+        }
     }
 
-    fn output(answered: &[(i64, i64)], withdraw: &[i64], new: Vec<(String, Archetype, Vec<i64>)>) -> PassOutput {
-        PassOutput {
-            answered: answered.to_vec(),
-            withdraw: withdraw.to_vec(),
-            new,
+    /// An open question kept, with `text` its wording (empty keeps it) or answered by `answered_by`.
+    fn kept(id: i64, text: &str, answered_by: Option<i64>) -> OutputQuestion {
+        OutputQuestion {
+            id: Some(id),
+            answered_by,
+            ..new_item(text, &[])
         }
+    }
+
+    /// Validates against open questions created on 2 January, entries 10 to 12 created on the 1st, 3rd and 4th, of
+    /// which 12 is new, and the minus examples.
+    fn check(open: &[Question], minus: &[RatedExample], out: Vec<OutputQuestion>) -> Validated {
+        let (existing, new) = (ids(&[10, 11, 12]), ids(&[12]));
+        let created = HashMap::from([
+            (10, "2026-01-01T00:00:00.000Z".to_string()),
+            (11, "2026-01-03T00:00:00.000Z".to_string()),
+            (12, "2026-01-04T00:00:00.000Z".to_string()),
+        ]);
+        let ctx = ValidationContext {
+            open,
+            existing_entry_ids: &existing,
+            new_entry_ids: &new,
+            entry_created: &created,
+            resolved: &[],
+            minus_examples: minus,
+            cap: 7,
+        };
+        validate(out, &ctx)
+    }
+
+    fn open_question(id: i64, text: &str, rating: Rating) -> Question {
+        question(id, text, "2026-01-02T00:00:00.000Z", rating)
     }
 
     #[test]
@@ -436,9 +464,9 @@ mod tests {
     #[test]
     fn pass_output_is_not_taken_from_an_item_of_a_broken_object() {
         // the outer object is broken (a missing comma) and cut off; its first item parses on its own
-        let text = "{\"answered\":[{\"question\":1,\"entry\":2}], \"new\":[{\"text\":\"a\" \"rests_on\":[1]";
+        let text = "{\"questions\":[{\"id\":1,\"answered_by\":2}, {\"text\":\"a\" \"rests_on\":[1]";
         assert!(parse_pass_output(text).is_err());
-        assert!(parse_pass_output("{\"question\":1,\"entry\":2}").is_err());
+        assert!(parse_pass_output("{\"id\":1,\"answered_by\":2}").is_err());
     }
 
     #[test]
@@ -464,162 +492,68 @@ mod tests {
     }
 
     #[test]
-    fn parse_defaults_missing_arrays() {
-        let p = parse_pass_output("{\"new\":[]}").unwrap();
-        assert!(p.answered.is_empty());
-        assert!(p.withdraw.is_empty());
-    }
-
-    #[test]
-    fn validate_drops_unknown_ids_and_keeps_reasons() {
-        let open = [question(
-            5,
-            "Who owns the server?",
-            "2026-01-01T00:00:00.000Z",
-            Rating::None,
-        )];
-        let (existing, new) = (ids(&[10]), ids(&[10]));
-        let created = HashMap::new();
-        let ctx = ValidationContext {
-            open: &open,
-            existing_entry_ids: &existing,
-            new_entry_ids: &new,
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &[],
-            cap: 7,
+    fn parse_reads_items_and_requires_the_array() {
+        let text = "{\"questions\":[{\"id\":3,\"text\":\" b \"}, 7, {\"text\":\"a\",\"rests_on\":[1]}]}";
+        let coverage = |q| OutputQuestion {
+            archetype: Archetype::Coverage,
+            ..q
         };
-        let v = validate(output(&[(99, 10)], &[], vec![]), &ctx);
-        assert!(v.answered.is_empty());
-        assert_eq!(v.dropped.len(), 1);
-        assert!(v.dropped[0].contains("99"));
-    }
-
-    #[test]
-    fn validate_requires_new_entry_or_later_entry_for_answered() {
-        let open = [question(
-            5,
-            "Who owns the server?",
-            "2026-01-02T00:00:00.000Z",
-            Rating::None,
-        )];
-        let (existing, new) = (ids(&[10, 11, 12]), ids(&[12]));
-        let created = HashMap::from([
-            (10, "2026-01-01T00:00:00.000Z".to_string()),
-            (11, "2026-01-03T00:00:00.000Z".to_string()),
-            (12, "2026-01-04T00:00:00.000Z".to_string()),
-        ]);
-        let ctx = ValidationContext {
-            open: &open,
-            existing_entry_ids: &existing,
-            new_entry_ids: &new,
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &[],
-            cap: 7,
-        };
-        let older = validate(output(&[(5, 10)], &[], vec![]), &ctx);
-        assert!(older.answered.is_empty());
-        assert_eq!(older.dropped.len(), 1);
-        assert_eq!(validate(output(&[(5, 11)], &[], vec![]), &ctx).answered, vec![(5, 11)]);
-        assert_eq!(validate(output(&[(5, 12)], &[], vec![]), &ctx).answered, vec![(5, 12)]);
-    }
-
-    #[test]
-    fn validate_ignores_withdraw_of_plus() {
-        let open = [
-            question(1, "Who owns the server?", "2026-01-01T00:00:00.000Z", Rating::Plus),
-            question(
-                2,
-                "Where is the backup stored?",
-                "2026-01-01T00:00:00.000Z",
-                Rating::None,
-            ),
-        ];
-        let existing = ids(&[10]);
-        let created = HashMap::new();
-        let ctx = ValidationContext {
-            open: &open,
-            existing_entry_ids: &existing,
-            new_entry_ids: &existing,
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &[],
-            cap: 7,
-        };
-        let v = validate(output(&[], &[1, 2], vec![]), &ctx);
-        assert_eq!(v.withdraw, vec![2]);
-        assert_eq!(v.dropped.len(), 1);
-    }
-
-    #[test]
-    fn validate_drops_new_without_valid_rests_on() {
-        let existing = ids(&[10]);
-        let created = HashMap::new();
-        let ctx = ValidationContext {
-            open: &[],
-            existing_entry_ids: &existing,
-            new_entry_ids: &existing,
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &[],
-            cap: 7,
-        };
-        let v = validate(
-            output(
-                &[],
-                &[],
-                vec![
-                    new_item("Which account logged in first?", &[77]),
-                    new_item("Who installed the plugin?", &[77, 10]),
-                ],
-            ),
-            &ctx,
+        assert_eq!(
+            parse_pass_output(text).unwrap(),
+            vec![coverage(kept(3, "b", None)), coverage(new_item("a", &[1]))]
         );
-        assert_eq!(v.new.len(), 1);
-        assert_eq!(v.new[0].rests_on, vec![10]);
-        assert_eq!(v.dropped.len(), 1);
-        assert!(v.dropped[0].contains("Which account logged in first?"));
+        assert!(parse_pass_output("{\"answered\":[]}").is_err());
     }
 
     #[test]
-    fn validate_detects_duplicates_by_jaccard() {
-        let open = [question(
+    fn unlisted_questions_are_withdrawn_except_plus() {
+        let open = [
+            open_question(1, "Who owns the server?", Rating::Plus),
+            open_question(2, "Where is the backup stored?", Rating::None),
+            open_question(3, "Which tool imaged the disk?", Rating::None),
+        ];
+        let v = check(&open, &[], vec![kept(3, "", None), kept(99, "", None)]);
+        assert_eq!(v.withdraw, vec![2]);
+        assert!(v.rephrased.is_empty());
+        assert_eq!(v.dropped, vec!["question 99 is not open".to_string()]);
+    }
+
+    #[test]
+    fn answered_needs_a_new_or_later_entry() {
+        let open = [open_question(5, "Who owns the server?", Rating::None)];
+        for (entry, answered) in [(10, false), (11, true), (12, true), (99, false)] {
+            let v = check(&open, &[], vec![kept(5, "", Some(entry))]);
+            assert_eq!(v.answered == [(5, entry)], answered, "entry {entry}");
+            assert!(v.withdraw.is_empty(), "a refused answer keeps the question");
+        }
+    }
+
+    #[test]
+    fn rephrasing_keeps_or_replaces_rests_on() {
+        let open = [
+            open_question(1, "Who owns the server?", Rating::Plus),
+            open_question(2, "Where is the backup stored?", Rating::None),
+        ];
+        let mut moved = kept(2, "Where is the backup of 12 March stored?", None);
+        moved.rests_on = vec![12, 99];
+        let v = check(&open, &[], vec![kept(1, "Who owns the web server?", None), moved]);
+        assert_eq!(
+            v.rephrased,
+            vec![
+                (1, "Who owns the web server?".to_string(), vec![1]),
+                (2, "Where is the backup of 12 March stored?".to_string(), vec![12]),
+            ]
+        );
+        assert!(v.withdraw.is_empty());
+    }
+
+    #[test]
+    fn new_questions_need_rests_on_and_no_duplicate() {
+        let open = [open_question(
             1,
             "Which vhost serves the compromised site?",
-            "2026-01-01T00:00:00.000Z",
             Rating::None,
         )];
-        let existing = ids(&[10]);
-        let created = HashMap::new();
-        let ctx = ValidationContext {
-            open: &open,
-            existing_entry_ids: &existing,
-            new_entry_ids: &existing,
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &[],
-            cap: 7,
-        };
-        let v = validate(
-            output(
-                &[],
-                &[],
-                vec![
-                    new_item("Which vhost is serving the compromised site", &[10]),
-                    new_item("Who installed the plugin recently?", &[10]),
-                    new_item("Who installed the plugin recently", &[10]),
-                ],
-            ),
-            &ctx,
-        );
-        assert_eq!(v.new.len(), 1);
-        assert_eq!(v.new[0].text, "Who installed the plugin recently?");
-        assert_eq!(v.dropped.len(), 2);
-    }
-
-    #[test]
-    fn validate_detects_duplicates_against_minus_examples() {
         let minus = [RatedExample {
             id: 1,
             text: "Is the firewall configuration documented?".into(),
@@ -627,27 +561,27 @@ mod tests {
             archetype: Archetype::Document,
             source_case_id: 2,
         }];
-        let existing = ids(&[10]);
-        let created = HashMap::new();
-        let ctx = ValidationContext {
-            open: &[],
-            existing_entry_ids: &existing,
-            new_entry_ids: &existing,
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &minus,
-            cap: 7,
-        };
-        let v = validate(
-            output(
-                &[],
-                &[],
-                vec![new_item("Is the firewall configuration documented?", &[10])],
-            ),
-            &ctx,
+        let v = check(
+            &open,
+            &minus,
+            vec![
+                new_item("Which vhost is serving the compromised site", &[10]),
+                new_item("Which account logged in first?", &[77]),
+                new_item("Who installed the plugin recently?", &[77, 10]),
+                new_item("Who installed the plugin recently", &[10]),
+                new_item("Is the firewall configuration documented?", &[10]),
+            ],
         );
-        assert!(v.new.is_empty());
-        assert_eq!(v.dropped.len(), 1);
+        assert!(
+            v.withdraw.is_empty(),
+            "restated without its id, the open question is kept"
+        );
+        assert_eq!(v.new.len(), 1);
+        assert_eq!(
+            (v.new[0].text.as_str(), &v.new[0].rests_on[..]),
+            ("Who installed the plugin recently?", &[10][..])
+        );
+        assert_eq!(v.dropped.len(), 3);
     }
 
     #[test]
@@ -658,63 +592,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_enforces_cap_on_newest() {
+    fn cap_drops_the_newest() {
         let open: Vec<Question> = (1..=6)
-            .map(|i| {
-                question(
-                    i,
-                    &format!("Unrelated open question number{i} alpha{i}"),
-                    "2026-01-01T00:00:00.000Z",
-                    Rating::None,
-                )
-            })
+            .map(|i| open_question(i, &format!("Unrelated open question number{i} alpha{i}"), Rating::None))
             .collect();
-        let existing = ids(&[10]);
-        let created = HashMap::new();
-        let ctx = ValidationContext {
-            open: &open,
-            existing_entry_ids: &existing,
-            new_entry_ids: &existing,
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &[],
-            cap: 7,
-        };
-        let v = validate(
-            output(
-                &[],
-                &[],
-                vec![
-                    new_item("First fresh topic gamma", &[10]),
-                    new_item("Second distinct subject delta", &[10]),
-                    new_item("Third separate matter epsilon", &[10]),
-                ],
-            ),
-            &ctx,
-        );
+        let mut out: Vec<OutputQuestion> = (1..=6).map(|i| kept(i, "", None)).collect();
+        out.extend([
+            new_item("First fresh topic gamma", &[10]),
+            new_item("Second distinct subject delta", &[10]),
+            new_item("Third separate matter epsilon", &[10]),
+        ]);
+        let v = check(&open, &[], out);
         assert_eq!(v.new.len(), 1);
         assert_eq!(v.new[0].text, "First fresh topic gamma");
         assert_eq!(v.dropped.len(), 2);
-    }
-
-    #[test]
-    fn validate_accepts_rests_on_superseded_entry() {
-        let existing = ids(&[10, 11]);
-        let created = HashMap::new();
-        let ctx = ValidationContext {
-            open: &[],
-            existing_entry_ids: &existing,
-            new_entry_ids: &ids(&[11]),
-            entry_created: &created,
-            resolved: &[],
-            minus_examples: &[],
-            cap: 7,
-        };
-        let v = validate(
-            output(&[], &[], vec![new_item("What did the original entry claim?", &[10])]),
-            &ctx,
-        );
-        assert_eq!(v.new.len(), 1);
-        assert!(v.dropped.is_empty());
     }
 }

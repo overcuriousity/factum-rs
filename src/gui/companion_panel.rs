@@ -83,13 +83,14 @@ fn header_status(view: &CompanionView, status: &Status) -> String {
     }
 }
 
-/// `QUESTIONS n` with its menu, the goal row while no goal is set, and one row per open question; the rows
-/// scroll within the height the caller's `ui` leaves.
+/// `QUESTIONS n` with its menu, and while `open` the goal row while no goal is set and one row per open question;
+/// the rows scroll within the height the caller's `ui` leaves. Clicking the heading opens and closes the rows.
 pub fn questions_section(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
     view: &CompanionView,
     status: &Status,
+    open: &mut bool,
     actions: &mut Vec<PanelAction>,
 ) {
     let p = *theme::current(ctx);
@@ -101,17 +102,22 @@ pub fn questions_section(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 // like PINNED and IOCS: no count when there is nothing
+                let arrow = if *open { "▾" } else { "▸" };
                 let heading = match view.questions.len() {
-                    0 => "QUESTIONS".to_string(),
-                    n => format!("QUESTIONS {n}"),
+                    0 => format!("{arrow} QUESTIONS"),
+                    n => format!("{arrow} QUESTIONS {n}"),
                 };
-                ui.label(
+                let heading = egui::Button::new(
                     RichText::new(heading)
                         .size(SMALL_SIZE)
                         .family(theme::bold())
                         .color(p.muted)
                         .extra_letter_spacing(1.2),
-                );
+                )
+                .frame(false);
+                if ui.add(heading).on_hover_text("Show or hide the questions").clicked() {
+                    *open = !*open;
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button("▾", |ui| {
                         for (label, action) in [
@@ -135,6 +141,10 @@ pub fn questions_section(
                     );
                 });
             });
+            if !*open {
+                ctx.data_mut(|d| d.insert_temp(Id::unique(CONTENT_HEIGHT), 0.0f32));
+                return;
+            }
             let rows = egui::ScrollArea::vertical()
                 .id_salt("questions")
                 .auto_shrink([false, true])

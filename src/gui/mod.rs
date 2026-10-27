@@ -163,6 +163,7 @@ struct FactumApp {
     /// the composer's panel, dragged at its top edge
     composer_height: f32,
     iocs_open: bool,
+    questions_open: bool,
     /// the scrolled height of the pinned notes in the last frame, for splitting the side panel
     pinned_height: f32,
     composer: String,
@@ -260,6 +261,7 @@ impl FactumApp {
             side_width,
             composer_height,
             iocs_open: false,
+            questions_open: true,
             pinned_height: 0.0,
             composer: String::new(),
             view: View::default(),
@@ -2265,7 +2267,14 @@ impl FactumApp {
             // the header line on top of the rows' share
             let size = egui::vec2(ui.available_width(), questions_max + 28.0);
             ui.allocate_ui(size, |ui| {
-                companion_panel::questions_section(ui, ctx, view, &self.companion_status, &mut panel_actions);
+                companion_panel::questions_section(
+                    ui,
+                    ctx,
+                    view,
+                    &self.companion_status,
+                    &mut self.questions_open,
+                    &mut panel_actions,
+                );
             });
         }
 

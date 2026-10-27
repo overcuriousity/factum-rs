@@ -123,7 +123,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Evidence descriptions are part of what it reads
 - **Case menu**: "Companion for this case" switches it per case, "Case goal…" gives it the question the case is meant
   to answer
-- The questions sit in the side panel; **+** and **−** rate them, which shapes later questions. The questions menu has
+- The questions sit in the side panel, collapsible under their heading; **+** and **−** rate them, which shapes later
+  questions. Each pass rewords questions whose context changed and drops the ones that went stale (never one rated
+  **+**). The questions menu has
   **Ask…** (a question answered only from the case log, with cited entries) and **History**
 - It keeps its state in a second SQLite file next to the case database (`factum.companion.db`). That file holds the
   API key and content derived from the case, so treat it as exactly as sensitive as the case database. Deleting it

@@ -197,6 +197,17 @@ fn add_event(
     Ok(())
 }
 
+fn set_rests_on(conn: &Connection, id: i64, rests_on: &[i64]) -> Result<()> {
+    conn.execute("DELETE FROM question_entries WHERE question_id = ?", [id])?;
+    for entry_id in rests_on {
+        conn.execute(
+            "INSERT OR IGNORE INTO question_entries (question_id, entry_id) VALUES (?, ?)",
+            params![id, entry_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// The question's state, or an error when it does not exist.
 fn state_of(conn: &Connection, id: i64) -> Result<QuestionState> {
     let state: Option<String> = conn
@@ -282,12 +293,7 @@ impl CompanionDb {
                 params![case_id, q.text, q.archetype.as_str(), pass_id, now],
             )?;
             let id = conn.last_insert_rowid();
-            for entry_id in &q.rests_on {
-                conn.execute(
-                    "INSERT OR IGNORE INTO question_entries (question_id, entry_id) VALUES (?, ?)",
-                    params![id, entry_id],
-                )?;
-            }
+            set_rests_on(conn, id, &q.rests_on)?;
             add_event(conn, id, "created", pass_id, None)?;
             Ok(id)
         })
@@ -303,6 +309,15 @@ impl CompanionDb {
                 params![pass_id, entry_id, utc_now(), id],
             )?;
             add_event(conn, id, "linked", Some(pass_id), Some(entry_id))
+        })
+    }
+
+    /// The companion rewords an open question for what the case log says now; it keeps its place, rating and history.
+    pub fn rephrase_question(&self, id: i64, text: &str, rests_on: &[i64]) -> Result<()> {
+        self.transaction(|conn| {
+            require_state(conn, id, &[QuestionState::Open], "rephrased")?;
+            conn.execute("UPDATE questions SET text = ? WHERE id = ?", params![text, id])?;
+            set_rests_on(conn, id, rests_on)
         })
     }
 
@@ -476,29 +491,6 @@ impl CompanionDb {
             [case_id],
             |row| row.get(0),
         )?)
-    }
-
-    /// The case's latest `n` successful passes are all diff passes and none of them answered or withdrew a
-    /// question. Fewer than `n` passes, or a full pass among them, is not a stall.
-    pub fn stalled(&self, case_id: i64, n: usize) -> Result<bool> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, kind FROM passes WHERE case_id = ? AND status = 'ok' ORDER BY id DESC LIMIT ?")?;
-        let passes: Vec<(i64, String)> = stmt
-            .query_map(params![case_id, n as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        if passes.len() < n || passes.iter().any(|(_, kind)| kind != PassKind::Diff.as_str()) {
-            return Ok(false);
-        }
-        // the events outlive an unlink or a restore, so a resolution the investigator undid still counts
-        let oldest = passes.last().map_or(0, |(id, _)| *id);
-        let closed: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM question_events e JOIN passes p ON p.id = e.pass_id \
-             WHERE p.case_id = ? AND e.pass_id >= ? AND e.kind IN ('linked', 'withdrawn')",
-            params![case_id, oldest],
-            |row| row.get(0),
-        )?;
-        Ok(closed == 0)
     }
 
     /// When the latest successful pass of the case finished; failed and skipped passes after it do not hide it.
@@ -698,6 +690,21 @@ mod tests {
         );
         assert_eq!(db.last_ok_pass(2).unwrap(), None);
         assert!(db.finish_pass(999, "ok", None, 0, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn rephrase_rewords_an_open_question_only() {
+        let (_dir, db) = temp_db();
+        let a = db.insert_question(1, None, &nq("A")).unwrap();
+        db.rate_question(a, Rating::Plus).unwrap();
+        db.rephrase_question(a, "A, now", &[7]).unwrap();
+        let open = &db.open_questions(1).unwrap()[0];
+        assert_eq!(
+            (open.text.as_str(), &open.rests_on[..], open.rating),
+            ("A, now", &[7][..], Rating::Plus)
+        );
+        db.answer_question(a, 8, 1).unwrap();
+        assert!(db.rephrase_question(a, "B", &[7]).is_err());
     }
 
     #[test]
