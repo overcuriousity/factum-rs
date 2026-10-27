@@ -16,7 +16,7 @@ exe=factum
 cp "$binary" "$dir/$exe"
 cp "$root/README.md" "$root/LICENSE" "$root/CHANGELOG.md" "$root/.env.example" "$dir/"
 cp "$root/install.sh" "$root/install.ps1" "$dir/"
-cp "$root"/assets/fonts/OFL-*.txt "$dir/licenses/"
+cp "$root"/assets/fonts/OFL-*.txt "$root/assets/fonts/LICENSE-Phosphor.txt" "$dir/licenses/"
 [[ -f $root/THIRD-PARTY-LICENSES.md ]] && cp "$root/THIRD-PARTY-LICENSES.md" "$dir/licenses/"
 cp "$root/assets/icon.png" "$dir/share/factum.png"
 cp "$root/packaging/factum.desktop" "$dir/share/factum.desktop"

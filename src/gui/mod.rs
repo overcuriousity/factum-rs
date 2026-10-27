@@ -6,6 +6,7 @@ mod companion_dialogs;
 mod companion_panel;
 mod companion_windows;
 mod dialogs;
+mod icons;
 mod theme;
 mod widgets;
 mod wizard;
@@ -31,13 +32,13 @@ use crate::pystr::{strip, tail};
 use crate::seals::{REASON_CHECKPOINT, SEAL_DIR_SETTING};
 use crate::services::Factum;
 use crate::signer::{ACTIVE_KEY_SETTING, GnupgSigner, Signer};
-use crate::verifier::{CaseReport, SignatureCheck};
+use crate::verifier::{CaseReport, Level, SignatureCheck};
 use companion_dialogs::CompanionSettingsDialog;
 use companion_panel::{CompanionView, PanelAction};
 use companion_windows::{CompanionWindow, WindowAction};
 use dialogs::{Dialog, DialogResult, NoGpgChoice, Pending, VerifyAction, VerifyWindow};
-use theme::{SMALL_SIZE, THEMES};
-use widgets::{Card, CardAction, CardView, CheckView};
+use theme::{MAX_CARD_WIDTH, SMALL_SIZE, THEMES};
+use widgets::{Card, CardAction, CardView, CheckView, IconButton};
 #[cfg(test)]
 use wizard::Step;
 use wizard::{Wizard, WizardChoices, WizardStart};
@@ -46,14 +47,16 @@ use wizard::{Wizard, WizardChoices, WizardStart};
 const THEME_SETTING: &str = "ui_theme";
 const SIDE_PANEL_VISIBLE_SETTING: &str = "ui_side_panel_visible";
 const SIDE_PANEL_WIDTH_SETTING: &str = "ui_side_panel_width";
+const TREE_WIDTH_SETTING: &str = "ui_tree_width";
 const COMPOSER_HEIGHT_SETTING: &str = "ui_composer_height";
 const EXPORT_DIR_SETTING: &str = "export_dir";
 /// "1" once the setup wizard was finished or cancelled
 const ONBOARDING_SETTING: &str = "onboarding_done";
 const DEFAULT_SIDE_PANEL_WIDTH: f32 = 340.0;
+const DEFAULT_TREE_WIDTH: f32 = 240.0;
 const DEFAULT_COMPOSER_HEIGHT: f32 = 170.0;
 const MIN_COMPOSER_HEIGHT: f32 = 150.0;
-const NOTE_PLACEHOLDER: &str = "Write a note. It is time-stamped when added; use #tags to categorize.";
+const NOTE_PLACEHOLDER: &str = "Write a note. It is time-stamped when added; #tags categorize it.";
 const ICON: &[u8] = include_bytes!("../../assets/icon.png");
 
 const fn shortcut(modifiers: Modifiers, key: Key) -> KeyboardShortcut {
@@ -120,10 +123,19 @@ impl Item {
     }
 }
 
+/// What the status bar says about the selected case.
+struct CaseStatus {
+    entries: usize,
+    /// when the newest seal was made
+    last_seal: Option<String>,
+}
+
 /// Everything the window shows, read from the database in one go.
 #[derive(Default)]
 struct View {
     tree: Vec<CaseNode>,
+    /// archived cases, shown or not
+    archived_cases: usize,
     /// the case of the selection, and the evidence if evidence is selected
     case: Option<Case>,
     evidence: Option<Evidence>,
@@ -135,6 +147,7 @@ struct View {
     pinned_empty_text: Option<String>,
     iocs: BTreeMap<String, Vec<String>>,
     cli_active: String,
+    case_status: Option<CaseStatus>,
     /// the Questions section: present while the companion is configured and a case is selected
     companion: Option<CompanionView>,
 }
@@ -160,6 +173,7 @@ struct FactumApp {
     theme: String,
     side_panel: bool,
     side_width: f32,
+    tree_width: f32,
     /// the composer's panel, dragged at its top edge
     composer_height: f32,
     iocs_open: bool,
@@ -177,6 +191,8 @@ struct FactumApp {
     signature_worker: Option<workers::Worker<workers::SignatureChecks>>,
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
+    /// each case's last verification in this session: outcome, time and the tree size it covered
+    verified: HashMap<i64, (Level, String, i64)>,
     dialogs: Vec<Dialog>,
     verify_windows: Vec<VerifyWindow>,
     companion_windows: Vec<CompanionWindow>,
@@ -222,6 +238,7 @@ impl FactumApp {
         let side_width = setting(SIDE_PANEL_WIDTH_SETTING)
             .parse()
             .unwrap_or(DEFAULT_SIDE_PANEL_WIDTH);
+        let tree_width = setting(TREE_WIDTH_SETTING).parse().unwrap_or(DEFAULT_TREE_WIDTH);
         let composer_height = setting(COMPOSER_HEIGHT_SETTING)
             .parse()
             .unwrap_or(DEFAULT_COMPOSER_HEIGHT);
@@ -259,6 +276,7 @@ impl FactumApp {
             theme,
             side_panel,
             side_width,
+            tree_width,
             composer_height,
             iocs_open: false,
             questions_open: true,
@@ -273,6 +291,7 @@ impl FactumApp {
             signature_worker: None,
             signature_check_pending: false,
             verify_job: None,
+            verified: HashMap::new(),
             dialogs: Vec::new(),
             verify_windows: Vec::new(),
             companion_windows: Vec::new(),
@@ -324,6 +343,7 @@ impl FactumApp {
             companion: self.companion_settings.clone(),
             db_path: self.db.path.clone(),
             seal_folder: self.db.get_setting(SEAL_DIR_SETTING).unwrap_or_default(),
+            default_seal_folder: self.factum().default_seal_dir().display().to_string(),
             seal_env: self.env_seal_dir.clone(),
             theme: self.theme.clone(),
         });
@@ -454,7 +474,7 @@ impl FactumApp {
         } else if let Some(key) = self.signer.active_key() {
             (tail(&key, 8).to_string(), false)
         } else {
-            ("Not configured".into(), true)
+            ("No signing key".into(), true)
         };
     }
 
@@ -560,7 +580,10 @@ impl FactumApp {
 
     fn read_view(&self) -> Result<View> {
         let factum = self.factum();
-        let mut view = View::default();
+        let mut view = View {
+            archived_cases: factum.list_cases(true)?.len() - factum.list_cases(false)?.len(),
+            ..Default::default()
+        };
         for case_id in factum.list_cases(self.show_archived)? {
             let Some(case) = factum.get_case(case_id)? else {
                 continue;
@@ -642,43 +665,43 @@ impl FactumApp {
                 text += &format!(" · {} system", view.items.len() - notes);
             }
             view.note_count = text;
-            let pinned_ids = if !self.pinned_scope_evidence {
-                factum.list_entries(
-                    case.id,
-                    &EntryFilter {
-                        pinned_only: true,
-                        ..Default::default()
-                    },
-                )?
-            } else if let Some(evidence_id) = self.evidence_id {
-                factum.list_entries(
-                    case.id,
-                    &EntryFilter {
-                        pinned_only: true,
-                        evidence_id: Some(evidence_id),
-                        ..Default::default()
-                    },
-                )?
-            } else {
-                Vec::new()
-            };
+            // the evidence scope only applies while evidence is selected
+            let pinned_ids = factum.list_entries(
+                case.id,
+                &EntryFilter {
+                    pinned_only: true,
+                    evidence_id: self.evidence_id.filter(|_| self.pinned_scope_evidence),
+                    ..Default::default()
+                },
+            )?;
             for entry_id in pinned_ids.iter().rev() {
                 if let Some(entry) = factum.get_entry(*entry_id)? {
                     view.pinned.push(self.card(&factum, entry, &case)?);
                 }
             }
-        } else {
-            view.empty_text = Some(if view.tree.is_empty() {
-                "No cases yet.\nCreate your first case with + New Case (Ctrl+N).".into()
-            } else {
-                "Select a case or evidence on the left to see its notes.".into()
+            if view.pinned.is_empty() {
+                view.pinned_empty_text = Some("Nothing pinned yet. Click a note and press P.".into());
+            }
+            // the newest entry is never a superseded one; its tree size counts every entry, earlier versions too
+            let newest = factum.list_entries(case.id, &EntryFilter::default())?.into_iter().max();
+            let entries = match newest {
+                Some(id) => factum.get_entry(id)?.map_or(0, |entry| entry.tree_size as usize),
+                None => 0,
+            };
+            view.case_status = Some(CaseStatus {
+                entries,
+                last_seal: factum
+                    .list_tree_heads(case.id)?
+                    .into_iter()
+                    .map(|h| h.created_utc)
+                    .max(),
             });
-        }
-        if view.pinned.is_empty() {
-            view.pinned_empty_text = Some(if self.pinned_scope_evidence && self.evidence_id.is_none() {
-                "Select an evidence item to see its pinned notes.".into()
+        } else {
+            // without cases, the log area shows the button that creates the first one
+            view.empty_text = Some(if view.tree.is_empty() {
+                "No cases yet.".into()
             } else {
-                "No pinned notes yet.\nHover a note and click Pin, or click the note and press P.".into()
+                "Select a case or evidence on the left.".into()
             });
         }
         view.iocs = if let Some(evidence_id) = self.evidence_id {
@@ -688,20 +711,20 @@ impl FactumApp {
         } else {
             BTreeMap::new()
         };
-        let mut parts = Vec::new();
-        if let Some(case) = factum
-            .get_active_case_id()?
-            .and_then(|id| factum.get_case(id).ok().flatten())
-        {
-            parts.push(format!("Case: {}", case.case_name));
-        }
-        if let Some(evidence) = factum
+        // the active evidence names its own case
+        let evidence = factum
             .get_active_evidence_id()?
-            .and_then(|id| factum.get_evidence(id).ok().flatten())
-        {
-            parts.push(format!("Evid: {}", evidence.description));
+            .and_then(|id| factum.get_evidence(id).ok().flatten());
+        let case_id = match &evidence {
+            Some(evidence) => Some(evidence.case_id),
+            None => factum.get_active_case_id()?,
+        };
+        if let Some(case) = case_id.and_then(|id| factum.get_case(id).ok().flatten()) {
+            view.cli_active = match evidence {
+                Some(evidence) => format!("{} › {}", case.case_name, evidence.description),
+                None => case.case_name,
+            };
         }
-        view.cli_active = parts.join("  /  ");
         view.companion = match (&self.companion_db, &view.case) {
             (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
                 CompanionView::read(&factum, cdb, case.id)
@@ -982,6 +1005,9 @@ impl FactumApp {
     }
 
     fn show_case_report(&mut self, report: CaseReport) {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        self.verified
+            .insert(report.case.id, (report.overall(), now, report.tree_size));
         for result in &report.entries {
             if result.signature.present {
                 self.signature_checks.insert(result.entry.id, result.signature.clone());
@@ -1113,10 +1139,26 @@ impl FactumApp {
                 });
                 self.run(result);
             }
-            CardAction::AddLabel(entry_id) => self.dialogs.push(Dialog::AddLabel {
-                entry_id,
-                label: String::new(),
-            }),
+            CardAction::AddLabel(entry_id) => {
+                // the tags and labels in use, without the ones the note already has
+                let own: Vec<String> = crate::tags::get_tags_for_entry(&self.db.conn, entry_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(tag, _)| tag)
+                    .collect();
+                let known = crate::tags::tag_counts(&self.db.conn)
+                    .inspect_err(|e| log::error!("The tags in use cannot be read: {e}"))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(tag, _)| !own.contains(tag))
+                    .collect();
+                self.dialogs.push(Dialog::AddLabel {
+                    entry_id,
+                    label: String::new(),
+                    known,
+                    highlight: None,
+                });
+            }
             CardAction::RemoveLabel(entry_id, label) => {
                 let result = crate::tags::remove_label(&self.db, entry_id, &label);
                 self.run(result);
@@ -1251,6 +1293,10 @@ impl FactumApp {
                 NoGpgChoice::Continue => self.carry_out(pending),
                 NoGpgChoice::Cancel => {}
             },
+            // the default folder is stored as no setting, so it follows the database
+            DialogResult::SealFolder(folder) if folder == self.factum().default_seal_dir().display().to_string() => {
+                let _ = self.db.delete_setting(SEAL_DIR_SETTING);
+            }
             DialogResult::SealFolder(folder) => {
                 let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
             }
@@ -1440,7 +1486,7 @@ impl FactumApp {
             (VERIFY_CASE, "Verify Case"),
             (EXPORT, "Export Case"),
             (SHOW_SYSTEM, "Show System Entries"),
-            (SIDE_PANEL, "Side Panel (Pinned Notes, IoCs)"),
+            (SIDE_PANEL, "Side Panel"),
             (HELP, "Keyboard Shortcuts"),
             (QUIT, "Quit"),
         ] {
@@ -1463,6 +1509,9 @@ impl FactumApp {
                 .db
                 .set_setting(SIDE_PANEL_WIDTH_SETTING, &format!("{:.0}", self.side_width));
         }
+        let _ = self
+            .db
+            .set_setting(TREE_WIDTH_SETTING, &format!("{:.0}", self.tree_width));
         let _ = self
             .db
             .set_setting(COMPOSER_HEIGHT_SETTING, &format!("{:.0}", self.composer_height));
@@ -1591,7 +1640,7 @@ impl FactumApp {
                         egui::Button::selectable(self.show_system, "Show System Entries")
                             .shortcut_text(ctx.format_shortcut(&SHOW_SYSTEM)),
                     )
-                    .on_hover_text("Entries Factum writes itself: case created, evidence added, ...")
+                    .on_hover_text("Case created, evidence added, …")
                     .clicked()
                 {
                     self.show_system = !self.show_system;
@@ -1606,7 +1655,7 @@ impl FactumApp {
                 }
                 if ui
                     .add(
-                        egui::Button::selectable(self.side_panel, "Side Panel (Pinned Notes, IoCs)")
+                        egui::Button::selectable(self.side_panel, "Side Panel")
                             .shortcut_text(ctx.format_shortcut(&SIDE_PANEL)),
                     )
                     .clicked()
@@ -1628,31 +1677,32 @@ impl FactumApp {
                 });
             });
             ui.menu_button("Settings", |ui| {
-                if ui.button("Setup Wizard…").clicked() {
-                    self.open_wizard();
+                if ui.button("Signing Key…").clicked() {
+                    self.open_gpg_keys();
                 }
-                ui.separator();
-                ui.menu_button("GPG", |ui| {
-                    if ui.button("Select Signing Key…").clicked() {
-                        self.open_gpg_keys();
-                    }
-                    if ui.button("Clear Active Key").clicked() {
-                        self.signer.clear_active_key(&self.db);
-                        self.update_gpg_status();
-                    }
-                });
-                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.signer.active_key().is_some(),
+                        egui::Button::new("Clear Signing Key"),
+                    )
+                    .clicked()
+                {
+                    self.signer.clear_active_key(&self.db);
+                    self.update_gpg_status();
+                }
                 if ui.button("Seal Folder…").clicked() {
                     self.choose_seal_folder();
                 }
-            });
-            ui.menu_button("Companion", |ui| {
                 if ui
-                    .add_enabled(!self.companion_db_failed, egui::Button::new("Settings…"))
-                    .on_disabled_hover_text("The companion database cannot be opened; see the log.")
+                    .add_enabled(!self.companion_db_failed, egui::Button::new("Companion…"))
+                    .on_disabled_hover_text("Companion database unreadable (see the log)")
                     .clicked()
                 {
                     self.open_companion_settings();
+                }
+                ui.separator();
+                if ui.button("Setup Wizard…").clicked() {
+                    self.open_wizard();
                 }
             });
             ui.menu_button("Help", |ui| {
@@ -1709,6 +1759,15 @@ impl FactumApp {
         if ui.add_enabled(is_open, egui::Button::new("Edit Case…")).clicked() {
             self.open_edit_case(case_id.unwrap());
         }
+        if ui
+            .add_enabled(
+                is_open && self.evidence_id.is_some(),
+                egui::Button::new("Edit Evidence…"),
+            )
+            .clicked()
+        {
+            self.open_edit_evidence(self.evidence_id.unwrap());
+        }
         ui.separator();
         if ui
             .add_enabled(
@@ -1764,7 +1823,7 @@ impl FactumApp {
         let deletable = self.view.evidence_deletable;
         let delete = ui
             .add_enabled(deletable, egui::Button::new("Delete Evidence…"))
-            .on_disabled_hover_text("Only evidence items without notes can be deleted.");
+            .on_disabled_hover_text("Only evidence without notes");
         if delete.clicked() {
             self.delete_evidence(self.evidence_id.unwrap());
         }
@@ -1810,154 +1869,158 @@ impl FactumApp {
 
     fn case_tree(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        header_row(ui, |ui| {
             Self::panel_header(ui, "Cases");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.menu_button("⋯", |ui| self.case_menu(ui, ctx))
-                    .response
-                    .on_hover_text("Case actions (also on right-click)");
+                ui.spacing_mut().item_spacing.x = 2.0;
+                IconButton::new(icons::MORE, "Case actions").menu(ui, |ui| self.case_menu(ui, ctx));
+                let new_case = IconButton::new(icons::PLUS, "New case")
+                    .shortcut(ctx.format_shortcut(&NEW_CASE))
+                    .color(p.accent)
+                    .show(ui);
+                if new_case.clicked() {
+                    self.open_new_case();
+                }
             });
         });
         ui.separator();
-        let bottom_height = 116.0;
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .max_height(ui.available_height() - bottom_height)
-            .show(ui, |ui| {
-                if self.view.tree.is_empty() {
-                    ui.label(RichText::new("No cases yet. Press Ctrl+N.").color(p.muted));
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            let mut clicked: Option<(Option<i64>, Option<i64>)> = None;
+            let mut menu_action: Option<TreeAction> = None;
+            let new_evidence = ctx.format_shortcut(&NEW_EVIDENCE);
+            for node in &self.view.tree {
+                let case = &node.case;
+                let selected = self.case_id == Some(case.id);
+                let (name, color) = if case.is_archived() {
+                    (format!("{}  {}", case.case_name, icons::ARCHIVE), p.muted)
+                } else {
+                    (case.case_name.clone(), p.text)
+                };
+                let (response, add_evidence) = tree_row(
+                    ui,
+                    selected,
+                    RichText::new(name).family(theme::bold()).color(color),
+                    node.notes,
+                    4.0,
+                    (!case.is_archived()).then_some(new_evidence.as_str()),
+                );
+                let response = response.on_hover_text(format!(
+                    "{} — {}{}",
+                    case.case_file,
+                    case.case_name,
+                    if case.is_archived() { " (archived)" } else { "" }
+                ));
+                if add_evidence {
+                    menu_action = Some(TreeAction::NewEvidence(case.id));
+                } else if response.clicked() {
+                    clicked = Some((Some(case.id), None));
                 }
-                let mut clicked: Option<(Option<i64>, Option<i64>)> = None;
-                let mut menu_action: Option<TreeAction> = None;
-                for node in &self.view.tree {
-                    let case = &node.case;
-                    let selected = self.case_id == Some(case.id);
-                    let name = format!(
-                        "{}{}",
-                        case.case_name,
-                        if case.is_archived() { "  [archived]" } else { "" }
-                    );
-                    let color = if case.is_archived() { p.muted } else { p.text };
-                    let response = tree_row(
-                        ui,
-                        selected,
-                        RichText::new(name).family(theme::bold()).color(color),
-                        node.notes,
-                        4.0,
-                    )
-                    .on_hover_text(format!("{} — {}", case.case_file, case.case_name));
-                    if response.clicked() {
-                        clicked = Some((Some(case.id), None));
-                    }
-                    response.context_menu(|ui| {
-                        if !case.is_archived() {
-                            if ui.button("New Evidence…").clicked() {
-                                menu_action = Some(TreeAction::NewEvidence(case.id));
-                            }
-                            if ui.button("Edit Case…").clicked() {
-                                menu_action = Some(TreeAction::Edit(case.id));
-                            }
-                            if ui.button("Set as CLI Active Case").clicked() {
-                                menu_action = Some(TreeAction::CliCase(case.id));
-                            }
-                            ui.separator();
+                response.context_menu(|ui| {
+                    if !case.is_archived() {
+                        if ui
+                            .add(egui::Button::new("New Evidence…").shortcut_text(&new_evidence))
+                            .clicked()
+                        {
+                            menu_action = Some(TreeAction::NewEvidence(case.id));
                         }
-                        for (label, action) in [
-                            ("Verify Case", TreeAction::Verify(case.id)),
-                            ("Seal Now", TreeAction::Seal(case.id)),
-                            ("Export…", TreeAction::Export(case.id)),
-                            ("Sign All Unsigned", TreeAction::SignAll(case.id)),
-                        ] {
-                            if ui.button(label).clicked() {
-                                menu_action = Some(action);
-                            }
+                        if ui.button("Edit Case…").clicked() {
+                            menu_action = Some(TreeAction::Edit(case.id));
+                        }
+                        if ui.button("Set as CLI Active Case").clicked() {
+                            menu_action = Some(TreeAction::CliCase(case.id));
                         }
                         ui.separator();
-                        if case.is_archived() {
-                            if ui.button("Reopen Case").clicked() {
-                                menu_action = Some(TreeAction::Reopen(case.id));
+                    }
+                    for (label, action) in [
+                        ("Verify Case", TreeAction::Verify(case.id)),
+                        ("Seal Now", TreeAction::Seal(case.id)),
+                        ("Export…", TreeAction::Export(case.id)),
+                        ("Sign All Unsigned", TreeAction::SignAll(case.id)),
+                    ] {
+                        if ui.button(label).clicked() {
+                            menu_action = Some(action);
+                        }
+                    }
+                    ui.separator();
+                    if case.is_archived() {
+                        if ui.button("Reopen Case").clicked() {
+                            menu_action = Some(TreeAction::Reopen(case.id));
+                        }
+                        if ui.button("Delete Permanently…").clicked() {
+                            menu_action = Some(TreeAction::DeleteCase(case.id));
+                        }
+                    } else if ui.button("Archive Case…").clicked() {
+                        menu_action = Some(TreeAction::Archive(case.id));
+                    }
+                });
+                for (evidence, count) in &node.evidence {
+                    let selected = self.evidence_id == Some(evidence.id);
+                    let color = if case.is_archived() { p.muted } else { p.secondary };
+                    let (response, _) = tree_row(
+                        ui,
+                        selected,
+                        RichText::new(&evidence.description).color(color),
+                        *count,
+                        20.0,
+                        None,
+                    );
+                    let response = response.on_hover_text(if evidence.details.is_empty() {
+                        evidence.description.clone()
+                    } else {
+                        format!("{}\n\n{}", evidence.description, evidence.details)
+                    });
+                    if response.clicked() {
+                        clicked = Some((None, Some(evidence.id)));
+                    }
+                    response.context_menu(|ui| {
+                        if ui.button("Set as CLI Active Evidence").clicked() {
+                            menu_action = Some(TreeAction::CliEvidence(evidence.id));
+                        }
+                        if !case.is_archived() {
+                            if ui.button("Edit Description…").clicked() {
+                                menu_action = Some(TreeAction::EditEvidence(evidence.id));
                             }
-                            if ui.button("Delete Permanently…").clicked() {
-                                menu_action = Some(TreeAction::DeleteCase(case.id));
+                            ui.separator();
+                            let empty = *count == 0 && !self.factum().has_entries(evidence.id).unwrap_or(true);
+                            if ui
+                                .add_enabled(empty, egui::Button::new("Delete Evidence…"))
+                                .on_disabled_hover_text("Only evidence without notes")
+                                .clicked()
+                            {
+                                menu_action = Some(TreeAction::DeleteEvidence(evidence.id));
                             }
-                        } else if ui.button("Archive Case…").clicked() {
-                            menu_action = Some(TreeAction::Archive(case.id));
                         }
                     });
-                    for (evidence, count) in &node.evidence {
-                        let selected = self.evidence_id == Some(evidence.id);
-                        let color = if case.is_archived() { p.muted } else { p.secondary };
-                        let response = tree_row(
-                            ui,
-                            selected,
-                            RichText::new(&evidence.description).color(color),
-                            *count,
-                            20.0,
-                        )
-                        .on_hover_text(if evidence.details.is_empty() {
-                            evidence.description.clone()
-                        } else {
-                            format!("{}\n\n{}", evidence.description, evidence.details)
-                        });
-                        if response.clicked() {
-                            clicked = Some((None, Some(evidence.id)));
-                        }
-                        response.context_menu(|ui| {
-                            if ui.button("Set as CLI Active Evidence").clicked() {
-                                menu_action = Some(TreeAction::CliEvidence(evidence.id));
-                            }
-                            if !case.is_archived() {
-                                if ui.button("Edit Description…").clicked() {
-                                    menu_action = Some(TreeAction::EditEvidence(evidence.id));
-                                }
-                                ui.separator();
-                                let empty = *count == 0 && !self.factum().has_entries(evidence.id).unwrap_or(true);
-                                let label = if empty {
-                                    "Delete Evidence…"
-                                } else {
-                                    "Delete Evidence… (only without notes)"
-                                };
-                                if ui.add_enabled(empty, egui::Button::new(label)).clicked() {
-                                    menu_action = Some(TreeAction::DeleteEvidence(evidence.id));
-                                }
-                            }
-                        });
-                    }
                 }
-                if let Some((case_id, evidence_id)) = clicked {
-                    self.select(case_id, evidence_id);
-                }
-                if let Some(action) = menu_action {
-                    self.tree_action(action, ctx);
-                }
-            });
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.add_space(10.0);
-            let width = ui.available_width();
-            let evidence_tip = format!(
-                "Add evidence to the selected case ({})",
-                ctx.format_shortcut(&NEW_EVIDENCE)
-            );
-            let is_open = self.view.case.as_ref().is_some_and(|c| !c.is_archived());
-            if ui
-                .add_enabled(
-                    is_open,
-                    egui::Button::new("+ New Evidence").min_size(egui::vec2(width, 30.0)),
-                )
-                .on_hover_text(evidence_tip)
-                .clicked()
-            {
-                self.open_new_evidence();
             }
-            let new_case = egui::Button::new(RichText::new("+ New Case").color(p.on_accent).family(theme::bold()))
-                .fill(p.accent)
-                .min_size(egui::vec2(width, 30.0));
-            if ui.add(new_case).on_hover_text(ctx.format_shortcut(&NEW_CASE)).clicked() {
-                self.open_new_case();
+            // archived cases are hidden by default; the list says how many there are
+            if self.view.archived_cases > 0 {
+                ui.add_space(8.0);
+                let text = RichText::new(format!("{}  {} archived", icons::ARCHIVE, self.view.archived_cases))
+                    .size(SMALL_SIZE)
+                    .color(if self.show_archived { p.accent } else { p.muted });
+                let button = egui::Button::new(text).frame_when_inactive(self.show_archived);
+                let button = if self.show_archived {
+                    button.fill(p.accent_soft).stroke(egui::Stroke::NONE)
+                } else {
+                    button
+                };
+                let toggle = ui.add(button).on_hover_text(if self.show_archived {
+                    "Hide archived cases"
+                } else {
+                    "Show archived cases"
+                });
+                if toggle.clicked() {
+                    self.show_archived = !self.show_archived;
+                    self.dirty = true;
+                }
             }
-            if ui.checkbox(&mut self.show_archived, "Show archived cases").changed() {
-                self.dirty = true;
+            if let Some((case_id, evidence_id)) = clicked {
+                self.select(case_id, evidence_id);
+            }
+            if let Some(action) = menu_action {
+                self.tree_action(action, ctx);
             }
         });
     }
@@ -1993,62 +2056,81 @@ impl FactumApp {
         }
     }
 
+    /// One centred column for the search, the log and the composer: the log keeps its line length on wide screens.
     fn notes_area(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let width = ui.available_width().min(MAX_CARD_WIDTH);
+        let left = ((ui.available_width() - width) / 2.0).max(0.0);
+        let column = egui::Rect::from_min_size(
+            ui.cursor().min + egui::vec2(left, 0.0),
+            egui::vec2(width, ui.available_height()),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(column), |ui| self.notes_column(ui, ctx));
+    }
+
+    fn notes_column(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
         let mut actions = Vec::new();
-        // search bar: free text, or #tag for tags only
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let hint = format!("Search notes, or #tag  ({})", ctx.format_shortcut(&SEARCH));
-            let search = ui.add(
-                TextEdit::singleline(&mut self.filter)
-                    .id(egui::Id::unique("search"))
-                    .hint_text(hint)
-                    .desired_width(280.0),
-            );
-            if std::mem::take(&mut self.focus_search) {
-                search.request_focus();
-            }
-            if search.changed() {
-                self.dirty = true;
-            }
-            if !self.filter.is_empty() && ui.small_button("✕").on_hover_text("Clear the search").clicked() {
-                self.filter.clear();
-                self.dirty = true;
-            }
+        header_row(ui, |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let toggle = ui
-                    .add(egui::Button::selectable(self.side_panel, "◨"))
-                    .on_hover_text(format!(
-                        "Show or hide pinned notes and IoCs ({})",
-                        ctx.format_shortcut(&SIDE_PANEL)
-                    ));
+                ui.spacing_mut().item_spacing.x = 2.0;
+                let toggle = IconButton::new(icons::SIDE_PANEL, "Side panel")
+                    .shortcut(ctx.format_shortcut(&SIDE_PANEL))
+                    .selected(self.side_panel)
+                    .show(ui);
                 if toggle.clicked() {
                     self.side_panel = !self.side_panel;
                 }
                 if self.view.case.is_some() {
+                    ui.add_space(8.0);
                     ui.label(RichText::new(&self.view.note_count).size(SMALL_SIZE).color(p.muted));
                 }
+                ui.add_space(8.0);
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| self.search_field(ui, ctx));
             });
         });
         ui.separator();
 
         // the composer at the bottom, resizable at its top edge; the log takes the rest
-        let max_composer = (ui.available_height() - 120.0).max(MIN_COMPOSER_HEIGHT);
-        let composer = egui::Panel::bottom("composer-panel")
-            .resizable(true)
-            .default_size(self.composer_height.clamp(MIN_COMPOSER_HEIGHT, max_composer))
-            .size_range(MIN_COMPOSER_HEIGHT..=max_composer)
-            .frame(egui::Frame::new().inner_margin(Margin { top: 6, ..Margin::ZERO }))
-            .show(ui, |ui| self.composer(ui, ctx));
-        self.composer_height = composer.response.rect.height();
+        match self.view.case.clone() {
+            None => {}
+            Some(case) if case.is_archived() => {
+                egui::Panel::bottom("archived-panel")
+                    .resizable(false)
+                    .frame(egui::Frame::new().inner_margin(Margin::symmetric(0, 8)))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icons::ARCHIVE).size(theme::ICON_SIZE).color(p.muted));
+                            ui.label(RichText::new(format!("{} (archived, read-only)", case.case_name)).color(p.muted));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Reopen").on_hover_text("Reopen for notes").clicked() {
+                                    let result = self.factum().reopen_case(case.id);
+                                    self.run(result);
+                                }
+                            });
+                        });
+                    });
+            }
+            Some(_) => {
+                let max_composer = (ui.available_height() - 120.0).max(MIN_COMPOSER_HEIGHT);
+                let composer = egui::Panel::bottom("composer-panel")
+                    .resizable(true)
+                    .default_size(self.composer_height.clamp(MIN_COMPOSER_HEIGHT, max_composer))
+                    .size_range(MIN_COMPOSER_HEIGHT..=max_composer)
+                    .frame(egui::Frame::new().inner_margin(Margin { top: 6, ..Margin::ZERO }))
+                    .show(ui, |ui| self.composer(ui, ctx));
+                self.composer_height = composer.response.rect.height();
+            }
+        }
         let now = chrono::Utc::now();
         egui::ScrollArea::vertical()
             .id_salt("notes")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(8.0);
-                if let Some(text) = &self.view.empty_text {
+                if self.view.tree.is_empty() {
+                    self.first_case(ui, ctx);
+                } else if let Some(text) = &self.view.empty_text {
                     ui.add_space(32.0);
                     ui.vertical_centered(|ui| ui.label(RichText::new(text).color(p.muted)));
                 }
@@ -2078,78 +2160,127 @@ impl FactumApp {
         }
     }
 
-    /// The target line on top, the buttons at the bottom, and the editor filling the height between them.
-    fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The search field: a magnifier, the text and, while there is one, a button that clears it.
+    fn search_field(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
-        let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
-        let is_open = self.view.case.is_some() && !archived;
-        let row = |panel: egui::Panel| {
-            panel
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(egui::Frame::NONE)
+        let id = egui::Id::unique("search");
+        let stroke = if ui.memory(|m| m.has_focus(id)) {
+            ui.visuals().selection.stroke
+        } else {
+            ui.visuals().widgets.inactive.bg_stroke
         };
-        row(egui::Panel::top("composer-target")).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Adding to:").size(SMALL_SIZE).color(p.muted));
-                match &self.view.case {
-                    None => {
-                        ui.label(
-                            RichText::new("nothing selected. Choose a case or evidence on the left.")
-                                .size(SMALL_SIZE)
-                                .color(p.muted)
-                                .italics(),
-                        );
+        let width = ui.available_width().min(340.0);
+        egui::Frame::new()
+            .fill(ui.visuals().text_edit_bg_color())
+            .stroke(stroke)
+            .corner_radius(ui.visuals().widgets.inactive.corner_radius)
+            .inner_margin(Margin::symmetric(6, 0))
+            .show(ui, |ui| {
+                ui.set_width(width - 14.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.label(RichText::new(icons::SEARCH).size(theme::ICON_SIZE).color(p.muted));
+                    let clear = !self.filter.is_empty();
+                    let field_width = ui.available_width() - if clear { 26.0 } else { 0.0 };
+                    let search = ui
+                        .add(
+                            TextEdit::singleline(&mut self.filter)
+                                .id(id)
+                                .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(4, 4)))
+                                .hint_text("Search, or #tag")
+                                .desired_width(field_width),
+                        )
+                        .on_hover_text(format!("Search notes ({})", ctx.format_shortcut(&SEARCH)));
+                    if std::mem::take(&mut self.focus_search) {
+                        search.request_focus();
                     }
-                    Some(case) => {
-                        let mut target = case.case_name.clone();
-                        if let Some(evidence) = &self.view.evidence {
-                            target += &format!(" › {}", evidence.description);
-                        }
-                        if archived {
-                            target += "  (archived, read-only)";
-                        }
-                        ui.label(
-                            RichText::new(target)
-                                .size(SMALL_SIZE)
-                                .family(theme::bold())
-                                .color(p.secondary),
-                        );
+                    if search.changed() {
+                        self.dirty = true;
                     }
-                }
-            });
-        });
-        row(egui::Panel::bottom("composer-buttons")).show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                // the key itself is in the status bar; the composer only warns when notes will not be signed
-                if self.signer.active_key().is_none() {
-                    let warning = if !self.signer.available() {
-                        "⚠ GPG is not installed: notes will not be signed"
-                    } else {
-                        "⚠ No GPG key selected: notes will not be signed (Settings → GPG)"
-                    };
-                    ui.label(RichText::new(warning).size(SMALL_SIZE).color(p.warn));
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let button = egui::Button::new(
-                        RichText::new(format!("Add Note   {}", ctx.format_shortcut(&ADD_NOTE)))
-                            .color(p.on_accent)
-                            .family(theme::bold()),
-                    )
-                    .fill(p.accent);
-                    if ui.add_enabled(is_open, button).clicked() {
-                        self.submit_note();
+                    if clear && IconButton::new(icons::CLOSE, "Clear search").show(ui).clicked() {
+                        self.filter.clear();
+                        self.dirty = true;
                     }
                 });
             });
-            ui.add_space(6.0);
+    }
+
+    /// The log area of a database without cases: one way in.
+    fn first_case(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::current(ctx);
+        let shortcut = ctx.format_shortcut(&NEW_CASE);
+        ui.add_space(56.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new("No cases yet").heading().color(p.secondary));
+            ui.add_space(10.0);
+            let button = egui::Button::new(
+                RichText::new(format!("{}  New case", icons::PLUS))
+                    .color(p.on_accent)
+                    .family(theme::bold()),
+            )
+            .fill(p.accent)
+            .min_size(egui::vec2(140.0, 32.0));
+            if ui.add(button).on_hover_text(&shortcut).clicked() {
+                self.open_new_case();
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(format!("or press {shortcut}"))
+                    .size(SMALL_SIZE)
+                    .color(p.muted),
+            );
         });
-        let placeholder = if archived {
-            "Case archived — reopen to add notes."
-        } else {
-            NOTE_PLACEHOLDER
-        };
+    }
+
+    /// The editor filling the panel's height; below it where the note goes, and the Add button.
+    fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::current(ctx);
+        let Some(case) = self.view.case.clone() else { return };
+        egui::Panel::bottom("composer-buttons")
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let add = egui::Button::new(RichText::new("Add").color(p.on_accent).family(theme::bold()))
+                            .fill(p.accent)
+                            .min_size(egui::vec2(72.0, 28.0));
+                        if ui
+                            .add(add)
+                            .on_hover_text(format!("Add note ({})", ctx.format_shortcut(&ADD_NOTE)))
+                            .clicked()
+                        {
+                            self.submit_note();
+                        }
+                        // the key itself is in the status bar; here only the warning that notes go unsigned
+                        if self.signer.active_key().is_none() {
+                            let tip = if self.signer.available() {
+                                "Unsigned: no signing key"
+                            } else {
+                                "Unsigned: GPG not installed"
+                            };
+                            let warning = egui::Button::new(RichText::new("⚠").size(theme::NOTE_SIZE).color(p.warn))
+                                .frame_when_inactive(false);
+                            if ui.add(warning).on_hover_text(tip).clicked() && self.signer.available() {
+                                self.open_gpg_keys();
+                            }
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let mut target = case.case_name.clone();
+                            if let Some(evidence) = &self.view.evidence {
+                                target += &format!(" › {}", evidence.description);
+                            }
+                            ui.add(
+                                egui::Label::new(RichText::new(target).size(SMALL_SIZE).color(p.secondary)).truncate(),
+                            )
+                            .on_hover_text("New notes go here");
+                        });
+                    });
+                });
+                ui.add_space(6.0);
+            });
         // a longer note scrolls inside the frame, which keeps its place
         let id = egui::Id::unique("composer");
         let stroke = if ui.memory(|m| m.has_focus(id)) {
@@ -2169,11 +2300,10 @@ impl FactumApp {
                     .max_height(inner)
                     .min_scrolled_height(inner) // the default of 64 px would reach into the buttons
                     .show(ui, |ui| {
-                        ui.add_enabled(
-                            is_open,
+                        ui.add(
                             TextEdit::multiline(&mut self.composer)
                                 .id(id)
-                                .hint_text(placeholder)
+                                .hint_text(NOTE_PLACEHOLDER)
                                 .font(egui::FontId::proportional(theme::NOTE_SIZE))
                                 .frame(egui::Frame::NONE.inner_margin(Margin::symmetric(8, 6)))
                                 .desired_width(f32::INFINITY)
@@ -2208,30 +2338,42 @@ impl FactumApp {
         let questions_max = share + (share - self.pinned_height).max(0.0);
 
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        if self.view.case.is_none() {
+            header_row(ui, |ui| Self::panel_header(ui, "Pinned"));
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("The selected case's pinned notes, questions and IoCs show here.")
+                    .size(SMALL_SIZE)
+                    .color(p.muted),
+            );
+            return;
+        }
+        header_row(ui, |ui| {
             let pinned = if self.view.pinned.is_empty() {
                 "PINNED".to_string()
             } else {
                 format!("PINNED {}", self.view.pinned.len())
             };
             Self::panel_header(ui, &pinned);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let evidence =
-                    ui.selectable_label(self.pinned_scope_evidence, RichText::new("Evidence").size(SMALL_SIZE));
-                if evidence
-                    .on_hover_text("Pinned notes of the selected evidence")
-                    .clicked()
-                    && !self.pinned_scope_evidence
-                {
-                    self.pinned_scope_evidence = true;
-                    self.dirty = true;
-                }
-                let case = ui.selectable_label(!self.pinned_scope_evidence, RichText::new("Case").size(SMALL_SIZE));
-                if case.on_hover_text("Pinned notes of the whole case").clicked() && self.pinned_scope_evidence {
-                    self.pinned_scope_evidence = false;
-                    self.dirty = true;
-                }
-            });
+            // the choice only means something while evidence is selected
+            if self.view.evidence.is_some() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (evidence, text, tip) in [
+                        (true, "Evidence", "Pinned on this evidence"),
+                        (false, "Case", "Pinned in the whole case"),
+                    ] {
+                        let chosen = self.pinned_scope_evidence == evidence;
+                        let button = egui::Button::selectable(chosen, RichText::new(text).size(SMALL_SIZE))
+                            .frame_when_inactive(false);
+                        if ui.add(button).on_hover_text(tip).clicked() && !chosen {
+                            self.pinned_scope_evidence = evidence;
+                            self.dirty = true;
+                        }
+                    }
+                });
+            }
         });
         ui.separator();
         let pinned = egui::ScrollArea::vertical()
@@ -2240,9 +2382,9 @@ impl FactumApp {
             .max_height(pinned_max)
             .show(ui, |ui| {
                 if let Some(text) = &self.view.pinned_empty_text {
-                    ui.add_space(8.0);
-                    ui.vertical_centered(|ui| ui.label(RichText::new(text).color(p.muted)));
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(text).size(SMALL_SIZE).color(p.muted));
+                    ui.add_space(6.0);
                 }
                 let now = chrono::Utc::now();
                 for card in &self.view.pinned {
@@ -2297,43 +2439,33 @@ impl FactumApp {
         .frame(false);
         if ui
             .add(header)
-            .on_hover_text("IPs, domains, hashes, ... found in the notes")
+            .on_hover_text("IPs, domains, hashes in the notes")
             .clicked()
         {
             self.iocs_open = !self.iocs_open;
         }
-        if self.iocs_open {
+        if self.iocs_open && self.view.case.is_some() {
             egui::ScrollArea::vertical()
                 .id_salt("iocs")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if self.view.iocs.is_empty() {
                         ui.label(
-                            RichText::new("No IoCs found. IPs, domains, hashes, ... in notes show up here.")
+                            RichText::new("No IPs, domains or hashes in the notes.")
+                                .size(SMALL_SIZE)
                                 .color(p.muted),
                         );
                     }
                     for (ioc_type, values) in &self.view.iocs {
-                        egui::CollapsingHeader::new(
-                            RichText::new(format!("{}  ({})", ioc_type.to_uppercase(), values.len()))
-                                .family(theme::bold()),
-                        )
-                        .id_salt(("ioc", ioc_type))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            for value in values {
-                                let label = ui.add(
-                                    egui::Label::new(RichText::new(value).monospace().color(p.text))
-                                        .selectable(true)
-                                        .wrap(),
-                                );
-                                label.context_menu(|ui| {
-                                    if ui.button("Copy").clicked() {
-                                        ctx.copy_text(value.clone());
-                                    }
-                                });
-                            }
-                        });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!("{} {}", ioc_type.to_uppercase(), values.len()))
+                                .size(SMALL_SIZE)
+                                .color(p.secondary),
+                        );
+                        for value in values {
+                            ioc_row(ui, ctx, value);
+                        }
                     }
                 });
         }
@@ -2347,28 +2479,68 @@ impl FactumApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
+        let small = |text: &str, color| RichText::new(text).size(SMALL_SIZE).color(color);
+        let now = chrono::Utc::now();
         ui.horizontal(|ui| {
-            // only shown while a CLI target is set; the GUI selection is shown above the note input
-            if !self.view.cli_active.is_empty() {
-                let tip = "Notes written on the command line (factum \"text\") go here.\nChange it by right-clicking a case or evidence → Set as CLI Active.";
-                ui.label(RichText::new("CLI active:").size(SMALL_SIZE).color(p.muted)).on_hover_text(tip);
-                ui.label(RichText::new(&self.view.cli_active).size(SMALL_SIZE).color(p.secondary)).on_hover_text(tip);
+            // the selected case: its size, its newest seal and, once verified in this session, the outcome
+            if let (Some(case), Some(status)) = (&self.view.case, &self.view.case_status) {
+                let entries = format!(
+                    "{} entr{}",
+                    status.entries,
+                    if status.entries == 1 { "y" } else { "ies" }
+                );
+                ui.label(small(&entries, p.muted));
+                ui.label(small("·", p.muted));
+                let sealed = match &status.last_seal {
+                    Some(utc) => format!("sealed {}", widgets::relative_time(utc, now)),
+                    None => "not sealed".to_string(),
+                };
+                let tip = status
+                    .last_seal
+                    .as_deref()
+                    .map(widgets::display_time)
+                    .unwrap_or_else(|| "Case ▸ Seal Now".into());
+                ui.label(small(&sealed, p.muted)).on_hover_text(tip);
+                if let Some((level, utc, size)) = self.verified.get(&case.id)
+                    && *size as usize == status.entries
+                {
+                    let (text, color) = match level {
+                        Level::Ok => ("✓ verified", p.ok),
+                        Level::Warn => ("⚠ verified with warnings", p.warn),
+                        Level::Fail => ("✗ verification failed", p.fail),
+                    };
+                    ui.label(small("·", p.muted));
+                    ui.label(small(text, color)).on_hover_text(format!(
+                        "{} ({})",
+                        widgets::display_time(utc),
+                        widgets::relative_time(utc, now)
+                    ));
+                }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (text, warning) = &self.gpg_status;
-                let color = if *warning { p.warn } else { p.ok };
-                let button = egui::Button::new(RichText::new(text).size(SMALL_SIZE).monospace().color(color)).frame(false);
-                if ui.add(button).on_hover_text("Key used to sign notes and seals. Click to choose another one.").clicked() {
+                let color = if *warning { p.warn } else { p.secondary };
+                let key = egui::Button::new(
+                    RichText::new(format!("{}  {text}", icons::KEY))
+                        .size(SMALL_SIZE)
+                        .monospace()
+                        .color(color),
+                )
+                .frame_when_inactive(false);
+                if ui.add(key).on_hover_text("Signing key").clicked() {
                     self.open_gpg_keys();
                 }
-                ui.label(RichText::new("GPG key:").size(SMALL_SIZE).color(p.muted));
                 if self.companion.is_some() {
-                    ui.add_space(16.0);
-                    ui.label(
-                        RichText::new(self.companion_status.line())
-                            .size(SMALL_SIZE)
-                            .color(p.muted),
-                    );
+                    ui.add_space(12.0);
+                    ui.label(small(&self.companion_status.line(), p.muted));
+                }
+                // only shown while a CLI target is set; the GUI selection is shown under the note input
+                if !self.view.cli_active.is_empty() {
+                    ui.add_space(12.0);
+                    let tip = "factum \"text\" on the command line writes here (right-click → Set as CLI Active)";
+                    ui.label(small(&self.view.cli_active, p.secondary)).on_hover_text(tip);
+                    let icon = ui.label(small(icons::TERMINAL, p.muted)).on_hover_text(tip);
+                    icon.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, "CLI target"));
                 }
             });
         });
@@ -2382,12 +2554,14 @@ impl FactumApp {
         }
         let done = job.progress.done.load(Ordering::Relaxed);
         let total = job.progress.total.load(Ordering::Relaxed);
-        egui::Modal::new(egui::Id::unique("verify-progress")).show(ctx, |ui| {
-            ui.set_width(320.0);
-            ui.label("Verifying case…");
-            let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
-            ui.add(egui::ProgressBar::new(fraction).text(format!("{done} / {total}")));
-        });
+        egui::Modal::new(egui::Id::unique("verify-progress"))
+            .frame(theme::dialog_frame(ctx))
+            .show(ctx, |ui| {
+                ui.set_width(320.0);
+                ui.label("Verifying case…");
+                let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
+                ui.add(egui::ProgressBar::new(fraction).text(format!("{done} / {total}")));
+            });
     }
 }
 
@@ -2416,12 +2590,53 @@ fn capitalize(text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// A row of the case tree: the name, and the number of notes on the right.
-fn tree_row(ui: &mut egui::Ui, selected: bool, text: RichText, count: usize, indent: f32) -> egui::Response {
+/// An IoC value, selectable; under the pointer a button copies it.
+fn ioc_row(ui: &mut egui::Ui, ctx: &egui::Context, value: &str) {
+    let p = *theme::current(ctx);
+    let id = ui.scope_id().with(("ioc", value));
+    let hovered = ui.data(|d| d.get_temp::<bool>(id)).unwrap_or(false);
+    let row = ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let copy = if hovered {
+                IconButton::new(icons::COPY, "Copy").show(ui).clicked()
+            } else {
+                ui.add_space(24.0);
+                false
+            };
+            if copy {
+                ctx.copy_text(value.to_string());
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(value).monospace().color(p.text))
+                        .selectable(true)
+                        .wrap(),
+                );
+            });
+        });
+    });
+    let now = row.response.contains_pointer();
+    if now != hovered {
+        ui.data_mut(|d| d.insert_temp(id, now));
+        ctx.request_repaint();
+    }
+}
+
+/// A row of the case tree: the name, and the number of notes on the right. With `add` (the shortcut), a + for new
+/// evidence shows under the pointer; the second value is true when it was clicked.
+fn tree_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    text: RichText,
+    count: usize,
+    indent: f32,
+    add: Option<&str>,
+) -> (egui::Response, bool) {
     let p = *theme::current(ui.ctx());
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 28.0), egui::Sense::click());
-    if selected || response.hovered() {
+    let hovered = response.contains_pointer();
+    if selected || hovered {
         let fill = if selected { p.accent_soft } else { p.panel };
         ui.painter().rect_filled(rect, 2.0, fill);
     }
@@ -2439,14 +2654,31 @@ fn tree_row(ui: &mut egui::Ui, selected: bool, text: RichText, count: usize, ind
             .layout(Layout::left_to_right(Align::Center)),
     );
     child.add_space(indent);
-    child.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(RichText::new(count_text).size(SMALL_SIZE).color(p.muted))
-            .on_hover_text(format!("{count} note{}", if count == 1 { "" } else { "s" }));
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            ui.add(egui::Label::new(text).truncate().selectable(false));
-        });
-    });
-    response
+    let added = child
+        .with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(count_text).size(SMALL_SIZE).color(p.muted))
+                .on_hover_text(format!("{count} note{}", if count == 1 { "" } else { "s" }));
+            let added = match add {
+                Some(shortcut) if hovered => IconButton::new(icons::PLUS, "New evidence")
+                    .shortcut(shortcut)
+                    .show(ui)
+                    .clicked(),
+                _ => false,
+            };
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(egui::Label::new(text).truncate().selectable(false));
+            });
+            added
+        })
+        .inner;
+    (response, added)
+}
+
+/// The first line of a column (CASES, the search, PINNED), the same height in all three.
+fn header_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let size = egui::vec2(ui.available_width(), 28.0);
+    ui.allocate_ui_with_layout(size, Layout::left_to_right(Align::Center), add)
+        .inner
 }
 
 impl eframe::App for FactumApp {
@@ -2469,11 +2701,13 @@ impl eframe::App for FactumApp {
             .show(ui, |ui| {
                 self.status_bar(ui, &ctx);
             });
-        egui::Panel::left("cases")
-            .resizable(false)
-            .exact_size(260.0)
+        let tree = egui::Panel::left("cases")
+            .resizable(true)
+            .default_size(self.tree_width)
+            .size_range(180.0..=420.0)
             .frame(egui::Frame::new().fill(p.panel).inner_margin(Margin::symmetric(10, 4)))
             .show(ui, |ui| self.case_tree(ui, &ctx));
+        self.tree_width = tree.response.rect.width();
         if self.side_panel {
             let response = egui::Panel::right("side")
                 .resizable(true)

@@ -88,15 +88,16 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   valid
 - **Edit Description…** on an evidence item changes its description through a signed `evidence_edited` entry; name
   and hash stay as created
-- **Archive** instead of delete: an archived case is read-only, hidden by default ("Show archived cases",
+- **Archive** instead of delete: an archived case is read-only, hidden by default ("n archived" below the case list,
   `--list-cases --all`) and sealed; it can be reopened. Archived cases can be deleted permanently in the GUI by typing
   the case file number; external seal files are kept
 - Evidence items can only be deleted while they have no notes
 
 ### Notes
 - Notes are never edited. **Correct Note** adds a new, signed version; only the newest version is shown, earlier ones
-  under "Show history". Tags, IOCs and pins follow the newest version
-- `#tags` in the note text are covered by the signature; **labels** added by hand are not signed and look different
+  behind its version chip (v2, v3, …). Tags, IOCs and pins follow the newest version
+- `#tags` in the note text are covered by the signature; **labels** added by hand are not signed and look different.
+  Add Label suggests the tags and labels in use, tolerating a typo
 - Pin/unpin notes, filter by tag or label (substring match)
 - Entry IDs are never reused
 
@@ -116,16 +117,16 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   case ("what corroborates this?", "which log did you not check?"). It asks; it never writes notes for you
 - Nothing it produces enters the log, exports, bundles or verification, and a case verifies identically with or
   without it. Case content is sent to the endpoint you configure, nowhere else
-- **Companion → Settings…**: endpoint URL, protocol (OpenAI- or Anthropic-compatible), API key and model; a local
+- **Settings → Companion…**: endpoint URL, protocol (OpenAI- or Anthropic-compatible), API key and model; a local
   server on the lab network works. Until it is configured, no companion section, status item or Case-menu item appears
 - A preset sets the lens it asks through, for all cases: **Forensics** (the default), **Generic investigator**, **OSINT
   research**, **Source criticism**, or **Custom** with a guideline of your own
 - Evidence descriptions are part of what it reads
 - **Case menu**: "Companion for this case" switches it per case, "Case goal…" gives it the question the case is meant
   to answer
-- The questions sit in the side panel, collapsible under their heading; **+** and **−** rate them, which shapes later
-  questions. Each pass rewords questions whose context changed and drops the ones that went stale (never one rated
-  **+**). The questions menu has
+- The questions sit in the side panel, collapsible under their heading; **useful** and **not useful** (thumbs up and
+  down) rate them, which shapes later questions. Each pass rewords questions whose context changed and drops the ones
+  that went stale (never one rated useful). The questions menu (⋯) has
   **Ask…** (a question answered only from the case log, with cited entries) and **History**
 - It keeps its state in a second SQLite file next to the case database (`factum.companion.db`). That file holds the
   API key and content derived from the case, so treat it as exactly as sensitive as the case database. Deleting it
@@ -133,8 +134,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 
 ### Setup wizard
 - On the first start with a new database, a wizard walks through the signing key, the companion (optional, with its
-  preset), the folder for seal copies and the theme. Every step can be skipped; **Settings → Setup Wizard…** runs it
-  again
+  preset), the folder for seal copies and the theme. It first asks whether the notes have to be provable; if not, it
+  leaves out the key and the seal folder. Every step can be skipped; **Settings → Setup Wizard…** runs it again
 
 ### GPG
 - Select a signing key from your secret keys; the choice is remembered (shared by CLI and GUI)
@@ -170,10 +171,12 @@ Notes are added to the active evidence item if one is set, otherwise to the acti
 GUI (right-click a case or evidence item → Set as CLI Active).
 
 **GUI** (`factum --gui`):
-- Case/evidence tree with note counts; note cards with pinning, history, tags and labels; search (free text, or
-  `#tag` for tags only)
+- Case/evidence tree with note counts; the case log as one centred column with a full timestamp and signature mark on
+  every entry, actions (pin, correct, more) under the pointer, tags and labels; search (free text, or `#tag` for tags
+  only)
 - Note and whole-case verification, seals, signing later, archiving, corrections, export
-- Pinned notes and IoC panel (toggle with Ctrl+B)
+- Pinned notes and IoC panel (toggle with Ctrl+B); the status bar shows the selected case's size, its newest seal and
+  the outcome of its last verification
 - Live sync between CLI and GUI: notes added on the command line appear in the open window
 - Light and dark theme (View → Theme, follows the system by default)
 - Keyboard shortcuts (Help → Keyboard Shortcuts, F1): Ctrl+Enter adds the note, Ctrl+F searches, Ctrl+N creates a
@@ -183,7 +186,8 @@ The interface is designed for long, focused sessions: dark text on an off-white 
 performance than dark mode in normal lighting), a dark theme for dim rooms, a neutral palette with one accent color,
 color-blind-safe status colors that always come with a symbol (✓ ⚠ ✗), [Atkinson Hyperlegible Next](https://www.brailleinstitute.org/freefont/)
 for text and [JetBrains Mono](https://www.jetbrains.com/lp/mono/) for hashes, timestamps and IoCs. Both fonts are
-embedded (SIL Open Font License).
+embedded (SIL Open Font License), as are the [Phosphor](https://phosphoricons.com/) icons it uses (MIT). Icon buttons
+name themselves in a tooltip, with their shortcut.
 
 ## Storage
 
@@ -248,4 +252,5 @@ everything. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-BSD-3-Clause. The embedded fonts are licensed under the SIL Open Font License 1.1 (see `assets/fonts/`).
+BSD-3-Clause. The embedded fonts are licensed under the SIL Open Font License 1.1, the embedded Phosphor icons under
+the MIT License (see `assets/fonts/`).

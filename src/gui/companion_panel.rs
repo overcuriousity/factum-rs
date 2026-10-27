@@ -1,17 +1,18 @@
-//! The companion's section of the side panel: the open questions of the selected case, rated with + and −.
+//! The companion's section of the side panel: the open questions of the selected case, rated useful or not.
 
 use std::collections::HashMap;
 
 use egui::{Align, Id, Layout, Margin, RichText};
 
+use super::icons;
 use super::theme::{self, SMALL_SIZE};
-use super::widgets::{display_time, relative_time};
+use super::widgets::{IconButton, display_time, relative_time};
 use crate::companion::thread::{State, Status};
 use crate::companion::{CompanionDb, Question, Rating};
 use crate::error::Result;
 use crate::services::Factum;
 
-pub const GOAL_ROW: &str = "No goal set for this case. Set it…";
+pub const GOAL_ROW: &str = "Set a goal for this case…";
 
 /// The scrolled height of the question rows in the last frame, for the side panel's height split.
 const CONTENT_HEIGHT: &str = "companion-questions-height";
@@ -115,14 +116,15 @@ pub fn questions_section(
                         .extra_letter_spacing(1.2),
                 )
                 .frame(false);
-                if ui.add(heading).on_hover_text("Show or hide the questions").clicked() {
+                if ui.add(heading).on_hover_text("Companion questions").clicked() {
                     *open = !*open;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.menu_button("▾", |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    IconButton::new(icons::MORE, "Companion").menu(ui, |ui| {
                         for (label, action) in [
-                            ("History…", PanelAction::OpenHistory),
                             ("Ask…", PanelAction::OpenAsk),
+                            ("History…", PanelAction::OpenHistory),
                             ("Case goal…", PanelAction::SetGoal),
                             ("Re-think now", PanelAction::Rethink),
                             ("Settings…", PanelAction::OpenSettings),
@@ -131,9 +133,8 @@ pub fn questions_section(
                                 actions.push(action);
                             }
                         }
-                    })
-                    .response
-                    .on_hover_text("Companion");
+                    });
+                    ui.add_space(4.0);
                     ui.label(
                         RichText::new(header_status(view, status))
                             .size(SMALL_SIZE)
@@ -151,8 +152,8 @@ pub fn questions_section(
                 .max_height(ui.available_height())
                 .show(ui, |ui| {
                     if !view.goal_set {
-                        let goal = ui.add(egui::Link::new(RichText::new(GOAL_ROW).color(p.secondary)));
-                        if goal.on_hover_text("What this case has to establish").clicked() {
+                        let goal = ui.add(egui::Link::new(RichText::new(GOAL_ROW).color(p.accent)));
+                        if goal.on_hover_text("What the case has to establish").clicked() {
                             actions.push(PanelAction::SetGoal);
                         }
                         ui.add_space(6.0);
@@ -175,42 +176,21 @@ pub fn questions_section(
     ui.painter().rect_filled(bar, 0.0, p.accent);
 }
 
-/// A quiet, frameless rating button; a given rating is shown filled in the accent colour.
-fn rate_button(ui: &mut egui::Ui, text: &str, rated: bool) -> egui::Response {
-    let p = *theme::current(ui.ctx());
-    let color = if rated { p.accent } else { p.muted };
-    let button = egui::Button::new(RichText::new(text).size(SMALL_SIZE).color(color)).min_size(egui::vec2(16.0, 16.0));
-    // fill and stroke turn the frame on: an unrated button shows one only under the pointer
-    let button = if rated {
-        button.fill(p.accent_soft).stroke(egui::Stroke::NONE)
-    } else {
-        button.frame_when_inactive(false)
-    };
-    let response = ui.add(button);
-    if response.hovered() && !rated {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
-}
-
-/// The text, the entries it rests on as `#id` links, and `+` / `−` on the right.
+/// The text, the entries it rests on as `#id` links, and the two ratings on the right: useful keeps the question
+/// and asks more like it, not useful removes it and asks less like it.
 fn question_row(ui: &mut egui::Ui, view: &CompanionView, question: &Question, actions: &mut Vec<PanelAction>) {
     let p = *theme::current(ui.ctx());
     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-        let minus = rate_button(ui, "−", false).on_hover_text("Not useful: remove it, and ask less like it");
-        if minus.clicked() {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        if IconButton::new(icons::NOT_USEFUL, "Not useful").show(ui).clicked() {
             actions.push(PanelAction::Rate(question.id, Rating::Minus));
         }
         let rated = question.rating == Rating::Plus;
-        let tip = if rated {
-            "Rated useful: it is kept, and the companion asks more like it"
-        } else {
-            "Useful: keep it, and ask more like it"
-        };
-        let plus = rate_button(ui, "+", rated).on_hover_text(tip);
-        if plus.clicked() && !rated {
+        let name = if rated { "Rated useful" } else { "Useful" };
+        if IconButton::new(icons::USEFUL, name).selected(rated).show(ui).clicked() && !rated {
             actions.push(PanelAction::Rate(question.id, Rating::Plus));
         }
+        ui.add_space(4.0);
         ui.with_layout(Layout::top_down(Align::Min), |ui| {
             ui.add(egui::Label::new(RichText::new(&question.text).color(p.text)).wrap())
                 .on_hover_text(format!(
@@ -221,7 +201,7 @@ fn question_row(ui: &mut egui::Ui, view: &CompanionView, question: &Question, ac
             ui.horizontal_wrapped(|ui| {
                 for id in &question.rests_on {
                     let link = ui.add(egui::Link::new(
-                        RichText::new(format!("#{id}")).size(SMALL_SIZE).color(p.muted),
+                        RichText::new(format!("#{id}")).size(SMALL_SIZE).color(p.accent),
                     ));
                     if link.on_hover_text("Show the entry").clicked() {
                         actions.push(PanelAction::Jump(view.latest_entry.get(id).copied().unwrap_or(*id)));
