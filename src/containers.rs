@@ -158,6 +158,15 @@ fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
 
+/// Records where the container's logged state ends, in the transaction of its log entry.
+fn store_end(conn: &rusqlite::Connection, uuid: &str, end: u64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![end_setting(uuid), end.to_string()],
+    )?;
+    Ok(())
+}
+
 fn has_storage(graph: &crate::container::turtle::Graph, arn: &str) -> bool {
     use crate::container::AFF4_NS;
     graph.has_type(arn, &format!("{AFF4_NS}ZipSegment")) || graph.has_type(arn, &format!("{AFF4_NS}ImageStream"))
@@ -468,16 +477,24 @@ impl Factum<'_> {
         let payload = json!({"event": "container_created", "case_id": case_id, "container_id": uuid, "name": name,
                              "evidence_id": evidence_id, "file_name": file_name, "base_path": base_path,
                              "created_utc": created_utc});
+        let end = volume.end();
+        let remember = |conn: &rusqlite::Connection, _: i64| -> Result<()> {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![path_setting(&uuid), path.display().to_string()],
+            )?;
+            store_end(conn, &uuid, end)
+        };
         let appended = self.append(
             case_id,
             KIND_SYSTEM,
             &text,
             Append {
                 payload: Some(payload),
+                on_commit: Some(&remember),
                 ..Default::default()
             },
         );
-        let end = volume.end();
         drop(volume);
         let id = match appended {
             Ok(id) => id,
@@ -486,8 +503,6 @@ impl Factum<'_> {
                 return Err(e);
             }
         };
-        self.db.set_setting(&path_setting(&uuid), &path.display().to_string())?;
-        self.db.set_setting(&end_setting(&uuid), &end.to_string())?;
         log::info!("Container #{id} created: {}", path.display());
         Ok(id)
     }
@@ -509,7 +524,7 @@ impl Factum<'_> {
             .get_setting(&end_setting(&detail.summary.uuid))
             .ok()
             .and_then(|end| end.parse().ok());
-        let (volume, discarded) = Volume::open(&path, hint)?;
+        let (mut volume, discarded) = Volume::open(&path)?;
         if volume.uuid() != detail.summary.uuid {
             return Err(FactumError::general(format!(
                 "{} is not container #{id} (it is {}).",
@@ -519,6 +534,25 @@ impl Factum<'_> {
         }
         if discarded > 0 {
             log::warn!("Container #{id}: an interrupted addition ({discarded} bytes) was discarded.");
+        }
+        // ahead of the log: written, but the log entry was never committed (a crash in between). The log's state
+        // ends where the setting (written with each log entry) says; what follows is set aside, never cut off.
+        let ahead = |volume: &Volume| {
+            !compare_records(detail, volume.graph(), i64::MAX).is_empty()
+                || volume.history_count() as usize > detail.closes.len()
+        };
+        if ahead(&volume)
+            && let Some(end) = hint.filter(|end| *end < volume.end())
+        {
+            let mark = volume.mark();
+            if volume.set_aside_after(end).is_ok() && !ahead(&volume) {
+                log::warn!(
+                    "Container #{id}: a state the case log does not record (written, then interrupted before it was \
+                     logged) was set aside; the container continues from the logged state."
+                );
+            } else {
+                volume.rollback_to(mark)?;
+            }
         }
         Ok(volume)
     }
@@ -569,11 +603,12 @@ impl Factum<'_> {
         );
         let payload = json!({"event": "container_files_added", "case_id": detail.summary.case_id,
                              "container_id": detail.summary.uuid, "files": files, "added_utc": utc_now()});
-        let start = staged.start;
+        let mark = staged.mark();
         let result = {
             let cell = RefCell::new(&mut *volume);
-            let finalize = |_: &rusqlite::Connection, entry_id: i64| -> Result<()> {
-                cell.borrow_mut().finalize_add(&staged, entry_id).map(|_| ())
+            let finalize = |conn: &rusqlite::Connection, entry_id: i64| -> Result<()> {
+                let end = cell.borrow_mut().finalize_add(&staged, entry_id)?;
+                store_end(conn, &detail.summary.uuid, end)
             };
             self.append(
                 detail.summary.case_id,
@@ -587,13 +622,9 @@ impl Factum<'_> {
             )
         };
         match result {
-            Ok(entry_id) => {
-                self.db
-                    .set_setting(&end_setting(&detail.summary.uuid), &volume.end().to_string())?;
-                Ok(entry_id)
-            }
+            Ok(entry_id) => Ok(entry_id),
             Err(e) => {
-                if let Err(rollback) = volume.rollback_to(start) {
+                if let Err(rollback) = volume.rollback_to(mark) {
                     log::error!("Container #{id} could not be restored after a failed addition: {rollback}");
                 }
                 Err(e)
@@ -702,11 +733,15 @@ impl Factum<'_> {
             "unsigned"
         };
         let text = format!("Container #{id} closed · {file_count} files · {signed}");
-        let previous_end = volume.end();
+        let mark = volume.mark();
+        let uuid = detail.summary.uuid.clone();
         let result = {
             let cell = RefCell::new(&mut volume);
-            let close =
-                |_: &rusqlite::Connection, _: i64| -> Result<()> { cell.borrow_mut().close(&signatures).map(|_| ()) };
+            let close = |conn: &rusqlite::Connection, _: i64| -> Result<()> {
+                let mut volume = cell.borrow_mut();
+                volume.close(&signatures)?;
+                store_end(conn, &uuid, volume.end())
+            };
             self.append(
                 detail.summary.case_id,
                 KIND_SYSTEM,
@@ -721,14 +756,12 @@ impl Factum<'_> {
         let entry_id = match result {
             Ok(entry_id) => entry_id,
             Err(e) => {
-                if let Err(rollback) = volume.rollback_to(previous_end) {
+                if let Err(rollback) = volume.rollback_to(mark) {
                     log::error!("Container #{id} could not be restored after a failed close: {rollback}");
                 }
                 return Err(e);
             }
         };
-        self.db
-            .set_setting(&end_setting(&detail.summary.uuid), &volume.end().to_string())?;
         Ok(CloseEvent {
             entry_id,
             utc: closed_utc,
@@ -800,11 +833,14 @@ impl Factum<'_> {
             let SignedState {
                 signatures, gpg, x509, ..
             } = self.sign_state(&turtle, &gpgsm, "GPG signing failed — nothing was signed.")?;
-            let previous_end = volume.end();
+            let mark = volume.mark();
+            let uuid = detail.summary.uuid.clone();
             let result = {
                 let cell = RefCell::new(&mut volume);
-                let add = |_: &rusqlite::Connection, _: i64| -> Result<()> {
-                    cell.borrow_mut().add_late_signatures(n, &signatures)
+                let add = |conn: &rusqlite::Connection, _: i64| -> Result<()> {
+                    let mut volume = cell.borrow_mut();
+                    volume.add_late_signatures(n, &signatures)?;
+                    store_end(conn, &uuid, volume.end())
                 };
                 self.append(
                     case_id,
@@ -821,11 +857,9 @@ impl Factum<'_> {
                 )
             };
             if let Err(e) = result {
-                let _ = volume.rollback_to(previous_end);
+                let _ = volume.rollback_to(mark);
                 return Err(e);
             }
-            self.db
-                .set_setting(&end_setting(&detail.summary.uuid), &volume.end().to_string())?;
             count += 1;
         }
         Ok((count, skipped))

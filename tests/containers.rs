@@ -451,18 +451,118 @@ fn list_containers_counts_files() {
 }
 
 #[test]
+fn crash_between_container_write_and_log_commit_is_set_aside() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    // the container was written, the process died before the log entry was committed
+    let (mut volume, _) = Volume::open(&s.container_path()).unwrap();
+    let staged = volume
+        .stage_add(
+            &[s.file("b.txt")],
+            &s.options(),
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    volume.finalize_add(&staged, 999_999).unwrap();
+    drop(volume);
+    let written = std::fs::metadata(s.container_path()).unwrap().len();
+    // the container goes on from the logged state; the unlogged one stays in the file, unreferenced
+    s.add(id, &[s.file("c.txt")]);
+    assert!(std::fs::metadata(s.container_path()).unwrap().len() > written);
+    let detail = s.f.factum().container(id).unwrap();
+    let paths: Vec<String> = detail.files().map(|(_, f)| f.path.clone()).collect();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(!paths.iter().any(|p| p.ends_with("b.txt")));
+    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    assert!(s.f.factum().compare_with_log(id, &volume).unwrap().is_empty());
+}
+
+#[test]
+fn crash_after_close_before_log_commit_is_set_aside() {
+    use factum::container::volume::Signatures;
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let (mut volume, _) = Volume::open(&s.container_path()).unwrap();
+    volume.close(&Signatures::default()).unwrap();
+    drop(volume);
+    s.f.factum().close_container(id).unwrap();
+    let report =
+        s.f.factum()
+            .verify_container_file(
+                &s.container_path(),
+                &factum::container::x509::Gpgsm::unavailable(),
+                &|_, _| {},
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+    assert_eq!(report.overall(), factum::verifier::Level::Ok, "{:?}", report.findings);
+    assert_eq!(report.states.len(), 1);
+}
+
+#[test]
+fn stale_end_setting_never_cuts_committed_data() {
+    let s = Setup::new();
+    let id = s.create();
+    let uuid = s.f.factum().container(id).unwrap().summary.uuid;
+    let before_add = s.f.db.get_setting(&format!("container_end:{uuid}")).unwrap();
+    s.add(id, &[s.file("a.txt")]);
+    // the setting lags behind (a restored database, say) and an addition was interrupted
+    s.f.db
+        .set_setting(&format!("container_end:{uuid}"), &before_add)
+        .unwrap();
+    let mut bytes = std::fs::read(s.container_path()).unwrap();
+    bytes.extend(vec![1u8; 100_000]);
+    std::fs::write(s.container_path(), bytes).unwrap();
+    s.add(id, &[s.file("b.txt")]);
+    assert_eq!(s.f.factum().container(id).unwrap().summary.file_count, 2);
+    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    assert!(s.f.factum().compare_with_log(id, &volume).unwrap().is_empty());
+}
+
+#[test]
+fn end_setting_moves_with_the_log_entry() {
+    let s = Setup::new();
+    let id = s.create();
+    let uuid = s.f.factum().container(id).unwrap().summary.uuid;
+    let key = format!("container_end:{uuid}");
+    let before = s.f.db.get_setting(&key).unwrap();
+    let factum = s.f.factum();
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    let staged = volume
+        .stage_add(
+            &[s.file("a.txt")],
+            &s.options(),
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    s.f.signer.fail_next.set(true);
+    assert!(factum.commit_container_add(id, &mut volume, staged).is_err());
+    assert_eq!(s.f.db.get_setting(&key).unwrap(), before);
+    drop(volume);
+    s.add(id, &[s.file("a.txt")]);
+    assert_eq!(
+        s.f.db.get_setting(&key).unwrap(),
+        std::fs::metadata(s.container_path()).unwrap().len().to_string()
+    );
+}
+
+#[test]
 fn container_differing_from_the_log_is_not_written() {
     let s = Setup::new();
     let id = s.create();
     s.add(id, &[s.file("a.txt")]);
     // the log entry of the addition disappears (another database, say): the container lists a file the log lacks
     let factum = s.f.factum();
-    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
+    let (volume, _) = Volume::open(&s.container_path()).unwrap();
     let findings = factum.compare_with_log(id, &volume).unwrap();
     assert!(findings.is_empty(), "{findings:?}");
     drop(volume);
     s.f.exec("UPDATE entries SET payload_json = replace(payload_json, 'container_files_added', 'something_else')");
-    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
+    let (volume, _) = Volume::open(&s.container_path()).unwrap();
     let findings = factum.compare_with_log(id, &volume).unwrap();
     assert!(findings.iter().any(|f| f.code == "log_mismatch"), "{findings:?}");
     drop(volume);
@@ -617,11 +717,14 @@ mod verify {
         let fails = codes(&report, Level::Fail);
         assert!(fails.contains(&"history"), "{:?}", report.findings);
         assert!(fails.contains(&"stream_hash"), "{:?}", report.findings);
-        // on the live file, the owner's own check refuses to add to it
+        // on the live file, the unlogged state is set aside: the container goes on from the logged, signed state
         swap_content_and_drop_storage_type(&s.container_path(), &arn);
         s.f.factum().reopen_container(id).unwrap();
-        let error = s.f.factum().open_container_for_add(id).err().unwrap();
-        assert!(error.to_string().contains("differs from the case log"), "{error}");
+        let mut volume = s.f.factum().open_container_for_add(id).unwrap();
+        assert!(s.f.factum().compare_with_log(id, &volume).unwrap().is_empty());
+        let mut content = Vec::new();
+        std::io::Read::read_to_end(&mut volume.read_file(&arn).unwrap(), &mut content).unwrap();
+        assert_eq!(content, b"a");
     }
 
     #[test]

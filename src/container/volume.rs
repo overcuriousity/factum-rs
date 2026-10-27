@@ -118,12 +118,25 @@ pub struct Staged {
     graph: Graph,
     task_arn: String,
     base: PathBuf,
+    mark: Mark,
 }
 
 impl Staged {
+    /// The volume as it was before this operation: rolling back to it removes the operation.
+    pub fn mark(&self) -> Mark {
+        self.mark
+    }
+
     pub fn bytes(&self) -> u64 {
         self.records.iter().filter(|r| !r.metadata_only).map(|r| r.size).sum()
     }
+}
+
+/// Where a state ends and where the next write goes; equal unless a state was set aside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    pub base_end: u64,
+    pub write_pos: u64,
 }
 
 /// The signatures of one close: (armored GPG signature, public key) and (PEM CMS signature, PEM chain).
@@ -404,8 +417,8 @@ impl Volume {
     }
 
     /// Opens a container for writing. An interrupted Add left bytes after the last complete state: they are cut
-    /// off; the second value says how many. `end_hint` is where the last write ended, if known.
-    pub fn open(path: &Path, end_hint: Option<u64>) -> Result<(Volume, u64)> {
+    /// off (never a complete state); the second value says how many.
+    pub fn open(path: &Path) -> Result<(Volume, u64)> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -415,7 +428,7 @@ impl Volume {
         let not_container =
             |why: String| FactumError::general(format!("{} is not a factum container: {why}", path.display()));
         let len = file.seek(SeekFrom::End(0)).map_err(|e| io_error(path, e))?;
-        let end = find_last_end(&mut file, end_hint)
+        let end = find_last_end(&mut file, None)
             .map_err(|e| not_container(e.to_string()))?
             .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
         let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
@@ -678,7 +691,8 @@ impl Volume {
         progress.files.store(0, Ordering::Relaxed);
         progress.bytes.store(0, Ordering::Relaxed);
 
-        let start = self.end();
+        let mark = self.mark();
+        let start = mark.write_pos;
         let volume_arn = self.arn();
         let limit = self.segment_limit;
         let path_of_container = self.path.clone();
@@ -829,6 +843,7 @@ impl Volume {
             graph,
             task_arn,
             base: options.base.clone(),
+            mark,
         })
     }
 
@@ -851,16 +866,33 @@ impl Volume {
 
     /// Drops a staged (or finalized but not logged) Add operation: the file is cut back to the state before it.
     pub fn discard(&mut self, staged: Staged) -> Result<()> {
-        self.rollback_to(staged.start)
+        self.rollback_to(staged.mark)
     }
 
-    /// Cuts the file back to an earlier state that ended at `end` and reloads it.
-    pub fn rollback_to(&mut self, end: u64) -> Result<()> {
+    pub fn mark(&self) -> Mark {
+        Mark {
+            base_end: self.archive.end,
+            write_pos: self.app.as_ref().map_or(self.archive.end, Appender::position),
+        }
+    }
+
+    /// Continues from the earlier complete state that ends at `end`; what was written after it stays in the file,
+    /// unreferenced (a state the case log never recorded).
+    pub fn set_aside_after(&mut self, end: u64) -> Result<()> {
+        let write_pos = self.mark().write_pos;
+        self.rollback_to(Mark {
+            base_end: end,
+            write_pos,
+        })
+    }
+
+    /// Cuts the file back to `mark.write_pos` and reloads the state that ends at `mark.base_end`.
+    pub fn rollback_to(&mut self, mark: Mark) -> Result<()> {
         let path = self.path.clone();
         let app = self.app.take().expect("the volume is open");
         let mut file = app.into_file();
-        file.set_len(end).map_err(|e| io_error(&path, e))?;
-        let archive = read_archive(&mut file, end).map_err(|e| io_error(&path, e))?;
+        file.set_len(mark.write_pos).map_err(|e| io_error(&path, e))?;
+        let archive = read_archive(&mut file, mark.base_end).map_err(|e| io_error(&path, e))?;
         let entry = archive
             .get(TURTLE)
             .ok_or_else(|| FactumError::general("information.turtle is missing."))?;
@@ -869,7 +901,7 @@ impl Volume {
             .and_then(|mut r| r.read_to_string(&mut turtle))
             .map_err(|e| io_error(&path, e))?;
         self.graph = turtle::parse(&turtle).map_err(FactumError::general)?;
-        self.app = Some(Appender::new(file, end, archive.entries.clone()).map_err(|e| io_error(&path, e))?);
+        self.app = Some(Appender::new(file, mark.write_pos, archive.entries.clone()).map_err(|e| io_error(&path, e))?);
         self.archive = archive;
         Ok(())
     }
@@ -1124,7 +1156,7 @@ mod tests {
             )
             .unwrap();
         drop(volume); // the process died before finalize
-        let (volume, discarded) = Volume::open(&setup.path(), None).unwrap();
+        let (volume, discarded) = Volume::open(&setup.path()).unwrap();
         assert!(discarded > 0);
         assert_eq!(volume.archive(), &before);
         assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), before.end);
@@ -1355,13 +1387,13 @@ mod tests {
     fn second_open_is_refused_while_locked() {
         let setup = Setup::new();
         let volume = setup.create();
-        let error = Volume::open(&setup.path(), None).err().unwrap();
+        let error = Volume::open(&setup.path()).err().unwrap();
         assert!(
             error.to_string().contains("in use by another factum process"),
             "{error}"
         );
         drop(volume);
-        Volume::open(&setup.path(), None).unwrap();
+        Volume::open(&setup.path()).unwrap();
     }
 
     #[test]
@@ -1507,7 +1539,7 @@ mod tests {
         assert_eq!(progress.files.load(std::sync::atomic::Ordering::Relaxed), 5000);
         assert_eq!(progress.total_bytes.load(std::sync::atomic::Ordering::Relaxed), 50_000);
         drop(volume);
-        let (volume, discarded) = Volume::open(&setup.path(), None).unwrap();
+        let (volume, discarded) = Volume::open(&setup.path()).unwrap();
         assert_eq!((discarded, file_records(volume.graph()).len()), (0, 5000));
         // adding, reopening and listing stay well below a second per thousand files, even in a debug build
         assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
