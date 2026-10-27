@@ -190,6 +190,11 @@ fn text_value(text: &str) -> Value {
     Value::String(text.to_string())
 }
 
+/// The `details` of an evidence event; payloads written before schema 4 have none, which reads as empty.
+fn details_of(payload: &serde_json::Map<String, Value>) -> Value {
+    payload.get("details").cloned().unwrap_or_else(|| text_value(""))
+}
+
 fn optional_value(text: &Option<String>) -> Value {
     text.as_ref().map_or(Value::Null, |t| Value::String(t.clone()))
 }
@@ -729,10 +734,16 @@ impl Factum<'_> {
             .collect();
         let mut created_events: BTreeMap<IdKey, serde_json::Map<String, Value>> = BTreeMap::new();
         let mut deleted_events: BTreeMap<IdKey, serde_json::Map<String, Value>> = BTreeMap::new();
+        // the description: the newest edit, else the creation; a payload before schema 4 has none
+        let mut details: BTreeMap<IdKey, Value> = BTreeMap::new();
         for payload in &events {
             match event_of(payload).as_deref() {
                 Some("evidence_created") => {
                     created_events.insert(IdKey::of(payload.get("evidence_id")), payload.clone());
+                    details.insert(IdKey::of(payload.get("evidence_id")), details_of(payload));
+                }
+                Some("evidence_edited") => {
+                    details.insert(IdKey::of(payload.get("evidence_id")), details_of(payload));
                 }
                 Some("evidence_deleted") => {
                     deleted_events.insert(IdKey::of(payload.get("evidence_id")), payload.clone());
@@ -757,6 +768,11 @@ impl Factum<'_> {
                         "Evidence #{evidence_id} field '{key}' was changed outside the log."
                     ));
                 }
+            }
+            if details.get(&IdKey::Int(*evidence_id)) != Some(&text_value(&evidence.details)) {
+                fail(format!(
+                    "Evidence #{evidence_id} field 'details' was changed outside the log."
+                ));
             }
             let deleted = deleted_events
                 .get(&IdKey::Int(*evidence_id))

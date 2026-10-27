@@ -10,8 +10,9 @@ case or evidence details is a leaf in a Merkle tree (RFC 9162), timestamped (UTC
 with the tree head it produces. Seals (signed tree heads) are copied to an external folder, and a case can be exported
 as a self-contained bundle that anyone can verify without factum.
 
-factum is a single binary with a command line and a desktop GUI. It is compatible with factum-notes: both use the
-same database (schema 3), seal files and bundle format, so either can verify and continue what the other wrote.
+factum is a single binary with a command line and a desktop GUI. It shares the seal files and bundle format with
+factum-notes. Since 2.2 its database (schema 4, which adds the evidence description) is no longer one factum-notes can
+open; factum upgrades a factum-notes database (schema 3) when it first opens it.
 
 ## Install
 
@@ -81,10 +82,12 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Entries and seals created without a key can be **signed later**; they are then shown as "signed later on <date>"
 
 ### Cases and evidence
-- Create cases (file number, name, description) and evidence items (description, hash), in the GUI or with
+- Create cases (file number, name, description) and evidence items (name, hash, description), in the GUI or with
   `--new-case`/`--new-evidence`; both are recorded in the log
 - **Edit Case** changes file number, name and description through a signed `case_edited` entry; earlier seals stay
   valid
+- **Edit Description…** on an evidence item changes its description through a signed `evidence_edited` entry; name
+  and hash stay as created
 - **Archive** instead of delete: an archived case is read-only, hidden by default ("Show archived cases",
   `--list-cases --all`) and sealed; it can be reopened. Archived cases can be deleted permanently in the GUI by typing
   the case file number; external seal files are kept
@@ -115,15 +118,21 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   without it. Case content is sent to the endpoint you configure, nowhere else
 - **Companion → Settings…**: endpoint URL, protocol (OpenAI- or Anthropic-compatible), API key and model; a local
   server on the lab network works. Until it is configured, no companion section, status item or Case-menu item appears
+- A preset sets the lens it asks through, for all cases: **Forensics** (the default), **Generic investigator**, **OSINT
+  research**, **Source criticism**, or **Custom** with a guideline of your own
+- Evidence descriptions are part of what it reads
 - **Case menu**: "Companion for this case" switches it per case, "Case goal…" gives it the question the case is meant
   to answer
 - The questions sit in the side panel; **+** and **−** rate them, which shapes later questions. The questions menu has
   **Ask…** (a question answered only from the case log, with cited entries) and **History**
-- `factum --questions [CASE]` prints the open questions and never creates anything; it says so when the companion is
-  not configured
 - It keeps its state in a second SQLite file next to the case database (`factum.companion.db`). That file holds the
   API key and content derived from the case, so treat it as exactly as sensitive as the case database. Deleting it
   loses ratings and settings, no evidence. `FACTUM_COMPANION_API_KEY` overrides the stored key and is never saved
+
+### Setup wizard
+- On the first start with a new database, a wizard walks through the signing key, the companion (optional, with its
+  preset), the folder for seal copies and the theme. Every step can be skipped; **Settings → Setup Wizard…** runs it
+  again
 
 ### GPG
 - Select a signing key from your secret keys; the choice is remembered (shared by CLI and GUI)
@@ -136,8 +145,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 
 ```bash
 factum --new-case 2026/041 "Ransomware Müller GmbH" --description "file server FS01"   # becomes the active case
-factum --new-evidence "FS01 disk image" --hash e3b0c442…                               # in the active case
-factum --set-active evidence 1          # by ID or description, must belong to the active case
+factum --new-evidence "FS01 disk image" --hash e3b0c442… --description "seized in rack 3"   # in the active case
+factum --set-active evidence 1          # by ID or name, must belong to the active case
 factum "Checked disk image, found suspicious binary at /tmp/.hidden #malware"
 factum --correct 42 "Binary was at /tmp/.cache, not /tmp/.hidden #malware"
 factum --list-cases [--all]
@@ -145,7 +154,6 @@ factum --set-active case 1              # by ID, file number or name; clears the
 factum --list-evidence                  # evidence of the active case
 factum --set-active evidence none       # notes go to the case itself again
 factum --verify [case] [-v]             # exit code 1 if verification fails
-factum --questions [case]               # open companion questions (read-only)
 factum --checkpoint [case]              # seal the current state
 factum --sign-unsigned [case]           # sign entries and seals created without a key
 factum --export [case] --format html,pdf,md,bundle --out ./reports
@@ -186,9 +194,10 @@ SQLite database in WAL mode for concurrent CLI and GUI access. The location does
 | macOS   | `~/Library/Application Support/factum/factum.db`               |
 | Windows | `%LOCALAPPDATA%\factum\factum.db`                               |
 
-Set `FACTUM_DB` to use a different file, e.g. one database per engagement or on an encrypted volume. Databases of the
-current factum-notes (schema 3, the tamper-evident log) open unchanged; databases of older factum versions are refused
-and never modified — set `FACTUM_DB` to a new file.
+Set `FACTUM_DB` to use a different file, e.g. one database per engagement or on an encrypted volume. Databases of
+schema 3 (factum up to 2.1 and the current factum-notes) are upgraded in place to schema 4 on first open (it adds the
+evidence description); factum-notes cannot open them afterwards. Databases of older factum versions are refused and
+never modified — set `FACTUM_DB` to a new file.
 
 ## Configuration
 

@@ -27,7 +27,9 @@ fn env() -> Env {
     let (case, notes) = {
         let factum = f.factum();
         let case = factum.create_case("C-9", "Webserver", "Defaced web site").unwrap();
-        let evidence = factum.create_evidence(case, "Webserver image", "sha256:abc").unwrap();
+        let evidence = factum
+            .create_evidence(case, "Webserver image", "sha256:abc", "")
+            .unwrap();
         let notes: Vec<i64> = [
             "Image of /dev/sda acquired, md5 verified",
             "Webshell found in /var/www/uploads/x.php",
@@ -53,6 +55,7 @@ fn env() -> Env {
         extra_headers: String::new(),
         model: "m".into(),
         context_window: Some(32000),
+        preset: factum::companion::Preset::Forensics,
         global_guideline: String::new(),
         enabled: true,
     };

@@ -256,6 +256,9 @@ def check_metadata(data):
         fail("The archive state differs from the log.")
     created_events = dict((p.get("evidence_id"), p) for p in events if p.get("event") == "evidence_created")
     deleted_events = dict((p.get("evidence_id"), p) for p in events if p.get("event") == "evidence_deleted")
+    # the description: the newest edit, else the creation; a payload before schema 4 has none
+    details = dict((p.get("evidence_id"), p.get("details", ""))
+                   for p in events if p.get("event") in ("evidence_created", "evidence_edited"))
     rows = dict((row["id"], row) for row in data["evidence"])
     for evidence_id, row in sorted(rows.items()):
         event = created_events.get(evidence_id)
@@ -265,6 +268,8 @@ def check_metadata(data):
         for key in ("description", "evidence_hash", "created_utc"):
             if row[key] != event.get(key):
                 fail("Evidence #%d field '%s' differs from the log." % (evidence_id, key))
+        if row.get("details", "") != details.get(evidence_id):
+            fail("Evidence #%d field 'details' differs from the log." % evidence_id)
         if row["deleted_utc"] != deleted_events.get(evidence_id, {}).get("deleted_utc"):
             fail("Evidence #%d deletion state differs from the log." % evidence_id)
     for evidence_id in sorted(set(created_events) - set(rows)):

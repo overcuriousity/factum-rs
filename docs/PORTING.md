@@ -4,7 +4,7 @@ The port keeps the behaviour, data formats and messages of factum-notes. Where i
 
 ## Identical
 
-- Database schema 3, all SQL, transaction boundaries and the append retry logic (three attempts when another
+- Database schema 3 (up to factum 2.1), all SQL, transaction boundaries and the append retry logic (three attempts when another
   process appends while signing)
 - Canonical JSON (byte-identical to `json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=False)`), leaf
   data, tree hashes (RFC 9162), signed payloads, seal payloads and seal file names
@@ -30,6 +30,7 @@ notes and corrections from both; bundles from factum pass `verify.py`.
 | Remove Label asks for the name | pick the label from a submenu | (decided in review) |
 | PyInstaller workaround for `LD_LIBRARY_PATH` | not needed | Rust binaries do not bundle shared libraries |
 | ⚙ before system entries | ◇ | the embedded fonts have no ⚙ |
+| database schema 3 | schema 4 since factum 2.2 (adds `evidence.details`; schema 3 is upgraded on open) | evidence descriptions |
 
 Unicode details follow Python where it matters: `str.strip()`/`splitlines()` semantics (`pystr.rs`), `\w` in tags and
 file names. Rust's regex engine treats a few rare combining characters as word characters where Python does not.

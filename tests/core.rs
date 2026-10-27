@@ -326,7 +326,7 @@ fn archive_makes_case_read_only_hidden_and_sealed() {
     assert!(factum.set_active_case(case_id).unwrap_err().is(ErrorKind::CaseArchived));
     assert!(
         factum
-            .create_evidence(case_id, "disk", "")
+            .create_evidence(case_id, "disk", "", "")
             .unwrap_err()
             .is(ErrorKind::CaseArchived)
     );
@@ -368,7 +368,7 @@ fn delete_permanently_needs_archive_and_exact_case_file() {
     let f = Fixture::new();
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "abc", "").unwrap();
     factum
         .append(
             case_id,
@@ -414,18 +414,97 @@ fn create_evidence_writes_system_entry_without_evidence_id() {
     let f = Fixture::new();
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, " Laptop HDD ", " abc ").unwrap();
+    let evidence_id = factum
+        .create_evidence(case_id, " Laptop HDD ", " abc ", " Seized at desk 4 ")
+        .unwrap();
     let evidence = factum.get_evidence(evidence_id).unwrap().unwrap();
     assert_eq!(
-        (evidence.description.as_str(), evidence.evidence_hash.as_str()),
-        ("Laptop HDD", "abc")
+        (
+            evidence.description.as_str(),
+            evidence.evidence_hash.as_str(),
+            evidence.details.as_str()
+        ),
+        ("Laptop HDD", "abc", "Seized at desk 4")
     );
     assert_eq!(
         system_events(&f.db, case_id).last().unwrap(),
         &json!({"event": "evidence_created", "evidence_id": evidence_id, "case_id": case_id,
-                "description": "Laptop HDD", "evidence_hash": "abc", "created_utc": evidence.created_utc})
+                "description": "Laptop HDD", "evidence_hash": "abc", "created_utc": evidence.created_utc,
+                "details": "Seized at desk 4"})
     );
     assert!(!factum.has_entries(evidence_id).unwrap());
+}
+
+#[test]
+fn update_evidence_details_writes_evidence_edited() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "").unwrap();
+    factum
+        .update_evidence_details(evidence_id, " imaged with FTK 4.7 ")
+        .unwrap();
+    assert_eq!(
+        factum.get_evidence(evidence_id).unwrap().unwrap().details,
+        "imaged with FTK 4.7"
+    );
+    assert_eq!(
+        system_events(&f.db, case_id).last().unwrap(),
+        &json!({"event": "evidence_edited", "evidence_id": evidence_id, "details": "imaged with FTK 4.7"})
+    );
+}
+
+#[test]
+fn unchanged_evidence_details_write_nothing() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "same").unwrap();
+    let before = system_events(&f.db, case_id).len();
+    factum.update_evidence_details(evidence_id, "same").unwrap();
+    assert_eq!(system_events(&f.db, case_id).len(), before);
+}
+
+#[test]
+fn evidence_details_refused_when_archived_or_deleted() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let deleted = factum.create_evidence(case_id, "gone", "", "").unwrap();
+    factum.delete_evidence(deleted).unwrap();
+    let error = factum.update_evidence_details(deleted, "x").unwrap_err();
+    assert!(error.message.contains("was deleted"), "{}", error.message);
+    let kept = factum.create_evidence(case_id, "disk", "", "").unwrap();
+    factum.archive_case(case_id).unwrap();
+    let error = factum.update_evidence_details(kept, "x").unwrap_err();
+    assert!(error.is(ErrorKind::CaseArchived));
+    assert_eq!(factum.get_evidence(kept).unwrap().unwrap().details, "");
+}
+
+#[test]
+fn evidence_deleted_while_signing_an_edit_is_refused() {
+    let f = Fixture::new();
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    let evidence_id = f.factum().create_evidence(case_id, "disk", "", "").unwrap();
+    let other_db = Db::open(&f.db.path).unwrap();
+    let other_signer = FakeSigner::new(true);
+    let mut once = true;
+    let signer = FakeSigner::new(true);
+    *signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        if std::mem::take(&mut once) {
+            Factum::with_seal_dir(&other_db, &other_signer, None)
+                .delete_evidence(evidence_id)
+                .unwrap();
+        }
+    }));
+    let factum = Factum::with_seal_dir(&f.db, &signer, None);
+    let error = factum.update_evidence_details(evidence_id, "late").unwrap_err();
+    assert!(error.message.contains("was deleted"), "{}", error.message);
+    assert_eq!(
+        system_events(&f.db, case_id).last().unwrap()["event"],
+        "evidence_deleted"
+    );
+    assert_eq!(factum.get_evidence(evidence_id).unwrap().unwrap().details, "");
 }
 
 #[test]
@@ -433,8 +512,8 @@ fn only_empty_evidence_can_be_deleted() {
     let f = Fixture::new();
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let empty = factum.create_evidence(case_id, "empty", "").unwrap();
-    let used = factum.create_evidence(case_id, "used", "").unwrap();
+    let empty = factum.create_evidence(case_id, "empty", "", "").unwrap();
+    let used = factum.create_evidence(case_id, "used", "", "").unwrap();
     factum
         .append(
             case_id,
@@ -468,7 +547,7 @@ fn set_active_evidence_activates_its_case() {
     let f = Fixture::new();
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "").unwrap();
     assert!(factum.set_active_evidence(Some(evidence_id)).unwrap());
     assert_eq!(factum.get_active_case_id().unwrap(), Some(case_id));
     assert_eq!(factum.get_active_evidence_id().unwrap(), Some(evidence_id));
@@ -478,7 +557,7 @@ fn set_active_evidence_activates_its_case() {
 
 fn case_with_evidence(factum: &Factum) -> (i64, i64) {
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    (case_id, factum.create_evidence(case_id, "disk", "").unwrap())
+    (case_id, factum.create_evidence(case_id, "disk", "", "").unwrap())
 }
 
 #[test]

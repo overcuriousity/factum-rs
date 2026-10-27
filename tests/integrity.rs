@@ -211,7 +211,7 @@ fn seal_file_keeps_gpg_line_endings() {
 /// A case with evidence and three notes on it: five entries.
 fn verifier_case(factum: &Factum) -> (i64, i64, Vec<i64>) {
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "abc", "").unwrap();
     let notes = (0..3)
         .map(|n| {
             factum
@@ -346,6 +346,63 @@ fn edited_evidence_row_fails() {
         "UPDATE evidence SET evidence_hash = 'other' WHERE id = {evidence_id}"
     ));
     assert!(codes(&factum.verify_case(case_id, None).unwrap(), Some(Level::Fail)).contains("metadata"));
+}
+
+fn metadata_messages(report: &CaseReport) -> Vec<String> {
+    report
+        .findings
+        .iter()
+        .filter(|f| f.code == "metadata")
+        .map(|f| f.message.clone())
+        .collect()
+}
+
+#[test]
+fn evidence_details_tamper_fails() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "seized").unwrap();
+    f.exec(&format!("UPDATE evidence SET details = 'x' WHERE id = {evidence_id}"));
+    let messages = metadata_messages(&factum.verify_case(case_id, None).unwrap());
+    assert!(messages.iter().any(|m| m.contains("field 'details'")), "{messages:?}");
+}
+
+#[test]
+fn edited_evidence_details_verify() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "seized").unwrap();
+    factum.update_evidence_details(evidence_id, "imaged").unwrap();
+    factum.update_evidence_details(evidence_id, "imaged twice").unwrap();
+    assert!(metadata_messages(&factum.verify_case(case_id, None).unwrap()).is_empty());
+}
+
+#[test]
+fn pre_v4_payload_without_details_verifies() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let created_utc = utc_now();
+    f.exec(&format!(
+        "INSERT INTO evidence (id, case_id, description, created_utc) VALUES (7, {case_id}, 'old disk', '{created_utc}')"
+    ));
+    factum
+        .append(
+            case_id,
+            "system",
+            "Evidence #7 created: old disk",
+            Append {
+                payload: Some(
+                    serde_json::json!({"event": "evidence_created", "evidence_id": 7, "case_id": case_id,
+                    "description": "old disk", "evidence_hash": "", "created_utc": created_utc}),
+                ),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(metadata_messages(&factum.verify_case(case_id, None).unwrap()).is_empty());
 }
 
 #[test]

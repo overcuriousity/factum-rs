@@ -23,6 +23,7 @@ fn client(fake: &FakeLlm) -> Client {
             extra_headers: String::new(),
             model: "m".into(),
             context_window: None,
+            preset: factum::companion::Preset::Forensics,
             global_guideline: String::new(),
             enabled: true,
         },

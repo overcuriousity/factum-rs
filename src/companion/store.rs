@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use super::presets::Preset;
 use super::prompts;
 use crate::error::{ErrorKind, FactumError, Result};
 
@@ -143,6 +144,8 @@ pub struct Settings {
     pub model: String,
     /// tokens
     pub context_window: Option<u32>,
+    pub preset: Preset,
+    /// the guideline of the Custom preset
     pub global_guideline: String,
     pub enabled: bool,
 }
@@ -159,7 +162,8 @@ impl Default for Settings {
             extra_headers: String::new(),
             model: String::new(),
             context_window: None,
-            global_guideline: prompts::DEFAULT_GUIDELINE.to_string(),
+            preset: Preset::Forensics,
+            global_guideline: String::new(),
             enabled: true,
         }
     }
@@ -175,6 +179,13 @@ impl Settings {
         let env_key = env_key.map(|key| key.trim().to_string()).filter(|key| !key.is_empty());
         let get = |key: &str| db.get_setting(key).map(|value| value.trim().to_string());
         let enabled = get("enabled")?;
+        let global_guideline = get("global_guideline")?;
+        // before presets, an edited guideline was stored and the default was stored as empty
+        let preset = Preset::parse(&get("preset")?).unwrap_or(if global_guideline.is_empty() {
+            Preset::Forensics
+        } else {
+            Preset::Custom
+        });
         Ok(Self {
             endpoint_url: get("endpoint_url")?,
             protocol: Protocol::parse(&get("protocol")?).unwrap_or(Protocol::OpenAi),
@@ -187,16 +198,14 @@ impl Settings {
             extra_headers: get("extra_headers")?,
             model: get("model")?,
             context_window: get("context_window")?.parse().ok(),
-            global_guideline: match get("global_guideline")? {
-                stored if stored.is_empty() => prompts::DEFAULT_GUIDELINE.to_string(),
-                stored => stored,
-            },
+            preset,
+            global_guideline,
             enabled: enabled.is_empty() || enabled == "1",
         })
     }
 
-    /// Trims every string field; the key is not written while it comes from the environment. The default guideline
-    /// is stored as empty, so that a later factum with a better default gives it to this database too.
+    /// Trims every string field; the key is not written while it comes from the environment. Only the custom
+    /// guideline is stored: a built-in preset's text comes with factum, so a later version can improve it.
     pub fn save(&self, db: &CompanionDb) -> Result<()> {
         db.transaction(|conn| {
             let put = |key: &str, value: &str| -> Result<()> {
@@ -215,14 +224,20 @@ impl Settings {
             put("extra_headers", &self.extra_headers)?;
             put("model", &self.model)?;
             put("context_window", &self.context_window.map(|n| n.to_string()).unwrap_or_default())?;
-            let guideline = self.global_guideline.trim();
-            put(
-                "global_guideline",
-                if guideline == prompts::DEFAULT_GUIDELINE.trim() { "" } else { guideline },
-            )?;
+            put("preset", self.preset.as_str())?;
+            put("global_guideline", &self.global_guideline)?;
             put("enabled", if self.enabled { "1" } else { "0" })?;
             Ok(())
         })
+    }
+
+    /// The guideline the model calls use: the preset's, or the custom text (the generic investigator's while empty).
+    pub fn guideline(&self) -> &str {
+        match self.preset.builtin_guideline() {
+            Some(text) => text,
+            None if self.global_guideline.trim().is_empty() => prompts::INVESTIGATOR_GUIDELINE,
+            None => &self.global_guideline,
+        }
     }
 
     pub fn is_configured(&self) -> bool {
@@ -503,15 +518,58 @@ mod tests {
         assert_eq!(back.endpoint_url, "http://h:8080/v1");
         assert_eq!(back.api_key, "k");
         assert!(back.is_configured());
-        // the untouched default is not frozen into the database; an edited guideline is kept
+        // no text of a built-in preset is frozen into the database; an edited guideline is kept
         assert_eq!(db.get_setting("global_guideline").unwrap(), "");
-        assert_eq!(back.global_guideline, prompts::DEFAULT_GUIDELINE);
+        assert_eq!(back.preset, Preset::Forensics);
+        assert_eq!(back.guideline(), prompts::DEFAULT_GUIDELINE);
         let mut edited = back.clone();
         edited.global_guideline = "Ask about timestamps.".into();
         edited.save(&db).unwrap();
         assert_eq!(Settings::load(&db).unwrap().global_guideline, "Ask about timestamps.");
         db.set_setting("model", " m2 \n").unwrap();
         assert_eq!(Settings::load(&db).unwrap().model, "m2");
+    }
+
+    #[test]
+    fn preset_round_trip() {
+        let (_dir, db) = temp_db();
+        for preset in Preset::ALL {
+            let mut s = Settings::load(&db).unwrap();
+            s.preset = preset;
+            s.save(&db).unwrap();
+            assert_eq!(Settings::load(&db).unwrap().preset, preset);
+            assert_eq!(db.get_setting("preset").unwrap(), preset.as_str());
+        }
+    }
+
+    #[test]
+    fn preset_inferred_for_older_databases() {
+        let (_dir, db) = temp_db();
+        assert_eq!(Settings::load(&db).unwrap().preset, Preset::Forensics);
+        db.set_setting("global_guideline", "Ask about timestamps.").unwrap();
+        let s = Settings::load(&db).unwrap();
+        assert_eq!(s.preset, Preset::Custom);
+        assert_eq!(s.guideline(), "Ask about timestamps.");
+    }
+
+    #[test]
+    fn guideline_per_preset() {
+        let mut s = Settings {
+            global_guideline: "Mine.".into(),
+            ..Settings::default()
+        };
+        for (preset, text) in [
+            (Preset::Forensics, prompts::DEFAULT_GUIDELINE),
+            (Preset::Investigator, prompts::INVESTIGATOR_GUIDELINE),
+            (Preset::Osint, prompts::OSINT_GUIDELINE),
+            (Preset::SourceCriticism, prompts::SOURCE_CRITICISM_GUIDELINE),
+            (Preset::Custom, "Mine."),
+        ] {
+            s.preset = preset;
+            assert_eq!(s.guideline(), text, "{preset:?}");
+        }
+        s.global_guideline = "  ".into();
+        assert_eq!(s.guideline(), prompts::INVESTIGATOR_GUIDELINE);
     }
 
     #[test]

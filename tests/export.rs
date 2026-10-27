@@ -21,7 +21,7 @@ const EXPORTED: &str = "2026-10-05T12:00:00.000Z";
 
 fn model_case(factum: &Factum) -> i64 {
     let case_id = factum.create_case("C-1", "Case <b>", "desc").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "abc", "").unwrap();
     let first = factum.create_note("first", Some(evidence_id), case_id).unwrap();
     factum.create_note(TRICKY, None, case_id).unwrap();
     factum.correct_note(first, "first, corrected").unwrap();
@@ -54,6 +54,20 @@ fn timeline_shows_newest_version_at_the_original_position() {
     assert!(corrected.version == 2 && corrected.origin_id != corrected.entry_id);
     assert!(corrected.correction_note().unwrap().starts_with("Corrected "));
     assert_eq!(model.appendix.len(), 5); // every leaf, including the superseded version
+}
+
+#[test]
+fn reports_show_the_evidence_description() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = model_case(&factum);
+    let evidence_id = factum.list_evidence_for_case(case_id, false).unwrap()[0];
+    factum.update_evidence_details(evidence_id, "seized at desk 4").unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    for text in [render_html(&model, false), render_markdown(&model)] {
+        assert!(text.contains("disk — seized at desk 4"), "{text}");
+    }
 }
 
 #[test]
@@ -320,7 +334,7 @@ const REPORTS: [(&str, &[u8]); 3] = [
 fn make_bundle(db: &factum::Db, signer: &dyn Signer, seal_dir: &Path, out_dir: &Path, case_file: &str) -> PathBuf {
     let factum = Factum::with_seal_dir(db, signer, Some(seal_dir.to_path_buf()));
     let case_id = factum.create_case(case_file, "Case", "").unwrap();
-    let evidence_id = factum.create_evidence(case_id, "disk", "abc").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "abc", "").unwrap();
     let first = factum
         .create_note("Müller ✓ 🦊\r\nzweite Zeile  ", Some(evidence_id), case_id)
         .unwrap();
@@ -448,6 +462,34 @@ fn verify_py_reports_references_to_unknown_evidence() {
     };
     assert!(
         output.contains("refers to evidence #999, which was not created in this case"),
+        "{output}"
+    );
+}
+
+#[test]
+fn bundle_carries_evidence_details_and_verify_py_checks_them() {
+    let f = Fixture::new();
+    let factum = Factum::with_seal_dir(&f.db, &f.signer, Some(f.seal_dir.clone()));
+    let case_id = factum.create_case("C-9", "Case", "").unwrap();
+    let evidence_id = factum.create_evidence(case_id, "disk", "", "seized").unwrap();
+    factum.update_evidence_details(evidence_id, "seized at desk 4").unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    let reports: Vec<(&str, Vec<u8>)> = REPORTS.iter().map(|(n, c)| (*n, c.to_vec())).collect();
+    let bundle = factum
+        .build_bundle(&model, &reports, &f.path().join("C-9.zip"))
+        .unwrap();
+    let mut data = case_json(&bundle);
+    assert_eq!(data["evidence"][0]["details"], "seized at desk 4");
+    let Some((_, output)) = run_verify(&bundle, None, &[]) else {
+        return;
+    };
+    assert!(!output.contains("field 'details'"), "{output}");
+    data["evidence"][0]["details"] = "forged".into();
+    rewrite_zip(&bundle, &[("case.json", serde_json::to_vec(&data).unwrap())]);
+    let (_, output) = run_verify(&bundle, None, &[]).unwrap();
+    assert!(
+        output.contains("Evidence #1 field 'details' differs from the log"),
         "{output}"
     );
 }

@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{FactumError, Result};
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE cases(
@@ -24,7 +24,8 @@ CREATE TABLE evidence(
     evidence_hash TEXT NOT NULL DEFAULT '',
     created_utc TEXT NOT NULL,
     is_active INTEGER NOT NULL DEFAULT 0,
-    deleted_utc TEXT
+    deleted_utc TEXT,
+    details TEXT NOT NULL DEFAULT ''
 );
 -- AUTOINCREMENT: entry ids are referenced in reports and must never be reused
 CREATE TABLE entries(
@@ -93,7 +94,7 @@ CREATE TABLE settings(
 );
 "#;
 
-/// The database connection. Schema-compatible with factum-notes (Python), so both can share a database.
+/// The database connection. Schema v3 was shared with factum-notes (Python); v4 added evidence.details.
 pub struct Db {
     pub conn: Connection,
     pub path: PathBuf,
@@ -144,11 +145,43 @@ impl Db {
             log::debug!("Database schema created.");
             return Ok(());
         }
-        // no migrations: databases of earlier versions are not carried forward
+        if version == 3 {
+            return self.migrate_from_3();
+        }
+        // databases before version 3 are not carried forward
         Err(FactumError::unsupported_database(format!(
             "This database was created by an older factum version and is not supported. Set FACTUM_DB to a new file. ({})",
             self.path.display()
         )))
+    }
+
+    /// Schema 3 → 4: adds the evidence description. Another process may have migrated since the version was read:
+    /// the version is read again under the write lock.
+    fn migrate_from_3(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let migrate = || -> Result<bool> {
+            let version: i64 = self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version != 3 {
+                return Ok(false);
+            }
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE evidence ADD COLUMN details TEXT NOT NULL DEFAULT ''; \
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))?;
+            Ok(true)
+        };
+        match migrate().and_then(|migrated| Ok((migrated, self.conn.execute_batch("COMMIT")?))) {
+            Ok((migrated, ())) => {
+                if migrated {
+                    log::info!("Database migrated to schema version {SCHEMA_VERSION}.");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Changes only when another connection commits, so the GUI can ignore its own writes.
@@ -261,7 +294,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("f.db")).unwrap();
         let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
+        db.conn.prepare("SELECT details FROM evidence").unwrap();
         for table in TABLES {
             let count: i64 = db
                 .conn
@@ -280,6 +314,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         drop(Db::open(&dir.path().join("f.db")).unwrap());
         drop(Db::open(&dir.path().join("f.db")).unwrap());
+    }
+
+    #[test]
+    fn version_3_database_is_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.db");
+        let conn = Connection::open(&path).unwrap();
+        let v3 = SCHEMA.replace(
+            "    deleted_utc TEXT,\n    details TEXT NOT NULL DEFAULT ''\n",
+            "    deleted_utc TEXT\n",
+        );
+        assert_ne!(v3, SCHEMA);
+        conn.execute_batch(&v3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO cases (id, case_file, case_name, created_utc) VALUES (1, 'C-1', 'C', 't');
+             INSERT INTO evidence (id, case_id, description, created_utc) VALUES (1, 1, 'disk', 't');
+             PRAGMA user_version = 3;",
+        )
+        .unwrap();
+        drop(conn);
+        let db = Db::open(&path).unwrap();
+        let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 4);
+        let (name, details): (String, String) = db
+            .conn
+            .query_row("SELECT description, details FROM evidence WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((name.as_str(), details.as_str()), ("disk", ""));
+    }
+
+    #[test]
+    fn migration_skips_a_database_another_process_already_migrated() {
+        // a second process read version 3 before the first one migrated
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.db");
+        let db = Db::open(&path).unwrap();
+        db.migrate_from_3().unwrap();
+        let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 4);
     }
 
     #[test]

@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use super::enrich::{enrich, index_unindexed};
 use super::llm::{ChatRequest, Client, LlmError, Role};
+use super::presets::Preset;
 use super::prompts::{
-    DEFAULT_GUIDELINE, archetype_hints, case_header, entry_line, example_lines, question_line, reflect_instruction,
+    archetype_hints, case_header, case_lines, entry_line, example_lines, question_line, reflect_instruction,
     serialize_instruction, timeline_line,
 };
 use super::questions::{PassKind, Question, Rating};
@@ -268,16 +269,14 @@ fn reflect(
     }
 
     let open = cdb.open_questions(case_id)?;
-    let guideline = match client.settings().global_guideline.trim() {
-        "" => DEFAULT_GUIDELINE,
-        _ => client.settings().global_guideline.as_str(),
-    };
+    let guideline = client.settings().guideline();
     let input = PromptInput {
         cdb,
         case_id,
         kind,
         data: &data,
         guideline,
+        preset: client.settings().preset,
         goal: &case_settings.goal,
         last_seen,
         new: &new,
@@ -482,6 +481,7 @@ struct PromptInput<'a> {
     kind: PassKind,
     data: &'a CaseData,
     guideline: &'a str,
+    preset: Preset,
     goal: &'a str,
     last_seen: i64,
     /// entries after the last pass, by leaf index
@@ -589,10 +589,10 @@ impl PromptInput<'_> {
             .iter()
             .map(|&(a, plus, minus)| (a.as_str(), plus, minus))
             .collect();
-        let instruction = reflect_instruction(full, &archetype_hints(&weights), QUESTION_CAP);
+        let instruction = reflect_instruction(full, &archetype_hints(self.preset, &weights), QUESTION_CAP);
 
         let header = case_header(&self.data.case, &self.data.evidence);
-        let header_lines = header.len() - self.data.evidence.len();
+        let header_lines = case_lines(&header);
         // spec 4.5: the related entries are cut first, the examples after them, the entries last; a diff pass keeps
         // its oldest new entry. What still overflows is shortened, then dropped, in the fixed sections: pinned and
         // evidence lines and the kept entry shortened, evidence lines (entries name their evidence) and pinned notes
