@@ -158,6 +158,11 @@ fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
 
+fn has_storage(graph: &crate::container::turtle::Graph, arn: &str) -> bool {
+    use crate::container::AFF4_NS;
+    graph.has_type(arn, &format!("{AFF4_NS}ZipSegment")) || graph.has_type(arn, &format!("{AFF4_NS}ImageStream"))
+}
+
 /// Differences between the files a container graph lists and the additions the log records up to entry `upto`.
 pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtle::Graph, upto: i64) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -181,6 +186,13 @@ pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtl
             None => fail(
                 format!(
                     "{} is in the case log (entry #{}) but not in the container.",
+                    record.path, add.entry_id
+                ),
+                Some(add.entry_id),
+            ),
+            Some(_) if !record.metadata_only && record.link.is_none() && !has_storage(graph, &record.arn) => fail(
+                format!(
+                    "{} has no stored content in the container, though the case log (entry #{}) records it as stored.",
                     record.path, add.entry_id
                 ),
                 Some(add.entry_id),

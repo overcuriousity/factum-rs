@@ -139,6 +139,13 @@ def has_type(graph, subject, name):
     return any(t[0] == RDF_TYPE and local(t[1]) == name for t in graph.get(subject, []))
 
 
+def first_factum(graph, subject, name):
+    for predicate, value, _, _ in graph.get(subject, []):
+        if predicate == FACTUM + name:
+            return value
+    return None
+
+
 def file_images(graph):
     return [s for s in graph if has_type(graph, s, "FileImage")]
 
@@ -198,8 +205,11 @@ def check_files(archive, graph):
             blocks = zip_segment(archive, arn)
         elif has_type(graph, arn, "ImageStream"):
             blocks = image_stream(archive, graph, arn)
+        elif first_factum(graph, arn, "metadataOnly") == "true" or first_factum(graph, arn, "symlinkTarget"):
+            continue  # metadata only, or a link: nothing stored
         else:
-            continue  # metadata only, or a link
+            fail("%s: no stored content, though it is neither metadata only nor a link." % name)
+            continue
         digests = {"MD5": hashlib.md5(), "SHA1": hashlib.sha1(), "SHA256": hashlib.sha256()}
         size = 0
         try:
@@ -423,10 +433,17 @@ def main(argv=None):
                 for arn in file_images(graph):
                     if arn not in newest:
                         fail("%s (%s) is no longer listed." % (display(graph, arn), label))
-                    elif hashes_of(graph, arn) != hashes_of(newest, arn):
-                        fail("%s: its hashes in %s differ from the newest state." % (display(graph, arn), label))
+                    elif sorted(graph[arn]) != sorted(newest[arn]):
+                        fail("%s: its metadata in %s differs from the newest state." % (display(graph, arn), label))
             checked = check_files(archive, newest)
             ok("%d file(s) checked against their hashes." % checked)
+            if not states[-1][3]:
+                closed = len(file_images(graphs[-2][1])) if len(graphs) > 1 else None
+                listed = len(file_images(newest))
+                if closed is None:
+                    warn("The container was never closed: none of its %d file(s) is signed." % listed)
+                else:
+                    warn("%d file(s) added after the last close are not signed yet." % (listed - closed))
     finally:
         gpg.cleanup()
         shutil.rmtree(workdir, ignore_errors=True)

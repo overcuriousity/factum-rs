@@ -110,6 +110,50 @@ fn member(path: &Path, name: &str) -> Option<Vec<u8>> {
     Some(data)
 }
 
+/// The review's attack: replace a file's content after a signed close and hide it from the hash check by dropping
+/// its storage type in a new, unsigned "open" state.
+fn swap_content_and_drop_storage_type(path: &Path, arn: &str) {
+    use factum::container::turtle::{self, Graph, Term};
+    use factum::container::zip64::{Appender, read_archive};
+    use factum::container::{AFF4_NS, RDF_NS};
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let old = turtle::parse(&String::from_utf8(member(path, TURTLE).unwrap()).unwrap()).unwrap();
+    let mut graph = Graph::default();
+    for t in old.triples() {
+        let storage = t.subject == arn
+            && t.predicate == format!("{RDF_NS}type")
+            && t.object == Term::Iri(format!("{AFF4_NS}ZipSegment"));
+        if !storage {
+            graph.add(&t.subject, &t.predicate, t.object.clone());
+        }
+    }
+    let text = turtle::write(&graph, &turtle::factum_prefixes());
+    let mut hashes = Graph::default();
+    let uuid = String::from_utf8(member(path, "container.description").unwrap()).unwrap();
+    for (name, value) in [
+        ("SHA256", hex::encode(sha2::Sha256::digest(text.as_bytes()))),
+        ("SHA512", hex::encode(sha2::Sha512::digest(text.as_bytes()))),
+    ] {
+        hashes.add(
+            &format!("{uuid}/{TURTLE}"),
+            &format!("{AFF4_NS}hash"),
+            Term::Literal {
+                value,
+                datatype: Some(format!("{AFF4_NS}{name}")),
+            },
+        );
+    }
+    let mut app = Appender::new(file, len, archive.entries).unwrap();
+    app.add_bytes(arn, 8, b"forged content").unwrap();
+    app.add_bytes(TURTLE, 8, text.as_bytes()).unwrap();
+    app.add_bytes(HASHES, 0, turtle::write(&hashes, &[("aff4", AFF4_NS)]).as_bytes())
+        .unwrap();
+    app.finish(&[SIG_GPG, "information.turtle.pubkey.asc"], &archive.comment)
+        .unwrap();
+}
+
 #[test]
 fn create_logs_event_with_spec_payload() {
     let s = Setup::new();
@@ -463,7 +507,7 @@ mod verify {
         assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
         s.add(id, &[s.file("c.txt")]);
         let report = verify(&s, &s.container_path());
-        assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+        assert_eq!(report.overall(), Level::Warn, "{:?}", report.findings);
         let labels: Vec<&str> = report.states.iter().map(|st| st.label.as_str()).collect();
         assert_eq!(labels, vec!["close 1", "current (open)"]);
         assert_eq!(report.states[1].files, 3);
@@ -541,6 +585,38 @@ mod verify {
     }
 
     #[test]
+    fn swapped_content_of_a_signed_close_fails() {
+        let s = Setup::new();
+        let id = closed_with_files(&s);
+        let arn = s.f.factum().container(id).unwrap().adds[0].files[0].arn.clone();
+        // a copy elsewhere: what a recipient gets, without the case log
+        let copy = s.f.path().join("received.aff4l");
+        std::fs::copy(s.container_path(), &copy).unwrap();
+        swap_content_and_drop_storage_type(&copy, &arn);
+        let report = verify(&s, &copy);
+        let fails = codes(&report, Level::Fail);
+        assert!(fails.contains(&"history"), "{:?}", report.findings);
+        assert!(fails.contains(&"stream_hash"), "{:?}", report.findings);
+        // on the live file, the owner's own check refuses to add to it
+        swap_content_and_drop_storage_type(&s.container_path(), &arn);
+        s.f.factum().reopen_container(id).unwrap();
+        let error = s.f.factum().open_container_for_add(id).err().unwrap();
+        assert!(error.to_string().contains("differs from the case log"), "{error}");
+    }
+
+    #[test]
+    fn unsigned_states_are_a_warning() {
+        let s = Setup::new();
+        let id = closed_with_files(&s);
+        s.f.factum().reopen_container(id).unwrap();
+        s.add(id, &[s.file("c.txt")]);
+        let report = verify(&s, &s.container_path());
+        assert_eq!(codes(&report, Level::Warn), vec!["not_signed"], "{:?}", report.findings);
+        let warning = report.findings.iter().find(|f| f.code == "not_signed").unwrap();
+        assert!(warning.message.contains("1 file"), "{}", warning.message);
+    }
+
+    #[test]
     fn live_file_replaced_by_an_older_copy_fails() {
         let s = Setup::new();
         let id = closed_with_files(&s);
@@ -607,12 +683,13 @@ mod verify {
         closed_with_files(&s);
         let report = verify(&s, &s.container_path());
         assert_eq!(codes(&report, Level::Fail), vec!["unsigned"], "{:?}", report.findings);
-        // an open container that was never closed is not expected to be signed
+        // a container never closed is not signed at all: a warning, so nobody reads ✓ as "signed"
         let t = Setup::with_signer(FakeSigner::new(false));
         let id = t.create();
         t.add(id, &[t.file("a.txt")]);
         let report = verify(&t, &t.container_path());
-        assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+        assert_eq!(codes(&report, Level::Warn), vec!["not_signed"], "{:?}", report.findings);
+        assert!(codes(&report, Level::Fail).is_empty());
     }
 
     #[test]
@@ -786,6 +863,7 @@ mod script {
         // open and never closed: nothing has to be signed yet
         assert_eq!(code, 0, "{output}");
         assert!(output.contains("\u{2713} 1 file(s) checked"), "{output}");
+        assert!(output.contains("\u{26a0} The container was never closed"), "{output}");
     }
 
     #[test]
@@ -832,6 +910,27 @@ mod script {
         };
         assert_eq!(code, 1, "{output}");
         assert!(output.contains('\u{2717}'), "{output}");
+    }
+
+    #[test]
+    fn script_fails_swapped_content_of_a_signed_close() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        let graph = factum::container::turtle::parse(
+            &String::from_utf8(member(&path, "factum/history/1/information.turtle").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let arn = factum::container::volume::file_records(&graph)[0].arn.clone();
+        swap_content_and_drop_storage_type(&path, &arn);
+        let Some((code, output)) = run(&path, &[], Some(&home.path())) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("differs from the newest state") || output.contains("no stored content"),
+            "{output}"
+        );
     }
 
     #[test]

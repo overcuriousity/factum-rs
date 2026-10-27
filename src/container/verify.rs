@@ -458,6 +458,10 @@ fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: 
     findings
 }
 
+fn plural_files(count: usize) -> String {
+    format!("{count} file{}", if count == 1 { "" } else { "s" })
+}
+
 struct Parsed {
     close: Option<u32>,
     current: bool,
@@ -687,28 +691,57 @@ pub fn verify_file(
         report.states.push(result);
     }
 
-    // a closed state's files are the same files, byte for byte, in every later state
-    let newest = states.last().map(|s| file_records(&s.graph)).unwrap_or_default();
-    let newest: HashMap<&str, &FileRecord> = newest.iter().map(|r| (r.arn.as_str(), r)).collect();
-    for state in &states {
-        let Some(n) = state.close else { continue };
-        for record in file_records(&state.graph) {
-            match newest.get(record.arn.as_str()) {
-                None => report.finding(
-                    Level::Fail,
-                    "history",
-                    format!("{} (close {n}) is no longer listed in the newest state.", record.path),
-                ),
-                Some(now) if **now != record => report.finding(
-                    Level::Fail,
-                    "history",
-                    format!(
-                        "{}: its metadata in close {n} differs from the newest state.",
-                        record.path
-                    ),
-                ),
-                Some(_) => {}
+    // a closed state's files are the same files, described alike (storage included), in every later state
+    if let Some(newest) = states.last() {
+        let listed: HashMap<String, FileRecord> = file_records(&newest.graph)
+            .into_iter()
+            .map(|r| (r.arn.clone(), r))
+            .collect();
+        for state in &states[..states.len() - 1] {
+            let Some(n) = state.close else { continue };
+            for record in file_records(&state.graph) {
+                if !listed.contains_key(&record.arn) {
+                    report.finding(
+                        Level::Fail,
+                        "history",
+                        format!("{} (close {n}) is no longer listed in the newest state.", record.path),
+                    );
+                } else if state.graph.about(&record.arn) != newest.graph.about(&record.arn) {
+                    report.finding(
+                        Level::Fail,
+                        "history",
+                        format!(
+                            "{}: its metadata in close {n} differs from the newest state.",
+                            record.path
+                        ),
+                    );
+                }
             }
+        }
+        // what was added after the last close is not signed yet; a container never closed is not signed at all
+        if report.format == ContainerFormat::Factum && newest.close.is_none() {
+            let closed = states
+                .iter()
+                .rev()
+                .find(|s| s.close.is_some())
+                .map(|s| file_records(&s.graph).len());
+            let open = file_records(&newest.graph).len();
+            let message = match closed {
+                Some(closed) => {
+                    let added = open.saturating_sub(closed);
+                    format!(
+                        "{} added after the last close {} not signed yet; closing the container signs {}.",
+                        plural_files(added),
+                        if added == 1 { "is" } else { "are" },
+                        if added == 1 { "it" } else { "them" }
+                    )
+                }
+                None => format!(
+                    "The container was never closed: none of its {} is signed.",
+                    plural_files(open)
+                ),
+            };
+            report.finding(Level::Warn, "not_signed", message);
         }
     }
 
@@ -742,6 +775,15 @@ pub fn verify_file(
                     "stream_hash",
                     format!("{name}: its content cannot be read ({e})."),
                 ),
+                Ok(Content::None)
+                    if report.format == ContainerFormat::Factum && !record.metadata_only && record.link.is_none() =>
+                {
+                    report.finding(
+                        Level::Fail,
+                        "stream_hash",
+                        format!("{name}: no stored content, though it is neither metadata only nor a link."),
+                    );
+                }
                 Ok(Content::None) => {}
                 Ok(Content::NotChecked(why)) => {
                     report.finding(Level::Warn, "not_checked", format!("{name}: not checked ({why})."));

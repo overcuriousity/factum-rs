@@ -103,6 +103,24 @@ impl Graph {
         &self.triples
     }
 
+    /// Everything said about a subject, as (predicate, object), sorted: equal for two graphs that describe the
+    /// subject alike.
+    pub fn about(&self, subject: &str) -> Vec<(&str, &Term)> {
+        let mut found: Vec<(&str, &Term)> = self
+            .by_subject
+            .get(subject)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|&index| (self.triples[index].predicate.as_str(), &self.triples[index].object))
+            .collect();
+        found.sort_by(|a, b| {
+            a.0.cmp(b.0)
+                .then_with(|| format!("{:?}", a.1).cmp(&format!("{:?}", b.1)))
+        });
+        found
+    }
+
     /// The objects of `subject`'s `predicate` (or a synonym of it), in order.
     pub fn objects<'g>(&'g self, subject: &str, predicate: &str) -> impl Iterator<Item = &'g Term> {
         let predicates = synonyms(predicate);

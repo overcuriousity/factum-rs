@@ -1715,8 +1715,9 @@ fn verify_container_opens_report_window() {
             .next()
             .is_some()
     );
-    // open and never closed, unsigned: nothing fails
-    assert!(harness.query_by_label_contains("\u{2713} 2 files verified").is_some());
+    // open and never closed: nothing fails, but nothing is signed either
+    assert!(harness.query_by_label_contains("\u{26a0} 1 warning").is_some());
+    assert!(harness.query_by_label_contains("never closed").is_some());
     screenshot(&mut harness, "verify_container");
 }
 
