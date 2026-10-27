@@ -96,6 +96,40 @@ impl FileRecord {
     }
 }
 
+/// One folder as the log records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderRecord {
+    pub arn: String,
+    pub path: String,
+}
+
+impl FolderRecord {
+    pub fn to_json(&self) -> Value {
+        json!({"arn": self.arn, "path": self.path})
+    }
+
+    pub fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            arn: value.get("arn")?.as_str()?.to_string(),
+            path: value.get("path")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// The folders a graph lists, in order.
+pub fn folder_records(graph: &Graph) -> Vec<FolderRecord> {
+    graph
+        .subjects_of_type(&aff4l("Folder"))
+        .map(|arn| FolderRecord {
+            arn: arn.to_string(),
+            path: graph
+                .first_value(arn, &aff4l("originalPathName"))
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect()
+}
+
 /// How far an Add operation got; read by the GUI while it runs.
 #[derive(Debug, Default)]
 pub struct AddProgress {
@@ -111,6 +145,7 @@ pub struct Staged {
     /// the end of the state before the operation
     pub start: u64,
     pub records: Vec<FileRecord>,
+    pub folders: Vec<FolderRecord>,
     /// (path, reason): special files
     pub skipped: Vec<(String, String)>,
     /// (path, reason): files that could not be read or changed while they were read
@@ -699,6 +734,7 @@ impl Volume {
         let task_arn = new_arn();
         let mut graph = Graph::default();
         let mut records = Vec::new();
+        let mut folders = Vec::new();
         let mut skipped = Vec::new();
         let mut done_bytes = 0u64;
         let app = self.app.as_mut().expect("the volume is open");
@@ -719,6 +755,10 @@ impl Volume {
                         graph.add(&arn, &rdf_type(), Term::Iri(aff4l("Folder")));
                         name_and_meta(&mut graph, &arn, &name, stored, meta);
                         graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
+                        folders.push(FolderRecord {
+                            arn,
+                            path: encode_name(stored).text,
+                        });
                     }
                 }
                 SourceKind::Special => {
@@ -838,6 +878,7 @@ impl Volume {
         Ok(Staged {
             start,
             records,
+            folders,
             skipped,
             errors,
             graph,

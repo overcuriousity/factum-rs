@@ -11,7 +11,8 @@ use sha2::Digest;
 
 use crate::canonical::utc_now;
 use crate::container::volume::{
-    FileRecord, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, history_member, task_entries,
+    FileRecord, FolderRecord, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, history_member,
+    task_entries,
 };
 use crate::container::x509::{Gpgsm, X509_CERT_SETTING, X509_CHAIN_SETTING};
 use crate::db::ensure_case_open;
@@ -64,6 +65,7 @@ pub struct AddEvent {
     pub entry_id: i64,
     pub utc: String,
     pub files: Vec<FileRecord>,
+    pub folders: Vec<FolderRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,6 +224,35 @@ pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtl
                 format!(
                     "{} is in the container but in no addition the case log records.",
                     record.path
+                ),
+                None,
+            );
+        }
+    }
+    let logged_folders: Vec<&FolderRecord> = detail
+        .adds
+        .iter()
+        .filter(|add| add.entry_id <= upto)
+        .flat_map(|add| &add.folders)
+        .collect();
+    let stored_folders = crate::container::volume::folder_records(graph);
+    for folder in &logged_folders {
+        if !stored_folders.contains(folder) {
+            fail(
+                format!(
+                    "The folder {} is in the case log but not in the container.",
+                    folder.path
+                ),
+                None,
+            );
+        }
+    }
+    for folder in &stored_folders {
+        if !logged_folders.contains(&folder) {
+            fail(
+                format!(
+                    "The folder {} is in the container but in no addition the case log records.",
+                    folder.path
                 ),
                 None,
             );
@@ -386,10 +417,17 @@ impl Factum<'_> {
                         .and_then(Value::as_array)
                         .map(|files| files.iter().filter_map(FileRecord::from_json).collect())
                         .unwrap_or_default();
+                    let folders = event
+                        .payload
+                        .get("folders")
+                        .and_then(Value::as_array)
+                        .map(|folders| folders.iter().filter_map(FolderRecord::from_json).collect())
+                        .unwrap_or_default();
                     detail.adds.push(AddEvent {
                         entry_id: event.entry_id,
                         utc: event.utc,
                         files,
+                        folders,
                     });
                 }
                 "container_closed" => {
@@ -591,18 +629,24 @@ impl Factum<'_> {
     /// Logs a staged Add operation and lists it in the container, both or neither.
     pub fn commit_container_add(&self, id: i64, volume: &mut Volume, staged: Staged) -> Result<i64> {
         let detail = self.container(id)?;
-        if staged.records.is_empty() {
+        if staged.records.is_empty() && staged.folders.is_empty() {
             volume.discard(staged)?;
             return Err(FactumError::general("Nothing was added."));
         }
         let files: Vec<Value> = staged.records.iter().map(FileRecord::to_json).collect();
-        let text = format!(
-            "{} added to container #{id} ({})",
-            plural(staged.records.len(), "file"),
-            human_size(staged.bytes())
-        );
+        let folders: Vec<Value> = staged.folders.iter().map(FolderRecord::to_json).collect();
+        let text = if staged.records.is_empty() {
+            format!("{} added to container #{id}", plural(staged.folders.len(), "folder"))
+        } else {
+            format!(
+                "{} added to container #{id} ({})",
+                plural(staged.records.len(), "file"),
+                human_size(staged.bytes())
+            )
+        };
         let payload = json!({"event": "container_files_added", "case_id": detail.summary.case_id,
-                             "container_id": detail.summary.uuid, "files": files, "added_utc": utc_now()});
+                             "container_id": detail.summary.uuid, "files": files, "folders": folders,
+                             "added_utc": utc_now()});
         let mark = staged.mark();
         let result = {
             let cell = RefCell::new(&mut *volume);

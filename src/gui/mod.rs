@@ -1140,10 +1140,11 @@ impl FactumApp {
                 .collect();
             notes.push(format!("Errors:\n{}", lines.join("\n")));
         }
-        let (count, bytes) = (staged.records.len(), staged.bytes());
+        let (count, bytes, folders) = (staged.records.len(), staged.bytes(), staged.folders.len());
         let result = self.factum().commit_container_add(id, &mut volume, staged);
         drop(volume);
         let head = match result {
+            Ok(_) if count == 0 => format!("{folders} folder{} added.", if folders == 1 { "" } else { "s" }),
             Ok(_) => format!(
                 "{count} file{} added ({}).",
                 if count == 1 { "" } else { "s" },

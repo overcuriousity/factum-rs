@@ -598,6 +598,28 @@ fn end_setting_moves_with_the_log_entry() {
 }
 
 #[test]
+fn an_empty_folder_alone_is_added_and_logged() {
+    let s = Setup::new();
+    let id = s.create();
+    let void = s.source.join("void");
+    std::fs::create_dir(&void).unwrap();
+    let entry = s.add(id, &[void]);
+    assert_eq!(s.entry_text(entry), format!("1 folder added to container #{id}"));
+    let detail = s.f.factum().container(id).unwrap();
+    assert_eq!(detail.adds[0].files.len(), 0);
+    assert_eq!(detail.adds[0].folders.len(), 1);
+    assert_eq!(detail.adds[0].folders[0].path, "void");
+    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    assert!(s.f.factum().compare_with_log(id, &volume).unwrap().is_empty());
+    drop(volume);
+    // a folder the log does not record is a difference
+    s.f.exec("UPDATE entries SET payload_json = replace(payload_json, '\"folders\":[{', '\"folders\":[],\"x\":[{')");
+    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    let findings = s.f.factum().compare_with_log(id, &volume).unwrap();
+    assert!(findings.iter().any(|f| f.message.contains("void")), "{findings:?}");
+}
+
+#[test]
 fn container_differing_from_the_log_is_not_written() {
     let s = Setup::new();
     let id = s.create();
