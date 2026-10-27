@@ -154,6 +154,26 @@ fn swap_content_and_drop_storage_type(path: &Path, arn: &str) {
         .unwrap();
 }
 
+/// Adds a second central directory entry for `arn` with other content (a placeholder renamed in the directory).
+fn duplicate_member(path: &Path, arn: &str) {
+    use factum::container::zip64::{Appender, read_archive};
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let placeholder = "X".repeat(arn.len());
+    let mut app = Appender::new(file, len, archive.entries).unwrap();
+    app.add_bytes(&placeholder, 8, b"other bytes").unwrap();
+    app.finish(&[], &archive.comment).unwrap();
+    drop(app);
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = bytes
+        .windows(placeholder.len())
+        .rposition(|w| w == placeholder.as_bytes())
+        .unwrap();
+    bytes[at..at + arn.len()].copy_from_slice(arn.as_bytes());
+    std::fs::write(path, bytes).unwrap();
+}
+
 #[test]
 fn create_logs_event_with_spec_payload() {
     let s = Setup::new();
@@ -605,6 +625,21 @@ mod verify {
     }
 
     #[test]
+    fn duplicate_member_names_fail() {
+        let s = Setup::new();
+        let id = closed_with_files(&s);
+        let arn = s.f.factum().container(id).unwrap().adds[0].files[0].arn.clone();
+        duplicate_member(&s.container_path(), &arn);
+        let report = verify(&s, &s.container_path());
+        let fail = report
+            .findings
+            .iter()
+            .find(|f| f.code == "duplicate_member")
+            .expect("a duplicate finding");
+        assert!(fail.message.contains(&arn), "{}", fail.message);
+    }
+
+    #[test]
     fn unsigned_states_are_a_warning() {
         let s = Setup::new();
         let id = closed_with_files(&s);
@@ -931,6 +966,19 @@ mod script {
             output.contains("differs from the newest state") || output.contains("no stored content"),
             "{output}"
         );
+    }
+
+    #[test]
+    fn script_fails_duplicate_member_names() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        duplicate_member(&path, "version.txt");
+        let Some((code, output)) = run(&path, &[], Some(&home.path())) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("listed more than once: version.txt"), "{output}");
     }
 
     #[test]

@@ -11,6 +11,7 @@ Every line starts with a check mark: passed, warning or failed. Exit code 0 only
 
 import argparse
 import base64
+import collections
 import hashlib
 import io
 import os
@@ -384,6 +385,9 @@ def main(argv=None):
     except (OSError, zipfile.BadZipFile) as e:
         fail("%s is not a readable container (%s)." % (args.container, e))
         return 1
+    counts = collections.Counter(archive.namelist())
+    for name in sorted(n for n, count in counts.items() if count > 1):
+        fail("listed more than once: %s (ZIP tools may read a different copy than this check)." % name)
     version = (read(archive, "version.txt") or b"").decode("utf-8", "replace")
     if "major=2" not in version or "minor=1" not in version:
         fail("Not an AFF4-L v1.0 container (version.txt: %r)." % version.strip())

@@ -515,6 +515,13 @@ pub fn verify_file(
         );
     }
     let archive = read_archive(&mut file, end)?;
+    for name in archive.duplicates() {
+        report.finding(
+            Level::Fail,
+            "duplicate_member",
+            format!("{name} is listed more than once; ZIP tools may read a different one than this check did."),
+        );
+    }
     let version = read_member(&mut file, &archive, "version.txt").and_then(|r| r.ok());
     let Some(version) = version.map(|v| String::from_utf8_lossy(&v).into_owned()) else {
         report.format = ContainerFormat::Legacy;

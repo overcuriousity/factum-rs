@@ -393,11 +393,7 @@ impl Volume {
         let mut volume = Volume {
             path: path.to_path_buf(),
             uuid: uuid.to_string(),
-            archive: Archive {
-                entries: Vec::new(),
-                comment: arn.clone().into_bytes(),
-                end: 0,
-            },
+            archive: Archive::new(Vec::new(), arn.clone().into_bytes(), 0),
             app: Some(app),
             graph: Graph::default(),
             segment_limit: ZIP_SEGMENT_LIMIT,
@@ -590,11 +586,7 @@ impl Volume {
             app.finish(omit, &comment)
         };
         let end = write().map_err(|e| io_error(&path, e))?;
-        self.archive = Archive {
-            entries: self.app().entries(),
-            comment,
-            end,
-        };
+        self.archive = Archive::new(self.app().entries(), comment, end);
         self.graph = graph;
         Ok(end)
     }
@@ -611,11 +603,7 @@ impl Volume {
             app.finish(&[], &comment)
         };
         let end = write().map_err(|e| io_error(&path, e))?;
-        self.archive = Archive {
-            entries: self.app().entries(),
-            comment,
-            end,
-        };
+        self.archive = Archive::new(self.app().entries(), comment, end);
         Ok(end)
     }
 
@@ -909,16 +897,12 @@ impl Volume {
         let app = self.app();
         let mut write = || -> io::Result<u64> {
             for (name, data) in &members {
-                app.add_bytes(name, 0, data)?;
+                app.add_bytes(name, if name.ends_with(TURTLE) { 8 } else { 0 }, data)?;
             }
             app.finish(&omit, &comment)
         };
         let end = write().map_err(|e| io_error(&path, e))?;
-        self.archive = Archive {
-            entries: self.app().entries(),
-            comment,
-            end,
-        };
+        self.archive = Archive::new(self.app().entries(), comment, end);
         Ok(n)
     }
 
@@ -1094,6 +1078,17 @@ mod tests {
                 continue; // replaced by the newer state; the old ones are under history/1/
             }
             assert_eq!(now.get(&name), Some(entry), "{name}");
+        }
+    }
+
+    #[test]
+    fn history_metadata_is_compressed() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        volume.close(&Signatures::default()).unwrap();
+        for name in [TURTLE, &history_member(1, TURTLE)] {
+            assert_eq!(volume.archive().get(name).unwrap().method, 8, "{name}");
         }
     }
 

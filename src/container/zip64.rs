@@ -36,17 +36,51 @@ impl CdEntry {
 }
 
 /// A central directory: the members of one state of the file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Archive {
     pub entries: Vec<CdEntry>,
     pub comment: Vec<u8>,
     /// the byte after the end-of-central-directory record
     pub end: u64,
+    /// name -> index of its last entry
+    index: std::collections::HashMap<Vec<u8>, usize>,
 }
 
+impl PartialEq for Archive {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.entries, &self.comment, self.end) == (&other.entries, &other.comment, other.end)
+    }
+}
+
+impl Eq for Archive {}
+
 impl Archive {
+    pub fn new(entries: Vec<CdEntry>, comment: Vec<u8>, end: u64) -> Self {
+        let index = entries.iter().enumerate().map(|(i, e)| (e.name.clone(), i)).collect();
+        Self {
+            entries,
+            comment,
+            end,
+            index,
+        }
+    }
+
+    /// The member of that name; of several, the last, as Python's zipfile reads it.
     pub fn get(&self, name: &str) -> Option<&CdEntry> {
-        self.entries.iter().find(|e| e.name == name.as_bytes())
+        self.index.get(name.as_bytes()).map(|&i| &self.entries[i])
+    }
+
+    /// Names listed more than once: ZIP readers disagree on which one they read.
+    pub fn duplicates(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut duplicates: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| !seen.insert(e.name.as_slice()))
+            .map(CdEntry::name_lossy)
+            .collect();
+        duplicates.dedup();
+        duplicates
     }
 }
 
@@ -153,7 +187,7 @@ pub fn read_archive(file: &mut File, end: u64) -> io::Result<Archive> {
         entries.push(entry);
         at = next;
     }
-    Ok(Archive { entries, comment, end })
+    Ok(Archive::new(entries, comment, end))
 }
 
 /// Replaces the 0xFFFFFFFF fields of a central directory entry with the values of its ZIP64 extra field.
@@ -588,6 +622,51 @@ mod tests {
         assert_eq!(find_last_end(&mut file, Some(end1)).unwrap(), Some(end1));
         // a wrong hint falls back to the scan
         assert_eq!(find_last_end(&mut file, Some(end1 + 1)).unwrap(), Some(end1));
+    }
+
+    /// Renames the central directory entry of `from` to `to` (same length): a crafted duplicate name.
+    pub(crate) fn rename_in_directory(path: &std::path::Path, from: &str, to: &str) {
+        assert_eq!(from.len(), to.len());
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes.windows(from.len()).rposition(|w| w == from.as_bytes()).unwrap();
+        bytes[at..at + to.len()].copy_from_slice(to.as_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn duplicate_names_are_reported_and_the_last_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
+        app.add_bytes("aaaa", 0, b"first").unwrap();
+        app.add_bytes("bbbb", 0, b"second").unwrap();
+        let end = app.finish(&[], b"").unwrap();
+        drop(app);
+        rename_in_directory(&dir.path().join("c.aff4l"), "bbbb", "aaaa");
+        let mut file = std::fs::File::open(dir.path().join("c.aff4l")).unwrap();
+        let archive = read_archive(&mut file, end).unwrap();
+        assert_eq!(archive.duplicates(), vec!["aaaa".to_string()]);
+        // like Python's zipfile: the last entry of a name is the one read
+        assert_eq!(content(&mut file, &archive, "aaaa"), b"second");
+    }
+
+    #[test]
+    fn lookups_stay_fast_with_many_members() {
+        let entries: Vec<CdEntry> = (0..50_000)
+            .map(|i| CdEntry {
+                name: format!("aff4://{i:036}").into_bytes(),
+                method: 0,
+                crc32: 0,
+                compressed_size: 0,
+                size: 0,
+                header_offset: i,
+            })
+            .collect();
+        let archive = Archive::new(entries, Vec::new(), 0);
+        let started = std::time::Instant::now();
+        for i in 0..50_000 {
+            assert!(archive.get(&format!("aff4://{i:036}")).is_some());
+        }
+        assert!(started.elapsed().as_millis() < 1000, "{:?}", started.elapsed());
     }
 
     #[test]
