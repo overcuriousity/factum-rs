@@ -5,7 +5,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
 use super::*;
-use crate::companion::Rating;
+use crate::companion::{Preset, Rating};
 use crate::signer::FakeSigner;
 
 struct Fixture {
@@ -411,6 +411,44 @@ fn settings_dialog_saves_trimmed_and_starts_thread() {
     assert_eq!(saved.model, "m");
     assert_eq!(saved.endpoint_url, "http://127.0.0.1:1");
     assert!(harness.state().companion.is_some());
+}
+
+/// Clicks a widget through AccessKit: a pointer click on a radio button in a freshly opened modal can be lost.
+fn click_label(harness: &mut Harness<'_, FactumApp>, label: &str) {
+    harness.get_by_label(label).click_accesskit();
+    harness.run_ok();
+}
+
+#[test]
+fn preset_choice_shows_builtin_read_only() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    click_label(&mut harness, "OSINT research");
+    assert_eq!(settings_dialog(&harness).draft.preset, Preset::Osint);
+    type_into(&mut harness, "Guideline", "X");
+    assert_eq!(settings_dialog(&harness).draft.global_guideline, "");
+}
+
+#[test]
+fn custom_text_survives_preset_switch() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    open_companion_settings(&mut harness);
+    click_label(&mut harness, "Custom");
+    // seeded from the preset chosen before
+    assert_eq!(
+        settings_dialog(&harness).draft.global_guideline,
+        crate::companion::prompts::DEFAULT_GUIDELINE
+    );
+    type_into(&mut harness, "Guideline", "Mine.");
+    click_label(&mut harness, "Forensics");
+    click_label(&mut harness, "Custom");
+    assert!(settings_dialog(&harness).draft.global_guideline.contains("Mine."));
+    click_label(&mut harness, "OK");
+    let saved = Settings::load(&CompanionDb::open_for(&fixture.path).unwrap()).unwrap();
+    assert_eq!(saved.preset, Preset::Custom);
+    assert!(saved.guideline().contains("Mine."));
 }
 
 #[test]

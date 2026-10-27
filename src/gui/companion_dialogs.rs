@@ -6,14 +6,13 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use egui::{Align, Layout, RichText, TextEdit};
+use egui::{RichText, TextEdit};
 
 use super::dialogs::{DialogResult, buttons, error_line, title};
 use super::theme::{self, SMALL_SIZE};
 use super::workers::Worker;
 use crate::companion::llm::{self, LlmError, ModelInfo};
-use crate::companion::prompts::DEFAULT_GUIDELINE;
-use crate::companion::{CompanionDb, Protocol, Settings};
+use crate::companion::{CompanionDb, Preset, Protocol, Settings};
 
 /// The model list is loaded this long after the last edit of URL, key, protocol or headers.
 const DEBOUNCE: Duration = Duration::from_millis(600);
@@ -193,7 +192,7 @@ impl CompanionSettingsDialog {
 
     /// Checks the draft and saves it, creating the companion database on first use; the error is shown in the
     /// dialog, which stays open with the draft.
-    fn save(&mut self) -> Option<Settings> {
+    pub fn save(&mut self) -> Option<Settings> {
         if !self.context_window.trim().is_empty() && self.context_window.trim().parse::<u32>().is_err() {
             self.error = Some("The context window is a number of tokens.".into());
             return None;
@@ -250,6 +249,33 @@ impl CompanionSettingsDialog {
     }
 
     fn fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.connection_fields(ui, ctx);
+        self.preset_fields(ui, ctx);
+        ui.checkbox(&mut self.draft.enabled, "Enabled");
+        self.endpoint_note(ui, ctx);
+        let p = *theme::current(ctx);
+        ui.horizontal(|ui| {
+            let testing = self.probe_worker.is_some();
+            if ui.add_enabled(!testing, egui::Button::new("Test connection")).clicked() {
+                self.test_connection(ctx);
+            }
+            if testing {
+                ui.spinner();
+            }
+            match &self.probe {
+                Some(Ok(_)) => {
+                    ui.label(RichText::new("✓ Reachable").color(p.ok));
+                }
+                Some(Err(line)) => {
+                    ui.label(RichText::new(format!("✗ {line}")).color(p.fail));
+                }
+                None => {}
+            }
+        });
+    }
+
+    /// Endpoint, protocol, key, headers, context window and model, with the model list.
+    pub fn connection_fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = *theme::current(ctx);
         let small = |text: &str| RichText::new(text).size(SMALL_SIZE).color(p.muted);
         let mut connection_edited = false;
@@ -350,26 +376,45 @@ impl CompanionSettingsDialog {
             }
         });
         ui.label(small(&self.models_status));
+    }
 
-        let guideline_label = ui.horizontal(|ui| {
-            let label = ui.label("Global guideline");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("Reset to default").clicked() {
-                    self.draft.global_guideline = DEFAULT_GUIDELINE.to_string();
-                }
-            });
-            label.id
-        });
+    /// The preset choice and its guideline; a built-in guideline is shown read-only.
+    pub fn preset_fields(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::current(ctx);
+        let small = |text: &str| RichText::new(text).size(SMALL_SIZE).color(p.muted);
+        ui.label("Companion preset");
+        for preset in Preset::ALL {
+            let before = self.draft.preset;
+            if ui.radio_value(&mut self.draft.preset, preset, preset.label()).changed()
+                && preset == Preset::Custom
+                && self.draft.global_guideline.trim().is_empty()
+            {
+                // a custom text starts from the guideline chosen before
+                self.draft.global_guideline = before.builtin_guideline().unwrap_or_default().to_string();
+            }
+            ui.label(small(preset.blurb()));
+        }
+        let guideline_label = ui.label("Guideline");
         // the dialog itself scrolls: a scroll area of its own here would catch the mouse wheel
-        ui.add(
-            TextEdit::multiline(&mut self.draft.global_guideline)
-                .desired_rows(6)
-                .desired_width(f32::INFINITY),
-        )
-        .labelled_by(guideline_label.inner);
+        match self.draft.preset.builtin_guideline() {
+            Some(text) => ui.add(
+                TextEdit::multiline(&mut { text })
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            ),
+            None => ui.add(
+                TextEdit::multiline(&mut self.draft.global_guideline)
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY),
+            ),
+        }
+        .labelled_by(guideline_label.id);
+    }
 
-        ui.checkbox(&mut self.draft.enabled, "Enabled");
-
+    /// Where case content goes, and through which proxy.
+    pub fn endpoint_note(&self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let p = *theme::current(ctx);
+        let small = |text: &str| RichText::new(text).size(SMALL_SIZE).color(p.muted);
         let url = self.draft.endpoint_url.trim();
         if !url.is_empty() {
             ui.label(format!("Case content is sent to {url}."));
@@ -379,24 +424,5 @@ impl CompanionSettingsDialog {
                 )));
             }
         }
-
-        ui.horizontal(|ui| {
-            let testing = self.probe_worker.is_some();
-            if ui.add_enabled(!testing, egui::Button::new("Test connection")).clicked() {
-                self.test_connection(ctx);
-            }
-            if testing {
-                ui.spinner();
-            }
-            match &self.probe {
-                Some(Ok(_)) => {
-                    ui.label(RichText::new("✓ Reachable").color(p.ok));
-                }
-                Some(Err(line)) => {
-                    ui.label(RichText::new(format!("✗ {line}")).color(p.fail));
-                }
-                None => {}
-            }
-        });
     }
 }
