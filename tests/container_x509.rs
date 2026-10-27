@@ -89,3 +89,20 @@ fn chain_without_root_is_refused() {
     let chain = gpgsm.chain(&home.leaf_fingerprint, &[home.file("root.pem")]).unwrap();
     assert_eq!(chain.matches("-----BEGIN CERTIFICATE-----").count(), 2);
 }
+
+#[test]
+fn signing_with_the_root_only_in_a_chain_file() {
+    let Some((home, gpgsm)) = home() else { return };
+    home.trusted();
+    let output = home.gpgsm(&["--delete-keys", &home.root_fingerprint], &[]).unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let (signature, chain) = gpgsm
+        .sign_with_chain(&home.leaf_fingerprint, b"data", &[home.file("root.pem")])
+        .unwrap();
+    assert_eq!(chain.matches("-----BEGIN CERTIFICATE-----").count(), 2);
+    let check = gpgsm.verify_detached(&signature, b"data");
+    assert!(check.valid && check.trusted, "{check:?}");
+    // trust still comes only from the trust list
+    let list = std::fs::read_to_string(home.path().join("trustlist.txt")).unwrap();
+    assert_eq!(list.lines().count(), 1);
+}

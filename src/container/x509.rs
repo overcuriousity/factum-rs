@@ -377,6 +377,21 @@ impl Gpgsm {
                 root.subject, root.fingerprint
             ));
         }
+        // gpgsm checks the chain from its own keybox when it signs: certificates given only as chain files are
+        // added to it (certificates only; whether a root is trusted stays with the trust list)
+        if !extra_pem.is_empty() {
+            let imported = self.run(None, &["--import"], chain.as_bytes())?;
+            if self
+                .follow(None, fingerprint)
+                .last()
+                .is_none_or(|c| !c.is_self_signed())
+            {
+                return Err(format!(
+                    "The chain files could not be added to gpgsm: {}",
+                    gpg_error(&imported.stderr)
+                ));
+            }
+        }
         let output = self.run(
             None,
             &[
