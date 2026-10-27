@@ -61,6 +61,7 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 
 - **GPG** for signing and verification: `gpg` on the `PATH` (Linux: the `gnupg2`/`gnupg` package; macOS:
   `brew install gnupg`; Windows: [Gpg4win](https://www.gpg4win.org/)). Without it, notes can still be written, unsigned.
+- **gpgsm** (part of GnuPG) only for X.509-signed evidence containers.
 - **GUI on Linux**: OpenGL (Mesa) and an X11 or Wayland session; nothing else is linked. The GUI's file dialogs use
   the desktop portal (`xdg-desktop-portal`); without it, type the folder into the text field.
 - Signing from the GUI needs a graphical pinentry (`pinentry-qt`, `pinentry-gnome3`, `pinentry-mac`, Gpg4win).
@@ -131,6 +132,35 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - It keeps its state in a second SQLite file next to the case database (`factum.companion.db`). That file holds the
   API key and content derived from the case, so treat it as exactly as sensitive as the case database. Deleting it
   loses ratings and settings, no evidence. `FACTUM_COMPANION_API_KEY` overrides the stored key and is never saved
+
+### Evidence containers
+- Preserve files themselves, not only their path and hash: an **evidence container** is a standard **AFF4-L v1.0**
+  file (`.aff4l`, ZIP64 inside) holding the files with their original path, timestamps, size, Unix mode and MD5,
+  SHA-1 and SHA-256, like an X-Ways evidence file container but in an open format. Files and folders come from a
+  mounted image or an export folder; links are recorded, not followed; devices and FIFOs are skipped
+- **Case → New Container…** creates one (optionally from an evidence item); its ⋯ menu or right-click in the case list
+  has **Add Files…**, **Add Folder…**, **Close Container**, **Reopen Container**, **Verify Container…**, **Locate…**
+  and **Show in Folder**. Adding asks for the base path (removed from the stored paths), whether to keep the path,
+  metadata only (hashed, not stored), and an excerpt (a byte range) for a single file. Progress and Cancel show in the
+  status bar; a cancelled or failed addition adds nothing
+- Every creation, addition (one entry per operation, listing every file with its hashes), close, reopen and late
+  signature is a **signed entry in the case log**. Archiving a case asks to close its open containers first
+- **Closing signs the container**: a GPG signature over `information.turtle`, which lists every file's hashes, plus an
+  X.509 (CMS) signature when **Settings → X.509 Certificate…** names a gpgsm certificate (the setup wizard offers it
+  too). Without a key the container can be closed unsigned and signed later (**Sign All Unsigned**)
+- Reopened and extended, a container keeps every closed state: its bytes never move, and each close's signed metadata
+  stays under `factum/history/<n>/`. A copy handed over after an earlier close still verifies
+- **Verify Container…** checks every stored file against its hashes, the metadata against its hash file, the GPG and
+  X.509 signatures (X.509 only against roots gpgsm trusts on this machine; revocation is not checked offline), every
+  closed state, and, for a container of this database, that the file matches the case log. Containers from other
+  tools get the AFF4-L v1.0 checks; older AFF4 formats are reported as unsupported
+- Recipients without factum run the script the container carries: extract `verify_container.py` and run
+  `python3 verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
+  `gpg` and `openssl` for the signatures)
+- Reports list each container with its files; the verification bundle carries the log entries, not the container
+- Limits: AFF4-L v1.0 is still a pre-release standard without signed reference images, so other tools may not yet
+  accept factum's X.509 signature; pyaff4 (the reference implementation) does not read AFF4-L v1.0 yet; metadata-only
+  files may look like broken files to tools that expect content for every file
 
 ### Setup wizard
 - On the first start with a new database, a wizard walks through the signing key, the companion (optional, with its

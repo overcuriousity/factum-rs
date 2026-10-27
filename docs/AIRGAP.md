@@ -96,6 +96,20 @@ factum --list-gpg && factum --set-active gpg <key-id>
 To verify bundles from colleagues offline, import their public keys and set the trust you have checked; or run
 `python3 verify.py bundle.zip --use-bundled-keys` and compare the printed fingerprints with a trusted list.
 
+### X.509 for evidence containers
+
+Containers can be signed with an X.509 certificate as well, through `gpgsm`, which ships with GnuPG (Gpg4win on
+Windows). Import the certificate with its private key and mark the root trusted after checking its fingerprint:
+
+```bash
+gpgsm --import examiner.p12
+echo "<root fingerprint, colon-separated> S relax" >> ~/.gnupg/trustlist.txt
+```
+
+factum signs only with a root that is already in the trust list; it never marks one trusted itself. Revocation is
+not checked (no CRL or OCSP offline); the verification says so. Recipients check the X.509 signature with
+`python3 verify_container.py <container>.aff4l --ca ROOT.pem`, which needs `openssl`.
+
 ## 4. Companion
 
 The optional analytical companion needs only an OpenAI- or Anthropic-compatible endpoint reachable on the lab network,

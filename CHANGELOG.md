@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Evidence containers: preserve files and folders (from a mounted image or an export folder) with their original
+  path, timestamps, size and MD5, SHA-1 and SHA-256 in a standard AFF4-L v1.0 container (`.aff4l`). Create, add to,
+  close and reopen them from the Case menu or the case list, like X-Ways evidence file containers; options for the
+  base path, keeping only file names, metadata only and an excerpt of one file. Progress and Cancel in the status bar
+- Every creation, addition, close, reopen and late signature of a container is a signed entry in the case log;
+  archiving a case asks to close its open containers first
+- Closing signs a container with GPG, and with X.509 (gpgsm) when Settings → X.509 Certificate… (or the setup wizard)
+  names a certificate; unsigned closes can be signed later with Sign All Unsigned. Every closed state is kept inside
+  the container, so an earlier copy still verifies
+- Verify Container…: stored files against their hashes, metadata, GPG and X.509 signatures, every closed state and
+  the case log; AFF4-L v1.0 checks for other tools' containers
+- `verify_container.py` inside every container, for recipients without factum (Python 3, `gpg`, `openssl`)
+- Reports list each container with its files
+
 ## [2.5.0] - 2026-10-27
 
 ### Added
