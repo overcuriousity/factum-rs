@@ -20,6 +20,7 @@ fn configure(f: &Fixture, endpoint_url: &str) {
         extra_headers: String::new(),
         model: "m".into(),
         context_window: Some(32000),
+        preset: factum::companion::Preset::Forensics,
         global_guideline: String::new(),
         enabled: true,
     };

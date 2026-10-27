@@ -10,6 +10,7 @@ pub mod enrich;
 pub mod fake_llm;
 #[cfg(feature = "gui")]
 pub mod llm;
+pub mod presets;
 pub mod prompts;
 pub mod questions;
 #[cfg(feature = "gui")]
@@ -28,6 +29,7 @@ use std::path::{Path, PathBuf};
 use crate::db::Db;
 use crate::error::Result;
 
+pub use presets::Preset;
 pub use questions::{Archetype, NewQuestion, PassKind, Question, QuestionEvent, QuestionState, RatedExample, Rating};
 pub use store::{CaseSettings, CompanionDb, Protocol, Settings};
 

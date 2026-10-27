@@ -477,6 +477,7 @@ mod tests {
             extra_headers: String::new(),
             model: "m".into(),
             context_window: None,
+            preset: crate::companion::Preset::Forensics,
             global_guideline: String::new(),
             enabled: true,
         }
