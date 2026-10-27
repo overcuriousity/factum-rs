@@ -37,6 +37,7 @@ pub struct WizardChoices {
     pub companion: Option<Box<CompanionSettingsDialog>>,
     /// the companion was declined while one is configured: it is disabled
     pub companion_off: bool,
+    /// empty: back to the folder next to the database
     pub seal_folder: Option<String>,
     pub theme: Option<String>,
 }
@@ -51,7 +52,7 @@ pub struct Wizard {
     pub use_companion: bool,
     companion_configured: bool,
     companion: Box<CompanionSettingsDialog>,
-    seal_folder: String,
+    pub(super) seal_folder: String,
     current_seal_folder: String,
     seal_env: Option<PathBuf>,
     theme: String,
@@ -169,9 +170,10 @@ impl Wizard {
             let placeholder = CompanionSettingsDialog::new(&Settings::default(), PathBuf::new());
             std::mem::replace(&mut self.companion, Box::new(placeholder))
         });
+        // an emptied field goes back to the folder next to the database
         let seal_folder = (!self.skipped(Step::SealFolder) && self.seal_env.is_none())
             .then(|| strip(&self.seal_folder).to_string())
-            .filter(|folder| !folder.is_empty() && *folder != self.current_seal_folder);
+            .filter(|folder| *folder != self.current_seal_folder);
         let theme = (!self.skipped(Step::Appearance))
             .then(|| self.theme.clone())
             .filter(|theme| *theme != self.previous_theme);

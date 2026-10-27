@@ -86,9 +86,11 @@ impl Factum<'_> {
 
     /// Changes the description of an evidence item; an unchanged text writes nothing.
     pub fn update_evidence_details(&self, evidence_id: i64, details: &str) -> Result<()> {
+        let deleted = || FactumError::general(format!("Evidence #{evidence_id} was deleted."));
         let evidence = match self.get_evidence(evidence_id)? {
-            Some(evidence) if !evidence.is_deleted() => evidence,
-            _ => {
+            Some(evidence) if evidence.is_deleted() => return Err(deleted()),
+            Some(evidence) => evidence,
+            None => {
                 return Err(FactumError::general(format!("Evidence #{evidence_id} does not exist.")));
             }
         };
@@ -97,6 +99,14 @@ impl Factum<'_> {
             return Ok(());
         }
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
+            // checked again inside the transaction: another process may have deleted it meanwhile
+            let deleted_utc: Option<String> =
+                conn.query_row("SELECT deleted_utc FROM evidence WHERE id = ?", [evidence_id], |row| {
+                    row.get(0)
+                })?;
+            if deleted_utc.is_some() {
+                return Err(deleted());
+            }
             conn.execute(
                 "UPDATE evidence SET details = ? WHERE id = ?",
                 params![details, evidence_id],

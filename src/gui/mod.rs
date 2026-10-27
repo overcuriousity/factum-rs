@@ -335,8 +335,14 @@ impl FactumApp {
         {
             self.update_gpg_status();
         }
-        if let Some(folder) = choices.seal_folder {
-            let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
+        match choices.seal_folder.as_deref() {
+            Some("") => {
+                let _ = self.db.delete_setting(SEAL_DIR_SETTING);
+            }
+            Some(folder) => {
+                let _ = self.db.set_setting(SEAL_DIR_SETTING, folder);
+            }
+            None => {}
         }
         match choices.theme {
             Some(theme) => self.set_theme(ctx, &theme),

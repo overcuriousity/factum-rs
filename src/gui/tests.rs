@@ -1016,3 +1016,24 @@ fn menu_opens_wizard() {
     assert!(wizard_open(&harness));
     screenshot(&mut harness, "wizard");
 }
+
+#[test]
+fn clearing_the_seal_folder_in_the_wizard_clears_the_setting() {
+    let fixture = Fixture::new();
+    let seals = tempfile::tempdir().unwrap();
+    fixture
+        .db()
+        .set_setting(SEAL_DIR_SETTING, &seals.path().display().to_string())
+        .unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().open_wizard();
+    harness.run_ok();
+    wizard_to(&mut harness, "Next", Step::SealFolder);
+    if let Some(Dialog::Wizard(wizard)) = harness.state_mut().dialogs.last_mut() {
+        wizard.seal_folder.clear();
+    }
+    wizard_to(&mut harness, "Next", Step::Summary);
+    assert!(harness.query_by_label("next to the database").is_some());
+    click_label(&mut harness, "Finish");
+    assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
+}

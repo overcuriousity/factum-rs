@@ -473,12 +473,38 @@ fn evidence_details_refused_when_archived_or_deleted() {
     let deleted = factum.create_evidence(case_id, "gone", "", "").unwrap();
     factum.delete_evidence(deleted).unwrap();
     let error = factum.update_evidence_details(deleted, "x").unwrap_err();
-    assert!(error.message.contains("does not exist"));
+    assert!(error.message.contains("was deleted"), "{}", error.message);
     let kept = factum.create_evidence(case_id, "disk", "", "").unwrap();
     factum.archive_case(case_id).unwrap();
     let error = factum.update_evidence_details(kept, "x").unwrap_err();
     assert!(error.is(ErrorKind::CaseArchived));
     assert_eq!(factum.get_evidence(kept).unwrap().unwrap().details, "");
+}
+
+#[test]
+fn evidence_deleted_while_signing_an_edit_is_refused() {
+    let f = Fixture::new();
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    let evidence_id = f.factum().create_evidence(case_id, "disk", "", "").unwrap();
+    let other_db = Db::open(&f.db.path).unwrap();
+    let other_signer = FakeSigner::new(true);
+    let mut once = true;
+    let signer = FakeSigner::new(true);
+    *signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        if std::mem::take(&mut once) {
+            Factum::with_seal_dir(&other_db, &other_signer, None)
+                .delete_evidence(evidence_id)
+                .unwrap();
+        }
+    }));
+    let factum = Factum::with_seal_dir(&f.db, &signer, None);
+    let error = factum.update_evidence_details(evidence_id, "late").unwrap_err();
+    assert!(error.message.contains("was deleted"), "{}", error.message);
+    assert_eq!(
+        system_events(&f.db, case_id).last().unwrap()["event"],
+        "evidence_deleted"
+    );
+    assert_eq!(factum.get_evidence(evidence_id).unwrap().unwrap().details, "");
 }
 
 #[test]

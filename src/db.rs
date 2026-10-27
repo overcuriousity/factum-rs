@@ -146,21 +146,42 @@ impl Db {
             return Ok(());
         }
         if version == 3 {
-            self.transaction(|conn| {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE evidence ADD COLUMN details TEXT NOT NULL DEFAULT ''; \
-                     PRAGMA user_version = {SCHEMA_VERSION};"
-                ))?;
-                Ok(())
-            })?;
-            log::info!("Database migrated to schema version {SCHEMA_VERSION}.");
-            return Ok(());
+            return self.migrate_from_3();
         }
         // databases before version 3 are not carried forward
         Err(FactumError::unsupported_database(format!(
             "This database was created by an older factum version and is not supported. Set FACTUM_DB to a new file. ({})",
             self.path.display()
         )))
+    }
+
+    /// Schema 3 → 4: adds the evidence description. Another process may have migrated since the version was read:
+    /// the version is read again under the write lock.
+    fn migrate_from_3(&self) -> Result<()> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let migrate = || -> Result<bool> {
+            let version: i64 = self.conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version != 3 {
+                return Ok(false);
+            }
+            self.conn.execute_batch(&format!(
+                "ALTER TABLE evidence ADD COLUMN details TEXT NOT NULL DEFAULT ''; \
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))?;
+            Ok(true)
+        };
+        match migrate().and_then(|migrated| Ok((migrated, self.conn.execute_batch("COMMIT")?))) {
+            Ok((migrated, ())) => {
+                if migrated {
+                    log::info!("Database migrated to schema version {SCHEMA_VERSION}.");
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Changes only when another connection commits, so the GUI can ignore its own writes.
@@ -323,6 +344,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!((name.as_str(), details.as_str()), ("disk", ""));
+    }
+
+    #[test]
+    fn migration_skips_a_database_another_process_already_migrated() {
+        // a second process read version 3 before the first one migrated
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.db");
+        let db = Db::open(&path).unwrap();
+        db.migrate_from_3().unwrap();
+        let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 4);
     }
 
     #[test]
