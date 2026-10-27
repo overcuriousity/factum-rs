@@ -380,6 +380,36 @@ fn close_without_key_then_sign_later() {
 }
 
 #[test]
+fn sign_later_works_in_an_archived_case() {
+    let s = Setup::with_signer(FakeSigner::new(false));
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    s.f.factum().close_container(id).unwrap();
+    s.f.factum().archive_case(s.case_id).unwrap();
+    s.f.signer.set_active(true);
+    let (count, skipped) = s.f.factum().sign_unsigned_containers(s.case_id).unwrap();
+    assert_eq!((count, skipped.len()), (1, 0), "{skipped:?}");
+}
+
+#[test]
+fn sign_later_goes_on_after_a_broken_container() {
+    let s = Setup::with_signer(FakeSigner::new(false));
+    let broken = s.create();
+    s.f.factum().close_container(broken).unwrap();
+    drop_history_1(&s.container_path());
+    let other =
+        s.f.factum()
+            .create_container(s.case_id, "Other", None, &s.f.path().join("other.aff4l"), "/")
+            .unwrap();
+    s.f.factum().close_container(other).unwrap();
+    s.f.signer.set_active(true);
+    let (count, skipped) = s.f.factum().sign_unsigned_containers(s.case_id).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(skipped.len(), 1);
+    assert!(skipped[0].contains(&format!("#{broken}")), "{}", skipped[0]);
+}
+
+#[test]
 fn sign_later_skips_missing_files() {
     let s = Setup::with_signer(FakeSigner::new(false));
     let id = s.create();
@@ -777,6 +807,30 @@ mod verify {
             .expect("a history failure");
         assert!(fail.message.contains("close 1"), "{}", fail.message);
         assert_eq!(report.states.len(), 1, "close 2 is still checked");
+    }
+
+    #[test]
+    fn an_unreadable_member_is_a_finding() {
+        use factum::container::zip64::read_archive;
+        let s = Setup::new();
+        closed_with_files(&s);
+        let path = s.container_path();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let entry = read_archive(&mut file, len)
+            .unwrap()
+            .get("factum/history/1/information.turtle.hashes")
+            .unwrap()
+            .clone();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[entry.header_offset as usize..entry.header_offset as usize + 4].copy_from_slice(b"XXXX");
+        std::fs::write(&path, bytes).unwrap();
+        let report = verify(&s, &path);
+        assert!(
+            codes(&report, Level::Fail).contains(&"turtle_hash"),
+            "{:?}",
+            report.findings
+        );
     }
 
     #[test]

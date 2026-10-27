@@ -823,7 +823,15 @@ impl Factum<'_> {
                     continue;
                 }
             };
-            let turtle = volume.member(&history_member(n, TURTLE))?;
+            let turtle = match volume.member(&history_member(n, TURTLE)) {
+                Ok(turtle) => turtle,
+                Err(e) => {
+                    skipped.push(format!(
+                        "Container #{id}: its closed state {n} cannot be read ({e}); not signed."
+                    ));
+                    continue;
+                }
+            };
             if hex::encode(sha2::Sha256::digest(&turtle)) != close.turtle_sha256 {
                 skipped.push(format!(
                     "Container #{id}: its closed state {n} differs from the case log; not signed."
@@ -852,6 +860,8 @@ impl Factum<'_> {
                                              "turtle_sha256": close.turtle_sha256,
                                              "signatures": signatures_json(&gpg, &x509), "signed_utc": utc_now()})),
                         on_commit: Some(&add),
+                        // like late signatures of entries: signing what was closed changes nothing in the case
+                        allow_archived: true,
                         ..Default::default()
                     },
                 )

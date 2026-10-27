@@ -1437,9 +1437,10 @@ impl FactumApp {
     fn sign_all_unsigned(&mut self, case_id: i64) {
         let result = self.factum().sign_all_unsigned(case_id);
         let Some(count) = self.run(result) else { return };
-        let result = self.factum().sign_unsigned_containers(case_id);
-        let Some((containers, skipped)) = self.run(result) else {
-            return;
+        // the entries are signed already: say so even when the containers are not
+        let (containers, skipped) = match self.factum().sign_unsigned_containers(case_id) {
+            Ok(done) => done,
+            Err(e) => (0, vec![format!("Containers: {e}")]),
         };
         let mut text = format!("Signed {} item(s).", count + containers);
         if !skipped.is_empty() {

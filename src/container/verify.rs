@@ -98,6 +98,28 @@ fn read_member(file: &mut File, archive: &Archive, name: &str) -> Option<io::Res
     )
 }
 
+/// A member's content; one that is listed but cannot be read is a failure (with `code`), not an error.
+fn read_checked(
+    file: &mut File,
+    archive: &Archive,
+    name: &str,
+    code: &'static str,
+    findings: &mut Vec<Finding>,
+) -> Option<Vec<u8>> {
+    match read_member(file, archive, name)? {
+        Ok(data) => Some(data),
+        Err(e) => {
+            findings.push(Finding::new(
+                Level::Fail,
+                code,
+                format!("{name} cannot be read ({e})."),
+                Ref::default(),
+            ));
+            None
+        }
+    }
+}
+
 fn hash_value(graph: &Graph, subject: &str, algorithm: &str) -> Option<String> {
     graph
         .objects(subject, &format!("{AFF4_NS}hash"))
@@ -627,14 +649,25 @@ pub fn verify_file(
     }
     let mut parsed = Vec::new();
     for n in closes.iter().copied() {
-        let turtle = read_member(&mut file, &archive, &history_member(n, TURTLE))
-            .transpose()?
-            .unwrap_or_default();
-        let hashes = read_member(&mut file, &archive, &history_member(n, HASHES)).transpose()?;
+        let turtle = read_checked(
+            &mut file,
+            &archive,
+            &history_member(n, TURTLE),
+            "history",
+            &mut report.findings,
+        )
+        .unwrap_or_default();
+        let hashes = read_checked(
+            &mut file,
+            &archive,
+            &history_member(n, HASHES),
+            "turtle_hash",
+            &mut report.findings,
+        );
         parsed.push((Some(n), n == count && turtle == current_turtle, turtle, hashes));
     }
     if count == 0 || parsed.last().is_some_and(|p| !p.1) {
-        let hashes = read_member(&mut file, &archive, HASHES).transpose()?;
+        let hashes = read_checked(&mut file, &archive, HASHES, "turtle_hash", &mut report.findings);
         parsed.push((None, true, current_turtle.clone(), hashes));
     }
     let mut states = Vec::new();
@@ -679,7 +712,13 @@ pub fn verify_file(
             findings: check_turtle_hashes(&state.turtle, state.hashes.as_deref(), &label),
         };
         let (gpg_name, x509_name) = signature_names(state.close);
-        if let Some(signature) = read_member(&mut file, &archive, &gpg_name).transpose()? {
+        if let Some(signature) = read_checked(
+            &mut file,
+            &archive,
+            &gpg_name,
+            "signature_invalid",
+            &mut result.findings,
+        ) {
             let check = gpg_check(signer, &String::from_utf8_lossy(&signature), &state.turtle);
             result.findings.extend(Factum::signature_findings(
                 &check,
@@ -688,7 +727,7 @@ pub fn verify_file(
             ));
             result.gpg = Some(check);
         }
-        if let Some(signature) = read_member(&mut file, &archive, &x509_name).transpose()? {
+        if let Some(signature) = read_checked(&mut file, &archive, &x509_name, "x509_invalid", &mut result.findings) {
             let check = gpgsm.verify_detached(&String::from_utf8_lossy(&signature), &state.turtle);
             result
                 .findings
@@ -710,8 +749,14 @@ pub fn verify_file(
         // the root signatures of a closed current state are that close's
         if let (Some(n), true) = (state.close, state.current) {
             for name in [SIG_GPG, KEY_GPG, SIG_X509, CER_X509] {
-                let root = read_member(&mut file, &archive, name).transpose()?;
-                let kept = read_member(&mut file, &archive, &history_member(n, name)).transpose()?;
+                let root = read_checked(&mut file, &archive, name, "history", &mut result.findings);
+                let kept = read_checked(
+                    &mut file,
+                    &archive,
+                    &history_member(n, name),
+                    "history",
+                    &mut result.findings,
+                );
                 if root.is_some() && root != kept {
                     result.findings.push(Finding::new(
                         Level::Fail,
