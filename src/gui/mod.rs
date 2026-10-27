@@ -167,6 +167,13 @@ struct AddJob {
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A container file being verified.
+struct ContainerVerifyJob {
+    worker: workers::Worker<workers::ContainerVerifyResult>,
+    progress: Arc<workers::Progress>,
+    started: Instant,
+}
+
 struct VerifyJob {
     worker: workers::Worker<workers::VerifyResult>,
     progress: Arc<workers::Progress>,
@@ -212,6 +219,8 @@ struct FactumApp {
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
     add_job: Option<AddJob>,
+    container_verify_job: Option<ContainerVerifyJob>,
+    container_verify_windows: Vec<containers::ContainerVerifyWindow>,
     /// each case's last verification in this session: outcome, time and the tree size it covered
     verified: HashMap<i64, (Level, String, i64)>,
     dialogs: Vec<Dialog>,
@@ -316,6 +325,8 @@ impl FactumApp {
             signature_check_pending: false,
             verify_job: None,
             add_job: None,
+            container_verify_job: None,
+            container_verify_windows: Vec::new(),
             verified: HashMap::new(),
             dialogs: Vec::new(),
             verify_windows: Vec::new(),
@@ -371,6 +382,21 @@ impl FactumApp {
             default_seal_folder: self.factum().default_seal_dir().display().to_string(),
             seal_env: self.env_seal_dir.clone(),
             theme: self.theme.clone(),
+            x509_certs: crate::container::x509::Gpgsm::new(self.signer.gpg_home()).list_secret_certs(),
+            x509: Some(
+                self.db
+                    .get_setting(crate::container::x509::X509_CERT_SETTING)
+                    .unwrap_or_default(),
+            )
+            .filter(|s| !s.is_empty()),
+            x509_chain: self
+                .db
+                .get_setting(crate::container::x509::X509_CHAIN_SETTING)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .filter(|l| !l.trim().is_empty())
+                .collect(),
         });
         self.dialogs.push(Dialog::Wizard(Box::new(wizard)));
     }
@@ -381,6 +407,9 @@ impl FactumApp {
             && self.signer.set_active_key(&self.db, &key)
         {
             self.update_gpg_status();
+        }
+        if let Some((certificate, chain_files)) = choices.x509 {
+            self.save_x509(certificate, chain_files);
         }
         match choices.seal_folder.as_deref() {
             Some("") => {
@@ -841,6 +870,22 @@ impl FactumApp {
                 Err(message) => self.message("Factum", format!("Verification failed: {message}")),
             }
         }
+        if let Some(job) = self.container_verify_job.as_mut()
+            && let Some(result) = job.worker.poll()
+        {
+            self.container_verify_job = None;
+            match result {
+                Ok(report) => {
+                    self.next_window_id += 1;
+                    self.container_verify_windows.push(containers::ContainerVerifyWindow {
+                        id: self.next_window_id,
+                        report,
+                        open: true,
+                    });
+                }
+                Err(message) => self.message("Factum", format!("Verification failed: {message}")),
+            }
+        }
         if let Some(job) = self.add_job.as_mut() {
             if let Some(result) = job.worker.poll() {
                 let job = self.add_job.take().expect("polled");
@@ -940,6 +985,57 @@ impl FactumApp {
         self.focused_card = None;
         self.dirty = true;
         self.send_companion(Command::Selected(self.current_case_id()));
+    }
+
+    /// Verifies a container file in the background; the result opens in a window.
+    fn verify_container_file(&mut self, path: PathBuf) {
+        if self
+            .container_verify_job
+            .as_ref()
+            .is_some_and(|job| job.worker.is_running())
+        {
+            self.message("Factum", "A verification is already running.");
+            return;
+        }
+        let ctx = self.egui_ctx.clone();
+        let (worker, progress) = workers::verify_container(&ctx, self.db.path.clone(), self.signer.gpg_home(), path);
+        self.container_verify_job = Some(ContainerVerifyJob {
+            worker,
+            progress,
+            started: Instant::now(),
+        });
+    }
+
+    fn open_x509(&mut self) {
+        let gpgsm = crate::container::x509::Gpgsm::new(self.signer.gpg_home());
+        let setting = |key: &str| self.db.get_setting(key).unwrap_or_default();
+        self.dialogs.push(Dialog::X509 {
+            available: gpgsm.available(),
+            certs: gpgsm.list_secret_certs(),
+            selected: Some(setting(crate::container::x509::X509_CERT_SETTING)).filter(|s| !s.is_empty()),
+            chain_files: setting(crate::container::x509::X509_CHAIN_SETTING)
+                .lines()
+                .map(str::to_string)
+                .filter(|l| !l.trim().is_empty())
+                .collect(),
+        });
+    }
+
+    /// The X.509 certificate that signs containers, and the chain files; None and empty remove them.
+    fn save_x509(&mut self, certificate: Option<String>, chain_files: Vec<String>) {
+        use crate::container::x509::{X509_CERT_SETTING, X509_CHAIN_SETTING};
+        let result = match certificate {
+            Some(fingerprint) => self.db.set_setting(X509_CERT_SETTING, &fingerprint),
+            None => self.db.delete_setting(X509_CERT_SETTING),
+        }
+        .and_then(|_| {
+            if chain_files.is_empty() {
+                self.db.delete_setting(X509_CHAIN_SETTING)
+            } else {
+                self.db.set_setting(X509_CHAIN_SETTING, &chain_files.join("\n"))
+            }
+        });
+        self.run(result);
     }
 
     fn locate_container(&mut self, id: i64, path: &std::path::Path) {
@@ -1105,8 +1201,11 @@ impl FactumApp {
                     self.open_add_to_container(id, picked);
                 }
             }
-            // verifying follows in the next step of this feature
-            ContainerAction::Verify(_) => {}
+            ContainerAction::Verify(id) => {
+                if let Some(path) = summary(self, id).and_then(|s| s.path) {
+                    self.verify_container_file(path);
+                }
+            }
         }
         self.dirty = true;
     }
@@ -1528,6 +1627,10 @@ impl FactumApp {
                     self.select_container(id);
                 }
             }
+            DialogResult::X509 {
+                certificate,
+                chain_files,
+            } => self.save_x509(certificate, chain_files),
             DialogResult::AddToContainer {
                 container_id,
                 sources,
@@ -1966,6 +2069,9 @@ impl FactumApp {
                 if ui.button("Signing Key…").clicked() {
                     self.open_gpg_keys();
                 }
+                if ui.button("X.509 Certificate…").clicked() {
+                    self.open_x509();
+                }
                 if ui
                     .add_enabled(
                         self.signer.active_key().is_some(),
@@ -2066,6 +2172,13 @@ impl FactumApp {
             .clicked()
         {
             self.verify_case(ctx, case_id.unwrap());
+        }
+        if ui.button("Verify Container…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("AFF4-L container", &["aff4l", "aff4"])
+                .pick_file()
+        {
+            self.verify_container_file(path);
         }
         if ui
             .add_enabled(case_id.is_some(), egui::Button::new("Seal Now"))
@@ -2899,20 +3012,31 @@ impl FactumApp {
     }
 
     fn verification_progress(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.verify_job else { return };
-        if job.started.elapsed() < Duration::from_millis(300) {
+        let (started, progress, text) = match (&self.verify_job, &self.container_verify_job) {
+            (Some(job), _) => (job.started, job.progress.clone(), "Verifying case…"),
+            (None, Some(job)) => (job.started, job.progress.clone(), "Verifying container…"),
+            (None, None) => return,
+        };
+        if started.elapsed() < Duration::from_millis(300) {
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
-        let done = job.progress.done.load(Ordering::Relaxed);
-        let total = job.progress.total.load(Ordering::Relaxed);
+        let done = progress.done.load(Ordering::Relaxed);
+        let total = progress.total.load(Ordering::Relaxed);
+        // entries for a case, bytes for a container
+        let counted = if self.verify_job.is_some() {
+            format!("{done} / {total}")
+        } else {
+            let size = |n: usize| crate::containers::human_size(n as u64);
+            format!("{} / {}", size(done), size(total))
+        };
         egui::Modal::new(egui::Id::unique("verify-progress"))
             .frame(theme::dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.set_width(320.0);
-                ui.label("Verifying case…");
+                ui.label(text);
                 let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
-                ui.add(egui::ProgressBar::new(fraction).text(format!("{done} / {total}")));
+                ui.add(egui::ProgressBar::new(fraction).text(counted));
             });
     }
 }
@@ -3097,6 +3221,16 @@ impl eframe::App for FactumApp {
                         self.message("Factum", format!("Seal #{tree_head_id} signed."));
                     }
                 }
+            }
+        }
+        let mut container_verify_actions = Vec::new();
+        for window in &mut self.container_verify_windows {
+            window.show(&ctx, &mut container_verify_actions);
+        }
+        self.container_verify_windows.retain(|w| w.open);
+        for action in container_verify_actions {
+            if let VerifyAction::ShowEntry(entry_id) = action {
+                self.jump_to_entry(entry_id);
             }
         }
         let mut window_actions = Vec::new();

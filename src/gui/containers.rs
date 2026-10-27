@@ -4,11 +4,15 @@ use std::path::Path;
 
 use egui::{Align, Layout, RichText};
 
+use super::dialogs::{VerifyAction, plural, report_window, verdict_color, verdict_mark};
 use super::icons;
 use super::theme::{self, MONO_SIZE, SMALL_SIZE};
 use super::widgets::{self, IconButton};
+use crate::container::FACTUM_NS;
+use crate::container::verify::{ContainerFormat, ContainerReport};
 use crate::container::volume::AddProgress;
 use crate::containers::{ContainerDetail, ContainerSummary, human_size};
+use crate::verifier::{Finding, Level};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerAction {
@@ -265,4 +269,145 @@ pub fn container_view(
                 });
             }
         });
+}
+
+/// The result of Verify Container, beside the main window like Verify Case.
+pub struct ContainerVerifyWindow {
+    pub id: u64,
+    pub report: ContainerReport,
+    pub open: bool,
+}
+
+impl ContainerVerifyWindow {
+    pub fn show(&mut self, ctx: &egui::Context, actions: &mut Vec<VerifyAction>) {
+        let report = &self.report;
+        let name = report
+            .graph
+            .as_ref()
+            .zip(report.uuid.as_ref())
+            .and_then(|(graph, uuid)| {
+                graph
+                    .first_value(&format!("aff4://{uuid}"), &format!("{FACTUM_NS}containerName"))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| {
+                report
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+        let heading = format!("Verify Container {name}");
+        let offset = 24.0 * (self.id % 5) as f32;
+        report_window(
+            ctx,
+            egui::Id::unique(("container-verify-window", self.id)),
+            &heading,
+            &mut self.open,
+            [720.0, 480.0],
+            offset,
+            |ui| {
+                let p = *theme::current(ui.ctx());
+                let overall = report.overall();
+                let fails: Vec<&Finding> = report.findings.iter().filter(|f| f.level == Level::Fail).collect();
+                let warnings: Vec<&Finding> = report.findings.iter().filter(|f| f.level == Level::Warn).collect();
+                let verdict = match overall {
+                    Level::Ok => format!("{} files verified", report.checked_files),
+                    Level::Warn => plural(warnings.len(), "warning"),
+                    Level::Fail if warnings.is_empty() => plural(fails.len(), "failure"),
+                    Level::Fail => format!(
+                        "{}, {}",
+                        plural(fails.len(), "failure"),
+                        plural(warnings.len(), "warning")
+                    ),
+                };
+                ui.label(
+                    RichText::new(format!("{} {verdict}", verdict_mark(overall)))
+                        .size(theme::NOTE_SIZE)
+                        .family(theme::bold())
+                        .color(verdict_color(ui, overall)),
+                );
+                let format = match report.format {
+                    ContainerFormat::Factum => "AFF4-L v1.0, written by factum",
+                    ContainerFormat::Aff4l => "AFF4-L v1.0, written by another tool",
+                    ContainerFormat::Legacy => "AFF4 before AFF4-L v1.0 (not supported)",
+                    ContainerFormat::NotAff4 => "not an AFF4 container",
+                };
+                ui.label(small(format!("{} · {format}", report.path.display()), p.muted));
+                ui.separator();
+                egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+                    for state in &report.states {
+                        ui.label(RichText::new(&state.label).family(theme::bold()).color(p.text));
+                        let gpg = match &state.gpg {
+                            Some(check) => format!(
+                                "GPG {} {} ({})",
+                                if check.valid { "\u{2713}" } else { "\u{2717}" },
+                                check.username.as_deref().unwrap_or("unknown signer"),
+                                check.fingerprint.as_deref().unwrap_or("?")
+                            ),
+                            None => "GPG: no signature".into(),
+                        };
+                        ui.label(small(gpg, p.secondary));
+                        if let Some(check) = &state.x509 {
+                            ui.label(small(
+                                format!(
+                                    "X.509 {} {} · root {} ({}) · {}",
+                                    if check.valid && check.trusted {
+                                        "\u{2713}"
+                                    } else {
+                                        "\u{2717}"
+                                    },
+                                    check.signer_subject.as_deref().unwrap_or("unknown signer"),
+                                    check.root_subject.as_deref().unwrap_or("unknown"),
+                                    check.root_fingerprint.as_deref().unwrap_or("?"),
+                                    check.status
+                                ),
+                                p.secondary,
+                            ));
+                        }
+                        ui.label(small(
+                            format!("{} files listed · SHA-256 {}", state.files, state.turtle_sha256),
+                            p.muted,
+                        ));
+                        ui.add_space(4.0);
+                    }
+                    if let Some(log) = &report.log {
+                        let state = match log.matches_close {
+                            Some(n) => format!("Case log: container #{}, in the state of close {n}", log.container_id),
+                            None => format!("Case log: container #{}, open", log.container_id),
+                        };
+                        ui.label(small(state, p.secondary));
+                        for line in &log.recorded_after {
+                            ui.label(small(format!("  recorded after it: {line}"), p.muted));
+                        }
+                        ui.add_space(4.0);
+                    }
+                    for (heading, list, open) in [("Failures", &fails, true), ("Warnings", &warnings, fails.is_empty())]
+                    {
+                        if list.is_empty() {
+                            continue;
+                        }
+                        egui::CollapsingHeader::new(format!("{heading} {}", list.len()))
+                            .default_open(open)
+                            .show(ui, |ui| {
+                                for finding in list.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(verdict_mark(finding.level))
+                                                .color(verdict_color(ui, finding.level)),
+                                        );
+                                        ui.add(egui::Label::new(finding.message.as_str()).wrap());
+                                        if let Some(entry_id) = finding.entry_id
+                                            && IconButton::new(icons::SHOW, "Show entry").show(ui).clicked()
+                                        {
+                                            actions.push(VerifyAction::ShowEntry(entry_id));
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                });
+            },
+        );
+    }
 }

@@ -169,3 +169,35 @@ pub fn add_to_container(
     });
     (worker, progress)
 }
+
+pub type ContainerVerifyResult = Result<crate::container::verify::ContainerReport, String>;
+
+/// Verifies a container file on a thread of its own; progress in bytes.
+pub fn verify_container(
+    ctx: &egui::Context,
+    db_path: PathBuf,
+    gpg_home: Option<PathBuf>,
+    path: PathBuf,
+) -> (Worker<ContainerVerifyResult>, Arc<Progress>) {
+    let progress = Arc::new(Progress {
+        done: AtomicUsize::new(0),
+        total: AtomicUsize::new(0),
+    });
+    let shared = progress.clone();
+    let repaint = ctx.clone();
+    let worker = Worker::spawn(ctx, move || {
+        let db = Db::open(&db_path).map_err(|e| e.to_string())?;
+        let signer = GnupgSigner::without_key(gpg_home.clone());
+        let factum = Factum::new(&db, &signer);
+        let gpgsm = crate::container::x509::Gpgsm::new(gpg_home);
+        let report_progress = |done: u64, total: u64| {
+            shared.done.store(done as usize, Ordering::Relaxed);
+            shared.total.store(total as usize, Ordering::Relaxed);
+            repaint.request_repaint();
+        };
+        factum
+            .verify_container_file(&path, &gpgsm, &report_progress, &AtomicBool::new(false))
+            .map_err(|e| e.to_string())
+    });
+    (worker, progress)
+}

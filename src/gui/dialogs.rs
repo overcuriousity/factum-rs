@@ -11,6 +11,7 @@ use super::widgets::{IconButton, actions_shown, remember_shown, visible_ui};
 use super::wizard::{SEAL_EXPLAINED, SEAL_FOLDER_EXPLAINED, Wizard, WizardChoices};
 use crate::companion::Settings;
 use crate::container::volume::AddOptions;
+use crate::container::x509::X509Cert;
 use crate::pystr::{head, splitlines, strip};
 use crate::signer::GpgKey;
 use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, SignatureCheck};
@@ -139,6 +140,13 @@ pub enum Dialog {
         base: String,
         error: Option<String>,
     },
+    X509 {
+        /// gpgsm is installed
+        available: bool,
+        certs: Vec<X509Cert>,
+        selected: Option<String>,
+        chain_files: Vec<String>,
+    },
     AddToContainer {
         container_id: i64,
         sources: Vec<PathBuf>,
@@ -190,6 +198,10 @@ pub enum DialogResult {
         container_id: i64,
         sources: Vec<PathBuf>,
         options: AddOptions,
+    },
+    X509 {
+        certificate: Option<String>,
+        chain_files: Vec<String>,
     },
     TypedConfirmed {
         case_id: i64,
@@ -280,6 +292,59 @@ pub(super) fn folder_field(ui: &mut egui::Ui, folder: &mut String, label: Option
             }
         });
     });
+}
+
+/// The signing certificates (one radio row each) and the chain files: the X.509 dialog and the setup wizard.
+pub fn x509_fields(
+    ui: &mut egui::Ui,
+    certs: &[X509Cert],
+    selected: &mut Option<String>,
+    chain_files: &mut Vec<String>,
+) {
+    let p = *theme::current(ui.ctx());
+    for cert in certs {
+        let chosen = selected.as_deref() == Some(cert.fingerprint.as_str());
+        let row = ui.radio(chosen, &cert.subject).on_hover_text(format!(
+            "{}\nIssued by {}\nValid {} to {}",
+            grouped_fingerprint(&cert.fingerprint),
+            cert.issuer,
+            cert.not_before.get(..10).unwrap_or(&cert.not_before),
+            cert.not_after.get(..10).unwrap_or(&cert.not_after)
+        ));
+        if row.clicked() {
+            *selected = (!chosen).then(|| cert.fingerprint.clone());
+        }
+    }
+    if certs.is_empty() && selected.is_none() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Chain files").size(SMALL_SIZE).color(p.muted));
+        if IconButton::new(icons::PLUS, "Add chain file").show(ui).clicked()
+            && let Some(files) = rfd::FileDialog::new()
+                .add_filter("PEM certificates", &["pem", "crt", "cer"])
+                .pick_files()
+        {
+            chain_files.extend(files.into_iter().map(|f| f.display().to_string()));
+        }
+    });
+    let mut remove = None;
+    for (index, file) in chain_files.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(file).size(SMALL_SIZE).color(p.secondary));
+            if IconButton::new(icons::CLOSE, "Remove").show(ui).clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        chain_files.remove(index);
+    }
+    note(
+        ui,
+        "Intermediate and root certificates (PEM), only if gpgsm does not have them.",
+    );
 }
 
 /// Anything to offer beyond what was typed?
@@ -576,7 +641,7 @@ fn first_line(text: &str) -> String {
         .unwrap_or_default()
 }
 
-fn verdict_color(ui: &egui::Ui, level: Level) -> egui::Color32 {
+pub(super) fn verdict_color(ui: &egui::Ui, level: Level) -> egui::Color32 {
     let p = theme::current(ui.ctx());
     match level {
         Level::Ok => p.ok,
@@ -586,7 +651,7 @@ fn verdict_color(ui: &egui::Ui, level: Level) -> egui::Color32 {
 }
 
 /// ✓, ⚠ or ✗: a status is never told by its colour alone.
-fn verdict_mark(level: Level) -> &'static str {
+pub(super) fn verdict_mark(level: Level) -> &'static str {
     match level {
         Level::Ok => "✓",
         Level::Warn => "⚠",
@@ -627,6 +692,7 @@ impl Dialog {
                     | Dialog::Correct { .. }
                     | Dialog::Shortcuts { .. }
                     | Dialog::CompanionSettings(_)
+                    | Dialog::X509 { .. }
                     | Dialog::Wizard(_) => 560.0,
                     _ => 460.0,
                 });
@@ -735,6 +801,50 @@ impl Dialog {
                     });
                 }
                 cancel.then_some(DialogResult::Cancel)
+            }
+            Dialog::X509 {
+                available,
+                certs,
+                selected,
+                chain_files,
+            } => {
+                title(ui, "X.509 Certificate");
+                note(
+                    ui,
+                    "Signs evidence containers in addition to GPG; the case log stays GPG-signed.",
+                );
+                ui.add_space(4.0);
+                if !*available {
+                    ui.label(RichText::new("gpgsm is not installed or not on the PATH.").color(p.warn));
+                    return close_button(ui, "Close").then_some(DialogResult::Cancel);
+                }
+                if certs.is_empty() {
+                    note(
+                        ui,
+                        "gpgsm has no certificate with a private key that can sign. Import one (gpgsm --import), \
+                         then open this again.",
+                    );
+                }
+                x509_fields(ui, certs, selected, chain_files);
+                let mut result = None;
+                button_row(ui, |ui| {
+                    if primary_button(ui, "Save", true, false) {
+                        result = Some(DialogResult::X509 {
+                            certificate: selected.clone(),
+                            chain_files: chain_files.clone(),
+                        });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(DialogResult::Cancel);
+                    }
+                    if ui.button("Clear").on_hover_text("Sign with GPG only").clicked() {
+                        result = Some(DialogResult::X509 {
+                            certificate: None,
+                            chain_files: Vec::new(),
+                        });
+                    }
+                });
+                result
             }
             Dialog::AddToContainer {
                 container_id,
@@ -1305,7 +1415,7 @@ pub(super) fn report_window(
         });
 }
 
-fn plural(count: usize, word: &str) -> String {
+pub(super) fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
 

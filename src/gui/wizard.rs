@@ -5,9 +5,12 @@ use std::path::PathBuf;
 use egui::RichText;
 
 use super::companion_dialogs::CompanionSettingsDialog;
-use super::dialogs::{DialogResult, error_line, folder_field, gpg_help_text, key_list, primary_button, title};
+use super::dialogs::{
+    DialogResult, error_line, folder_field, gpg_help_text, key_list, primary_button, title, x509_fields,
+};
 use super::theme::{self, MONO_SIZE, SMALL_SIZE, THEMES};
 use crate::companion::Settings;
+use crate::container::x509::{Gpgsm, X509Cert};
 use crate::pystr::strip;
 use crate::signer::{GnupgSigner, GpgKey, Signer};
 
@@ -47,6 +50,8 @@ pub struct WizardChoices {
     /// empty: back to the folder next to the database
     pub seal_folder: Option<String>,
     pub theme: Option<String>,
+    /// the X.509 certificate and chain files that sign containers
+    pub x509: Option<(Option<String>, Vec<String>)>,
 }
 
 pub struct Wizard {
@@ -72,6 +77,12 @@ pub struct Wizard {
     /// whether signing and seals are set up: without, the wizard leaves out the key and the seal folder
     pub integrity: bool,
     error: Option<String>,
+    /// gpgsm's certificates that can sign; the X.509 part of the signing key step shows only with some
+    pub x509_certs: Vec<X509Cert>,
+    x509: Option<String>,
+    x509_chain: Vec<String>,
+    current_x509: Option<String>,
+    current_x509_chain: Vec<String>,
 }
 
 /// What the wizard starts from: the current settings.
@@ -84,6 +95,9 @@ pub struct WizardStart {
     pub default_seal_folder: String,
     pub seal_env: Option<PathBuf>,
     pub theme: String,
+    pub x509_certs: Vec<X509Cert>,
+    pub x509: Option<String>,
+    pub x509_chain: Vec<String>,
 }
 
 fn theme_label(theme: &str) -> &'static str {
@@ -122,6 +136,11 @@ impl Wizard {
             skipped: Vec::new(),
             integrity: true,
             error: None,
+            x509_certs: start.x509_certs,
+            x509: start.x509.clone(),
+            x509_chain: start.x509_chain.clone(),
+            current_x509: start.x509,
+            current_x509_chain: start.x509_chain,
         };
         wizard.check_gpg();
         wizard
@@ -135,6 +154,11 @@ impl Wizard {
         } else {
             Vec::new()
         };
+    }
+
+    /// Asks gpgsm again for its certificates (Check again).
+    fn check_x509(&mut self) {
+        self.x509_certs = Gpgsm::new(self.gpg_home.clone()).list_secret_certs();
     }
 
     /// The steps this run goes through.
@@ -221,13 +245,22 @@ impl Wizard {
         let theme = (!self.skipped(Step::Appearance))
             .then(|| self.theme.clone())
             .filter(|theme| *theme != self.previous_theme);
+        let x509 = (self.x509_shown()
+            && (self.x509 != self.current_x509 || self.x509_chain != self.current_x509_chain))
+            .then(|| (self.x509.clone(), self.x509_chain.clone()));
         WizardChoices {
             key,
             companion,
             companion_off: companion_step && !self.use_companion && self.companion_configured,
             seal_folder,
             theme,
+            x509,
         }
+    }
+
+    /// The signing key step offers the X.509 certificate: gpgsm has one, and the step is part of this run.
+    fn x509_shown(&self) -> bool {
+        !self.x509_certs.is_empty() && !self.skipped(Step::Gpg)
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) -> Option<DialogResult> {
@@ -323,6 +356,7 @@ impl Wizard {
                     ui.label(RichText::new(gpg_help_text()).font(egui::FontId::monospace(MONO_SIZE)));
                     if ui.button("Check again").clicked() {
                         self.check_gpg();
+                        self.check_x509();
                     }
                 } else if self.keys.is_empty() {
                     ui.label(RichText::new("⚠ No signing key found. Create one, then check again:").color(p.warn));
@@ -332,11 +366,18 @@ impl Wizard {
                     );
                     if ui.button("Check again").clicked() {
                         self.check_gpg();
+                        self.check_x509();
                     }
                 } else {
                     key_list(ui, &self.keys, &mut self.key);
                 }
                 ui.label(small("Without one, notes stay unsigned until signed later."));
+                if !self.x509_certs.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("X.509 certificate (optional)").family(theme::bold()));
+                    ui.label(small("Also signs evidence containers."));
+                    x509_fields(ui, &self.x509_certs, &mut self.x509, &mut self.x509_chain);
+                }
             }
             Step::Companion => {
                 ui.label("Optional: a language model you choose reads the log and asks open questions.");
@@ -409,16 +450,31 @@ impl Wizard {
                 } else {
                     theme_label(&self.theme)
                 };
+                let x509 = self.x509_shown().then(|| {
+                    self.x509
+                        .as_ref()
+                        .map(|fingerprint| {
+                            self.x509_certs
+                                .iter()
+                                .find(|c| c.fingerprint == *fingerprint)
+                                .map_or(fingerprint.clone(), |c| c.subject.clone())
+                        })
+                        .unwrap_or_else(|| "not set".into())
+                });
+                let mut rows = vec![("Signing key", key.as_str())];
+                if let Some(x509) = &x509 {
+                    rows.push(("X.509 certificate", x509.as_str()));
+                }
+                rows.extend([
+                    ("Companion", companion.as_str()),
+                    ("Seal folder", seal_folder.as_str()),
+                    ("Theme", theme),
+                ]);
                 egui::Grid::new("wizard-summary")
                     .num_columns(2)
                     .spacing([16.0, 6.0])
                     .show(ui, |ui| {
-                        for (name, value) in [
-                            ("Signing key", key.as_str()),
-                            ("Companion", companion.as_str()),
-                            ("Seal folder", seal_folder.as_str()),
-                            ("Theme", theme),
-                        ] {
+                        for (name, value) in rows {
                             ui.label(RichText::new(name).color(p.muted));
                             let color = if value == unchanged { p.muted } else { p.text };
                             ui.label(RichText::new(value).color(color));

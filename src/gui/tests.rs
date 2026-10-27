@@ -1700,3 +1700,144 @@ fn close_and_reopen_from_the_menu() {
     harness.run_ok();
     assert!(harness.state().factum().container(id).unwrap().summary.open);
 }
+
+#[test]
+fn verify_container_opens_report_window() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().container_action(ContainerAction::Verify(id), &ctx);
+    run_until(&mut harness, |h| !h.state().container_verify_windows.is_empty());
+    harness.run_ok();
+    assert!(
+        harness
+            .query_all_by_label("Verify Container FS01 preserved")
+            .next()
+            .is_some()
+    );
+    // open and never closed, unsigned: nothing fails
+    assert!(harness.query_by_label_contains("\u{2713} 2 files verified").is_some());
+    screenshot(&mut harness, "verify_container");
+}
+
+fn x509_cert(fingerprint: &str, subject: &str) -> crate::container::x509::X509Cert {
+    crate::container::x509::X509Cert {
+        fingerprint: fingerprint.into(),
+        subject: subject.into(),
+        issuer: "CN=Root".into(),
+        issuer_fingerprint: "R".into(),
+        not_before: "2026-01-01T00:00:00Z".into(),
+        not_after: "2027-01-01T00:00:00Z".into(),
+        can_sign: true,
+        has_secret: true,
+    }
+}
+
+#[test]
+fn x509_dialog_without_gpgsm_says_so() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::X509 {
+        available: false,
+        certs: Vec::new(),
+        selected: None,
+        chain_files: Vec::new(),
+    });
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("gpgsm is not installed").is_some());
+}
+
+#[test]
+fn x509_result_saves_and_clears_settings() {
+    use crate::container::x509::{X509_CERT_SETTING, X509_CHAIN_SETTING};
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::X509 {
+        available: true,
+        certs: vec![x509_cert("ABC", "CN=Examiner One")],
+        selected: None,
+        chain_files: vec!["/certs/intermediate.pem".into()],
+    });
+    harness.run_ok();
+    click_label(&mut harness, "CN=Examiner One");
+    click_label(&mut harness, "Save");
+    let db = fixture.db();
+    assert_eq!(db.get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+    assert_eq!(db.get_setting(X509_CHAIN_SETTING).unwrap(), "/certs/intermediate.pem");
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_dialog_result(
+        DialogResult::X509 {
+            certificate: None,
+            chain_files: Vec::new(),
+        },
+        &ctx,
+    );
+    let db = fixture.db();
+    assert_eq!(db.get_setting(X509_CERT_SETTING).unwrap(), "");
+    assert_eq!(db.get_setting(X509_CHAIN_SETTING).unwrap(), "");
+}
+
+fn with_wizard_certs(harness: &mut Harness<'_, FactumApp>, certs: Vec<crate::container::x509::X509Cert>) {
+    if let Some(Dialog::Wizard(wizard)) = harness.state_mut().dialogs.last_mut() {
+        wizard.x509_certs = certs;
+    }
+    harness.run_ok();
+}
+
+#[test]
+fn wizard_hides_x509_without_certificates() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    with_wizard_certs(&mut harness, Vec::new());
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    assert!(harness.query_by_label("X.509 certificate (optional)").is_none());
+    wizard_to(&mut harness, "Next", Step::Summary);
+    assert!(harness.query_by_label("X.509 certificate").is_none());
+}
+
+#[test]
+fn wizard_x509_choice_applied_on_finish() {
+    use crate::container::x509::X509_CERT_SETTING;
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    with_wizard_certs(&mut harness, vec![x509_cert("ABC", "CN=Examiner One")]);
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    assert!(harness.query_by_label("X.509 certificate (optional)").is_some());
+    click_label(&mut harness, "CN=Examiner One");
+    screenshot(&mut harness, "wizard_x509");
+    wizard_to(&mut harness, "Next", Step::Summary);
+    assert!(harness.query_by_label("CN=Examiner One").is_some());
+    click_label(&mut harness, "Finish");
+    assert_eq!(fixture.db().get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+}
+
+#[test]
+fn wizard_prefills_and_keeps_x509() {
+    use crate::container::x509::{X509_CERT_SETTING, X509_CHAIN_SETTING};
+    let fixture = Fixture::new();
+    let db = fixture.db();
+    db.set_setting(X509_CERT_SETTING, "ABC").unwrap();
+    db.set_setting(X509_CHAIN_SETTING, "/certs/root.pem").unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().open_wizard();
+    harness.run_ok();
+    with_wizard_certs(&mut harness, vec![x509_cert("ABC", "CN=Examiner One")]);
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    let db = fixture.db();
+    assert_eq!(db.get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+    assert_eq!(db.get_setting(X509_CHAIN_SETTING).unwrap(), "/certs/root.pem");
+}
+
+#[test]
+fn not_now_leaves_x509_unchanged() {
+    use crate::container::x509::X509_CERT_SETTING;
+    let fixture = Fixture::empty();
+    fixture.db().set_setting(X509_CERT_SETTING, "ABC").unwrap();
+    let mut harness = fixture.harness();
+    with_wizard_certs(&mut harness, vec![x509_cert("XYZ", "CN=Other")]);
+    click_label(&mut harness, "Not now: skip signing and seals");
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    assert_eq!(fixture.db().get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+}
