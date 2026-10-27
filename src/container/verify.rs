@@ -593,12 +593,28 @@ pub fn verify_file(
         );
         return Ok(report);
     };
-    let count = (1..)
-        .take_while(|n| archive.get(&history_member(*n, TURTLE)).is_some())
-        .last()
-        .unwrap_or(0);
+    // every closed state kept, numbered from 1 without gaps: a gap is a closed state that was removed
+    let closes: std::collections::BTreeSet<u32> = archive
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let name = std::str::from_utf8(&e.name).ok()?;
+            name.strip_prefix("factum/history/")?
+                .strip_suffix(&format!("/{TURTLE}"))?
+                .parse()
+                .ok()
+        })
+        .collect();
+    let count = closes.last().copied().unwrap_or(0);
+    for missing in (1..count).filter(|n| !closes.contains(n)) {
+        report.finding(
+            Level::Fail,
+            "history",
+            format!("The closed state of close {missing} is missing from the container."),
+        );
+    }
     let mut parsed = Vec::new();
-    for n in 1..=count {
+    for n in closes.iter().copied() {
         let turtle = read_member(&mut file, &archive, &history_member(n, TURTLE))
             .transpose()?
             .unwrap_or_default();

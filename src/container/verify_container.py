@@ -399,11 +399,16 @@ def main(argv=None):
         fail("information.turtle is missing.")
         return 1
     states = []  # (label, prefix of its members, turtle, closed)
-    n = 1
-    while read(archive, "factum/history/%d/%s" % (n, TURTLE)) is not None:
+    closes = set()
+    for name in archive.namelist():
+        match = re.match(r"^factum/history/(\d+)/information\.turtle$", name)
+        if match:
+            closes.add(int(match.group(1)))
+    for missing in sorted(set(range(1, max(closes, default=0))) - closes):
+        fail("closed state %d is missing from the container (a removed close)." % missing)
+    for n in sorted(closes):
         states.append(("close %d" % n, "factum/history/%d/" % n, read(archive, "factum/history/%d/%s" % (n, TURTLE)),
                        True))
-        n += 1
     if not states or states[-1][2] != current:
         states.append(("current (open)", "", current, False))
     else:

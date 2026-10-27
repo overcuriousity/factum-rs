@@ -174,6 +174,23 @@ fn duplicate_member(path: &Path, arn: &str) {
     std::fs::write(path, bytes).unwrap();
 }
 
+/// Rewrites the directory without close 1's history members.
+fn drop_history_1(path: &Path) {
+    use factum::container::zip64::{Appender, read_archive};
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let dropped: Vec<String> = archive
+        .entries
+        .iter()
+        .map(|e| e.name_lossy())
+        .filter(|n| n.starts_with("factum/history/1/"))
+        .collect();
+    let omit: Vec<&str> = dropped.iter().map(String::as_str).collect();
+    let mut app = Appender::new(file, len, archive.entries.clone()).unwrap();
+    app.finish(&omit, &archive.comment).unwrap();
+}
+
 #[test]
 fn create_logs_event_with_spec_payload() {
     let s = Setup::new();
@@ -743,6 +760,26 @@ mod verify {
     }
 
     #[test]
+    fn a_missing_closed_state_fails() {
+        let s = Setup::new();
+        let id = closed_with_files(&s);
+        s.f.factum().reopen_container(id).unwrap();
+        s.add(id, &[s.file("c.txt")]);
+        s.f.factum().close_container(id).unwrap();
+        let copy = s.f.path().join("received.aff4l");
+        std::fs::copy(s.container_path(), &copy).unwrap();
+        drop_history_1(&copy);
+        let report = verify(&s, &copy);
+        let fail = report
+            .findings
+            .iter()
+            .find(|f| f.code == "history")
+            .expect("a history failure");
+        assert!(fail.message.contains("close 1"), "{}", fail.message);
+        assert_eq!(report.states.len(), 1, "close 2 is still checked");
+    }
+
+    #[test]
     fn unsigned_states_are_a_warning() {
         let s = Setup::new();
         let id = closed_with_files(&s);
@@ -1096,6 +1133,20 @@ mod script {
         };
         assert_eq!(code, 1, "{output}");
         assert!(output.contains("listed more than once: version.txt"), "{output}");
+    }
+
+    #[test]
+    fn script_fails_a_missing_closed_state() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        drop_history_1(&path);
+        let Some((code, output)) = run(&path, &[], Some(&home.path())) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("closed state 1 is missing"), "{output}");
+        assert!(output.contains("Close 2 (current)"), "{output}");
     }
 
     #[test]
