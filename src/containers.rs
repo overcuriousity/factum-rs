@@ -158,6 +158,66 @@ fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
 
+/// Differences between the files a container graph lists and the additions the log records up to entry `upto`.
+pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtle::Graph, upto: i64) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut fail = |message: String, entry_id: Option<i64>| {
+        findings.push(Finding::new(
+            Level::Fail,
+            "log_mismatch",
+            message,
+            Ref {
+                entry_id,
+                tree_head_id: None,
+            },
+        ));
+    };
+    let in_container: std::collections::HashMap<String, FileRecord> =
+        file_records(graph).into_iter().map(|r| (r.arn.clone(), r)).collect();
+    let mut in_log = std::collections::HashSet::new();
+    for (add, record) in detail.files().filter(|(add, _)| add.entry_id <= upto) {
+        in_log.insert(record.arn.clone());
+        match in_container.get(&record.arn) {
+            None => fail(
+                format!(
+                    "{} is in the case log (entry #{}) but not in the container.",
+                    record.path, add.entry_id
+                ),
+                Some(add.entry_id),
+            ),
+            Some(stored) if stored != record => fail(
+                format!(
+                    "{} differs between the container and the case log (entry #{}).",
+                    record.path, add.entry_id
+                ),
+                Some(add.entry_id),
+            ),
+            Some(_) => {}
+        }
+    }
+    for (arn, record) in &in_container {
+        if !in_log.contains(arn) {
+            fail(
+                format!(
+                    "{} is in the container but in no addition the case log records.",
+                    record.path
+                ),
+                None,
+            );
+        }
+    }
+    let adds: std::collections::HashSet<i64> = detail.adds.iter().map(|a| a.entry_id).collect();
+    for entry_id in task_entries(graph) {
+        if !adds.contains(&entry_id) {
+            fail(
+                format!("The container names log entry #{entry_id}, which is not an addition to it."),
+                None,
+            );
+        }
+    }
+    findings
+}
+
 impl Factum<'_> {
     /// The container events of a case (or of one container), in log order.
     fn container_events(&self, case_id: i64, uuid: Option<&str>) -> Result<Vec<Event>> {
@@ -453,65 +513,7 @@ impl Factum<'_> {
 
     /// Differences between the container file and the case log (spec 4.5); reported, never repaired.
     pub fn compare_with_log(&self, id: i64, volume: &Volume) -> Result<Vec<Finding>> {
-        let detail = self.container(id)?;
-        let mut findings = Vec::new();
-        let mut fail = |message: String, entry_id: Option<i64>| {
-            findings.push(Finding::new(
-                Level::Fail,
-                "log_mismatch",
-                message,
-                Ref {
-                    entry_id,
-                    tree_head_id: None,
-                },
-            ));
-        };
-        let in_container: std::collections::HashMap<String, FileRecord> = file_records(volume.graph())
-            .into_iter()
-            .map(|r| (r.arn.clone(), r))
-            .collect();
-        let mut in_log = std::collections::HashSet::new();
-        for (add, record) in detail.files() {
-            in_log.insert(record.arn.clone());
-            match in_container.get(&record.arn) {
-                None => fail(
-                    format!(
-                        "{} is in the case log (entry #{}) but not in the container.",
-                        record.path, add.entry_id
-                    ),
-                    Some(add.entry_id),
-                ),
-                Some(stored) if stored != record => fail(
-                    format!(
-                        "{} differs between the container and the case log (entry #{}).",
-                        record.path, add.entry_id
-                    ),
-                    Some(add.entry_id),
-                ),
-                Some(_) => {}
-            }
-        }
-        for (arn, record) in &in_container {
-            if !in_log.contains(arn) {
-                fail(
-                    format!(
-                        "{} is in the container but in no addition the case log records.",
-                        record.path
-                    ),
-                    None,
-                );
-            }
-        }
-        let adds: std::collections::HashSet<i64> = detail.adds.iter().map(|a| a.entry_id).collect();
-        for entry_id in task_entries(volume.graph()) {
-            if !adds.contains(&entry_id) {
-                fail(
-                    format!("The container names log entry #{entry_id}, which is not an addition to it."),
-                    None,
-                );
-            }
-        }
-        Ok(findings)
+        Ok(compare_records(&self.container(id)?, volume.graph(), i64::MAX))
     }
 
     fn ensure_matches_log(&self, id: i64, volume: &Volume) -> Result<()> {
@@ -831,5 +833,105 @@ impl Factum<'_> {
         self.db.set_setting(&path_setting(&uuid), &path.display().to_string())?;
         self.db.delete_setting(&end_setting(&uuid))?;
         Ok(())
+    }
+}
+
+impl Factum<'_> {
+    /// Verifies a container file (spec 4.6); for a container of this database also against its case log: the
+    /// closed states against the logged closes, the files against the logged additions, and what the log
+    /// recorded after the state the file is in.
+    pub fn verify_container_file(
+        &self,
+        path: &Path,
+        gpgsm: &Gpgsm,
+        progress: &dyn Fn(u64, u64),
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::container::verify::ContainerReport> {
+        let mut report = crate::container::verify::verify_file(path, self.signer, gpgsm, progress, cancel)?;
+        let (Some(uuid), Some(graph)) = (report.uuid.clone(), report.graph.clone()) else {
+            return Ok(report);
+        };
+        let Some(id) = self.find_container_by_uuid(&uuid)? else {
+            return Ok(report);
+        };
+        let detail = self.container(id)?;
+        let fail = |message: String, entry_id: Option<i64>| {
+            Finding::new(
+                Level::Fail,
+                "log_mismatch",
+                message,
+                Ref {
+                    entry_id,
+                    tree_head_id: None,
+                },
+            )
+        };
+        let mut findings = Vec::new();
+        for state in &report.states {
+            let Some(n) = state.close else { continue };
+            match detail.closes.get(n as usize - 1) {
+                Some(close) if close.turtle_sha256 == state.turtle_sha256 => {}
+                Some(close) => findings.push(fail(
+                    format!(
+                        "Closed state {n} differs from the close the case log records (entry #{}).",
+                        close.entry_id
+                    ),
+                    Some(close.entry_id),
+                )),
+                None => findings.push(fail(format!("Closed state {n} is not in the case log."), None)),
+            }
+        }
+        let current = report.states.iter().find(|s| s.current);
+        let matches_close = current.and_then(|s| s.close);
+        // the file at the container's place must hold everything the log records; a copy elsewhere may be older
+        let canonical = |p: &Path| std::fs::canonicalize(p).ok();
+        let live = detail
+            .summary
+            .path
+            .as_deref()
+            .and_then(canonical)
+            .is_some_and(|p| Some(p) == canonical(path));
+        let upto = match matches_close {
+            _ if live => i64::MAX,
+            Some(n) => detail.closes.get(n as usize - 1).map_or(i64::MAX, |c| c.entry_id),
+            None => task_entries(&graph).into_iter().max().unwrap_or(id),
+        };
+        findings.extend(compare_records(&detail, &graph, upto));
+        let mut after: Vec<(i64, String)> = Vec::new();
+        for add in detail.adds.iter().filter(|a| a.entry_id > upto) {
+            after.push((add.entry_id, format!("{} added", plural(add.files.len(), "file"))));
+        }
+        for close in detail.closes.iter().filter(|c| c.entry_id > upto) {
+            after.push((close.entry_id, "closed".into()));
+        }
+        for (entry_id, _) in detail.reopens.iter().filter(|(e, _)| *e > upto) {
+            after.push((*entry_id, "reopened".into()));
+        }
+        for (entry_id, ..) in detail.late_signatures.iter().filter(|(e, ..)| *e > upto) {
+            after.push((*entry_id, "signed".into()));
+        }
+        after.sort();
+        if live {
+            // the live file is in the newest state: its newest close is the log's newest (a reopen does not touch
+            // the file), and it is not open while the log has it closed
+            let lacking = match matches_close {
+                Some(n) => (n as usize) < detail.closes.len(),
+                None => !detail.summary.open,
+            };
+            if lacking {
+                findings.push(fail(
+                    "The container file is in an earlier state than the case log records: the log has a later close."
+                        .into(),
+                    None,
+                ));
+            }
+        }
+        report.findings.extend(findings);
+        report.log = Some(crate::container::verify::LogMatch {
+            container_id: id,
+            matches_close,
+            recorded_after: after.into_iter().map(|(e, text)| format!("#{e} {text}")).collect(),
+        });
+        Ok(report)
     }
 }

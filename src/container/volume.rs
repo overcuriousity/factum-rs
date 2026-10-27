@@ -223,6 +223,39 @@ pub fn task_entries(graph: &Graph) -> Vec<i64> {
         .collect()
 }
 
+/// The stored content of a FileImage (ZipSegment or ImageStream); None when it has none (metadata only, link).
+pub fn content_reader<'f>(
+    file: &'f mut File,
+    archive: &Archive,
+    graph: &Graph,
+    arn: &str,
+) -> io::Result<Option<Box<dyn Read + 'f>>> {
+    let number = |p: &str| graph.first_value(arn, p).and_then(|v| v.parse::<u64>().ok());
+    let missing = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("{arn}: {what} is missing"));
+    if graph.has_type(arn, &aff4("ZipSegment")) {
+        let entry = archive.get(arn).ok_or_else(|| missing("its ZIP member"))?;
+        return member_reader(file, entry).map(Some);
+    }
+    if graph.has_type(arn, &aff4("ImageStream")) {
+        let compression = graph
+            .objects(arn, &aff4("compressionMethod"))
+            .find_map(|t| t.iri().or(t.value()))
+            .unwrap_or(ZLIB)
+            .to_string();
+        return stream::image_stream_reader(
+            file,
+            archive,
+            arn,
+            number(&aff4("size")).ok_or_else(|| missing("aff4:size"))?,
+            number(&aff4("chunkSize")).unwrap_or(stream::CHUNK_SIZE),
+            number(&aff4("chunksInSegment")).unwrap_or(stream::CHUNKS_PER_SEGMENT),
+            &compression,
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
 fn volume_graph(uuid: &str, info: &VolumeInfo) -> Graph {
     let arn = format!("aff4://{uuid}");
     let mut graph = Graph::default();
@@ -528,37 +561,16 @@ impl Volume {
 
     /// The stored content of a file.
     pub fn read_file(&mut self, arn: &str) -> Result<Box<dyn Read + '_>> {
-        let graph = &self.graph;
-        let number = |p: &str| graph.first_value(arn, p).and_then(|v| v.parse::<u64>().ok());
-        let missing = || FactumError::general(format!("{arn} has no stored content."));
+        let path = self.path.clone();
         let file = self
             .app
             .as_mut()
             .expect("the volume is open")
             .file_mut()
-            .map_err(|e| io_error(&self.path, e))?;
-        if graph.has_type(arn, &aff4("ZipSegment")) {
-            let entry = self.archive.get(arn).ok_or_else(missing)?;
-            return member_reader(file, entry).map_err(|e| io_error(&self.path, e));
-        }
-        if graph.has_type(arn, &aff4("ImageStream")) {
-            let compression = graph
-                .objects(arn, &aff4("compressionMethod"))
-                .find_map(|t| t.iri().or(t.value()))
-                .unwrap_or(ZLIB)
-                .to_string();
-            return stream::image_stream_reader(
-                file,
-                &self.archive,
-                arn,
-                number(&aff4("size")).ok_or_else(missing)?,
-                number(&aff4("chunkSize")).ok_or_else(missing)?,
-                number(&aff4("chunksInSegment")).ok_or_else(missing)?,
-                &compression,
-            )
-            .map_err(|e| io_error(&self.path, e));
-        }
-        Err(missing())
+            .map_err(|e| io_error(&path, e))?;
+        content_reader(file, &self.archive, &self.graph, arn)
+            .map_err(|e| io_error(&path, e))?
+            .ok_or_else(|| FactumError::general(format!("{arn} has no stored content.")))
     }
 
     /// Writes `graph` as the new information.turtle (and its hashes), then `extra` members, then the directory

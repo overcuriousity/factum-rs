@@ -87,6 +87,8 @@ pub trait Signer {
     fn sign_detached(&self, data: &[u8]) -> Option<String>;
     fn export_public_keys(&self, fingerprints: &[String]) -> String;
     fn verify_signature(&self, clearsigned: &str) -> VerifyResult;
+    /// Checks an armored detached signature over data; `signed_text` stays None.
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult;
     fn last_sign_failed(&self) -> bool;
     fn gpg_home(&self) -> Option<PathBuf>;
 }
@@ -465,6 +467,31 @@ impl Signer for GnupgSigner {
         }
     }
 
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
+        let error = |message: String| {
+            log::error!("Error verifying a detached signature: {message}");
+            VerifyResult {
+                status: format!("error: {message}"),
+                ..Default::default()
+            }
+        };
+        // the signature goes through a file, the data through stdin
+        let file = match tempfile::NamedTempFile::new().and_then(|mut f| f.write_all(signature.as_bytes()).map(|_| f)) {
+            Ok(file) => file,
+            Err(e) => return error(e.to_string()),
+        };
+        let path = file.path().display().to_string();
+        match self.run(&["--verify", &path, "-"], data) {
+            None => error("gpg is not installed or not on the PATH".into()),
+            Some(Err(e)) => error(e.to_string()),
+            Some(Ok(output)) => {
+                let mut result = verify_result(&output);
+                result.signed_text = None;
+                result
+            }
+        }
+    }
+
     fn last_sign_failed(&self) -> bool {
         self.last_sign_failed.get()
     }
@@ -520,6 +547,9 @@ impl Signer for LazySigner<'_> {
     }
     fn verify_signature(&self, clearsigned: &str) -> VerifyResult {
         self.get().verify_signature(clearsigned)
+    }
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
+        self.get().verify_detached(signature, data)
     }
     fn last_sign_failed(&self) -> bool {
         self.inner.get().is_some_and(|signer| signer.last_sign_failed())
@@ -617,6 +647,20 @@ impl Signer for FakeSigner {
             valid: ok,
             status: if ok { "signature valid" } else { "bad signature" }.into(),
             signed_text: ok.then(|| signature[Self::PREFIX.len()..signature.len() - Self::SUFFIX.len()].to_string()),
+            key_id: Some("FAKEKEY1".into()),
+            fingerprint: Some("FAKEFINGERPRINT1".into()),
+            username: Some("Fake Signer".into()),
+            signature_timestamp: None,
+            trust: Some(self.trust.borrow().clone()),
+        }
+    }
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
+        use sha2::Digest;
+        let ok = signature == format!("FAKE DETACHED {}", hex::encode(sha2::Sha256::digest(data)));
+        VerifyResult {
+            valid: ok,
+            status: if ok { "signature valid" } else { "bad signature" }.into(),
+            signed_text: None,
             key_id: Some("FAKEKEY1".into()),
             fingerprint: Some("FAKEFINGERPRINT1".into()),
             username: Some("Fake Signer".into()),

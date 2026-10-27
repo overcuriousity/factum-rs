@@ -5,6 +5,7 @@
 pub mod source;
 pub mod stream;
 pub mod turtle;
+pub mod verify;
 pub mod volume;
 pub mod x509;
 pub mod zip64;
