@@ -5,6 +5,7 @@
 mod companion_dialogs;
 mod companion_panel;
 mod companion_windows;
+mod containers;
 mod dialogs;
 mod icons;
 mod tag_completion;
@@ -37,6 +38,7 @@ use crate::verifier::{CaseReport, Level, SignatureCheck};
 use companion_dialogs::CompanionSettingsDialog;
 use companion_panel::{CompanionView, PanelAction};
 use companion_windows::{CompanionWindow, WindowAction};
+use containers::ContainerAction;
 use dialogs::{Dialog, DialogResult, NoGpgChoice, Pending, VerifyAction, VerifyWindow};
 use theme::{MAX_CARD_WIDTH, SMALL_SIZE, THEMES};
 use widgets::{Card, CardAction, CardView, CheckView, IconButton};
@@ -108,6 +110,7 @@ struct CaseNode {
     case: Case,
     notes: usize,
     evidence: Vec<(Evidence, usize)>,
+    containers: Vec<crate::containers::ContainerSummary>,
 }
 
 enum Item {
@@ -151,6 +154,8 @@ struct View {
     case_status: Option<CaseStatus>,
     /// the Questions section: present while the companion is configured and a case is selected
     companion: Option<CompanionView>,
+    /// the selected container, shown in place of the log
+    container: Option<crate::containers::ContainerDetail>,
 }
 
 struct VerifyJob {
@@ -167,6 +172,8 @@ struct FactumApp {
     // what is selected in the tree; when evidence is selected, case_id is None (like the case tree items)
     case_id: Option<i64>,
     evidence_id: Option<i64>,
+    /// a selected container (its case is case_id then)
+    container_id: Option<i64>,
     filter: String,
     pinned_scope_evidence: bool,
     show_archived: bool,
@@ -271,6 +278,7 @@ impl FactumApp {
             env_seal_dir: crate::config::settings().seal_dir.clone(),
             case_id: None,
             evidence_id: None,
+            container_id: None,
             filter: String::new(),
             pinned_scope_evidence: false,
             show_archived: false,
@@ -602,7 +610,13 @@ impl FactumApp {
                     evidence.push((item, factum.list_entries(case_id, &filter)?.len()));
                 }
             }
-            view.tree.push(CaseNode { case, notes, evidence });
+            let containers = factum.list_containers(case_id)?;
+            view.tree.push(CaseNode {
+                case,
+                notes,
+                evidence,
+                containers,
+            });
         }
         let case_id = self.current_case_id();
         view.case = match case_id {
@@ -626,8 +640,13 @@ impl FactumApp {
                 pinned_only: false,
                 search: search.as_deref(),
             };
-            let entry_ids = factum.list_entries(case.id, &filter)?;
-            if entry_ids.is_empty() {
+            // a selected container is shown in place of the log
+            let entry_ids = if self.container_id.is_some() {
+                Vec::new()
+            } else {
+                factum.list_entries(case.id, &filter)?
+            };
+            if entry_ids.is_empty() && self.container_id.is_none() {
                 view.empty_text = Some(if let Some(tag) = &tag {
                     format!("No notes with a tag matching '{tag}'.")
                 } else if let Some(search) = &search {
@@ -728,6 +747,13 @@ impl FactumApp {
                 None => case.case_name,
             };
         }
+        view.container = match self.container_id {
+            Some(id) => factum
+                .container(id)
+                .inspect_err(|e| log::error!("Container #{id} cannot be read: {e}"))
+                .ok(),
+            None => None,
+        };
         view.companion = match (&self.companion_db, &view.case) {
             (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
                 CompanionView::read(&factum, cdb, case.id)
@@ -871,13 +897,72 @@ impl FactumApp {
     }
 
     fn select(&mut self, case_id: Option<i64>, evidence_id: Option<i64>) {
-        if (self.case_id, self.evidence_id) != (case_id, evidence_id) {
+        if (self.case_id, self.evidence_id) != (case_id, evidence_id) || self.container_id.is_some() {
+            self.container_id = None;
             self.case_id = case_id;
             self.evidence_id = evidence_id;
             self.focused_card = None;
             self.dirty = true;
             self.send_companion(Command::Selected(self.current_case_id()));
         }
+    }
+
+    /// Shows a container in place of the log; its case becomes the current case.
+    fn select_container(&mut self, id: i64) {
+        let Ok(detail) = self.factum().container(id) else {
+            return;
+        };
+        self.case_id = Some(detail.summary.case_id);
+        self.evidence_id = None;
+        self.container_id = Some(id);
+        self.focused_card = None;
+        self.dirty = true;
+        self.send_companion(Command::Selected(self.current_case_id()));
+    }
+
+    fn locate_container(&mut self, id: i64, path: &std::path::Path) {
+        let result = self.factum().locate_container(id, path);
+        self.run(result);
+    }
+
+    fn container_action(&mut self, action: ContainerAction, _ctx: &egui::Context) {
+        let summary = |app: &Self, id: i64| app.factum().container(id).ok().map(|d| d.summary);
+        match action {
+            ContainerAction::ShowEntry(entry_id) => self.jump_to_entry(entry_id),
+            ContainerAction::Locate(id) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("AFF4-L container", &["aff4l"])
+                    .pick_file()
+                {
+                    self.locate_container(id, &path);
+                }
+            }
+            ContainerAction::ShowInFolder(id) => {
+                if let Some(path) = summary(self, id).and_then(|s| s.path)
+                    && let Err(e) = containers::show_in_folder(&path)
+                {
+                    self.message("Factum", format!("The folder cannot be opened: {e}"));
+                }
+            }
+            ContainerAction::Close(id) => {
+                let result = self.factum().close_container(id);
+                if let Some(close) = self.run(result)
+                    && let Some(reason) = close.x509_refused
+                {
+                    self.message(
+                        "Container closed",
+                        format!("Container #{id} was closed and signed with GPG only. X.509: {reason}"),
+                    );
+                }
+            }
+            ContainerAction::Reopen(id) => {
+                let result = self.factum().reopen_container(id);
+                self.run(result);
+            }
+            // adding and verifying follow in the next steps of this feature
+            ContainerAction::AddFiles(_) | ContainerAction::AddFolder(_) | ContainerAction::Verify(_) => {}
+        }
+        self.dirty = true;
     }
 
     /// Before sealing without a key, ask once per GUI session whether to configure one.
@@ -1890,11 +1975,12 @@ impl FactumApp {
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut clicked: Option<(Option<i64>, Option<i64>)> = None;
+            let mut clicked_container: Option<i64> = None;
             let mut menu_action: Option<TreeAction> = None;
             let new_evidence = ctx.format_shortcut(&NEW_EVIDENCE);
             for node in &self.view.tree {
                 let case = &node.case;
-                let selected = self.case_id == Some(case.id);
+                let selected = self.case_id == Some(case.id) && self.container_id.is_none();
                 let (name, color) = if case.is_archived() {
                     (format!("{}  {}", case.case_name, icons::ARCHIVE), p.muted)
                 } else {
@@ -1904,9 +1990,10 @@ impl FactumApp {
                     ui,
                     selected,
                     RichText::new(name).family(theme::bold()).color(color),
-                    node.notes,
+                    (node.notes, "note"),
                     4.0,
                     (!case.is_archived()).then_some(new_evidence.as_str()),
+                    None,
                 );
                 let response = response.on_hover_text(format!(
                     "{} — {}{}",
@@ -1964,8 +2051,9 @@ impl FactumApp {
                         ui,
                         selected,
                         RichText::new(&evidence.description).color(color),
-                        *count,
+                        (*count, "note"),
                         20.0,
+                        None,
                         None,
                     );
                     let response = response.on_hover_text(if evidence.details.is_empty() {
@@ -1996,6 +2084,33 @@ impl FactumApp {
                         }
                     });
                 }
+                for summary in &node.containers {
+                    let selected = self.container_id == Some(summary.id);
+                    let color = if case.is_archived() { p.muted } else { p.secondary };
+                    let (response, _) = tree_row(
+                        ui,
+                        selected,
+                        RichText::new(containers::tree_label(summary)).color(color),
+                        (summary.file_count as usize, "file"),
+                        20.0,
+                        None,
+                        summary.missing.then_some(("⚠", "File missing")),
+                    );
+                    let response = response.on_hover_text(match &summary.path {
+                        Some(path) if !summary.missing => path.display().to_string(),
+                        _ => "File missing — Locate…".to_string(),
+                    });
+                    if response.clicked() {
+                        clicked_container = Some(summary.id);
+                    }
+                    response.context_menu(|ui| {
+                        let mut actions = Vec::new();
+                        containers::menu(ui, summary, case.is_archived(), &mut actions);
+                        if let Some(action) = actions.pop() {
+                            menu_action = Some(TreeAction::Container(action));
+                        }
+                    });
+                }
             }
             // archived cases are hidden by default; the list says how many there are
             if self.view.archived_cases > 0 {
@@ -2021,6 +2136,9 @@ impl FactumApp {
             }
             if let Some((case_id, evidence_id)) = clicked {
                 self.select(case_id, evidence_id);
+            }
+            if let Some(id) = clicked_container {
+                self.select_container(id);
             }
             if let Some(action) = menu_action {
                 self.tree_action(action, ctx);
@@ -2056,6 +2174,7 @@ impl FactumApp {
             TreeAction::Archive(case_id) => self.archive(case_id),
             TreeAction::DeleteEvidence(evidence_id) => self.delete_evidence(evidence_id),
             TreeAction::EditEvidence(evidence_id) => self.open_edit_evidence(evidence_id),
+            TreeAction::Container(action) => self.container_action(action, ctx),
         }
     }
 
@@ -2084,7 +2203,7 @@ impl FactumApp {
                 if toggle.clicked() {
                     self.side_panel = !self.side_panel;
                 }
-                if self.view.case.is_some() {
+                if self.view.case.is_some() && self.view.container.is_none() {
                     ui.add_space(8.0);
                     ui.label(RichText::new(&self.view.note_count).size(SMALL_SIZE).color(p.muted));
                 }
@@ -2093,6 +2212,25 @@ impl FactumApp {
             });
         });
         ui.separator();
+
+        // a selected container is shown in place of the log and the note input
+        if let Some(detail) = self.view.container.clone() {
+            let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
+            let evidence = detail.evidence_id.and_then(|id| {
+                self.view
+                    .tree
+                    .iter()
+                    .flat_map(|node| &node.evidence)
+                    .find(|(e, _)| e.id == id)
+                    .map(|(e, _)| e.description.clone())
+            });
+            let mut container_actions = Vec::new();
+            containers::container_view(ui, &detail, evidence.as_deref(), archived, &mut container_actions);
+            for action in container_actions {
+                self.container_action(action, ctx);
+            }
+            return;
+        }
 
         // the composer at the bottom, resizable at its top edge; the log takes the rest
         match self.view.case.clone() {
@@ -2581,6 +2719,7 @@ enum TreeAction {
     Archive(i64),
     DeleteEvidence(i64),
     EditEvidence(i64),
+    Container(ContainerAction),
 }
 
 fn capitalize(text: &str) -> String {
@@ -2623,15 +2762,17 @@ fn ioc_row(ui: &mut egui::Ui, ctx: &egui::Context, value: &str) {
     }
 }
 
-/// A row of the case tree: the name, and the number of notes on the right. With `add` (the shortcut), a + for new
-/// evidence shows under the pointer; the second value is true when it was clicked.
+/// A row of the case tree: the name, and the number of notes (or files) on the right; `mark` is an icon with its
+/// tooltip. With `add` (the shortcut), a + for new evidence shows under the pointer; the second value is true when
+/// it was clicked.
 fn tree_row(
     ui: &mut egui::Ui,
     selected: bool,
     text: RichText,
-    count: usize,
+    (count, unit): (usize, &str),
     indent: f32,
     add: Option<&str>,
+    mark: Option<(&str, &str)>,
 ) -> (egui::Response, bool) {
     let p = *theme::current(ui.ctx());
     let width = ui.available_width();
@@ -2658,7 +2799,13 @@ fn tree_row(
     let added = child
         .with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(RichText::new(count_text).size(SMALL_SIZE).color(p.muted))
-                .on_hover_text(format!("{count} note{}", if count == 1 { "" } else { "s" }));
+                .on_hover_text(format!("{count} {unit}{}", if count == 1 { "" } else { "s" }));
+            if let Some((icon, tip)) = mark {
+                let mark = ui
+                    .label(RichText::new(icon).size(SMALL_SIZE).color(p.warn))
+                    .on_hover_text(tip);
+                mark.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, tip));
+            }
             let added = match add {
                 Some(shortcut) if hovered => IconButton::new(icons::PLUS, "New evidence")
                     .shortcut(shortcut)

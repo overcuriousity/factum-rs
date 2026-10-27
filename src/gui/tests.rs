@@ -1396,3 +1396,154 @@ fn without_signing_the_wizard_leaves_out_key_and_seal_folder() {
     assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
 }
+
+// --- evidence containers
+
+impl Fixture {
+    /// The usual case, plus an open container "FS01 preserved" with two files; returns its id and file.
+    fn with_container() -> (Self, i64, PathBuf) {
+        use crate::container::volume::{AddOptions, AddProgress};
+        let fixture = Self::new();
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let case_id = factum.list_cases(false).unwrap()[0];
+        let source = fixture._dir.path().join("mnt");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("evil.exe"), b"MZ").unwrap();
+        std::fs::write(source.join("notes.txt"), b"notes").unwrap();
+        let path = fixture._dir.path().join("fs01.aff4l");
+        let id = factum
+            .create_container(case_id, "FS01 preserved", None, &path, &source.display().to_string())
+            .unwrap();
+        let mut volume = factum.open_container_for_add(id).unwrap();
+        let options = AddOptions {
+            base: source.clone(),
+            keep_path: true,
+            metadata_only: false,
+            excerpt: None,
+        };
+        let staged = volume
+            .stage_add(
+                &[source.join("evil.exe"), source.join("notes.txt")],
+                &options,
+                &AddProgress::default(),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+        factum.commit_container_add(id, &mut volume, staged).unwrap();
+        (fixture, id, path)
+    }
+}
+
+fn close_container(fixture: &Fixture, id: i64) {
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    Factum::with_seal_dir(&db, &signer, None).close_container(id).unwrap();
+}
+
+#[test]
+fn tree_lists_container_with_count_and_state() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let node = &harness.state().view.tree[0];
+    assert_eq!(node.containers.len(), 1);
+    assert_eq!((node.containers[0].id, node.containers[0].file_count), (id, 2));
+    assert!(harness.query_by_label_contains("FS01 preserved · open").is_some());
+    close_container(&fixture, id);
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("FS01 preserved").is_some());
+    assert!(harness.query_by_label_contains("FS01 preserved · open").is_none());
+}
+
+#[test]
+fn selecting_container_shows_its_files() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.run_ok();
+    let app = harness.state();
+    assert_eq!(app.container_id, Some(id));
+    assert!(app.case_id.is_some(), "the case of the container is the current case");
+    assert!(app.view.items.is_empty());
+    assert_eq!(app.view.container.as_ref().map(|c| c.summary.id), Some(id));
+    assert!(harness.query_by_label("evil.exe").is_some());
+    assert!(harness.query_by_label("notes.txt").is_some());
+    screenshot(&mut harness, "container_view");
+    // selecting the case again leaves the container
+    let case_id = harness.state().case_id;
+    harness.state_mut().select(case_id, None);
+    harness.run_ok();
+    assert!(harness.state().container_id.is_none());
+    assert!(harness.state().view.container.is_none());
+}
+
+#[test]
+fn jump_to_entry_leaves_the_container_view() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.run_ok();
+    harness.state_mut().jump_to_entry(id);
+    harness.run_ok();
+    assert!(harness.state().container_id.is_none());
+    assert!(harness.state().view.items.iter().any(|i| i.entry().id == id));
+}
+
+#[test]
+fn missing_file_is_marked_and_locate_enabled() {
+    let (fixture, id, path) = Fixture::with_container();
+    std::fs::remove_file(&path).unwrap();
+    let mut harness = fixture.harness();
+    harness.run_ok();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    assert!(summary.missing);
+    assert!(harness.query_by_label("File missing").is_some());
+    let items = containers::menu_items(&summary, false);
+    let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(enabled("Locate…"));
+    assert!(!enabled("Add Files…") && !enabled("Show in Folder") && !enabled("Verify Container…"));
+    let _ = id;
+}
+
+#[test]
+fn add_disabled_while_closed() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    let items = containers::menu_items(&summary, false);
+    let enabled =
+        |items: &[(&str, ContainerAction, bool)], label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(enabled(&items, "Add Files…") && enabled(&items, "Close Container"));
+    assert!(!enabled(&items, "Reopen Container") && !enabled(&items, "Locate…"));
+    close_container(&fixture, id);
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    let items = containers::menu_items(&summary, false);
+    assert!(!enabled(&items, "Add Files…") && !enabled(&items, "Add Folder…") && !enabled(&items, "Close Container"));
+    assert!(enabled(&items, "Reopen Container"));
+    // an archived case takes nothing and reopens nothing
+    let items = containers::menu_items(&summary, true);
+    assert!(!enabled(&items, "Reopen Container") && enabled(&items, "Verify Container…"));
+}
+
+#[test]
+fn locate_accepts_the_moved_file() {
+    let (fixture, id, path) = Fixture::with_container();
+    let moved = fixture._dir.path().join("moved.aff4l");
+    std::fs::rename(&path, &moved).unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().locate_container(id, &moved);
+    harness.run_ok();
+    assert!(!harness.state().view.tree[0].containers[0].missing);
+    assert!(harness.state().dialogs.is_empty());
+    // another file is refused with a message
+    std::fs::write(fixture._dir.path().join("x.aff4l"), b"no").unwrap();
+    harness
+        .state_mut()
+        .locate_container(id, &fixture._dir.path().join("x.aff4l"));
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+}
