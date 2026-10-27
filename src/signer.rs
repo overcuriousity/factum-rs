@@ -101,14 +101,14 @@ pub fn gpg_error(stderr: &str) -> String {
         .join("; ")
 }
 
-struct GpgOutput {
-    stdout: Vec<u8>,
-    stderr: String,
-    status: Vec<(String, Vec<String>)>,
+pub(crate) struct GpgOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: String,
+    pub(crate) status: Vec<(String, Vec<String>)>,
 }
 
 impl GpgOutput {
-    fn has(&self, keyword: &str) -> bool {
+    pub(crate) fn has(&self, keyword: &str) -> bool {
         self.status.iter().any(|(key, _)| key == keyword)
     }
 }
@@ -127,8 +127,13 @@ fn run_gpg(binary: &Path, home: Option<&Path>, args: &[&str], input: &[u8]) -> s
     if let Some(home) = home {
         command.arg("--homedir").arg(home);
     }
+    command.args(args);
+    run_program(command, input)
+}
+
+/// Runs a GnuPG program with `input` on stdin; its status lines are read from stderr (`--status-fd 2`).
+pub(crate) fn run_program(mut command: Command, input: &[u8]) -> std::io::Result<GpgOutput> {
     command
-        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

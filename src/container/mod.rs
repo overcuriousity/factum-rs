@@ -6,6 +6,7 @@ pub mod source;
 pub mod stream;
 pub mod turtle;
 pub mod volume;
+pub mod x509;
 pub mod zip64;
 
 /// `aff4:` — the AFF4 Standard v1.0 lexicon

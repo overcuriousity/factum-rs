@@ -170,3 +170,198 @@ macro_rules! require_gpg {
         }
     };
 }
+
+/// A throwaway gpgsm home with a root CA (made with openssl) and a signing certificate under it; None when gpgsm
+/// or openssl is missing. The root is not trusted until `trusted()`.
+pub struct GpgsmHome {
+    pub dir: tempfile::TempDir,
+    /// root.pem, root.key, leaf.pem live here
+    pub files: tempfile::TempDir,
+    pub leaf_fingerprint: String,
+    pub root_fingerprint: String,
+}
+
+impl GpgsmHome {
+    pub fn new() -> Option<Self> {
+        which::which("gpgsm").ok()?;
+        which::which("openssl").ok()?;
+        let dir = tempfile::Builder::new()
+            .prefix("fx-")
+            .tempdir_in("/tmp")
+            .or_else(|_| tempfile::tempdir())
+            .ok()?;
+        let files = tempfile::tempdir().ok()?;
+        std::fs::write(
+            dir.path().join("gpg-agent.conf"),
+            "allow-loopback-pinentry\nno-allow-mark-trusted\n",
+        )
+        .ok()?;
+        let f = |name: &str| files.path().join(name);
+        let openssl = |args: &[&str]| -> Option<()> {
+            let output = Command::new("openssl")
+                .args(args)
+                .current_dir(files.path())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                eprintln!("openssl {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+                return None;
+            }
+            Some(())
+        };
+        openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "root.key",
+            "-out",
+            "root.pem",
+            "-days",
+            "3650",
+            "-subj",
+            "/CN=Factum Test Root",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ])?;
+        openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "leaf.key",
+            "-out",
+            "leaf.csr",
+            "-subj",
+            "/CN=Examiner One/O=Lab",
+        ])?;
+        std::fs::write(
+            f("ext"),
+            "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,nonRepudiation\n",
+        )
+        .ok()?;
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "leaf.csr",
+            "-CA",
+            "root.pem",
+            "-CAkey",
+            "root.key",
+            "-CAcreateserial",
+            "-out",
+            "leaf.pem",
+            "-days",
+            "365",
+            "-extfile",
+            "ext",
+        ])?;
+        openssl(&[
+            "pkcs12",
+            "-export",
+            "-inkey",
+            "leaf.key",
+            "-in",
+            "leaf.pem",
+            "-certfile",
+            "root.pem",
+            "-out",
+            "leaf.p12",
+            "-passout",
+            "pass:",
+        ])?;
+        let mut home = Self {
+            dir,
+            files,
+            leaf_fingerprint: String::new(),
+            root_fingerprint: String::new(),
+        };
+        let output = home.gpgsm(
+            &["--pinentry-mode", "loopback", "--passphrase", "", "--import"],
+            &[&home.file("leaf.p12")],
+        )?;
+        if !output.status.success() {
+            eprintln!(
+                "cannot import the test certificate: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+        let listing = home.gpgsm(&["--with-colons", "--list-keys"], &[])?;
+        let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+        // fpr records: field 10 the certificate's fingerprint, field 13 its issuer's
+        let fprs: Vec<(String, String)> = listing
+            .lines()
+            .filter(|l| l.starts_with("fpr:"))
+            .map(|l| {
+                let fields: Vec<&str> = l.split(':').collect();
+                (fields[9].to_string(), fields.get(12).unwrap_or(&"").to_string())
+            })
+            .collect();
+        let root = fprs.iter().find(|(fpr, issuer)| fpr == issuer)?.0.clone();
+        let leaf = fprs.iter().find(|(fpr, _)| *fpr != root)?.0.clone();
+        home.leaf_fingerprint = leaf;
+        home.root_fingerprint = root;
+        Some(home)
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.dir.path().to_path_buf()
+    }
+
+    pub fn file(&self, name: &str) -> PathBuf {
+        self.files.path().join(name)
+    }
+
+    pub fn gpgsm(&self, args: &[&str], paths: &[&Path]) -> Option<std::process::Output> {
+        Command::new("gpgsm")
+            .arg("--homedir")
+            .arg(self.dir.path())
+            .arg("--batch")
+            .args(args)
+            .args(paths)
+            .output()
+            .ok()
+    }
+
+    /// Marks the root trusted, as an examiner does in trustlist.txt.
+    pub fn trusted(&self) {
+        let colons: Vec<String> = self
+            .root_fingerprint
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| String::from_utf8_lossy(pair).into_owned())
+            .collect();
+        std::fs::write(
+            self.dir.path().join("trustlist.txt"),
+            format!("{} S relax\n", colons.join(":")),
+        )
+        .unwrap();
+        self.reload_agent();
+    }
+
+    pub fn untrusted(&self) {
+        let _ = std::fs::remove_file(self.dir.path().join("trustlist.txt"));
+        self.reload_agent();
+    }
+
+    fn reload_agent(&self) {
+        let _ = Command::new("gpgconf")
+            .arg("--homedir")
+            .arg(self.dir.path())
+            .args(["--kill", "gpg-agent"])
+            .output();
+    }
+}
+
+impl Drop for GpgsmHome {
+    fn drop(&mut self) {
+        self.reload_agent();
+    }
+}
