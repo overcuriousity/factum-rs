@@ -330,20 +330,18 @@ fn choose_kind_rules() {
 }
 
 #[test]
-fn cap_of_seven_is_enforced() {
+fn a_full_list_makes_room_for_new_questions_up_to_the_cap() {
     let e = env();
-    let open: Vec<serde_json::Value> = [
+    let ids: Vec<i64> = [
         "Where did the uploaded webshell come from?",
         "Which hash algorithm verified the disk image?",
         "Was the plaso timeline filtered by date?",
-        "Who administers the Apache server?",
-        "Are there backups older than March?",
-        "Has the firewall export been secured?",
     ]
     .iter()
-    .map(|text| json!({"id": question(&e, text)}))
+    .map(|text| question(&e, text))
     .collect();
-    let mut questions = open.clone();
+    e.cdb.rate_question(ids[0], Rating::Plus).unwrap();
+    let mut questions: Vec<serde_json::Value> = ids.iter().map(|id| json!({"id": id})).collect();
     questions.extend([
         json!({"text": "Which user agent sent the POST request?", "rests_on": [e.notes[2]]}),
         json!({"text": "Is 203.0.113.5 seen in other cases?", "rests_on": [e.notes[4]]}),
@@ -351,8 +349,11 @@ fn cap_of_seven_is_enforced() {
     ]);
     script(&e, json!({ "questions": questions }));
     let s = pass(&e, PassKind::Full).unwrap();
-    assert_eq!(s.created, 1);
-    assert_eq!(open_ids(&e).len(), 7);
+    // the two unrated questions make room; the plus one stays, so the third new question does not fit
+    assert_eq!((s.created, s.withdrawn, s.dropped.len()), (2, 2, 1));
+    let open = open_ids(&e);
+    assert_eq!(open.len(), 3);
+    assert_eq!(open[0], ids[0]);
 }
 
 #[test]

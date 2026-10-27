@@ -203,7 +203,7 @@ Two layers, both plain text, both outside the signed corpus.
 **Global guideline** (app level, shipped default, editable, rarely changed). The default, in English, states in
 roughly this order:
 - Role: a mentor looking over a digital forensics investigator's shoulder; gentle, concise, never doing the work.
-- Output discipline: questions only, at most seven open at a time, each resting on specific entries by id; prefer
+- Output discipline: questions only, at most three open at a time, each resting on specific entries by id; prefer
   withdrawing stale questions to piling up; one question per issue; written in the language the notes are written
   in; concrete over generic; never assume facts the log does not state.
 - The BSI lens, used to find gaps: the core questions (what, where, when, how; who and prevention where relevant);
@@ -309,7 +309,7 @@ next pass and does not trigger one.
 **Pass kinds.**
 - A *diff pass* sees sections 1 to 9 as in 4.5 and is asked to restate the open questions: each one is answered
   (with the entry's id), reworded for what the log says now, kept as it is, or left out, which withdraws it; and to
-  propose new questions, keeping the open count at most seven. A plus-rated question may be answered or reworded but
+  propose new questions, keeping the open count at most three. A plus-rated question may be answered or reworded but
   is not withdrawn.
 - A *full pass* replaces section 6 with a compact timeline: one line per entry, text truncated to about 100
   characters, newest entries complete, oldest first, cut from the oldest end if needed; and widens section 7 to
@@ -359,7 +359,9 @@ sends no thinking switch of its own: the server's (llama.cpp `--reasoning-budget
    or with any minus-rated example anywhere, is reached. Minus examples are compared against globally. The nearest
    minus examples are also in the prompt (4.8), so the model is told what not to resurrect before the mechanical
    check runs.
-6. The cap: if more than seven would be open, the newest `new` items beyond the cap are dropped.
+6. The cap: if more than three would be open, new questions replace the oldest kept questions that are neither
+   rated plus nor reworded in this pass, so a full list does not freeze; what still does not fit is dropped, newest
+   first.
 7. An open question the output leaves out is withdrawn, unless it is rated plus.
 
 Surviving changes are applied in one transaction: answered questions get `state=answered`, `resolved_entry_id`,

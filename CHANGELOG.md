@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [2.3.1] - 2026-10-27
+
+### Changed
+- Companion: at most three questions are open at a time (was seven). A case with more is trimmed on its next pass:
+  the oldest ones that are neither rated plus nor reworded are withdrawn
+
+### Fixed
+- Companion: questions were kept unchanged and new ones added until the list was full, after which it froze. The
+  instruction asked the model to list every open question, unchanged where it saw fit; it now asks for each kept
+  question as it should read now. A full list no longer freezes: a new question replaces the oldest one that is
+  neither rated plus nor reworded in the pass
+
 ## [2.3.0] - 2026-10-27
 
 ### Changed
