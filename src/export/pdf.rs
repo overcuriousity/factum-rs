@@ -179,7 +179,7 @@ fn decode(image: &NoteImage) -> Option<PdfImage> {
         let rgba = decoded.into_rgba8().into_raw();
         let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
         let mut alpha = Vec::with_capacity(rgba.len() / 4);
-        for pixel in rgba.chunks_exact(4) {
+        for pixel in rgba.as_chunks::<4>().0 {
             rgb.extend_from_slice(&pixel[..3]);
             alpha.push(pixel[3]);
         }

@@ -1209,8 +1209,9 @@ fn pdf_text(f: &Fixture, pdf: &[u8]) -> Option<String> {
     which::which("pdftotext").ok()?;
     let path = f.path().join("check.pdf");
     std::fs::write(&path, pdf).unwrap();
+    // UTF-8 explicitly: on Windows pdftotext writes the system code page by default, which has no "•"
     let output = Command::new("pdftotext")
-        .arg("-layout")
+        .args(["-layout", "-enc", "UTF-8"])
         .arg(&path)
         .arg("-")
         .output()
