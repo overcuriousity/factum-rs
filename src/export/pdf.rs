@@ -1465,11 +1465,12 @@ mod tests {
         let body = Style::new(FontId::Sans, 11.0, TEXT);
         let image = rgba_image(30, 20, 255);
         let mut text = String::new();
-        for level in 0..60 {
+        // as deep as markup keeps structure: 15 lists, 30 quotes (deeper is literal text)
+        for level in 0..14 {
             text += &format!("{}- level {level}\n", "  ".repeat(level));
         }
-        text += &format!("{}- {}\n", "  ".repeat(60), image.reference("deep"));
-        let quotes = format!("{} deep quote {}", ">".repeat(60), image.reference("q"));
+        text += &format!("{}- {}\n", "  ".repeat(14), image.reference("deep"));
+        let quotes = format!("{} deep quote {}", ">".repeat(30), image.reference("q"));
         writer.markup(&text, std::slice::from_ref(&image), body);
         writer.markup(&quotes, std::slice::from_ref(&image), body);
         let mut drawn = 0;
@@ -1505,6 +1506,15 @@ mod tests {
             CONTENT_WIDTH - MAX_INDENT,
         );
         assert!(lines.len() < 10, "the clamped width still holds several words per line");
+    }
+
+    #[test]
+    fn a_note_nested_100_000_deep_renders() {
+        for note in markup::deeply_nested_notes() {
+            let mut writer = Writer::new();
+            writer.markup(&note, &[], Style::new(FontId::Sans, 11.0, TEXT));
+            assert!(!writer.pages[0].is_empty());
+        }
     }
 
     /// A PNG whose header declares width x height with a tiny (invalid) body, the size of a decompression bomb.

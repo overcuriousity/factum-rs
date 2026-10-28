@@ -334,3 +334,15 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
     parts.push("</div></div></body></html>".into());
     parts.join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_note_nested_100_000_deep_renders() {
+        for note in markup::deeply_nested_notes() {
+            assert!(markup_html(&note, &[]).contains('x'));
+        }
+    }
+}

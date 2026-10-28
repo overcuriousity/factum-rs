@@ -442,6 +442,18 @@ mod tests {
     }
 
     #[test]
+    fn a_note_nested_100_000_deep_draws() {
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        for note in markup::deeply_nested_notes() {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| note_body(ui, 1, &note, &[], 16.0, Color32::BLACK));
+            });
+            output.textures_delta.clear();
+        }
+    }
+
+    #[test]
     fn a_screenshot_over_the_texture_limit_is_scaled_down() {
         let ctx = egui::Context::default();
         let limit = ctx.input(|i| i.max_texture_side);

@@ -385,6 +385,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_note_nested_100_000_deep_renders() {
+        for note in markup::deeply_nested_notes() {
+            assert!(markup_markdown(&note, &[], "images").concat().contains('x'));
+        }
+    }
+
+    #[test]
     fn inline_keeps_entities_literal() {
         assert_eq!(inline("R&D &amp; <b>"), "R\\&D \\&amp; \\<b\\>");
     }

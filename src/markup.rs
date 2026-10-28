@@ -49,6 +49,10 @@ pub enum ImageTarget {
     External(String),
 }
 
+/// At most this many elements are open at once (a quote in a list in a quote ...; emphasis in a link): deeper
+/// structure stays its literal source text, so no renderer recurses without bound.
+pub const MAX_DEPTH: usize = 32;
+
 /// An open container while walking the parser's events.
 enum Frame {
     Root(Vec<Block>),
@@ -110,7 +114,10 @@ pub fn parse(text: &str) -> Vec<Block> {
             continue;
         }
         match event {
-            Event::Start(tag) => match start_frame(&tag) {
+            // an item is never refused: its list is open already and takes nothing else
+            Event::Start(tag) => match start_frame(&tag)
+                .filter(|frame| matches!(frame, Frame::Item { .. }) || stack.len() <= MAX_DEPTH)
+            {
                 Some(frame) => stack.push(frame),
                 None => {
                     skipping = 1;
@@ -365,6 +372,19 @@ fn collect(blocks: &[Block], parts: &mut Vec<String>) {
     }
 }
 
+/// Notes of about 100,000 characters nested as deep as they go, for the renderers' tests.
+#[cfg(test)]
+pub fn deeply_nested_notes() -> Vec<String> {
+    vec![
+        format!("{} x", ">".repeat(100_000)),
+        format!("{}x", "- ".repeat(50_000)),
+        format!("{}x", "> 1. ".repeat(20_000)),
+        format!("{}x{}", "*".repeat(50_000), "*".repeat(50_000)),
+        format!("{}x{}", "![".repeat(25_000), "](u)".repeat(25_000)),
+        format!("{}x{}", "**a ".repeat(25_000), " b**".repeat(25_000)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +634,47 @@ mod tests {
         assert_eq!(parse(""), Vec::<Block>::new());
         assert_eq!(parse("\n\n"), Vec::<Block>::new());
         assert_eq!(parse("héllo ✓"), vec![para("héllo ✓")]);
+    }
+
+    fn block_depth(blocks: &[Block]) -> usize {
+        blocks
+            .iter()
+            .map(|block| match block {
+                Block::Paragraph(v) | Block::Heading(_, v) => 1 + inline_depth(v),
+                Block::List { items, .. } => 2 + items.iter().map(|item| block_depth(item)).max().unwrap_or(0),
+                Block::Quote(inner) => 1 + block_depth(inner),
+                Block::Code(_) => 1,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn inline_depth(inlines: &[Inline]) -> usize {
+        inlines
+            .iter()
+            .map(|inline| match inline {
+                Inline::Emphasis(v) | Inline::Strong(v) | Inline::Link { text: v, .. } => 1 + inline_depth(v),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn deep_nesting_is_capped_and_the_rest_stays_text() {
+        for note in deeply_nested_notes() {
+            let tree = parse(&note);
+            let depth = block_depth(&tree);
+            assert!(depth <= MAX_DEPTH + 2, "{depth} for {}", &note[..20]);
+            // what is not structure any more is its source: the innermost text is still there
+            assert!(to_plain(&note).contains('x'), "{}", &note[..20]);
+        }
+        // up to the cap nothing changes
+        let quote = parse(&format!("{}x", "> ".repeat(MAX_DEPTH - 1)));
+        assert_eq!(block_depth(&quote), MAX_DEPTH);
+        assert!(!to_plain(&format!("{}x", "> ".repeat(MAX_DEPTH - 1))).contains('>'));
+        // one more and the innermost quote is its source
+        assert!(to_plain(&format!("{}x", "> ".repeat(MAX_DEPTH + 1))).contains("> x"));
     }
 
     #[test]
