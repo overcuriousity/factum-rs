@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-10-28
+
 ### Added
 - Markdown in notes: a toolbar above the note field and the correction dialog (bold, italic, code, link, heading,
   list, quote); notes are shown formatted in the log and in HTML, Markdown and PDF reports, with a source toggle on
