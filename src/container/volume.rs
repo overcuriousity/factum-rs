@@ -434,6 +434,16 @@ fn lock(file: &File) -> Result<()> {
     ))
 }
 
+/// The writer of a volume; gone only after a failed rollback left the file in an unknown state.
+fn writer<'a>(app: &'a mut Option<Appender>, path: &Path) -> Result<&'a mut Appender> {
+    app.as_mut().ok_or_else(|| {
+        FactumError::general(format!(
+            "The container {} could not be restored after a failed write; open it again.",
+            path.display()
+        ))
+    })
+}
+
 /// An open container file, locked for writing as long as this value lives.
 pub struct Volume {
     path: PathBuf,
@@ -593,8 +603,8 @@ impl Volume {
         self.archive.end
     }
 
-    fn app(&mut self) -> &mut Appender {
-        self.app.as_mut().expect("the volume is open")
+    fn app(&mut self) -> Result<&mut Appender> {
+        writer(&mut self.app, &self.path)
     }
 
     /// The bytes `information.turtle` has in the current state; what a close signs.
@@ -626,7 +636,7 @@ impl Volume {
             .cloned()
             .ok_or_else(|| FactumError::general(format!("{name} is not in the container.")))?;
         let path = self.path.clone();
-        let file = self.app().file_mut().map_err(|e| io_error(&path, e))?;
+        let file = self.app()?.file_mut().map_err(|e| io_error(&path, e))?;
         let mut data = Vec::new();
         member_reader(file, &entry)
             .and_then(|mut r| r.read_to_end(&mut data))
@@ -637,10 +647,7 @@ impl Volume {
     /// The stored content of a file.
     pub fn read_file(&mut self, arn: &str) -> Result<Box<dyn Read + '_>> {
         let path = self.path.clone();
-        let file = self
-            .app
-            .as_mut()
-            .expect("the volume is open")
+        let file = writer(&mut self.app, &path)?
             .file_mut()
             .map_err(|e| io_error(&path, e))?;
         content_reader(file, &self.archive, &self.graph, arn)
@@ -655,7 +662,7 @@ impl Volume {
         let hashes = hashes_bytes(&self.uuid, &turtle);
         let comment = self.archive.comment.clone();
         let path = self.path.clone();
-        let app = self.app();
+        let app = self.app()?;
         let mut write = || -> io::Result<u64> {
             app.add_bytes(TURTLE, 8, &turtle)?;
             app.add_bytes(HASHES, 0, &hashes)?;
@@ -665,7 +672,7 @@ impl Volume {
             app.finish(omit, &comment)
         };
         let end = write().map_err(|e| io_error(&path, e))?;
-        self.archive = Archive::new(self.app().entries(), comment, end);
+        self.archive = Archive::new(self.app()?.entries(), comment, end);
         self.graph = graph;
         Ok(end)
     }
@@ -674,7 +681,7 @@ impl Volume {
     fn commit_members(&mut self, members: &[(String, Vec<u8>)]) -> Result<u64> {
         let comment = self.archive.comment.clone();
         let path = self.path.clone();
-        let app = self.app();
+        let app = self.app()?;
         let mut write = || -> io::Result<u64> {
             for (name, data) in members {
                 app.add_bytes(name, 0, data)?;
@@ -682,7 +689,7 @@ impl Volume {
             app.finish(&[], &comment)
         };
         let end = write().map_err(|e| io_error(&path, e))?;
-        self.archive = Archive::new(self.app().entries(), comment, end);
+        self.archive = Archive::new(self.app()?.entries(), comment, end);
         Ok(end)
     }
 
@@ -764,7 +771,7 @@ impl Volume {
         let mut folders = Vec::new();
         let mut skipped = Vec::new();
         let mut done_bytes = 0u64;
-        let app = self.app.as_mut().expect("the volume is open");
+        let app = self.app()?;
         let cancelled = |app: &mut Appender| -> Result<Staged> {
             app.rewind_to(start).map_err(|e| io_error(&path_of_container, e))?;
             Err(FactumError::general("Cancelled — nothing was added."))
@@ -955,21 +962,23 @@ impl Volume {
     }
 
     /// Cuts the file back to `mark.write_pos` and reloads the state that ends at `mark.base_end`.
+    /// The state is read first: when it cannot be, nothing changes and the volume stays as it was.
     pub fn rollback_to(&mut self, mark: Mark) -> Result<()> {
         let path = self.path.clone();
-        let app = self.app.take().expect("the volume is open");
-        let mut file = app.into_file();
-        file.set_len(mark.write_pos).map_err(|e| io_error(&path, e))?;
-        let archive = read_archive(&mut file, mark.base_end).map_err(|e| io_error(&path, e))?;
+        let file = self.app()?.file_mut().map_err(|e| io_error(&path, e))?;
+        let archive = read_archive(file, mark.base_end).map_err(|e| io_error(&path, e))?;
         let entry = archive
             .get(TURTLE)
             .ok_or_else(|| FactumError::general("information.turtle is missing."))?;
         let mut turtle = String::new();
-        member_reader(&mut file, entry)
+        member_reader(file, entry)
             .and_then(|mut r| r.read_to_string(&mut turtle))
             .map_err(|e| io_error(&path, e))?;
-        self.graph = turtle::parse(&turtle).map_err(FactumError::general)?;
+        let graph = turtle::parse(&turtle).map_err(FactumError::general)?;
+        let file = self.app.take().expect("checked above").into_file();
+        // only a failed truncation leaves the volume without a writer; app() then says so
         self.app = Some(Appender::new(file, mark.write_pos, archive.entries.clone()).map_err(|e| io_error(&path, e))?);
+        self.graph = graph;
         self.archive = archive;
         Ok(())
     }
@@ -994,7 +1003,7 @@ impl Volume {
             .collect();
         let comment = self.archive.comment.clone();
         let path = self.path.clone();
-        let app = self.app();
+        let app = self.app()?;
         let mut write = || -> io::Result<u64> {
             for (name, data) in &members {
                 app.add_bytes(name, if name.ends_with(TURTLE) { 8 } else { 0 }, data)?;
@@ -1002,7 +1011,7 @@ impl Volume {
             app.finish(&omit, &comment)
         };
         let end = write().map_err(|e| io_error(&path, e))?;
-        self.archive = Archive::new(self.app().entries(), comment, end);
+        self.archive = Archive::new(self.app()?.entries(), comment, end);
         Ok(n)
     }
 
@@ -1228,6 +1237,27 @@ mod tests {
         assert!(discarded > 0);
         assert_eq!(volume.archive(), &before);
         assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), before.end);
+    }
+
+    #[test]
+    fn a_failed_set_aside_leaves_the_volume_usable() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        let before = volume.archive().clone();
+        let mark = volume.mark();
+        // not the end of a state: the set-aside fails, and the volume is unchanged
+        assert!(volume.set_aside_after(volume.end() - 7).is_err());
+        assert_eq!(volume.archive(), &before);
+        volume.rollback_to(mark).unwrap();
+        assert_eq!(volume.archive(), &before);
+        add(
+            &mut volume,
+            &[setup.source.join("Users/x/notes.txt")],
+            &setup.options(),
+            2,
+        );
+        assert_eq!(file_records(volume.graph()).len(), 3);
     }
 
     #[test]
