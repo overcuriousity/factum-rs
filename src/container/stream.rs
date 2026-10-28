@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::Digest;
 
 use super::AFF4_NS;
-use super::zip64::{Appender, Archive, member_reader};
+use super::zip64::{Appender, Archive, member_bytes};
 
 pub const CHUNK_SIZE: u64 = 32 * 1024;
 pub const CHUNKS_PER_SEGMENT: u64 = 2048;
@@ -324,9 +324,7 @@ impl ImageStreamReader<'_> {
             .get(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("member {name} is missing")))?
             .clone();
-        let mut data = Vec::with_capacity(entry.size.min(1 << 28) as usize);
-        member_reader(self.file, &entry)?.read_to_end(&mut data)?;
-        Ok(data)
+        member_bytes(self.file, &entry)
     }
 
     fn load_chunk(&mut self, number: u64) -> io::Result<()> {

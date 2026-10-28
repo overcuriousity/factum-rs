@@ -12,7 +12,7 @@ use sha2::Digest;
 use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_bytes, read_meta, stored_path};
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
-use super::zip64::{Appender, Archive, CdEntry, find_last_end, member_reader, read_archive};
+use super::zip64::{Appender, Archive, CdEntry, find_last_end, member_bytes, member_reader, member_text, read_archive};
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS, RDF_NS, XSD_NS, ZIP_SEGMENT_LIMIT};
 use crate::error::{FactumError, Result};
 
@@ -243,10 +243,7 @@ pub fn read_graph(path: &Path) -> Result<Graph> {
     let entry = archive
         .get(TURTLE)
         .ok_or_else(|| not_container("information.turtle is missing".into()))?;
-    let mut text = String::new();
-    member_reader(&mut file, entry)
-        .and_then(|mut r| r.read_to_string(&mut text))
-        .map_err(|e| not_container(e.to_string()))?;
+    let text = member_text(&mut file, entry).map_err(|e| not_container(e.to_string()))?;
     turtle::parse(&text).map_err(not_container)
 }
 
@@ -512,11 +509,7 @@ impl Volume {
             let entry = archive
                 .get(name)
                 .ok_or_else(|| not_container(format!("{name} is missing")))?;
-            let mut data = Vec::new();
-            member_reader(file, entry)
-                .and_then(|mut r| r.read_to_end(&mut data))
-                .map_err(|e| not_container(e.to_string()))?;
-            Ok(data)
+            member_bytes(file, entry).map_err(|e| not_container(e.to_string()))
         };
         let version = String::from_utf8_lossy(&read(&mut file, "version.txt")?).into_owned();
         if !(version.contains("major=2") && version.contains("minor=1")) {
@@ -565,10 +558,7 @@ impl Volume {
         let entry = archive
             .get("container.description")
             .ok_or_else(|| not_container("container.description is missing".into()))?;
-        let mut description = String::new();
-        member_reader(&mut file, entry)
-            .and_then(|mut r| r.read_to_string(&mut description))
-            .map_err(|e| not_container(e.to_string()))?;
+        let description = member_text(&mut file, entry).map_err(|e| not_container(e.to_string()))?;
         let description = description.trim();
         if description.as_bytes() != archive.comment.as_slice() {
             return Err(not_container("its description and its ZIP comment differ".into()));
@@ -637,11 +627,7 @@ impl Volume {
             .ok_or_else(|| FactumError::general(format!("{name} is not in the container.")))?;
         let path = self.path.clone();
         let file = self.app()?.file_mut().map_err(|e| io_error(&path, e))?;
-        let mut data = Vec::new();
-        member_reader(file, &entry)
-            .and_then(|mut r| r.read_to_end(&mut data))
-            .map_err(|e| io_error(&path, e))?;
-        Ok(data)
+        member_bytes(file, &entry).map_err(|e| io_error(&path, e))
     }
 
     /// The stored content of a file.
@@ -970,10 +956,7 @@ impl Volume {
         let entry = archive
             .get(TURTLE)
             .ok_or_else(|| FactumError::general("information.turtle is missing."))?;
-        let mut turtle = String::new();
-        member_reader(file, entry)
-            .and_then(|mut r| r.read_to_string(&mut turtle))
-            .map_err(|e| io_error(&path, e))?;
+        let turtle = member_text(file, entry).map_err(|e| io_error(&path, e))?;
         let graph = turtle::parse(&turtle).map_err(FactumError::general)?;
         let file = self.app.take().expect("checked above").into_file();
         // only a failed truncation leaves the volume without a writer; app() then says so

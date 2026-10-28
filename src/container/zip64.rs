@@ -269,6 +269,30 @@ pub fn member_reader<'f>(file: &'f mut File, entry: &CdEntry) -> io::Result<Box<
     }
 }
 
+/// The most of one member read into memory (metadata, signatures, a bevy of an ImageStream): a crafted container
+/// cannot make factum hold more, whatever its directory claims or its data inflates to.
+pub const MAX_IN_MEMORY: u64 = 1 << 30;
+
+/// A member's content in memory; refused when it is larger than MAX_IN_MEMORY.
+pub fn member_bytes(file: &mut File, entry: &CdEntry) -> io::Result<Vec<u8>> {
+    member_bytes_up_to(file, entry, MAX_IN_MEMORY)
+}
+
+fn member_bytes_up_to(file: &mut File, entry: &CdEntry, limit: u64) -> io::Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(entry.size.min(limit).min(1 << 24) as usize);
+    member_reader(file, entry)?.take(limit + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > limit {
+        return Err(invalid(format!("{} is larger than {limit} bytes", entry.name_lossy())));
+    }
+    Ok(data)
+}
+
+/// A member's content as UTF-8 text (see `member_bytes`).
+pub fn member_text(file: &mut File, entry: &CdEntry) -> io::Result<String> {
+    String::from_utf8(member_bytes(file, entry)?)
+        .map_err(|_| invalid(format!("{} is not UTF-8 text", entry.name_lossy())))
+}
+
 /// The current time as MS-DOS time and date (UTC).
 fn dos_now() -> (u16, u16) {
     use chrono::{Datelike, Timelike};
@@ -668,6 +692,23 @@ mod tests {
             assert!(archive.get(&format!("aff4://{i:036}")).is_some());
         }
         assert!(started.elapsed().as_millis() < 1000, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_member_inflating_beyond_the_limit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
+        let bomb = app.add_bytes("bomb", 8, &vec![0u8; 4 << 20]).unwrap();
+        let end = app.finish(&[], b"").unwrap();
+        let mut file = app.into_file();
+        let mut entry = read_archive(&mut file, end).unwrap().get("bomb").unwrap().clone();
+        assert!(bomb.compressed_size < 64 << 10);
+        // a directory claiming far more than the data: only the limit is ever read
+        entry.size = 1 << 40;
+        let error = member_bytes_up_to(&mut file, &entry, 1 << 20).unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error}");
+        entry.size = 4 << 20;
+        assert_eq!(member_bytes_up_to(&mut file, &entry, 4 << 20).unwrap().len(), 4 << 20);
     }
 
     #[test]

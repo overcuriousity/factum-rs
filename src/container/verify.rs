@@ -16,7 +16,7 @@ use super::volume::{
     CER_X509, FileRecord, HASHES, KEY_GPG, SIG_GPG, SIG_X509, TURTLE, content_reader, file_records, history_member,
 };
 use super::x509::{Gpgsm, X509Check};
-use super::zip64::{Archive, find_last_end, member_reader, read_archive};
+use super::zip64::{Archive, find_last_end, member_bytes, read_archive};
 use super::{AFF4_NS, AFF4L_NS};
 use crate::error::{FactumError, Result};
 use crate::services::Factum;
@@ -89,13 +89,7 @@ impl ContainerReport {
 }
 
 fn read_member(file: &mut File, archive: &Archive, name: &str) -> Option<io::Result<Vec<u8>>> {
-    let entry = archive.get(name)?;
-    let mut data = Vec::new();
-    Some(
-        member_reader(file, entry)
-            .and_then(|mut r| r.read_to_end(&mut data))
-            .map(|_| data),
-    )
+    Some(member_bytes(file, archive.get(name)?))
 }
 
 /// A member's content; one that is listed but cannot be read is a failure (with `code`), not an error.
@@ -301,6 +295,9 @@ fn hash_content(
     Ok(Content::None)
 }
 
+/// Maps claiming more are not hashed (1 PiB: hashing that many zeros alone would take days).
+const MAX_MAP_SIZE: u64 = 1 << 50;
+
 /// A Map (AFF4 Standard v1.0): `<map>/map` entries (u64 mapped offset, u64 length, u64 target offset, u32 target)
 /// over the targets in `<map>/idx`; what no entry covers reads as zeros.
 fn hash_map(
@@ -343,22 +340,30 @@ fn hash_map(
     if end_of_ranges > size {
         return Err(damaged("ranges beyond its size"));
     }
+    if size > MAX_MAP_SIZE {
+        return Ok(Content::NotChecked(format!("its map claims {size} bytes")));
+    }
     let mut hasher = stream::Hasher::new();
     let mut position = 0u64;
     let zeros = vec![0u8; 1 << 16];
-    let fill = |hasher: &mut stream::Hasher, mut count: u64, byte: u8| -> io::Result<()> {
+    // what no range covers is hashed too, so its progress shows and it can be cancelled like stored content
+    let fill = |hasher: &mut stream::Hasher, at: u64, count: u64, byte: u8| -> io::Result<()> {
         let block = if byte == 0 {
             zeros.clone()
         } else {
             vec![byte; zeros.len()]
         };
-        while count > 0 {
+        let mut done = 0u64;
+        while done < count {
             if cancel.load(Ordering::Relaxed) {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
             }
-            let take = count.min(block.len() as u64) as usize;
+            let take = (count - done).min(block.len() as u64) as usize;
             hasher.update(&block[..take]);
-            count -= take as u64;
+            done += take as u64;
+            if done.is_multiple_of(1 << 24) {
+                progress(at + done);
+            }
         }
         Ok(())
     };
@@ -367,7 +372,7 @@ fn hash_map(
             return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
         }
         if mapped > position {
-            fill(&mut hasher, mapped - position, 0)?;
+            fill(&mut hasher, position, mapped - position, 0)?;
         }
         let target = targets.get(target as usize).ok_or_else(|| {
             io::Error::new(
@@ -376,12 +381,12 @@ fn hash_map(
             )
         })?;
         if target == &format!("{AFF4_NS}Zero") {
-            fill(&mut hasher, length, 0)?;
+            fill(&mut hasher, mapped, length, 0)?;
         } else if let Some(byte) = target
             .strip_prefix(&format!("{AFF4_NS}SymbolicStream"))
             .and_then(|hex| u8::from_str_radix(hex, 16).ok())
         {
-            fill(&mut hasher, length, byte)?;
+            fill(&mut hasher, mapped, length, byte)?;
         } else if target.starts_with(AFF4_NS) {
             return Ok(Content::NotChecked(format!("its map uses {target}")));
         } else if graph.has_type(target, &format!("{AFF4_NS}ImageStream")) {
@@ -420,7 +425,7 @@ fn hash_map(
         progress(position);
     }
     if size > position {
-        fill(&mut hasher, size - position, 0)?;
+        fill(&mut hasher, position, size - position, 0)?;
     }
     Ok(Content::Hashed(size.max(position), hasher.finish()))
 }
@@ -1311,5 +1316,34 @@ mod crafted {
             "{:?}",
             report.findings
         );
+    }
+
+    #[test]
+    fn a_map_of_implausible_size_is_not_hashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = Graph::default();
+        let file = "aff4://file";
+        a(&mut graph, file, &aff4("FileImage"));
+        a(&mut graph, file, &aff4("Map"));
+        graph.add(file, &aff4("size"), typed(1u64 << 62, &format!("{XSD_NS}long")));
+        graph.add(file, &aff4("hash"), typed("00", &aff4("SHA1")));
+        let path = foreign(
+            &dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes("aff4://file/map", 0, b"").unwrap();
+                app.add_bytes("aff4://file/idx", 0, b"").unwrap();
+            },
+            V21,
+        );
+        let started = std::time::Instant::now();
+        let report = check(&path);
+        assert!(started.elapsed().as_secs() < 10);
+        let warning = report
+            .findings
+            .iter()
+            .find(|f| f.code == "not_checked")
+            .expect("not checked");
+        assert!(warning.message.contains("claims"), "{}", warning.message);
     }
 }
