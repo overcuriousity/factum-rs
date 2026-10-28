@@ -4,7 +4,7 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
 use crate::images::SCHEME;
 
@@ -73,10 +73,12 @@ enum Frame {
     Link {
         text: Vec<Inline>,
         url: String,
+        title: String,
     },
     Image {
         alt: Vec<Inline>,
         url: String,
+        title: String,
     },
     Code(String),
     /// raw HTML block, kept as its source lines
@@ -103,8 +105,13 @@ pub fn parse(text: &str) -> Vec<Block> {
     let mut stack = vec![Frame::Root(Vec::new())];
     // nesting depth inside an unsupported element whose events are dropped
     let mut skipping = 0usize;
+    // the source the top-level elements take, to find what the parser consumed without an event
+    let mut covered: Vec<Range<usize>> = Vec::new();
     let mut events = Parser::new_ext(text, Options::empty()).into_offset_iter();
     for (event, range) in events.by_ref() {
+        if skipping == 0 && stack.len() == 1 {
+            covered.push(range.clone());
+        }
         if skipping > 0 {
             match event {
                 Event::Start(_) => skipping += 1,
@@ -118,7 +125,15 @@ pub fn parse(text: &str) -> Vec<Block> {
             Event::Start(tag) => match start_frame(&tag)
                 .filter(|frame| matches!(frame, Frame::Item { .. }) || stack.len() <= MAX_DEPTH)
             {
-                Some(frame) => stack.push(frame),
+                Some(frame) => {
+                    // a fence's info string is signed text too: it heads the code
+                    if let Tag::CodeBlock(CodeBlockKind::Fenced(info)) = &tag
+                        && !info.is_empty()
+                    {
+                        push_block(&mut stack, Block::Paragraph(text_lines(info)));
+                    }
+                    stack.push(frame);
+                }
                 None => {
                     skipping = 1;
                     literal(&mut stack, &text[range]);
@@ -147,15 +162,26 @@ pub fn parse(text: &str) -> Vec<Block> {
     let Some(Frame::Root(mut blocks)) = stack.pop() else {
         return Vec::new();
     };
-    // the parser consumes link reference definitions without an event; show them, after everything else
+    // the parser consumes link reference definitions without an event; show them, after everything else, and
+    // whatever else no top-level event covers (a second definition of a label is not even listed)
     let mut spans: Vec<_> = events
         .reference_definitions()
         .iter()
         .map(|(_, def)| def.span.clone())
         .collect();
+    covered.extend(spans.iter().cloned());
+    covered.sort_by_key(|r| r.start);
+    let mut at = 0;
+    for range in covered.into_iter().chain([text.len()..text.len()]) {
+        if range.start > at && !text[at..range.start].trim().is_empty() {
+            spans.push(at..range.start);
+        }
+        at = at.max(range.end);
+    }
     spans.sort_by_key(|r| r.start);
     for span in spans {
-        blocks.push(Block::Paragraph(text_lines(text[span].trim_end())));
+        let source = text[span].trim_start_matches(['\n', '\r']).trim_end();
+        blocks.push(Block::Paragraph(text_lines(source)));
     }
     blocks
 }
@@ -177,13 +203,15 @@ fn start_frame(tag: &Tag) -> Option<Frame> {
         },
         Tag::Emphasis => Frame::Emphasis(Vec::new()),
         Tag::Strong => Frame::Strong(Vec::new()),
-        Tag::Link { dest_url, .. } => Frame::Link {
+        Tag::Link { dest_url, title, .. } => Frame::Link {
             text: Vec::new(),
             url: dest_url.to_string(),
+            title: title.to_string(),
         },
-        Tag::Image { dest_url, .. } => Frame::Image {
+        Tag::Image { dest_url, title, .. } => Frame::Image {
             alt: Vec::new(),
             url: dest_url.to_string(),
+            title: title.to_string(),
         },
         _ => return None,
     })
@@ -212,8 +240,11 @@ fn end_frame(stack: &mut Vec<Frame>) {
         Frame::Heading(level, v) => push_block(stack, Block::Heading(level, v)),
         Frame::Emphasis(v) => push_inline(stack, Inline::Emphasis(v)),
         Frame::Strong(v) => push_inline(stack, Inline::Strong(v)),
-        Frame::Link { text, url } => push_inline(stack, Inline::Link { text, url }),
-        Frame::Image { alt, url } => {
+        Frame::Link { text, url, title } => {
+            push_inline(stack, Inline::Link { text, url });
+            push_title(stack, &title);
+        }
+        Frame::Image { alt, url, title } => {
             let target = match url.strip_prefix(SCHEME) {
                 Some(id) => ImageTarget::Note(id.to_string()),
                 None => ImageTarget::External(url),
@@ -225,6 +256,7 @@ fn end_frame(stack: &mut Vec<Frame>) {
                     target,
                 },
             );
+            push_title(stack, &title);
         }
         Frame::Code(mut code) => {
             if code.ends_with('\n') {
@@ -233,6 +265,13 @@ fn end_frame(stack: &mut Vec<Frame>) {
             push_block(stack, Block::Code(code));
         }
         Frame::Html(source) => push_block(stack, Block::Paragraph(text_lines(source.trim_end()))),
+    }
+}
+
+/// A link's or image's title is signed text: it follows them in quotes.
+fn push_title(stack: &mut [Frame], title: &str) {
+    if !title.is_empty() {
+        literal_inline(stack, &format!(" \"{title}\""));
     }
 }
 
@@ -510,15 +549,65 @@ mod tests {
         assert_eq!(
             parse("[a][r]\n\n[r]: https://x \"title\"\n[s]: https://y"),
             vec![
-                Block::Paragraph(vec![Inline::Link {
-                    text: vec![t("a")],
-                    url: "https://x".into(),
-                }]),
+                Block::Paragraph(vec![
+                    Inline::Link {
+                        text: vec![t("a")],
+                        url: "https://x".into(),
+                    },
+                    t(" \"title\""),
+                ]),
                 para("[r]: https://x \"title\""),
                 para("[s]: https://y"),
             ]
         );
         assert_eq!(parse("[r]: https://evil"), vec![para("[r]: https://evil")]);
+    }
+
+    #[test]
+    fn link_and_image_titles_are_shown_after_them() {
+        assert_eq!(
+            parse("[x](https://e \"title words\")"),
+            vec![Block::Paragraph(vec![
+                Inline::Link {
+                    text: vec![t("x")],
+                    url: "https://e".into(),
+                },
+                t(" \"title words\""),
+            ])]
+        );
+        assert_eq!(
+            parse("![a](factum-image:i 't')"),
+            vec![Block::Paragraph(vec![
+                Inline::Image {
+                    alt: "a".into(),
+                    target: ImageTarget::Note("i".into()),
+                },
+                t(" \"t\""),
+            ])]
+        );
+        assert_eq!(to_plain("[x](https://e (two\nlines))"), "x (https://e) \"two lines\"");
+    }
+
+    #[test]
+    fn a_code_fence_info_string_is_shown_above_the_code() {
+        assert_eq!(
+            parse("```rust secret info\ncode\n```"),
+            vec![para("rust secret info"), Block::Code("code".into())]
+        );
+        assert_eq!(parse("```\ncode\n```"), vec![Block::Code("code".into())]);
+    }
+
+    #[test]
+    fn source_the_parser_consumes_silently_stays_visible() {
+        // a second definition of a label is dropped by the parser without an event
+        assert_eq!(
+            parse("[a]: https://one\n[a]: https://two"),
+            vec![para("[a]: https://one"), para("[a]: https://two")]
+        );
+        assert_eq!(
+            parse("x\n\n[a]: https://one\n\n[a]: https://two\n\ny"),
+            vec![para("x"), para("y"), para("[a]: https://one"), para("[a]: https://two")]
+        );
     }
 
     #[test]
