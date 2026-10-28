@@ -2220,6 +2220,28 @@ fn an_image_is_decoded_only_while_it_is_on_screen() {
 }
 
 #[test]
+fn a_texture_scrolled_away_for_30_seconds_is_released() {
+    let fixture = Fixture::new();
+    let image = test_image(40, 30);
+    let note = add_note(&fixture, &image.reference("far below"), &[image]);
+    let filler = add_note(&fixture, &"line\n\n".repeat(120), &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.state_mut().scroll_to = Some(note);
+    harness.run_ok();
+    let ctx = harness.ctx.clone();
+    assert!(markup_view::texture_cached(&ctx, note));
+    // back to the top: the image is laid out below the visible part every frame, but not drawn
+    harness.state_mut().scroll_to = Some(filler);
+    harness.run_ok();
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_none());
+    let now = ctx.input(|i| i.time);
+    harness.input_mut().time = Some(now + 31.0);
+    harness.run_ok();
+    assert!(!markup_view::texture_cached(&ctx, note));
+}
+
+#[test]
 fn an_image_that_does_not_decode_says_so_where_it_stands() {
     let fixture = Fixture::new();
     let mut image = test_image(8, 8);

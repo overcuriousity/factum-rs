@@ -27,12 +27,14 @@ pub fn fit(size: [usize; 2], max_side: usize) -> [usize; 2] {
 /// Textures are dropped when no frame drew them for this many seconds of input time.
 const KEEP_SECONDS: f64 = 30.0;
 
-/// What is known about one picture of one entry, and when a frame last needed it.
+/// What is known about one picture of one entry, and when a frame last drew it.
 struct Slot {
     /// the size it is shown at before scaling to the card: `Some(None)` when its header does not read
     size: Option<Option<[usize; 2]>>,
     /// the decoded picture: `Some(None)` when it does not decode
     texture: Option<Option<TextureHandle>>,
+    /// when it was drawn last (or first laid out); laying it out again does not count, as the log lays out every
+    /// card each frame, also those scrolled away
     last_used: f64,
 }
 
@@ -56,6 +58,7 @@ fn texture_at(ctx: &egui::Context, entry_id: i64, image: &NoteImage, now: f64) -
     let cache = cache(ctx);
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     let slot = slot(&mut cache, entry_id, image, now);
+    slot.last_used = now;
     slot.texture.get_or_insert_with(|| decode(ctx, entry_id, image)).clone()
 }
 
@@ -74,13 +77,11 @@ fn display_size(ctx: &egui::Context, entry_id: i64, image: &NoteImage, now: f64)
 }
 
 fn slot<'a>(cache: &'a mut Cache, entry_id: i64, image: &NoteImage, now: f64) -> &'a mut Slot {
-    let slot = cache.entry((entry_id, image.id.clone())).or_insert(Slot {
+    cache.entry((entry_id, image.id.clone())).or_insert(Slot {
         size: None,
         texture: None,
         last_used: now,
-    });
-    slot.last_used = now;
-    slot
+    })
 }
 
 /// How many pictures are kept, for tests.
@@ -100,7 +101,8 @@ pub(super) fn texture_cached(ctx: &egui::Context, entry_id: i64) -> bool {
 }
 
 /// Once per frame: drops the pictures no frame has drawn for [`KEEP_SECONDS`] (a case that was left, a note that was
-/// scrolled away or corrected), which frees their textures. Asks for a frame to come back to it while any are kept.
+/// scrolled away or corrected), which frees their textures. Asks for a frame to come back to it while any texture
+/// is kept. A picture still laid out reads its size from the header again.
 pub fn evict_unused(ctx: &egui::Context) {
     let keeping = evict_older_than(ctx, ctx.input(|i| i.time) - KEEP_SECONDS);
     if keeping {
@@ -108,12 +110,12 @@ pub fn evict_unused(ctx: &egui::Context) {
     }
 }
 
-/// Drops what was last used before `limit`; true while something is left.
+/// Drops what was last used before `limit`; true while a texture is left.
 fn evict_older_than(ctx: &egui::Context, limit: f64) -> bool {
     let cache = cache(ctx);
     let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
     cache.retain(|_, slot| slot.last_used >= limit);
-    !cache.is_empty()
+    cache.values().any(|slot| matches!(slot.texture, Some(Some(_))))
 }
 
 fn decode(ctx: &egui::Context, entry_id: i64, image: &NoteImage) -> Option<TextureHandle> {
@@ -500,6 +502,19 @@ mod tests {
         let _ = texture_at(&ctx, 2, &fresh, 40.0).unwrap();
         assert!(!evict_older_than(&ctx, 71.0 - KEEP_SECONDS));
         assert_eq!(cached_count(&ctx), 0);
+    }
+
+    #[test]
+    fn laying_an_image_out_does_not_keep_its_texture() {
+        let ctx = egui::Context::default();
+        let image = png(3, 3);
+        let _ = texture_at(&ctx, 1, &image, 0.0).unwrap();
+        // the log lays out every card each frame, also those scrolled away: that is no use of the picture
+        for now in [10.0, 20.0, 40.0] {
+            assert_eq!(display_size(&ctx, 1, &image, now), Some([3, 3]));
+        }
+        assert!(!evict_older_than(&ctx, 40.0 - KEEP_SECONDS));
+        assert!(!texture_cached(&ctx, 1));
     }
 
     #[test]
