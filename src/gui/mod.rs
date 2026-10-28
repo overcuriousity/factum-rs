@@ -3623,6 +3623,7 @@ fn ioc_row(ui: &mut egui::Ui, ctx: &egui::Context, value: &str) {
 /// A row of the case tree: the name, and the number of notes (or files) on the right; `mark` is an icon with its
 /// tooltip. With `add` (the shortcut), a + for new evidence shows under the pointer; the second value is true when
 /// it was clicked.
+#[allow(clippy::too_many_arguments)]
 fn tree_row(
     ui: &mut egui::Ui,
     selected: bool,
