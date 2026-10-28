@@ -1167,3 +1167,21 @@ fn verify_py_accepts_a_bundle_with_images_and_detects_a_swapped_one() {
         "{output}"
     );
 }
+
+#[test]
+fn markdown_report_keeps_indented_literal_lines_literal() {
+    let f = Fixture::new();
+    let markdown = markdown_of_note(&f, "<div>\n  - a\n  ===\n  1. x\n  ~~~\n    deep\n</div>", &[]);
+    for line in [
+        r"&nbsp;&nbsp;- a",
+        r"&nbsp;&nbsp;===",
+        r"&nbsp;&nbsp;1. x",
+        r"&nbsp;&nbsp;~~~",
+        r"&nbsp;&nbsp;&nbsp;&nbsp;deep",
+    ] {
+        assert!(markdown.contains(line), "{line:?} in {markdown}");
+    }
+    for structural in ["\n  - a", "\n  ===", "\n  1. x", "\n  ~~~", "\n    deep"] {
+        assert!(!markdown.contains(structural), "{structural:?} in {markdown}");
+    }
+}

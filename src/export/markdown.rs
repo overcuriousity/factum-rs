@@ -102,6 +102,13 @@ fn inlines_markdown(inlines: &[Inline], images: &[NoteImage], image_dir: &str) -
 
 /// A line that starts like a list item, rule or heading underline would change the structure.
 fn escape_line_start(line: &str) -> String {
+    // literal lines (HTML blocks) keep their indentation: up to three spaces still let a list, rule or fence start,
+    // four make a code block. Non-breaking spaces show the indentation and start nothing.
+    let stripped = line.trim_start_matches([' ', '\t']);
+    if stripped.len() < line.len() {
+        let indent = line[..line.len() - stripped.len()].chars().count();
+        return format!("{}{stripped}", "&nbsp;".repeat(indent));
+    }
     let digits = line.bytes().take_while(u8::is_ascii_digit).count();
     if line.starts_with(['-', '+', '=', '~']) {
         format!("\\{line}")
