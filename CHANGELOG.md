@@ -5,6 +5,35 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Containers are evidence: an evidence item can hold several containers and shows a container symbol in the case
+  list (blue while one is open); selecting it shows its notes and, below them, each container with its file,
+  history and files
+- New Container… on a case creates a new evidence item with its container; on an evidence item it adds one.
+  Acquire copies a folder (e.g. a read-only xmount mount) in right away, in one step
+- The base path is optional: without it, the full original path is kept (with the drive on Windows), so files from
+  anywhere, several drives included, go into one container
+- Every addition records the mount its files were read from (Linux: device, file system, options and the image
+  behind a loop or xmount mount; Windows: file system, volume serial, label and GUID) and each file's absolute
+  source path; reports list them
+- Closing re-checks what was added since the last close against its hashes, reading past the page cache on Linux.
+  A mismatch offers Add Again (copies the files again; the damaged copies stay, marked as replaced, and both
+  verifiers report them as warnings), Close as Damaged (logged, not signed) or Cancel
+- The container's README names the factum version and the SHA-256 of its `verify_container.py`, with the same
+  script on GitHub to compare
+- `samples/container/`: a signed sample container with throwaway TEST ONLY GPG and X.509 keys, for testing other
+  AFF4-L tools; CI checks that it verifies
+
+### Changed
+- A container always belongs to an evidence item; containers have no rows of their own in the case list any more
+  (except those from 2.6/2.7 without an evidence item, or whose evidence item was deleted)
+- An evidence item with containers cannot be deleted
+
+### Known limitations
+- Windows: the re-check at close reads through the file cache and may not detect a bad write to the disk; the
+  last-access time of sources on a writable volume may be updated (the Add dialog says so). Add from a read-only
+  mounted image or behind a write blocker
+
 ## [2.7.0] - 2026-10-28
 
 ### Added
