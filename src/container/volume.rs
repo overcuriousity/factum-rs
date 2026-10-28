@@ -82,7 +82,7 @@ pub struct FileRecord {
     pub metadata_only: bool,
     pub excerpt: Option<(u64, u64)>,
     pub link: Option<String>,
-    /// the absolute path it was read from (not recorded before 2.8)
+    /// the absolute path it was read from (not recorded before 2.7)
     pub source: Option<String>,
 }
 

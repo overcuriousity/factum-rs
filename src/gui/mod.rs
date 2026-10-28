@@ -2849,7 +2849,7 @@ impl FactumApp {
                         }
                     });
                 }
-                // containers without a live evidence item (from before 2.8, or their evidence was deleted): rows
+                // containers without a live evidence item (from before 2.7, or their evidence was deleted): rows
                 // of their own
                 let live: std::collections::HashSet<i64> = node.evidence.iter().map(|(e, _)| e.id).collect();
                 for summary in node

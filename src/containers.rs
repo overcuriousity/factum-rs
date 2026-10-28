@@ -58,7 +58,7 @@ pub struct ContainerSummary {
     pub path: Option<PathBuf>,
     /// no file at the remembered path
     pub missing: bool,
-    /// the evidence item it belongs to (containers from before 2.8 may have none)
+    /// the evidence item it belongs to (containers from before 2.7 may have none)
     pub evidence_id: Option<i64>,
     /// the newest close is signed, when it was made or later
     pub signed: bool,
@@ -72,9 +72,9 @@ pub struct AddEvent {
     pub utc: String,
     pub files: Vec<FileRecord>,
     pub folders: Vec<FolderRecord>,
-    /// the mounts the sources were read from (not recorded before 2.8)
+    /// the mounts the sources were read from (not recorded before 2.7)
     pub mounts: Vec<crate::container::mounts::Mount>,
-    /// the base path and path option the files were added with (not recorded before 2.8)
+    /// the base path and path option the files were added with (not recorded before 2.7)
     pub base_path: Option<String>,
     pub keep_path: Option<bool>,
     /// (ARN, ARN of the copy added again in its place)
@@ -1061,7 +1061,7 @@ impl Factum<'_> {
     }
 
     /// How to add damaged files again: one Add operation per original one, with its base path and options, each
-    /// replacing the damaged copies. Fails when a file's source was not recorded (added before 2.8).
+    /// replacing the damaged copies. Fails when a file's source was not recorded (added before 2.7).
     pub fn add_again_plan(
         &self,
         id: i64,

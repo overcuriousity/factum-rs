@@ -5,35 +5,6 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
-- Containers are evidence: an evidence item can hold several containers and shows a container symbol in the case
-  list (blue while one is open); selecting it shows its notes and, below them, each container with its file,
-  history and files
-- New Container… on a case creates a new evidence item with its container; on an evidence item it adds one.
-  Acquire copies a folder (e.g. a read-only xmount mount) in right away, in one step
-- The base path is optional: without it, the full original path is kept (with the drive on Windows), so files from
-  anywhere, several drives included, go into one container
-- Every addition records the mount its files were read from (Linux: device, file system, options and the image
-  behind a loop or xmount mount; Windows: file system, volume serial, label and GUID) and each file's absolute
-  source path; reports list them
-- Closing re-checks what was added since the last close against its hashes, reading past the page cache on Linux.
-  A mismatch offers Add Again (copies the files again; the damaged copies stay, marked as replaced, and both
-  verifiers report them as warnings), Close as Damaged (logged, not signed) or Cancel
-- The container's README names the factum version and the SHA-256 of its `verify_container.py`, with the same
-  script on GitHub to compare
-- `samples/container/`: a signed sample container with throwaway TEST ONLY GPG and X.509 keys, for testing other
-  AFF4-L tools; CI checks that it verifies
-
-### Changed
-- A container always belongs to an evidence item; containers have no rows of their own in the case list any more
-  (except those from 2.6/2.7 without an evidence item, or whose evidence item was deleted)
-- An evidence item with containers cannot be deleted
-
-### Known limitations
-- Windows: the re-check at close reads through the file cache and may not detect a bad write to the disk; the
-  last-access time of sources on a writable volume may be updated (the Add dialog says so). Add from a read-only
-  mounted image or behind a write blocker
-
 ## [2.7.0] - 2026-10-28
 
 ### Added
@@ -47,8 +18,31 @@ All notable changes to this project are documented here. The format follows
   edited) is marked under the field, and the note is not saved until it is fixed or removed. On Wayland, pasting an
   image depends on the compositor offering clipboard data control (not verified; GNOME likely does not); inserting
   from a file always works
+- Containers are evidence: an evidence item can hold several containers and shows a container symbol in the case
+  list (blue while one is open); selecting it shows its notes and, below them, each container with its file,
+  history and files
+- New Container… on a case creates a new evidence item with its container; on an evidence item it adds one.
+  Acquire copies a folder (e.g. a disk image mounted read-only with xmount) in right away, in one step
+- The base path of a container is optional: without it, the full original path is kept (with the drive on
+  Windows), so files from anywhere, several drives included, go into one container
+- Every addition to a container records the mount its files were read from (Linux: device, file system, options
+  and the image behind a loop or xmount mount; Windows: file system, volume serial, label and GUID) and each file's
+  absolute source path; reports list them
+- Closing a container re-checks what was added since the last close against its hashes, reading past the page
+  cache on Linux. A mismatch offers Add Again (copies the files again; the damaged copies stay, marked as replaced,
+  and both verifiers report them as warnings), Close as Damaged (logged, not signed) or Cancel. On Windows the
+  re-check reads through the file cache and may not detect a bad write to the disk
+- A container's README names the factum version and the SHA-256 of its `verify_container.py`, with the same script
+  on GitHub to compare
+- `samples/container/`: a signed sample container with throwaway TEST ONLY GPG and X.509 keys, for testing other
+  AFF4-L tools; CI checks that it verifies
 
 ### Changed
+- A container always belongs to an evidence item; containers have no rows of their own in the case list any more
+  (except those from 2.6 without an evidence item, or whose evidence item was deleted)
+- An evidence item with containers cannot be deleted
+- On Windows, adding from a writable volume may update the sources' last-access times (factum does not prevent it
+  there; the Add dialog says so): add from a read-only mounted image or behind a write blocker
 - Existing notes are shown as Markdown too, so some read differently than before: `__init__` turns bold, lines
   starting with `* x` or `1.` become lists. Backslashes and entity references stay as typed (`\\fs01`,
   `C:\$Recycle.Bin`, `&amp;`), so paths and names are never changed. The source toggle in the log (and the source
