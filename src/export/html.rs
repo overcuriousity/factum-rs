@@ -1,6 +1,11 @@
 //! Self-contained HTML report: the notes first, the verification data at the end.
 
 use super::model::{ReportEntry, ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+
+use crate::images::{self, NoteImage};
+use crate::markup::{self, Block, ImageTarget, Inline};
 use crate::pystr::html_escape as escape;
 use crate::verifier::Level;
 
@@ -22,7 +27,13 @@ table.grid th, table.grid td { border: 1px solid #d6d3d1; padding: .25em .5em; t
 .note { margin: 1.4em 0; padding-bottom: .8em; border-bottom: 1px solid #e7e5e4; }
 .note-head { font-size: .85em; color: #78716c; margin-bottom: .3em; }
 .note-head b { color: #44403c; }
-pre.text { white-space: pre-wrap; font-family: Georgia, 'Times New Roman', serif; font-size: 1.1em; margin: .2em 0 .4em 0; }
+.text { font-family: Georgia, 'Times New Roman', serif; font-size: 1.1em; margin: .2em 0 .4em 0; }
+.text > :first-child { margin-top: 0; }
+.text p { margin: .4em 0; }
+.text img { max-width: 100%; height: auto; }
+.text blockquote { margin: .4em 0 .4em 1em; padding-left: .8em; border-left: 3px solid #d6d3d1; color: #44403c; }
+.text pre, .text code { font-family: 'Courier New', monospace; font-size: .9em; }
+.text pre { white-space: pre-wrap; background: #f5f5f4; padding: .5em; }
 .aside { font-size: .8em; font-style: italic; color: #78716c; }
 .alert { font-size: .9em; font-weight: bold; color: #b91c1c; }
 ul.activity { font-size: .9em; color: #57534e; padding-left: 1.2em; }
@@ -39,15 +50,98 @@ fn row(label: &str, value: &str) -> String {
     format!("<tr><td><b>{}</b></td><td>{}</td></tr>", escape(label), escape(value))
 }
 
-fn note_html(item: &ReportEntry) -> String {
+/// Only these types become a `data:` URI; a stored `mime` is untrusted data.
+const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+fn image_html(alt: &str, target: &ImageTarget, images: &[NoteImage]) -> String {
+    match target {
+        ImageTarget::External(url) => format!("[external image {} not loaded]", escape(url)),
+        ImageTarget::Note(id) => {
+            match images::find(images, id).filter(|image| IMAGE_TYPES.contains(&image.mime.as_str())) {
+                Some(image) => format!(
+                    "<img src='data:{};base64,{}' alt='{}'>",
+                    escape(&image.mime),
+                    STANDARD.encode(&image.bytes),
+                    escape(alt)
+                ),
+                None => format!("[image {} missing]", escape(id)),
+            }
+        }
+    }
+}
+
+fn inlines_html(inlines: &[Inline], images: &[NoteImage]) -> String {
+    let mut out = String::new();
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => out += &escape(text),
+            Inline::Emphasis(inner) => out += &format!("<em>{}</em>", inlines_html(inner, images)),
+            Inline::Strong(inner) => out += &format!("<strong>{}</strong>", inlines_html(inner, images)),
+            Inline::Code(code) => out += &format!("<code>{}</code>", escape(code)),
+            Inline::LineBreak => out += "<br>",
+            // never clickable: the address is printed so a reader of the report can see where it points
+            Inline::Link { text, url } => {
+                out += &inlines_html(text, images);
+                if markup::shows_address(text, url) {
+                    out += &format!(" ({})", escape(url));
+                }
+            }
+            Inline::Image { alt, target } => out += &image_html(alt, target, images),
+        }
+    }
+    out
+}
+
+fn blocks_html(blocks: &[Block], images: &[NoteImage]) -> String {
+    let mut out = String::new();
+    for block in blocks {
+        match block {
+            Block::Paragraph(inlines) => out += &format!("<p>{}</p>", inlines_html(inlines, images)),
+            // the report's own headings are h1 to h3, so a note's start below them
+            Block::Heading(level, inlines) => {
+                let level = (*level + 2).min(6);
+                out += &format!("<h{level}>{}</h{level}>", inlines_html(inlines, images));
+            }
+            Block::List { start, items } => {
+                let (open, close) = match start {
+                    None => ("<ul>".to_string(), "</ul>"),
+                    Some(1) => ("<ol>".to_string(), "</ol>"),
+                    Some(n) => (format!("<ol start='{n}'>"), "</ol>"),
+                };
+                out += &open;
+                for item in items {
+                    out += &format!("<li>{}</li>", blocks_html(item, images));
+                }
+                out += close;
+            }
+            Block::Quote(inner) => out += &format!("<blockquote>{}</blockquote>", blocks_html(inner, images)),
+            Block::Code(code) => out += &format!("<pre>{}</pre>", escape(code)),
+        }
+    }
+    out
+}
+
+/// A note's Markdown as HTML. Every text node is escaped, links are text with their address, and only the note's own
+/// images are embedded.
+pub fn markup_html(text: &str, images: &[NoteImage]) -> String {
+    blocks_html(&markup::parse(text), images)
+}
+
+fn note_html(item: &ReportEntry, print_variant: bool) -> String {
     let mut head = format!("<b>{}</b>", escape(&readable_utc(Some(&item.origin_created_utc))));
     if let Some(evidence) = &item.evidence {
         head += &format!(" · {}", escape(evidence));
     }
     let mut parts = vec![
         format!("<div class='note'><div class='note-head'>{head}</div>"),
-        format!("<pre class='text'>{}</pre>", escape(&item.text)),
+        format!("<div class='text'>{}</div>", markup_html(&item.text, &item.images)),
     ];
+    if !print_variant {
+        parts.push(format!(
+            "<details class='source'><summary>Source</summary><pre>{}</pre></details>",
+            escape(&item.text)
+        ));
+    }
     if item.status == Level::Fail {
         parts.push(format!("<div class='alert'>{ALERT}</div>"));
     }
@@ -169,7 +263,7 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
     if notes.is_empty() {
         parts.push("<p>No notes.</p>".into());
     }
-    parts.extend(notes.iter().map(|item| note_html(item)));
+    parts.extend(notes.iter().map(|item| note_html(item, print_variant)));
     parts.push("<h2>Evidence</h2>".into());
     if model.evidence.is_empty() {
         parts.push("<p>No evidence items.</p>".into());

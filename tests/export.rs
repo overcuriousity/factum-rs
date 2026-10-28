@@ -12,6 +12,7 @@ use factum::Factum;
 use factum::export::html::render_html;
 use factum::export::markdown::{inline, prose, render_markdown};
 use factum::export::model::ReportModel;
+use factum::images::NoteImage;
 use factum::signer::{FakeSigner, GnupgSigner, Signer};
 use factum::verifier::Level;
 use sha2::Digest;
@@ -782,4 +783,131 @@ fn reports_mark_files_whose_content_is_not_stored() {
         assert!(text.contains("huge.img (metadata only, not stored)"), "{text}");
         assert!(text.contains("part.bin (excerpt, bytes 2–5)"), "{text}");
     }
+}
+
+/// The HTML report of a case with one note carrying `text` and the given images.
+fn html_of_note(f: &Fixture, text: &str, images: &[NoteImage]) -> (String, i64) {
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let id = factum.create_note_with_images(text, images, None, case_id).unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    (render_html(&model, false), id)
+}
+
+fn red_pixel() -> NoteImage {
+    NoteImage::from_rgba(1, 1, &[255, 0, 0, 255]).unwrap()
+}
+
+#[test]
+fn html_report_renders_markdown_and_embeds_images() {
+    let f = Fixture::new();
+    let image = red_pixel();
+    let text = format!("a **bold** <b>claim</b>\n\n{}", image.reference("login page"));
+    let (html, _) = html_of_note(&f, &text, std::slice::from_ref(&image));
+    assert!(html.contains("<strong>bold</strong>"), "{html}");
+    assert!(html.contains("<img src='data:image/png;base64,"), "{html}");
+    assert!(html.contains("alt='login page'"), "{html}");
+    assert!(
+        html.contains(&format!(
+            "<details class='source'><summary>Source</summary><pre>{}</pre></details>",
+            factum::pystr::html_escape(&text)
+        )),
+        "{html}"
+    );
+}
+
+#[test]
+fn html_report_print_variant_has_no_source_block() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("a **bold** note", None, case_id).unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    assert!(!render_html(&model, true).contains("class='source'"));
+    assert!(render_html(&model, true).contains("<strong>bold</strong>"));
+}
+
+#[test]
+fn html_report_shows_link_addresses() {
+    let f = Fixture::new();
+    let (html, _) = html_of_note(&f, "see [here](https://x.test) and <https://y.test>", &[]);
+    assert!(html.contains("here (https://x.test)"), "{html}");
+    assert_eq!(
+        html.matches("https://y.test").count(),
+        2,
+        "once in the text, once in the source: {html}"
+    );
+    assert!(!html.contains("<a "), "{html}");
+}
+
+#[test]
+fn html_report_escapes_raw_html() {
+    let f = Fixture::new();
+    let (html, _) = html_of_note(
+        &f,
+        "<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n`<script>`\n\n```\n<script>\n```",
+        &[],
+    );
+    assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{html}");
+    assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"), "{html}");
+    assert!(!html.contains("<script"), "{html}");
+    assert!(!html.contains("<img src=x"), "{html}");
+}
+
+#[test]
+fn html_report_marks_missing_and_external_images() {
+    let f = Fixture::new();
+    let image = red_pixel();
+    let text = format!("{} ![out](https://x.test/a.png)", image.reference("x"));
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let id = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    f.db.conn
+        .execute("UPDATE entries SET payload_json = NULL WHERE id = ?", [id])
+        .unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let html = render_html(&build(&factum, case_id, seal_id, None), false);
+    assert!(html.contains(&format!("[image {} missing]", image.id)), "{html}");
+    assert!(
+        html.contains("[external image https://x.test/a.png not loaded]"),
+        "{html}"
+    );
+    assert!(!html.contains("<img"), "{html}");
+}
+
+#[test]
+fn html_report_never_trusts_a_stored_mime() {
+    let f = Fixture::new();
+    let image = red_pixel();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let id = factum
+        .create_note_with_images(
+            &image.reference("x\" onerror=\"y"),
+            std::slice::from_ref(&image),
+            None,
+            case_id,
+        )
+        .unwrap();
+    let json: String =
+        f.db.conn
+            .query_row("SELECT payload_json FROM entries WHERE id = ?", [id], |r| r.get(0))
+            .unwrap();
+    let tampered = json.replace("image/png", "image/png\\\" onerror=\\\"x");
+    assert_ne!(tampered, json);
+    f.db.conn
+        .execute(
+            "UPDATE entries SET payload_json = ? WHERE id = ?",
+            rusqlite::params![tampered, id],
+        )
+        .unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let html = render_html(&build(&factum, case_id, seal_id, None), false);
+    assert!(html.contains(&format!("[image {} missing]", image.id)), "{html}");
+    assert!(!html.contains("data:image"), "{html}");
+    assert!(!html.contains("onerror=\""), "{html}");
 }

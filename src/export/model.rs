@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::cases::Case;
 use crate::error::Result;
+use crate::images::NoteImage;
 use crate::pystr::{head, tail};
 use crate::seals::TreeHead;
 use crate::services::Factum;
@@ -44,6 +45,8 @@ pub struct ReportEntry {
     pub origin_created_utc: String,
     pub evidence: Option<String>,
     pub text: String,
+    /// the images the note carries in its payload (notes only)
+    pub images: Vec<NoteImage>,
     pub labels: Vec<String>,
     /// 1 = never corrected
     pub version: usize,
@@ -368,6 +371,7 @@ impl Factum<'_> {
                     .unwrap_or_else(|| entry.created_utc.clone()),
                 evidence: entry.evidence_id.and_then(|id| names.get(&id).cloned()),
                 text: entry.text.clone(),
+                images: if entry.is_note() { entry.images() } else { Vec::new() },
                 labels,
                 version: line_version,
                 status: result.status(),
