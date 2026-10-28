@@ -2380,12 +2380,15 @@ fn a_note_that_fails_to_save_keeps_its_images() {
     let fixture = Fixture::new();
     let mut harness = fixture.harness();
     select_case(&mut harness);
-    let image = test_image(4, 4);
-    // the reference is to an image that is not attached
-    harness.state_mut().composer = image.reference("gone");
+    let (image, gone) = (test_image(4, 4), test_image(5, 5));
+    // one reference is to an image that is not attached
+    let text = format!("{} {}", image.reference("kept"), gone.reference("gone"));
+    harness.state_mut().composer = text.clone();
+    harness.state_mut().composer_images = vec![image.clone()];
     harness.state_mut().submit_note();
     harness.run_ok();
-    assert!(!harness.state().composer.is_empty());
+    assert_eq!(harness.state().composer, text);
+    assert_eq!(harness.state().composer_images, vec![image]);
     assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
 }
 
