@@ -219,10 +219,17 @@ def check_files(archive, graph, volume):
         name = display(graph, arn)
         replaced_by = first_factum(graph, arn, "replacedBy")
 
-        def fail_or_replaced(message, name=name, replaced_by=replaced_by):
-            # a damaged copy that was added again (Add Again) is a known, logged fact: a warning, not a failure
-            if replaced_by:
+        def fail_or_replaced(message, name=name, arn=arn, replaced_by=replaced_by):
+            # a damaged copy that was added again (Add Again) is a known, logged fact: a warning, not a failure,
+            # but only when the replacement is a file of this state with the same hashes and size
+            same = (replaced_by in file_images(graph)
+                    and hashes_of(graph, replaced_by) == hashes_of(graph, arn)
+                    and first(graph, replaced_by, "size") == first(graph, arn, "size"))
+            if replaced_by and same:
                 warn("%s: the content does not match its hashes; replaced by a copy added again (%s)."
+                     % (name, display(graph, replaced_by)))
+            elif replaced_by:
+                fail("%s: the content does not match its hashes; replaced by a copy with different content (%s)."
                      % (name, display(graph, replaced_by)))
             else:
                 fail(message)

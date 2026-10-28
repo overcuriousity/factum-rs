@@ -1,6 +1,7 @@
 //! Where the sources of an Add operation were read from: the mount (Linux) or volume (Windows) below each source,
 //! so the log and the container say through which device, file system and options the files were read.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -122,30 +123,94 @@ pub fn mount_line(m: &Mount) -> String {
     parts.join(" · ")
 }
 
-/// The mounts below the sources, one per mount, each with the sources below it.
-pub fn mounts_for(paths: &[PathBuf]) -> Vec<Mount> {
+/// The mounts the sources, and everything walked below them, were read from: one per mount. Each lists the sources
+/// below it or, for a mount reached only by walking into it (a partition mounted inside an added folder), its mount
+/// point. The mount table is read once.
+pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
+    let canonical = |p: &Path| plain(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+    let sources: Vec<PathBuf> = sources.iter().map(|s| canonical(s)).collect();
+    // a walked item's folder is resolved once; the item itself is not followed (a link is read where it lies)
+    let mut folders: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let walked: Vec<PathBuf> = walked
+        .iter()
+        .map(|p| match (p.parent(), p.file_name()) {
+            (Some(parent), Some(name)) => folders
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| canonical(parent))
+                .join(name),
+            _ => canonical(p),
+        })
+        .collect();
+    platform::mounts_for(&sources, &walked)
+}
+
+/// Groups paths by the mount `resolve` finds for them (unknown when it finds none).
+fn group(sources: &[PathBuf], walked: &[PathBuf], resolve: &mut dyn FnMut(&Path) -> Option<Mount>) -> Vec<Mount> {
     let mut mounts: Vec<Mount> = Vec::new();
-    for path in paths {
-        let mount = mount_of(path).unwrap_or_default();
-        let display = path.display().to_string();
-        match mounts
-            .iter_mut()
-            .find(|m| m.mount_point == mount.mount_point && m.device == mount.device)
+    for (path, is_source) in sources
+        .iter()
+        .map(|p| (p, true))
+        .chain(walked.iter().map(|p| (p, false)))
+    {
+        let mount = resolve(path).unwrap_or_default();
+        let index = match mounts
+            .iter()
+            .position(|m| m.mount_point == mount.mount_point && m.device == mount.device)
         {
-            Some(known) => known.paths.push(display),
-            None => mounts.push(Mount {
-                paths: vec![display],
-                ..mount
-            }),
+            Some(index) => index,
+            None => {
+                mounts.push(mount);
+                mounts.len() - 1
+            }
+        };
+        let known = &mut mounts[index];
+        let label = if is_source || known.mount_point.is_empty() {
+            path.display().to_string()
+        } else {
+            known.mount_point.clone()
+        };
+        if (is_source || known.paths.is_empty()) && !known.paths.contains(&label) {
+            known.paths.push(label);
         }
     }
     mounts
 }
 
+/// The mounts of `entries` the paths lie on, as `group` lists them; `to_mount` turns an entry into a mount.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn assign(
+    entries: &[MountEntry],
+    sources: &[PathBuf],
+    walked: &[PathBuf],
+    to_mount: &dyn Fn(&MountEntry) -> Mount,
+) -> Vec<Mount> {
+    group(sources, walked, &mut |path| containing(entries, path).map(to_mount))
+}
+
 /// The mount a path lies on; None when the platform does not say.
 pub fn mount_of(path: &Path) -> Option<Mount> {
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    platform::mount_of(&path)
+    mounts_for(&[path.to_path_buf()], &[])
+        .into_iter()
+        .next()
+        .filter(|m| !m.is_unknown())
+}
+
+/// A path without Windows' verbatim prefix (`\\?\C:\x` is `C:\x`, `\\?\UNC\server\share` is `\\server\share`), as
+/// canonicalize returns it there and as people know it.
+fn plain(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && rest.as_bytes().get(1) == Some(&b':')
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    path
 }
 
 /// One line of `/proc/self/mountinfo`.
@@ -236,21 +301,23 @@ mod platform {
         }
     }
 
-    pub fn mount_of(path: &Path) -> Option<Mount> {
-        let entries = entries()?;
-        let entry = containing(&entries, path)?;
-        let mut mount = to_mount(entry);
+    pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
+        let entries = entries().unwrap_or_default();
         // a loop device: the image file behind it, and the FUSE mount that file lies on (xmount and similar)
-        if let Some(loop_name) = entry.device.strip_prefix("/dev/").filter(|d| d.starts_with("loop")) {
-            let backing = std::fs::read_to_string(format!("/sys/block/{loop_name}/loop/backing_file")).ok();
-            if let Some(image) = backing.map(|b| b.trim_end().to_string()).filter(|b| !b.is_empty()) {
-                mount.backing = containing(&entries, Path::new(&image))
-                    .filter(|e| e.fs_type.starts_with("fuse"))
-                    .map(|e| Box::new(to_mount(e)));
-                mount.image = Some(image);
+        let with_backing = |entry: &MountEntry| {
+            let mut mount = to_mount(entry);
+            if let Some(loop_name) = entry.device.strip_prefix("/dev/").filter(|d| d.starts_with("loop")) {
+                let backing = std::fs::read_to_string(format!("/sys/block/{loop_name}/loop/backing_file")).ok();
+                if let Some(image) = backing.map(|b| b.trim_end().to_string()).filter(|b| !b.is_empty()) {
+                    mount.backing = containing(&entries, Path::new(&image))
+                        .filter(|e| e.fs_type.starts_with("fuse"))
+                        .map(|e| Box::new(to_mount(e)));
+                    mount.image = Some(image);
+                }
             }
-        }
-        Some(mount)
+            mount
+        };
+        assign(&entries, sources, walked, &with_backing)
     }
 }
 
@@ -275,7 +342,16 @@ mod platform {
             .into_owned()
     }
 
-    pub fn mount_of(path: &Path) -> Option<Mount> {
+    pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
+        // one volume lookup per folder, not per file
+        let mut by_folder: HashMap<PathBuf, Option<Mount>> = HashMap::new();
+        group(sources, walked, &mut |path| {
+            let folder = path.parent().unwrap_or(path).to_path_buf();
+            by_folder.entry(folder).or_insert_with(|| volume_of(path)).clone()
+        })
+    }
+
+    fn volume_of(path: &Path) -> Option<Mount> {
         let mut root = vec![0u16; 1024];
         // SAFETY: the buffers are valid for the lengths given; the strings are NUL-terminated
         if unsafe { GetVolumePathNameW(wide(path).as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
@@ -320,8 +396,8 @@ mod platform {
     use super::*;
 
     /// macOS and others: not recorded (optional, spec 5.1)
-    pub fn mount_of(_path: &Path) -> Option<Mount> {
-        None
+    pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
+        group(sources, walked, &mut |_| None)
     }
 }
 
@@ -347,6 +423,32 @@ mod tests {
         assert_eq!(
             containing(&entries, Path::new("/mnt/xmountain")).unwrap().mount_point,
             "/"
+        );
+    }
+
+    #[test]
+    fn nested_mounts_below_a_source_are_recorded() {
+        let entries = parse_mountinfo(MOUNTINFO);
+        let mounts = assign(
+            &entries,
+            &[PathBuf::from("/mnt")],
+            &[PathBuf::from("/mnt/x.txt"), PathBuf::from("/mnt/my disk/Users/a")],
+            &|e| Mount {
+                mount_point: e.mount_point.clone(),
+                device: Some(e.device.clone()),
+                ..Default::default()
+            },
+        );
+        let points: Vec<(&str, &[String])> = mounts
+            .iter()
+            .map(|m| (m.mount_point.as_str(), m.paths.as_slice()))
+            .collect();
+        assert_eq!(
+            points,
+            vec![
+                ("/", &["/mnt".to_string()][..]),
+                ("/mnt/my disk", &["/mnt/my disk".to_string()][..])
+            ]
         );
     }
 
@@ -393,7 +495,10 @@ mod tests {
     #[test]
     fn mounts_for_temp_dir_is_known() {
         let dir = tempfile::tempdir().unwrap();
-        let mounts = mounts_for(&[dir.path().to_path_buf(), dir.path().join("x")]);
+        let mounts = mounts_for(
+            &[dir.path().to_path_buf(), dir.path().join("x")],
+            &[dir.path().join("y")],
+        );
         assert_eq!(mounts.len(), 1);
         assert!(!mounts[0].mount_point.is_empty());
         assert!(mounts[0].fs_type.is_some());
@@ -404,8 +509,9 @@ mod tests {
     #[test]
     fn mounts_for_temp_dir_has_volume() {
         let dir = tempfile::tempdir().unwrap();
-        let mounts = mounts_for(&[dir.path().to_path_buf()]);
+        let mounts = mounts_for(&[dir.path().to_path_buf()], &[]);
         assert_eq!(mounts.len(), 1);
+        assert!(!mounts[0].mount_point.starts_with(r"\\?\"), "{}", mounts[0].mount_point);
         assert!(mounts[0].fs_type.is_some());
         assert!(mounts[0].volume_serial.is_some());
         assert!(mounts[0].volume_guid.is_some());

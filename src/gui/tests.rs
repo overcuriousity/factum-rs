@@ -2987,3 +2987,39 @@ fn add_again_with_source_gone_shows_error() {
     close_from_menu(&mut harness, id);
     assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Damaged { .. })));
 }
+
+#[test]
+fn add_again_that_cannot_start_leaves_no_state() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    std::fs::remove_file(&path).unwrap();
+    click_label(&mut harness, "Add Again");
+    assert!(harness.state().add_job.is_none());
+    assert!(harness.state().close_after_adds.is_none());
+    assert!(harness.state().pending_adds.is_empty());
+}
+
+#[test]
+fn container_details_are_reused_between_rebuilds() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    let mut harness = fixture.harness();
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
+    harness.run_ok();
+    let cached = |h: &Harness<'_, FactumApp>| h.state().container_details.borrow().get(&id).map(|(key, _)| *key);
+    let first = cached(&harness).expect("the shown container is cached");
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert_eq!(cached(&harness), Some(first));
+    close_container(&fixture, id);
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(
+        cached(&harness).unwrap() > first,
+        "a new event replaces the cached detail"
+    );
+    assert!(!harness.state().view.containers[0].summary.open);
+}

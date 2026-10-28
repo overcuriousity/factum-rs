@@ -1282,6 +1282,28 @@ mod script {
         );
     }
 
+    #[test]
+    fn verify_container_py_fails_a_replacement_with_other_content() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let (id, _) = damaged(&s);
+        let detail = s.f.factum().container(id).unwrap();
+        add_triple(
+            &s.container_path(),
+            &detail.adds[0].files[0].arn,
+            &format!("{}replacedBy", factum::container::FACTUM_NS),
+            &detail.adds[0].files[1].arn,
+        );
+        let Some((_, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert!(
+            output
+                .lines()
+                .any(|l| l.starts_with('✗') && l.contains("different content")),
+            "{output}"
+        );
+    }
+
     /// A container signed with a real gpg key: two closes, one file stored as an ImageStream.
     fn signed_container(dir: &tempfile::TempDir, home: &common::GpgHome) -> PathBuf {
         let db = Db::open(&dir.path().join("factum.db")).unwrap();
@@ -2029,4 +2051,108 @@ fn add_again_needs_a_recorded_source() {
     unknown[0].source = None;
     let error = s.f.factum().add_again_plan(id, &unknown).unwrap_err();
     assert!(error.to_string().contains("its source is not recorded"), "{error}");
+}
+
+// --- review fixes
+
+/// Adds `subject predicate <object>` to the container's current state, as a forger with write access would.
+fn add_triple(path: &Path, subject: &str, predicate: &str, object: &str) {
+    use factum::container::AFF4_NS;
+    use factum::container::turtle::{self, Term};
+    use factum::container::zip64::{Appender, read_archive};
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let mut graph = turtle::parse(&String::from_utf8(member(path, TURTLE).unwrap()).unwrap()).unwrap();
+    graph.add(subject, predicate, Term::Iri(object.to_string()));
+    let text = turtle::write(&graph, &turtle::factum_prefixes());
+    let uuid = String::from_utf8(member(path, "container.description").unwrap()).unwrap();
+    let mut hashes = turtle::Graph::default();
+    for (name, value) in [
+        ("SHA256", hex::encode(sha2::Sha256::digest(text.as_bytes()))),
+        ("SHA512", hex::encode(sha2::Sha512::digest(text.as_bytes()))),
+    ] {
+        hashes.add(
+            &format!("{uuid}/{TURTLE}"),
+            &format!("{AFF4_NS}hash"),
+            Term::Literal {
+                value,
+                datatype: Some(format!("{AFF4_NS}{name}")),
+            },
+        );
+    }
+    let mut app = Appender::new(file, len, archive.entries).unwrap();
+    app.add_bytes(TURTLE, 8, text.as_bytes()).unwrap();
+    app.add_bytes(HASHES, 0, turtle::write(&hashes, &[("aff4", AFF4_NS)]).as_bytes())
+        .unwrap();
+    app.finish(&[SIG_GPG, "information.turtle.pubkey.asc"], &archive.comment)
+        .unwrap();
+}
+
+#[test]
+fn verify_after_damaged_close_names_it() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    let factum = s.f.factum();
+    let entry = factum.close_container_damaged(id, &recheck.mismatches).unwrap();
+    let report = factum
+        .verify_container_file(
+            &s.container_path(),
+            &factum.gpgsm(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let messages: Vec<&str> = report.findings.iter().map(|f| f.message.as_str()).collect();
+    assert!(!messages.iter().any(|m| m.contains("earlier state")), "{messages:?}");
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.contains("as damaged") && m.contains(&format!("#{entry}"))),
+        "{messages:?}"
+    );
+}
+
+#[test]
+fn add_again_with_changed_source_is_not_a_replacement() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    std::fs::write(s.file("a.txt"), "changed since").unwrap();
+    add_again(&s, id, &recheck);
+    let added = s.events("container_files_added");
+    assert!(added[1].get("replaces").is_none(), "{}", added[1]);
+    // the damaged copy is still unreplaced: closing fails again
+    assert!(s.f.factum().close_container(id).is_err());
+}
+
+#[test]
+fn replacement_with_other_content_fails_verification() {
+    let s = Setup::new();
+    let (id, _) = damaged(&s);
+    let detail = s.f.factum().container(id).unwrap();
+    let (damaged_arn, other_arn) = (detail.adds[0].files[0].arn.clone(), detail.adds[0].files[1].arn.clone());
+    add_triple(
+        &s.container_path(),
+        &damaged_arn,
+        &format!("{}replacedBy", factum::container::FACTUM_NS),
+        &other_arn,
+    );
+    let report = factum::container::verify::verify_file(
+        &s.container_path(),
+        &FakeSigner::new(false),
+        &s.f.factum().gpgsm(),
+        &|_, _| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let codes: Vec<&str> = report.findings.iter().map(|f| f.code).collect();
+    assert!(!codes.contains(&"replaced_copy"), "{:?}", report.findings);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.code == "stream_hash" && f.message.contains("different content")),
+        "{:?}",
+        report.findings
+    );
 }

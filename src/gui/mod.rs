@@ -159,7 +159,7 @@ struct View {
     /// the Questions section: present while the companion is configured and a case is selected
     companion: Option<CompanionView>,
     /// the containers below the notes: the selected evidence's, or the one selected on its own (a row of its own)
-    containers: Vec<crate::containers::ContainerDetail>,
+    containers: Vec<std::rc::Rc<crate::containers::ContainerDetail>>,
     /// their files' last-written times, by container id, then by ARN, from the container files
     container_times: HashMap<i64, HashMap<String, String>>,
 }
@@ -251,6 +251,9 @@ struct FactumApp {
     close_after_adds: Option<(i64, Option<i64>)>,
     /// the shown containers' file times: (file, its logged end (else its length) when read, times), by container id
     container_times_cache: std::cell::RefCell<HashMap<i64, TimesCache>>,
+    /// the shown containers as the log describes them, by id, with the id of the newest event they include: read
+    /// again only when there is a newer one (a container's file list can be long)
+    container_details: std::cell::RefCell<HashMap<i64, (i64, std::rc::Rc<crate::containers::ContainerDetail>)>>,
     /// the decoded images of the note entries shown, by entry id: entries never change, so a rebuild (every
     /// keystroke in the search, every action) does not parse and decode them again
     note_images: std::cell::RefCell<HashMap<i64, Arc<[NoteImage]>>>,
@@ -366,6 +369,7 @@ impl FactumApp {
             pending_adds: std::collections::VecDeque::new(),
             close_after_adds: None,
             container_times_cache: std::cell::RefCell::new(HashMap::new()),
+            container_details: std::cell::RefCell::new(HashMap::new()),
             note_images: Default::default(),
             container_verify_job: None,
             container_verify_windows: Vec::new(),
@@ -860,25 +864,47 @@ impl FactumApp {
             };
         }
         let selected_case = view.case.as_ref().map(|c| c.id);
-        let container_ids: Vec<i64> = match (self.container_id, self.evidence_id, selected_case) {
-            (Some(id), ..) => vec![id],
-            (None, Some(evidence_id), Some(case_id)) => factum
-                .list_containers(case_id)?
-                .into_iter()
-                .filter(|c| c.evidence_id == Some(evidence_id))
-                .map(|c| c.id)
-                .collect(),
-            _ => Vec::new(),
+        let summaries = match selected_case {
+            Some(case_id) => factum.list_containers(case_id)?,
+            None => Vec::new(),
         };
-        view.containers = container_ids
-            .into_iter()
-            .filter_map(|id| {
-                factum
-                    .container(id)
-                    .inspect_err(|e| log::error!("Container #{id} cannot be read: {e}"))
-                    .ok()
+        let shown: Vec<&crate::containers::ContainerSummary> = summaries
+            .iter()
+            .filter(|c| match (self.container_id, self.evidence_id) {
+                (Some(id), _) => c.id == id,
+                (None, Some(evidence_id)) => c.evidence_id == Some(evidence_id),
+                _ => false,
             })
             .collect();
+        let mut details = self.container_details.borrow_mut();
+        details.retain(|id, _| shown.iter().any(|c| c.id == *id));
+        view.containers = shown
+            .into_iter()
+            .filter_map(|summary| {
+                let detail = match details.get(&summary.id) {
+                    Some((key, detail)) if *key == summary.last_event => detail.clone(),
+                    _ => {
+                        let detail = std::rc::Rc::new(
+                            factum
+                                .container(summary.id)
+                                .inspect_err(|e| log::error!("Container #{} cannot be read: {e}", summary.id))
+                                .ok()?,
+                        );
+                        details.insert(summary.id, (summary.last_event, detail.clone()));
+                        detail
+                    }
+                };
+                // the file can go missing or come back without a log entry
+                Some(if detail.summary == *summary {
+                    detail
+                } else {
+                    let mut fresh = (*detail).clone();
+                    fresh.summary = summary.clone();
+                    std::rc::Rc::new(fresh)
+                })
+            })
+            .collect();
+        drop(details);
         view.container_times = view
             .containers
             .iter()
@@ -1240,7 +1266,7 @@ impl FactumApp {
         };
         // a documented limitation: Windows may update the access times of sources on a writable volume
         let writable_hint = cfg!(windows)
-            && crate::container::mounts::mounts_for(&sources)
+            && crate::container::mounts::mounts_for(&sources, &[])
                 .iter()
                 .any(|m| m.read_only == Some(false));
         self.dialogs.push(Dialog::AddToContainer {
@@ -1263,16 +1289,16 @@ impl FactumApp {
         sources: Vec<PathBuf>,
         options: crate::container::volume::AddOptions,
         cancel: Arc<std::sync::atomic::AtomicBool>,
-    ) {
+    ) -> bool {
         if self.add_job.is_some() {
             self.message(
                 "Factum",
                 "Files are being added already. Wait for it, or cancel it in the status bar.",
             );
-            return;
+            return false;
         }
         let result = self.factum().open_container_for_add(id);
-        let Some(volume) = self.run(result) else { return };
+        let Some(volume) = self.run(result) else { return false };
         let name = self.factum().container(id).map(|d| d.summary.name).unwrap_or_default();
         let ctx = self.egui_ctx.clone();
         let (worker, progress) = workers::add_to_container(&ctx, volume, sources, options, cancel.clone());
@@ -1283,6 +1309,7 @@ impl FactumApp {
             progress,
             cancel,
         });
+        true
     }
 
     /// Logs and lists what the worker staged, and says what happened.
@@ -1330,7 +1357,9 @@ impl FactumApp {
                 match self.pending_adds.pop_front() {
                     Some((sources, options)) => {
                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        self.start_add(id, sources, options, cancel);
+                        if !self.start_add(id, sources, options, cancel) {
+                            failed(self);
+                        }
                     }
                     None => {
                         self.close_after_adds = None;
@@ -2048,11 +2077,14 @@ impl FactumApp {
                 plan,
                 then_archive,
             } => {
-                self.pending_adds = plan.into();
-                self.close_after_adds = Some((container_id, then_archive));
-                if let Some((sources, options)) = self.pending_adds.pop_front() {
+                let mut plan: std::collections::VecDeque<_> = plan.into();
+                if let Some((sources, options)) = plan.pop_front() {
                     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    self.start_add(container_id, sources, options, cancel);
+                    // the run continues only once its first addition is under way
+                    if self.start_add(container_id, sources, options, cancel) {
+                        self.pending_adds = plan;
+                        self.close_after_adds = Some((container_id, then_archive));
+                    }
                 }
             }
             DialogResult::CloseDamaged {
@@ -3085,18 +3117,14 @@ impl FactumApp {
     fn container_sections(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
         let mut container_actions = Vec::new();
+        let no_times = HashMap::new();
         for detail in &self.view.containers {
             let busy = self
                 .add_job
                 .as_ref()
                 .is_some_and(|job| job.container_id == detail.summary.id);
-            let times = self
-                .view
-                .container_times
-                .get(&detail.summary.id)
-                .cloned()
-                .unwrap_or_default();
-            containers::container_section(ui, detail, &times, (archived, busy), &mut container_actions);
+            let times = self.view.container_times.get(&detail.summary.id).unwrap_or(&no_times);
+            containers::container_section(ui, detail, times, (archived, busy), &mut container_actions);
         }
         for action in container_actions {
             self.container_action(action, ctx);

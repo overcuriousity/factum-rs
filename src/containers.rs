@@ -64,6 +64,8 @@ pub struct ContainerSummary {
     pub signed: bool,
     /// the newest close was a close as damaged
     pub damaged: bool,
+    /// the entry id of its newest event: what it shows changes only with a new one
+    pub last_event: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +358,7 @@ impl Factum<'_> {
             evidence_id,
             signed: false,
             damaged: false,
+            last_event: id,
         }
     }
 
@@ -396,6 +399,7 @@ impl Factum<'_> {
             let Some(container) = containers.iter_mut().find(|c| c.uuid == uuid) else {
                 continue;
             };
+            container.last_event = entry_id;
             match event.as_str() {
                 "container_files_added" => container.file_count += files.unwrap_or(0).max(0) as u64,
                 "container_closed" => {
@@ -464,6 +468,7 @@ impl Factum<'_> {
             late_signatures: Vec::new(),
         };
         for event in self.container_events(entry.case_id, Some(&uuid))? {
+            detail.summary.last_event = detail.summary.last_event.max(event.entry_id);
             match event.text("event").as_str() {
                 "container_files_added" => {
                     let files = event
@@ -1358,6 +1363,9 @@ impl Factum<'_> {
         for (entry_id, _) in detail.closed_without_file.iter().filter(|(e, _)| *e > upto) {
             after.push((*entry_id, "closed while its file was missing".into()));
         }
+        for (entry_id, ..) in detail.damaged_closes.iter().filter(|(e, ..)| *e > upto) {
+            after.push((*entry_id, "closed as damaged".into()));
+        }
         for (entry_id, ..) in detail.late_signatures.iter().filter(|(e, ..)| *e > upto) {
             after.push((*entry_id, "signed".into()));
         }
@@ -1377,6 +1385,20 @@ impl Factum<'_> {
                          file is in an open state that was never closed or signed."
                     ),
                     Some(entry_id),
+                ));
+            } else if lacking && matches_close.is_none() && detail.summary.damaged {
+                let (entry_id, ..) = detail.damaged_closes.last().cloned().unwrap_or_default();
+                findings.push(Finding::new(
+                    Level::Warn,
+                    "log_mismatch",
+                    format!(
+                        "The case log closed this container as damaged (entry #{entry_id}); the file is in its \
+                         unsigned open state."
+                    ),
+                    Ref {
+                        entry_id: Some(entry_id),
+                        tree_head_id: None,
+                    },
                 ));
             } else if lacking {
                 findings.push(fail(

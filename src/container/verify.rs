@@ -947,13 +947,29 @@ pub fn verify_file(
                         .first_value(&replacement, &format!("{AFF4L_NS}originalPathName"))
                         .unwrap_or(&replacement)
                         .to_string();
-                    report.finding(
-                        Level::Warn,
-                        "replaced_copy",
-                        format!(
-                            "{name}: the content does not match its hashes; replaced by a copy added again ({by})."
-                        ),
-                    );
+                    // a replacement counts only when it is a file of this state with the same hashes and size
+                    let same = stored.iter().find(|r| r.arn == replacement).is_some_and(|new| {
+                        (&new.md5, &new.sha1, &new.sha256, new.size)
+                            == (&record.md5, &record.sha1, &record.sha256, record.size)
+                    });
+                    if same {
+                        report.finding(
+                            Level::Warn,
+                            "replaced_copy",
+                            format!(
+                                "{name}: the content does not match its hashes; replaced by a copy added again ({by})."
+                            ),
+                        );
+                    } else {
+                        report.finding(
+                            Level::Fail,
+                            "stream_hash",
+                            format!(
+                                "{name}: the content does not match its hashes; replaced by a copy with different \
+                                 content ({by})."
+                            ),
+                        );
+                    }
                 }
             }
             if counted(record) {

@@ -290,6 +290,18 @@ fn drop_cache(file: &File) -> bool {
     }
 }
 
+/// Whether a read error during a re-check means the stored content is damaged (missing, corrupt, cut short), rather
+/// than that the container could not be read right now (a pulled drive, a lock, permissions).
+fn is_damage(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::InvalidData
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// Reads the stored content of `records` back from the state that ends at `end` (the newest when None) and
 /// compares it with their hashes.
 pub fn recheck(
@@ -335,6 +347,8 @@ pub fn recheck(
         };
         let matches = match hashed {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(cancelled()),
+            // not damage: the check stops, the container stays open and nothing is logged
+            Err(e) if !is_damage(e.kind()) => return Err(unreadable(e.to_string())),
             Ok(Some((size, digests))) => {
                 size == record.size
                     && digests.md5 == record.md5
@@ -960,7 +974,8 @@ impl Volume {
         progress.files.store(0, Ordering::Relaxed);
         progress.bytes.store(0, Ordering::Relaxed);
 
-        let mounts = crate::container::mounts::mounts_for(sources);
+        let walked: Vec<PathBuf> = items.iter().map(|(path, _)| path.clone()).collect();
+        let mounts = crate::container::mounts::mounts_for(sources, &walked);
         let mark = self.mark();
         let start = mark.write_pos;
         let volume_arn = self.arn();
@@ -1115,13 +1130,18 @@ impl Volume {
                 }
             }
         }
+        // a copy replaces a damaged one only when it is the same content: a source that changed since is new evidence
+        let earlier = file_records(&self.graph);
         let replaced = options
             .replaces
             .iter()
             .filter_map(|(source, old)| {
                 let source = source.display().to_string();
                 let new = records.iter().find(|r| r.source.as_deref() == Some(source.as_str()))?;
-                Some((old.clone(), new.arn.clone()))
+                let old_record = earlier.iter().find(|r| r.arn == *old)?;
+                let same = (&new.md5, &new.sha1, &new.sha256, new.size)
+                    == (&old_record.md5, &old_record.sha1, &old_record.sha256, old_record.size);
+                same.then(|| (old.clone(), new.arn.clone()))
             })
             .collect();
         Ok(Staged {
@@ -1947,6 +1967,17 @@ mod tests {
         let mut back = Vec::new();
         volume.read_file(&arn).unwrap().read_to_end(&mut back).unwrap();
         assert_eq!(back, data);
+    }
+
+    #[test]
+    fn recheck_tells_damage_from_read_errors() {
+        use io::ErrorKind::*;
+        for kind in [InvalidData, InvalidInput, NotFound, UnexpectedEof] {
+            assert!(is_damage(kind), "{kind:?}");
+        }
+        for kind in [PermissionDenied, Other, TimedOut, WouldBlock] {
+            assert!(!is_damage(kind), "{kind:?}");
+        }
     }
 
     #[test]
