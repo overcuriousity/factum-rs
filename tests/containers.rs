@@ -505,6 +505,54 @@ fn archive_refused_with_open_container() {
 }
 
 #[test]
+fn a_container_whose_file_is_missing_is_closed_without_it() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    // while the file is there, it is closed as usual
+    assert!(factum.close_container_without_file(id).is_err());
+    let copy = s.f.path().join("found-again.aff4l");
+    std::fs::rename(s.container_path(), &copy).unwrap();
+    assert!(factum.close_container(id).is_err());
+    assert!(factum.archive_case(s.case_id).is_err());
+    let entry = factum.close_container_without_file(id).unwrap();
+    assert!(
+        s.entry_text(entry).contains("without its file"),
+        "{}",
+        s.entry_text(entry)
+    );
+    let event = &s.events("container_closed")[0];
+    assert_eq!(event["file_missing"], true);
+    let detail = factum.container(id).unwrap();
+    assert!(!detail.summary.open);
+    assert!(detail.closes.is_empty());
+    assert_eq!(detail.closed_without_file.len(), 1);
+    assert!(factum.close_container_without_file(id).is_err());
+    factum.archive_case(s.case_id).unwrap();
+    // the file found again: it was never closed, and the log says why
+    factum.locate_container(id, &copy).unwrap();
+    let report = factum
+        .verify_container_file(
+            &copy,
+            &factum::container::x509::Gpgsm::unavailable(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let mismatch = report
+        .findings
+        .iter()
+        .find(|f| f.code == "log_mismatch")
+        .expect("a log mismatch");
+    assert!(
+        mismatch.message.contains("while its file was missing"),
+        "{}",
+        mismatch.message
+    );
+}
+
+#[test]
 fn archive_allowed_after_close() {
     let s = Setup::new();
     let id = s.create();

@@ -270,6 +270,7 @@ impl Factum<'_> {
         for summary in self.list_containers(case_id)? {
             let detail = self.container(summary.id)?;
             let signatures = match detail.closes.last() {
+                _ if detail.last_closed_without_file() => "none: closed while its file was missing".to_string(),
                 None => "not closed".to_string(),
                 Some(close) => {
                     let (gpg, x509) = match close.signed_later {
@@ -304,7 +305,12 @@ impl Factum<'_> {
                 file_name: detail.file_name.clone(),
                 uuid: summary.uuid.clone(),
                 evidence: detail.evidence_id.and_then(|id| evidence_names.get(&id).cloned()),
-                state: if summary.open { "open" } else { "closed" }.to_string(),
+                state: match (summary.open, detail.last_closed_without_file()) {
+                    (true, _) => "open",
+                    (false, true) => "closed (file missing)",
+                    (false, false) => "closed",
+                }
+                .to_string(),
                 signatures,
                 files: detail
                     .files()

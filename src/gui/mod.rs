@@ -1243,6 +1243,16 @@ impl FactumApp {
                     );
                 }
             }
+            ContainerAction::CloseWithoutFile(id) => {
+                self.dialogs.push(Dialog::Confirm {
+                    message: format!(
+                        "The file of container #{id} is missing. Close the container without it? The case log \
+                         records that it was closed while its file was missing; nothing is signed or written. If \
+                         you can find the file, use Locate… and close it as usual instead."
+                    ),
+                    then: Pending::CloseContainerWithoutFile(id),
+                });
+            }
             ContainerAction::Reopen(id) => {
                 let result = self.factum().reopen_container(id);
                 self.run(result);
@@ -1287,12 +1297,22 @@ impl FactumApp {
             }
             Pending::CloseContainersAndArchive(case_id) => {
                 for container in self.factum().open_containers(case_id).unwrap_or_default() {
-                    let result = self.factum().close_container(container.id);
-                    if self.run(result).is_none() {
+                    let closed = if container.missing {
+                        let result = self.factum().close_container_without_file(container.id);
+                        self.run(result).is_some()
+                    } else {
+                        let result = self.factum().close_container(container.id);
+                        self.run(result).is_some()
+                    };
+                    if !closed {
                         return;
                     }
                 }
                 self.carry_out(Pending::Archive(case_id));
+            }
+            Pending::CloseContainerWithoutFile(id) => {
+                let result = self.factum().close_container_without_file(id);
+                self.run(result);
             }
             Pending::DeleteEvidence(evidence_id) => {
                 let result = self.factum().delete_evidence(evidence_id);
@@ -1440,9 +1460,27 @@ impl FactumApp {
         }
         if !open.is_empty() {
             let names: Vec<String> = open.iter().map(|c| format!("#{} \"{}\"", c.id, c.name)).collect();
+            let missing: Vec<String> = open
+                .iter()
+                .filter(|c| c.missing)
+                .map(|c| format!("#{}", c.id))
+                .collect();
+            let missing = match missing.len() {
+                0 => String::new(),
+                1 => format!(
+                    " The file of {} is missing: it is closed without its file (the log records that; nothing is \
+                     signed).",
+                    missing[0]
+                ),
+                _ => format!(
+                    " The files of {} are missing: they are closed without their files (the log records that; \
+                     nothing is signed).",
+                    missing.join(", ")
+                ),
+            };
             self.dialogs.push(Dialog::Confirm {
                 message: format!(
-                    "Container{} {} {} open. Close {} (each close is signed) and archive the case '{}'?",
+                    "Container{} {} {} open. Close {} (each close is signed) and archive the case '{}'?{missing}",
                     if open.len() == 1 { "" } else { "s" },
                     names.join(", "),
                     if open.len() == 1 { "is" } else { "are" },
@@ -1684,7 +1722,10 @@ impl FactumApp {
                 let result = crate::tags::add_label(&self.db, entry_id, &label);
                 self.run(result);
             }
-            DialogResult::Confirmed(Pending::Archive(case_id)) => self.with_key_check(Pending::Archive(case_id)),
+            // archiving seals the case; closing its containers first signs them: both ask about a missing key
+            DialogResult::Confirmed(pending @ (Pending::Archive(_) | Pending::CloseContainersAndArchive(_))) => {
+                self.with_key_check(pending)
+            }
             DialogResult::Confirmed(pending) => self.carry_out(pending),
             DialogResult::NewContainer {
                 case_id,

@@ -1683,9 +1683,60 @@ fn archive_with_open_container_asks_to_close() {
         _ => panic!("no confirmation"),
     }
     click_label(&mut harness, "Close and Archive");
+    // no key is active: the closes would be unsigned, so it asks first, as a plain Archive does
+    assert!(matches!(
+        harness.state().dialogs.last(),
+        Some(Dialog::NoGpgKey {
+            then: Pending::CloseContainersAndArchive(_)
+        })
+    ));
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+    click_label(&mut harness, "Continue unsigned");
     let factum = harness.state().factum();
     assert!(!factum.container(id).unwrap().summary.open);
     assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
+}
+
+#[test]
+fn archive_closes_a_container_whose_file_is_missing_without_it() {
+    let (fixture, id, path) = Fixture::with_container();
+    std::fs::remove_file(&path).unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().no_gpg_key_prompted = true;
+    harness.state_mut().archive(case_id);
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::Confirm { message, .. }) => {
+            assert!(message.contains(&format!("The file of #{id} is missing")), "{message}")
+        }
+        _ => panic!("no confirmation"),
+    }
+    click_label(&mut harness, "Close and Archive");
+    let factum = harness.state().factum();
+    let detail = factum.container(id).unwrap();
+    assert!(!detail.summary.open && detail.closes.is_empty());
+    assert_eq!(detail.closed_without_file.len(), 1);
+    assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
+}
+
+#[test]
+fn close_without_file_from_the_menu() {
+    let (fixture, id, path) = Fixture::with_container();
+    std::fs::remove_file(&path).unwrap();
+    let mut harness = fixture.harness();
+    let summary = harness.state().factum().container(id).unwrap().summary;
+    let items = containers::menu_items(&summary, false, false);
+    let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(enabled("Close Without File…") && !enabled("Close Container"));
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .container_action(ContainerAction::CloseWithoutFile(id), &ctx);
+    harness.run_ok();
+    click_label(&mut harness, "Close Without File");
+    assert!(!harness.state().factum().container(id).unwrap().summary.open);
 }
 
 #[test]

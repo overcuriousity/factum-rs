@@ -22,6 +22,8 @@ pub enum Pending {
     Archive(i64),
     /// close the case's open containers, then archive it
     CloseContainersAndArchive(i64),
+    /// close an open container whose file is missing
+    CloseContainerWithoutFile(i64),
     DeleteEvidence(i64),
     Seal(i64),
     Export {
@@ -1117,6 +1119,7 @@ impl Dialog {
                 let (heading, verb) = match then {
                     Pending::Archive(_) => ("Archive Case?", "Archive"),
                     Pending::CloseContainersAndArchive(_) => ("Archive Case?", "Close and Archive"),
+                    Pending::CloseContainerWithoutFile(_) => ("Close Without File?", "Close Without File"),
                     Pending::DeleteEvidence(_) => ("Delete Evidence?", "Delete"),
                     Pending::Seal(_) => ("Seal Case?", "Seal"),
                     Pending::Export { .. } => ("Export Case?", "Export"),

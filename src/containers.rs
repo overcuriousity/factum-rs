@@ -101,11 +101,20 @@ pub struct ContainerDetail {
     pub closes: Vec<CloseEvent>,
     /// (entry id, time)
     pub reopens: Vec<(i64, String)>,
+    /// closes logged while the file was missing (entry id, time): no state was signed or written, so they are not
+    /// in `closes`, whose order matches the closed states kept in the file
+    pub closed_without_file: Vec<(i64, String)>,
     /// `container_signed` entries: (entry id, turtle_sha256, gpg fingerprint, x509 fingerprint)
     pub late_signatures: Vec<(i64, String, Option<String>, Option<String>)>,
 }
 
 impl ContainerDetail {
+    /// The newest close was logged while the file was missing.
+    pub fn last_closed_without_file(&self) -> bool {
+        let without = self.closed_without_file.last().map(|(id, _)| *id);
+        without > self.closes.last().map(|c| c.entry_id)
+    }
+
     pub fn files(&self) -> impl Iterator<Item = (&AddEvent, &FileRecord)> {
         self.adds
             .iter()
@@ -406,6 +415,7 @@ impl Factum<'_> {
             adds: Vec::new(),
             closes: Vec::new(),
             reopens: Vec::new(),
+            closed_without_file: Vec::new(),
             late_signatures: Vec::new(),
         };
         for event in self.container_events(entry.case_id, Some(&uuid))? {
@@ -429,6 +439,10 @@ impl Factum<'_> {
                         files,
                         folders,
                     });
+                }
+                "container_closed" if event.payload.get("file_missing") == Some(&Value::Bool(true)) => {
+                    detail.summary.open = false;
+                    detail.closed_without_file.push((event.entry_id, event.utc));
                 }
                 "container_closed" => {
                     let (gpg, x509) = event.signatures();
@@ -829,6 +843,40 @@ impl Factum<'_> {
         })
     }
 
+    /// Closes an open container whose file is missing, so that its case can be archived: `container_closed` with
+    /// `file_missing`, and nothing signed or written, as there is no file. Refused while the file is there.
+    pub fn close_container_without_file(&self, id: i64) -> Result<i64> {
+        let detail = self.container(id)?;
+        ensure_case_open(&self.db.conn, detail.summary.case_id)?;
+        if !detail.summary.open {
+            return Err(FactumError::general(format!("Container #{id} is already closed.")));
+        }
+        if !detail.summary.missing {
+            return Err(FactumError::general(format!(
+                "The file of container #{id} is there; close it as usual."
+            )));
+        }
+        let file_count = detail.summary.file_count;
+        let path = detail
+            .summary
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.append(
+            detail.summary.case_id,
+            KIND_SYSTEM,
+            &format!("Container #{id} closed without its file (missing) · {file_count} files · nothing signed"),
+            Append {
+                payload: Some(json!({"event": "container_closed", "case_id": detail.summary.case_id,
+                                     "container_id": detail.summary.uuid, "file_missing": true,
+                                     "missing_path": path, "file_count": file_count,
+                                     "closed_utc": utc_now()})),
+                ..Default::default()
+            },
+        )
+    }
+
     /// Logs `container_reopened`; Add is possible again. The file is not touched.
     pub fn reopen_container(&self, id: i64) -> Result<i64> {
         let detail = self.container(id)?;
@@ -1039,6 +1087,9 @@ impl Factum<'_> {
         for (entry_id, _) in detail.reopens.iter().filter(|(e, _)| *e > upto) {
             after.push((*entry_id, "reopened".into()));
         }
+        for (entry_id, _) in detail.closed_without_file.iter().filter(|(e, _)| *e > upto) {
+            after.push((*entry_id, "closed while its file was missing".into()));
+        }
         for (entry_id, ..) in detail.late_signatures.iter().filter(|(e, ..)| *e > upto) {
             after.push((*entry_id, "signed".into()));
         }
@@ -1050,7 +1101,16 @@ impl Factum<'_> {
                 Some(n) => (n as usize) < detail.closes.len(),
                 None => !detail.summary.open,
             };
-            if lacking {
+            if lacking && matches_close.is_none() && detail.last_closed_without_file() {
+                let (entry_id, _) = detail.closed_without_file.last().cloned().unwrap_or_default();
+                findings.push(fail(
+                    format!(
+                        "The case log closed this container while its file was missing (entry #{entry_id}); the \
+                         file is in an open state that was never closed or signed."
+                    ),
+                    Some(entry_id),
+                ));
+            } else if lacking {
                 findings.push(fail(
                     "The container file is in an earlier state than the case log records: the log has a later close."
                         .into(),

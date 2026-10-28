@@ -88,6 +88,7 @@ Events (payloads are canonical JSON, like the existing ones; `container_id` is t
 | `container_created`  | New Container            | `name`, `evidence_id` (or null), `file_name` (the `.aff4l` file name), `base_path`, `created_utc` |
 | `container_files_added` | one Add operation completes | `files`: list of `{arn, path, size, md5, sha1, sha256, metadata_only, excerpt}` for that operation; `added_utc` |
 | `container_closed`   | Close Container          | `turtle_sha256` (SHA-256 of `information.turtle` as signed), `file_count`, `signatures` (`gpg` fingerprint, `x509` fingerprint or null), `closed_utc` |
+| `container_closed` (file missing) | Close Without File, or Close and Archive with the file missing | `file_missing: true`, `missing_path`, `file_count`, `closed_utc`; nothing is signed or written, and it is not a closed state of the file |
 | `container_reopened` | Reopen                   | `reopened_utc`                                                                            |
 
 `text` examples: `Container #2 "FS01 preserved" created (from evidence #1)`, `12 files added to container #2

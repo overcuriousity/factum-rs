@@ -19,6 +19,8 @@ pub enum ContainerAction {
     AddFiles(i64),
     AddFolder(i64),
     Close(i64),
+    /// close an open container whose file is missing (asks first)
+    CloseWithoutFile(i64),
     Reopen(i64),
     Verify(i64),
     Locate(i64),
@@ -39,6 +41,11 @@ pub fn menu_items(
         ("Add Files…", ContainerAction::AddFiles(id), writable),
         ("Add Folder…", ContainerAction::AddFolder(id), writable),
         ("Close Container", ContainerAction::Close(id), writable),
+        (
+            "Close Without File…",
+            ContainerAction::CloseWithoutFile(id),
+            summary.open && !archived && summary.missing && !busy,
+        ),
         (
             "Reopen Container",
             ContainerAction::Reopen(id),
@@ -222,6 +229,9 @@ pub fn container_view(
     for close in &detail.closes {
         let signed = if close.is_signed() { "signed" } else { "unsigned" };
         history.push((close.entry_id, close.utc.clone(), format!("closed · {signed}")));
+    }
+    for (entry_id, utc) in &detail.closed_without_file {
+        history.push((*entry_id, utc.clone(), "closed without its file (missing)".into()));
     }
     for (entry_id, utc) in &detail.reopens {
         history.push((*entry_id, utc.clone(), "reopened".into()));
