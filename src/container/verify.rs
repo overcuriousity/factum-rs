@@ -309,8 +309,9 @@ fn hash_map(
     cancel: &AtomicBool,
 ) -> io::Result<Content> {
     let missing = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("{map}: {what} is missing"));
-    let entries = read_member(file, archive, &format!("{map}/map")).ok_or_else(|| missing("its map"))??;
-    let index = read_member(file, archive, &format!("{map}/idx")).ok_or_else(|| missing("its idx"))??;
+    let read_arn = |file: &mut File, arn: String| archive.get_arn(&arn).map(|entry| member_bytes(file, entry));
+    let entries = read_arn(file, format!("{map}/map")).ok_or_else(|| missing("its map"))??;
+    let index = read_arn(file, format!("{map}/idx")).ok_or_else(|| missing("its idx"))??;
     let targets: Vec<String> = String::from_utf8_lossy(&index)
         .lines()
         .map(str::trim)
@@ -462,7 +463,7 @@ fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: 
         }
         for store in imports {
             done.insert(store.clone());
-            let name = store.strip_prefix(&format!("{volume}/")).unwrap_or(&store).to_string();
+            let name = super::member_name(&store, &volume);
             let Some(Ok(data)) = read_member(file, archive, &name) else {
                 findings.push(fail(format!("{label}: the secondary store {name} is missing.")));
                 continue;
@@ -1062,6 +1063,33 @@ mod tests {
     }
 
     #[test]
+    fn zip_segments_are_found_by_the_standard_member_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = Graph::default();
+        let sha1 = "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed"; // "hello world"
+        let relative = format!("aff4://{VOLUME}/docs/a.txt");
+        for arn in [relative.as_str(), "aff4://0b4c6f2e-1a2b-4c3d-8e9f-001122334455"] {
+            a(&mut graph, arn, &aff4("FileImage"));
+            a(&mut graph, arn, &aff4("ZipSegment"));
+            graph.add(arn, &aff4("size"), typed(11, &format!("{XSD_NS}long")));
+            graph.add(arn, &aff4("hash"), typed(sha1, &aff4("SHA1")));
+        }
+        let path = foreign(
+            &dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes("docs/a.txt", 8, b"hello world").unwrap();
+                app.add_bytes("aff4%3A%2F%2F0b4c6f2e-1a2b-4c3d-8e9f-001122334455", 8, b"hello world")
+                    .unwrap();
+            },
+            V21,
+        );
+        let report = check(&path);
+        assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+        assert_eq!(report.checked_files, 2);
+    }
+
+    #[test]
     fn map_over_image_stream_verified() {
         let dir = tempfile::tempdir().unwrap();
         let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
@@ -1095,15 +1123,15 @@ mod tests {
             &mut |app| {
                 store_image_stream(
                     app,
-                    "aff4://stream",
+                    "aff4%3A%2F%2Fstream",
                     &mut data.as_slice(),
                     CHUNKS_PER_SEGMENT,
                     &|_| {},
                     &AtomicBool::new(false),
                 )
                 .unwrap();
-                app.add_bytes("aff4://file/map", 0, &map).unwrap();
-                app.add_bytes("aff4://file/idx", 0, b"aff4://stream\n").unwrap();
+                app.add_bytes("aff4%3A%2F%2Ffile/map", 0, &map).unwrap();
+                app.add_bytes("aff4%3A%2F%2Ffile/idx", 0, b"aff4://stream\n").unwrap();
             },
             V21,
         );
@@ -1129,8 +1157,8 @@ mod tests {
             &dir,
             &graph,
             &mut |app| {
-                app.add_bytes("aff4://s/00000000", 0, b"compressed").unwrap();
-                app.add_bytes("aff4://s/00000000.index", 0, &[0; 12]).unwrap();
+                app.add_bytes("aff4%3A%2F%2Fs/00000000", 0, b"compressed").unwrap();
+                app.add_bytes("aff4%3A%2F%2Fs/00000000.index", 0, &[0; 12]).unwrap();
             },
             V21,
         );
@@ -1247,8 +1275,8 @@ mod crafted {
             &dir,
             &graph,
             &mut |app| {
-                app.add_bytes("aff4://s/00000000", 0, b"x").unwrap();
-                app.add_bytes("aff4://s/00000000.index", 0, &[0; 12]).unwrap();
+                app.add_bytes("aff4%3A%2F%2Fs/00000000", 0, b"x").unwrap();
+                app.add_bytes("aff4%3A%2F%2Fs/00000000.index", 0, &[0; 12]).unwrap();
             },
             V21,
         );
@@ -1272,8 +1300,8 @@ mod crafted {
             &dir,
             &graph,
             &mut |app| {
-                app.add_bytes("aff4://s/00000000", 0, &bomb).unwrap();
-                app.add_bytes("aff4://s/00000000.index", 0, &index).unwrap();
+                app.add_bytes("aff4%3A%2F%2Fs/00000000", 0, &bomb).unwrap();
+                app.add_bytes("aff4%3A%2F%2Fs/00000000.index", 0, &index).unwrap();
             },
             V21,
         );
@@ -1304,8 +1332,8 @@ mod crafted {
             &dir,
             &graph,
             &mut |app| {
-                app.add_bytes("aff4://file/map", 0, &map).unwrap();
-                app.add_bytes("aff4://file/idx", 0, format!("{AFF4_NS}Zero\n").as_bytes())
+                app.add_bytes("aff4%3A%2F%2Ffile/map", 0, &map).unwrap();
+                app.add_bytes("aff4%3A%2F%2Ffile/idx", 0, format!("{AFF4_NS}Zero\n").as_bytes())
                     .unwrap();
             },
             V21,
@@ -1331,8 +1359,8 @@ mod crafted {
             &dir,
             &graph,
             &mut |app| {
-                app.add_bytes("aff4://file/map", 0, b"").unwrap();
-                app.add_bytes("aff4://file/idx", 0, b"").unwrap();
+                app.add_bytes("aff4%3A%2F%2Ffile/map", 0, b"").unwrap();
+                app.add_bytes("aff4%3A%2F%2Ffile/idx", 0, b"").unwrap();
             },
             V21,
         );

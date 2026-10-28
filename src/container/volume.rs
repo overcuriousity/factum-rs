@@ -13,7 +13,7 @@ use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_b
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
 use super::zip64::{Appender, Archive, CdEntry, find_last_end, member_bytes, member_reader, member_text, read_archive};
-use super::{AFF4_NS, AFF4L_NS, FACTUM_NS, RDF_NS, XSD_NS, ZIP_SEGMENT_LIMIT};
+use super::{AFF4_NS, AFF4L_NS, FACTUM_NS, RDF_NS, XSD_NS, ZIP_SEGMENT_LIMIT, member_name};
 use crate::error::{FactumError, Result};
 
 pub const TURTLE: &str = "information.turtle";
@@ -309,7 +309,7 @@ pub fn content_reader<'f>(
     let number = |p: &str| graph.first_value(arn, p).and_then(|v| v.parse::<u64>().ok());
     let missing = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("{arn}: {what} is missing"));
     if graph.has_type(arn, &aff4("ZipSegment")) {
-        let entry = archive.get(arn).ok_or_else(|| missing("its ZIP member"))?;
+        let entry = archive.get_arn(arn).ok_or_else(|| missing("its ZIP member"))?;
         return member_reader(file, entry).map(Some);
     }
     if graph.has_type(arn, &aff4("ImageStream")) {
@@ -807,6 +807,7 @@ impl Volume {
                 }
                 SourceKind::File => {
                     let arn = new_arn();
+                    let member = member_name(&arn, &volume_arn);
                     let file_start = app.position();
                     let report = |read: u64| progress.bytes.store(done_bytes + read, Ordering::Relaxed);
                     let result = (|| -> io::Result<Content> {
@@ -818,10 +819,10 @@ impl Volume {
                         if let Some((from, to)) = options.excerpt {
                             src.seek(SeekFrom::Start(from))?;
                             let mut part = src.take(to - from);
-                            return stream::store(app, &arn, &mut part, to - from, limit, &report, cancel)
+                            return stream::store(app, &member, &mut part, to - from, limit, &report, cancel)
                                 .map(Content::Stored);
                         }
-                        stream::store(app, &arn, &mut src, meta.size, limit, &report, cancel).map(Content::Stored)
+                        stream::store(app, &member, &mut src, meta.size, limit, &report, cancel).map(Content::Stored)
                     })();
                     after_read(path);
                     let content = match result {

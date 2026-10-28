@@ -167,7 +167,17 @@ def display(graph, arn):
 
 # --- content
 
-def image_stream(archive, graph, arn):
+def member_name(arn, volume):
+    """The ZIP member that holds an ARN (AFF4 Standard v1.0, 5.1 and 5.2): below the volume's ARN, the rest of the
+    ARN; any other ARN under its scheme and GUID URL-encoded (aff4%3A%2F%2F<guid>/...)."""
+    if volume and arn.startswith(volume + "/"):
+        return arn[len(volume) + 1:]
+    if arn.startswith("aff4://"):
+        return "aff4%3A%2F%2F" + arn[len("aff4://"):]
+    return arn
+
+
+def image_stream(archive, graph, arn, volume):
     if first(graph, arn, "size") is None:
         raise ValueError("it has no aff4:size")
     size = int(first(graph, arn, "size"))
@@ -178,8 +188,9 @@ def image_stream(archive, graph, arn):
         raise NotImplementedError("compression " + compression)
     remaining, bevy = size, 0
     while remaining > 0:
-        data = archive.read("%s/%08d" % (arn, bevy))
-        index = archive.read("%s/%08d.index" % (arn, bevy))
+        member = member_name(arn, volume)
+        data = archive.read("%s/%08d" % (member, bevy))
+        index = archive.read("%s/%08d.index" % (member, bevy))
         for i in range(min(per_bevy, len(index) // 12)):
             offset, length = struct.unpack_from("<QI", index, i * 12)
             chunk = data[offset:offset + length]
@@ -193,8 +204,8 @@ def image_stream(archive, graph, arn):
         bevy += 1
 
 
-def zip_segment(archive, arn):
-    with archive.open(arn) as member:
+def zip_segment(archive, arn, volume):
+    with archive.open(member_name(arn, volume)) as member:
         while True:
             block = member.read(1 << 20)
             if not block:
@@ -202,14 +213,14 @@ def zip_segment(archive, arn):
             yield block
 
 
-def check_files(archive, graph):
+def check_files(archive, graph, volume):
     checked = 0
     for arn in file_images(graph):
         name = display(graph, arn)
         if has_type(graph, arn, "ZipSegment"):
-            blocks = zip_segment(archive, arn)
+            blocks = zip_segment(archive, arn, volume)
         elif has_type(graph, arn, "ImageStream"):
-            blocks = image_stream(archive, graph, arn)
+            blocks = image_stream(archive, graph, arn, volume)
         elif first_factum(graph, arn, "metadataOnly") == "true" or first_factum(graph, arn, "symlinkTarget"):
             continue  # metadata only, or a link: nothing stored
         else:
@@ -512,7 +523,8 @@ def main(argv=None):
                         fail("%s (%s) is no longer listed." % (display(graph, arn), label))
                     elif sorted(graph[arn]) != sorted(newest[arn]):
                         fail("%s: its metadata in %s differs from the newest state." % (display(graph, arn), label))
-            checked = check_files(archive, newest)
+            volume = (read(archive, "container.description") or b"").decode("utf-8", "replace").strip()
+            checked = check_files(archive, newest, volume or archive.comment.decode("utf-8", "replace").strip())
             ok("%d file(s) checked against their hashes." % checked)
             if not states[-1][3]:
                 closed = len(file_images(graphs[-2][1])) if len(graphs) > 1 else None

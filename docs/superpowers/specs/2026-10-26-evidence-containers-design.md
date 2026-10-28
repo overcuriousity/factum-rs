@@ -118,6 +118,10 @@ Content storage follows the standard's section 6: ZipSegment storage streams for
 deflated); ImageStream storage (AFF4 v1.0) for larger files, which the standard requires since ZipSegments should not
 exceed 1 GiB.
 
+ZIP member names follow the AFF4 Standard v1.0, section 5: an ARN below the volume's ARN is stored relative to the
+root; any other ARN under its scheme and GUID URL-encoded, so a file `aff4://<guid>` is the member
+`aff4%3A%2F%2F<guid>` and its bevies `aff4%3A%2F%2F<guid>/00000000` and `…/00000000.index`.
+
 `information.turtle.hashes` holds SHA-256 and SHA-512 of `information.turtle` (standard section 10.1, mandatory).
 
 factum-specific facts go into RDF properties in a factum namespace (`https://factum.invalid/Schema/2026/#`, final

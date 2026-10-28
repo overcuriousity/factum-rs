@@ -146,7 +146,8 @@ fn swap_content_and_drop_storage_type(path: &Path, arn: &str) {
         );
     }
     let mut app = Appender::new(file, len, archive.entries).unwrap();
-    app.add_bytes(arn, 8, b"forged content").unwrap();
+    let member = factum::container::member_name(arn, &uuid);
+    app.add_bytes(&member, 8, b"forged content").unwrap();
     app.add_bytes(TURTLE, 8, text.as_bytes()).unwrap();
     app.add_bytes(HASHES, 0, turtle::write(&hashes, &[("aff4", AFF4_NS)]).as_bytes())
         .unwrap();
@@ -812,7 +813,7 @@ mod verify {
         let path = s.container_path();
         let mut file = std::fs::File::open(&path).unwrap();
         let len = file.metadata().unwrap().len();
-        let entry = read_archive(&mut file, len).unwrap().get(&arn).unwrap().clone();
+        let entry = read_archive(&mut file, len).unwrap().get_arn(&arn).unwrap().clone();
         let mut bytes = std::fs::read(&path).unwrap();
         let header = entry.header_offset as usize;
         let name_len = u16::from_le_bytes([bytes[header + 26], bytes[header + 27]]) as usize;
@@ -932,14 +933,15 @@ mod verify {
         let s = Setup::new();
         let id = closed_with_files(&s);
         let arn = s.f.factum().container(id).unwrap().adds[0].files[0].arn.clone();
-        duplicate_member(&s.container_path(), &arn);
+        let member = factum::container::member_name(&arn, "");
+        duplicate_member(&s.container_path(), &member);
         let report = verify(&s, &s.container_path());
         let fail = report
             .findings
             .iter()
             .find(|f| f.code == "duplicate_member")
             .expect("a duplicate finding");
-        assert!(fail.message.contains(&arn), "{}", fail.message);
+        assert!(fail.message.contains(&member), "{}", fail.message);
     }
 
     #[test]

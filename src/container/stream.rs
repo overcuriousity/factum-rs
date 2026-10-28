@@ -106,10 +106,11 @@ impl Read for Watched<'_> {
     }
 }
 
-/// Stores `src` under `arn`: a deflated ZipSegment below `limit` bytes (by `size_hint`), an ImageStream from it on.
+/// Stores `src` in the member `member` (the ARN's, see `member_name`): a deflated ZipSegment below `limit` bytes
+/// (by `size_hint`), an ImageStream from it on.
 pub fn store(
     app: &mut Appender,
-    arn: &str,
+    member: &str,
     src: &mut dyn Read,
     size_hint: u64,
     limit: u64,
@@ -117,7 +118,7 @@ pub fn store(
     cancel: &AtomicBool,
 ) -> io::Result<Stored> {
     if size_hint >= limit {
-        return store_image_stream(app, arn, src, CHUNKS_PER_SEGMENT, progress, cancel);
+        return store_image_stream(app, member, src, CHUNKS_PER_SEGMENT, progress, cancel);
     }
     let mut hasher = Hasher::new();
     let mut watched = Watched {
@@ -126,7 +127,7 @@ pub fn store(
         progress,
         cancel,
     };
-    let entry = app.add_member(arn, 8, &mut watched, &mut |bytes| hasher.update(bytes))?;
+    let entry = app.add_member(member, 8, &mut watched, &mut |bytes| hasher.update(bytes))?;
     Ok(Stored {
         storage: Storage::ZipSegment,
         size: entry.size,
@@ -147,11 +148,11 @@ fn read_full(src: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// An ImageStream: chunks of CHUNK_SIZE, each zlib-compressed unless that does not save at least 16 bytes (then
-/// stored raw, padded to CHUNK_SIZE, as pyaff4 does), `chunks_per_segment` to a bevy member `<arn>/%08d` with its
-/// index `<arn>/%08d.index` of (u64 offset, u32 length) entries.
+/// stored raw, padded to CHUNK_SIZE, as pyaff4 does), `chunks_per_segment` to a bevy member `<member>/%08d` with
+/// its index `<member>/%08d.index` of (u64 offset, u32 length) entries.
 pub fn store_image_stream(
     app: &mut Appender,
-    arn: &str,
+    member: &str,
     src: &mut dyn Read,
     chunks_per_segment: u64,
     progress: &dyn Fn(u64),
@@ -168,8 +169,8 @@ pub fn store_image_stream(
     let (mut bevy, mut index) = (Vec::new(), Vec::new());
     let (mut size, mut chunks, mut bevy_number, mut in_bevy) = (0u64, 0u64, 0u64, 0u64);
     let flush = |app: &mut Appender, bevy: &mut Vec<u8>, index: &mut Vec<u8>, number: u64| -> io::Result<()> {
-        app.add_bytes(&format!("{arn}/{number:08}"), 0, bevy)?;
-        app.add_bytes(&format!("{arn}/{number:08}.index"), 0, index)?;
+        app.add_bytes(&format!("{member}/{number:08}"), 0, bevy)?;
+        app.add_bytes(&format!("{member}/{number:08}.index"), 0, index)?;
         bevy.clear();
         index.clear();
         Ok(())
@@ -286,6 +287,7 @@ pub fn open_image_stream<'f>(
     }
     Ok(ImageStreamReader {
         file,
+        member: super::member_name(arn, &archive.volume()),
         archive: archive.clone(),
         arn: arn.to_string(),
         size,
@@ -306,6 +308,8 @@ pub struct ImageStreamReader<'f> {
     file: &'f mut File,
     archive: Archive,
     arn: String,
+    /// the member its bevies are named after
+    member: String,
     size: u64,
     chunk_size: u64,
     chunks_per_segment: u64,
@@ -330,8 +334,8 @@ impl ImageStreamReader<'_> {
     fn load_chunk(&mut self, number: u64) -> io::Result<()> {
         let bevy_number = number / self.chunks_per_segment;
         if self.bevy.as_ref().is_none_or(|(n, _, _)| *n != bevy_number) {
-            let data = self.member(&format!("{}/{bevy_number:08}", self.arn))?;
-            let raw_index = self.member(&format!("{}/{bevy_number:08}.index", self.arn))?;
+            let data = self.member(&format!("{}/{bevy_number:08}", self.member))?;
+            let raw_index = self.member(&format!("{}/{bevy_number:08}.index", self.member))?;
             let index = raw_index
                 .as_chunks::<12>()
                 .0
@@ -422,6 +426,7 @@ impl Read for ImageStreamReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container::member_name;
     use crate::container::zip64::{Appender, read_archive};
     use std::fs::OpenOptions;
     use std::io::Read;
@@ -488,7 +493,7 @@ mod tests {
         let data = sample();
         let stored = store(
             &mut app,
-            "aff4://big",
+            &member_name("aff4://big", ""),
             &mut data.as_slice(),
             data.len() as u64,
             1,
@@ -504,10 +509,14 @@ mod tests {
         let mut file = app.into_file();
         let archive = read_archive(&mut file, end).unwrap();
         let names: Vec<String> = archive.entries.iter().map(|e| e.name_lossy()).collect();
-        assert_eq!(names, vec!["aff4://big/00000000", "aff4://big/00000000.index"]);
-        assert_eq!(archive.get("aff4://big/00000000.index").unwrap().size, 12 * chunks);
+        // AFF4 Standard v1.0, 5.5: the scheme and GUID are escaped
+        assert_eq!(
+            names,
+            vec!["aff4%3A%2F%2Fbig/00000000", "aff4%3A%2F%2Fbig/00000000.index"]
+        );
+        assert_eq!(archive.get_arn("aff4://big/00000000.index").unwrap().size, 12 * chunks);
         // the zeros were compressed, the noise was stored raw
-        assert!(archive.get("aff4://big/00000000").unwrap().size < data.len() as u64);
+        assert!(archive.get_arn("aff4://big/00000000").unwrap().size < data.len() as u64);
         let mut back = Vec::new();
         image_stream_reader(
             &mut file,
@@ -532,7 +541,7 @@ mod tests {
         // three chunks per bevy, to get several bevies from a small input
         store_image_stream(
             &mut app,
-            "aff4://s",
+            &member_name("aff4://s", ""),
             &mut data.as_slice(),
             3,
             &|_| {},
@@ -542,7 +551,7 @@ mod tests {
         let end = app.finish(&[], b"").unwrap();
         let mut file = app.into_file();
         let archive = read_archive(&mut file, end).unwrap();
-        assert!(archive.get("aff4://s/00000002").is_some());
+        assert!(archive.get_arn("aff4://s/00000002").is_some());
         let mut back = Vec::new();
         image_stream_reader(&mut file, &archive, "aff4://s", data.len() as u64, CHUNK_SIZE, 3, ZLIB)
             .unwrap()
@@ -596,7 +605,7 @@ mod tests {
         let mut app = appender(&dir);
         let stored = store(
             &mut app,
-            "aff4://l",
+            &member_name("aff4://l", ""),
             &mut std::fs::File::open(&source).unwrap(),
             size,
             crate::container::ZIP_SEGMENT_LIMIT,

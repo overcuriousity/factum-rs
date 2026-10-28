@@ -70,6 +70,16 @@ impl Archive {
         self.index.get(name.as_bytes()).map(|&i| &self.entries[i])
     }
 
+    /// The volume ARN the ZIP comment gives (AFF4 Standard v1.0, 5.4).
+    pub fn volume(&self) -> String {
+        String::from_utf8_lossy(&self.comment).trim().to_string()
+    }
+
+    /// The member that holds an ARN (see `member_name`).
+    pub fn get_arn(&self, arn: &str) -> Option<&CdEntry> {
+        self.get(&super::member_name(arn, &self.volume()))
+    }
+
     /// Names listed more than once: ZIP readers disagree on which one they read.
     pub fn duplicates(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
