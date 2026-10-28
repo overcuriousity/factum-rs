@@ -1977,3 +1977,28 @@ fn add_dialog_needs_a_base_path() {
     assert!(harness.state().add_job.is_none());
     assert!(harness.query_by_label_contains("Choose the base path").is_some());
 }
+
+#[test]
+fn hidden_excerpt_fields_do_not_block_a_metadata_only_add() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let source = fixture._dir.path().join("mnt/evil.exe");
+    harness.state_mut().open_add_to_container(id, vec![source]);
+    if let Some(Dialog::AddToContainer {
+        metadata_only,
+        excerpt_from,
+        ..
+    }) = harness.state_mut().dialogs.last_mut()
+    {
+        // typed while shown, then hidden by ticking Metadata only
+        *excerpt_from = "10".into();
+        *metadata_only = true;
+    }
+    harness.run_ok();
+    click_label(&mut harness, "Add");
+    assert!(harness.query_by_label_contains("The excerpt needs").is_none());
+    assert!(!matches!(
+        harness.state().dialogs.last(),
+        Some(Dialog::AddToContainer { .. })
+    ));
+}

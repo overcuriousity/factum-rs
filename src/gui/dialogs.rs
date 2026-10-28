@@ -891,7 +891,9 @@ impl Dialog {
                     let base_path = PathBuf::from(strip(base));
                     let outside = sources.iter().find(|s| !s.starts_with(&base_path));
                     let number = |text: &str| strip(text).parse::<u64>().ok();
+                    // the excerpt fields count only while they are shown
                     let excerpt = match (strip(excerpt_from), strip(excerpt_to)) {
+                        _ if !single_file || *metadata_only => Ok(None),
                         ("", "") => Ok(None),
                         (from, to) => match (number(from), number(to)) {
                             (Some(from), Some(to)) if from < to => Ok(Some((from, to))),
@@ -917,7 +919,7 @@ impl Dialog {
                             base: base_path,
                             keep_path: *keep_path,
                             metadata_only: *metadata_only,
-                            excerpt: excerpt.ok().flatten().filter(|_| single_file && !*metadata_only),
+                            excerpt: excerpt.ok().flatten(),
                         },
                     });
                 }
