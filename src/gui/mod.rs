@@ -234,6 +234,9 @@ struct FactumApp {
     add_job: Option<AddJob>,
     /// the selected container's file times: (file, its logged end (else its length) when read, times)
     container_times_cache: std::cell::RefCell<Option<TimesCache>>,
+    /// the decoded images of the note entries shown, by entry id: entries never change, so a rebuild (every
+    /// keystroke in the search, every action) does not parse and decode them again
+    note_images: std::cell::RefCell<HashMap<i64, Arc<[NoteImage]>>>,
     container_verify_job: Option<ContainerVerifyJob>,
     container_verify_windows: Vec<containers::ContainerVerifyWindow>,
     /// each case's last verification in this session: outcome, time and the tree size it covered
@@ -343,6 +346,7 @@ impl FactumApp {
             verify_job: None,
             add_job: None,
             container_times_cache: std::cell::RefCell::new(None),
+            note_images: Default::default(),
             container_verify_job: None,
             container_verify_windows: Vec::new(),
             verified: HashMap::new(),
@@ -580,6 +584,14 @@ impl FactumApp {
             Ok(view) => self.view = view,
             Err(e) => log::error!("Failed to populate the window: {e}"),
         }
+        let shown: HashSet<i64> = self
+            .view
+            .items
+            .iter()
+            .map(|item| item.entry().id)
+            .chain(self.view.pinned.iter().map(|card| card.entry.id))
+            .collect();
+        self.note_images.borrow_mut().retain(|id, _| shown.contains(id));
         self.reload_history();
         self.notify_companion();
         self.check_shown_signatures(ctx);
@@ -626,7 +638,22 @@ impl FactumApp {
         }
     }
 
-    fn card(&self, factum: &Factum, entry: Entry, case: &Case) -> Result<Card> {
+    /// The entry's images, decoded once; the card keeps them and not the base64.
+    fn card_images(&self, entry: &mut Entry) -> Arc<[NoteImage]> {
+        let images = match entry.payload_json {
+            None => Arc::from([]),
+            Some(_) => self
+                .note_images
+                .borrow_mut()
+                .entry(entry.id)
+                .or_insert_with(|| entry.images().into())
+                .clone(),
+        };
+        entry.payload_json = None;
+        images
+    }
+
+    fn card(&self, factum: &Factum, mut entry: Entry, case: &Case) -> Result<Card> {
         let evidence = match entry.evidence_id {
             Some(id) => factum.get_evidence(id)?,
             None => None,
@@ -634,7 +661,8 @@ impl FactumApp {
         let mut history = Vec::new();
         let versions = factum.history(entry.id)?;
         for id in &versions[..versions.len() - 1] {
-            if let Some(old) = factum.get_entry(*id)? {
+            if let Some(mut old) = factum.get_entry(*id)? {
+                old.payload_json = None; // only its text is shown
                 history.push(old);
             }
         }
@@ -646,7 +674,7 @@ impl FactumApp {
                 .filter(|e| Some(e.id) != self.evidence_id)
                 .map(|e| e.description),
             archived: case.is_archived(),
-            images: entry.images(),
+            images: self.card_images(&mut entry),
             entry,
         })
     }
@@ -954,6 +982,8 @@ impl FactumApp {
             {
                 self.data_version = version;
                 self.dirty = true;
+                // another connection wrote: decode afresh what is shown, whatever it changed
+                self.note_images.borrow_mut().clear();
             }
         }
         ctx.request_repaint_after(Duration::from_secs(1));

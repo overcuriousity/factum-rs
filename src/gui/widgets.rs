@@ -199,8 +199,8 @@ pub struct Card {
     /// the evidence, when the view does not already show it
     pub evidence: Option<String>,
     pub archived: bool,
-    /// the images in the note's payload, decoded from base64 once when the card is built
-    pub images: Vec<NoteImage>,
+    /// the images in the note's payload, decoded from base64 once per entry (shared by its cards and rebuilds)
+    pub images: std::sync::Arc<[NoteImage]>,
 }
 
 impl Card {

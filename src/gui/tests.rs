@@ -2135,7 +2135,12 @@ fn images_that_cannot_be_shown_say_so() {
         if let Item::Note(card) = item
             && card.entry.id == note
         {
-            card.images.retain(|image| image.id != gone.id);
+            card.images = card
+                .images
+                .iter()
+                .filter(|image| image.id != gone.id)
+                .cloned()
+                .collect();
         }
     }
     harness.run_ok();
@@ -2168,7 +2173,9 @@ fn an_image_of_another_type_counts_as_missing() {
         if let Item::Note(card) = item
             && card.entry.id == note
         {
-            card.images[0].mime = "image/svg+xml".into();
+            let mut images = card.images.to_vec();
+            images[0].mime = "image/svg+xml".into();
+            card.images = images.into();
         }
     }
     harness.run_ok();
@@ -2239,6 +2246,51 @@ fn a_texture_scrolled_away_for_30_seconds_is_released() {
     harness.input_mut().time = Some(now + 31.0);
     harness.run_ok();
     assert!(!markup_view::texture_cached(&ctx, note));
+}
+
+#[test]
+fn a_rebuild_does_not_decode_the_images_again() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let text = format!("see {}", image.reference("x"));
+    let first = add_note(&fixture, &text, std::slice::from_ref(&image));
+    let note = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let note = factum.correct_note(first, &format!("{text}, corrected")).unwrap();
+        factum.pin_note(note).unwrap();
+        note
+    };
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let cards = |harness: &Harness<'_, FactumApp>| -> Vec<Arc<[crate::images::NoteImage]>> {
+        let view = &harness.state().view;
+        let listed = view.items.iter().filter_map(|item| match item {
+            Item::Note(card) => Some(card),
+            Item::System(_) => None,
+        });
+        listed
+            .chain(&view.pinned)
+            .filter(|card| card.entry.id == note)
+            .map(|card| {
+                // the card keeps the decoded images only, not the base64 of its own or its earlier versions
+                assert!(card.entry.payload_json.is_none());
+                assert!(card.history.iter().all(|old| old.payload_json.is_none()));
+                card.images.clone()
+            })
+            .collect()
+    };
+    let before = cards(&harness);
+    assert_eq!(before.len(), 2); // in the log and pinned
+    assert_eq!(&*before[0], std::slice::from_ref(&image));
+    let ctx = harness.ctx.clone();
+    harness.state_mut().rebuild(&ctx);
+    // the same decoded images: nothing was decoded again
+    for (old, new) in before.iter().zip(cards(&harness)) {
+        assert!(Arc::ptr_eq(old, &new));
+    }
+    assert!(Arc::ptr_eq(&before[0], &before[1]));
 }
 
 #[test]
