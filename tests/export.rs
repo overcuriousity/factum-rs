@@ -1185,3 +1185,128 @@ fn markdown_report_keeps_indented_literal_lines_literal() {
         assert!(!markdown.contains(structural), "{structural:?} in {markdown}");
     }
 }
+
+/// A 3×2 image with all pixels opaque
+fn small_image() -> NoteImage {
+    let pixels: Vec<u8> = (0..6).flat_map(|n| [n * 40, 90, 200, 255]).collect();
+    NoteImage::from_rgba(3, 2, &pixels).unwrap()
+}
+
+/// The bytes of the PDF report of a case with one note carrying `text` and the given images.
+fn pdf_of_note(f: &Fixture, text: &str, images: &[NoteImage]) -> Vec<u8> {
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note_with_images(text, images, None, case_id).unwrap();
+    let [path] = factum
+        .export(case_id, &["pdf"], &f.path().join("out"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    std::fs::read(path).unwrap()
+}
+
+fn pdf_text(f: &Fixture, pdf: &[u8]) -> Option<String> {
+    which::which("pdftotext").ok()?;
+    let path = f.path().join("check.pdf");
+    std::fs::write(&path, pdf).unwrap();
+    let output = Command::new("pdftotext")
+        .arg("-layout")
+        .arg(&path)
+        .arg("-")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[test]
+fn pdf_embeds_note_images() {
+    let f = Fixture::new();
+    let image = small_image();
+    let pdf = pdf_of_note(&f, &image.reference("login"), std::slice::from_ref(&image));
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.contains("/Subtype /Image"), "no image object");
+    assert!(text.contains("/Width 3") && text.contains("/Height 2"));
+    assert!(text.contains("/Im0 "));
+}
+
+#[test]
+fn pdf_writes_a_shared_image_once() {
+    let f = Fixture::new();
+    let image = small_image();
+    let out = f.path().join("out");
+    let paths = export_two_notes_with(&f, &image, &["pdf"], &out);
+    let pdf = std::fs::read(&paths[0]).unwrap();
+    assert_eq!(String::from_utf8_lossy(&pdf).matches("/Subtype /Image").count(), 1);
+}
+
+#[test]
+fn pdf_marks_missing_external_and_undecodable_images() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let good = small_image();
+    let text = format!("{} ![out](https://x.test/a.png)", good.reference("x"));
+    let truncated = f.db.conn.execute(
+        "UPDATE entries SET payload_json = ? WHERE id = ?",
+        (
+            // the stored image keeps its id but loses the end of its data
+            factum::images::to_payload(&[NoteImage {
+                bytes: good.bytes[..good.bytes.len() / 2].to_vec(),
+                ..good.clone()
+            }])
+            .unwrap()
+            .to_string(),
+            factum
+                .create_note_with_images(&text, std::slice::from_ref(&good), None, case_id)
+                .unwrap(),
+        ),
+    );
+    assert_eq!(truncated.unwrap(), 1);
+    let gone = factum
+        .create_note_with_images(&good.reference("gone"), std::slice::from_ref(&good), None, case_id)
+        .unwrap();
+    f.db.conn
+        .execute("UPDATE entries SET payload_json = NULL WHERE id = ?", [gone])
+        .unwrap();
+    let [path] = factum
+        .export(case_id, &["pdf"], &f.path().join("out"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let pdf = std::fs::read(path).unwrap();
+    assert!(!String::from_utf8_lossy(&pdf).contains("/Subtype /Image"));
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        let flat = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+        for expected in [
+            format!("[image {} could not be shown]", good.id),
+            "[external image https://x.test/a.png not loaded]".to_string(),
+            format!("[image {} missing]", good.id),
+        ] {
+            assert!(flat.contains(&expected), "{expected:?} in {flat}");
+        }
+    }
+}
+
+#[test]
+fn pdf_renders_note_markdown() {
+    let f = Fixture::new();
+    let text = "# Heading\n\nSome **bold** and *italic* with `code` and <b>raw</b>, see [the site](https://x.test).\n\n- one\n  - nested\n- two\n\n3. three\n4. four\n\n> quoted\n\n```\nlet a = 1;\n```";
+    let pdf = pdf_of_note(&f, text, &[]);
+    assert!(String::from_utf8_lossy(&pdf).contains("/BaseFont /AtkinsonHyperlegibleNext-Italic"));
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        for expected in [
+            "Heading",
+            "Some bold and italic with code and <b>raw</b>, see the site (https://x.test).",
+            "• one",
+            "• nested",
+            "3. three",
+            "4. four",
+            "quoted",
+            "let a = 1;",
+        ] {
+            assert!(extracted.contains(expected), "{expected:?} in {extracted}");
+        }
+        assert!(!extracted.contains("**") && !extracted.contains("```"), "{extracted}");
+    }
+}

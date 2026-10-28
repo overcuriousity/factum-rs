@@ -3,16 +3,19 @@
 //! with embedded TrueType fonts (Type0 / Identity-H with a ToUnicode map, so text stays searchable and
 //! copyable). No external renderer: PDF export works on air-gapped machines without a browser or Qt.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
-use std::io::Write as _;
+use std::io::{Cursor, Write as _};
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use image::{ImageReader, Limits};
 use ttf_parser::{Face, GlyphId};
 
 use super::html::{ALERT, evidence_cells, meta_rows, technical_rows};
 use super::model::{ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
+use crate::images::{self, NoteImage};
+use crate::markup::{self, Block, ImageTarget, Inline};
 use crate::verifier::Level;
 
 const SANS: &[u8] = include_bytes!("../../assets/fonts/AtkinsonHyperlegibleNext-Regular.ttf");
@@ -61,7 +64,7 @@ fn status_colors(level: Level) -> (Rgb, Rgb, Rgb) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Style {
     font: FontId,
     size: f32,
@@ -117,9 +120,85 @@ struct Run {
     glyphs: Vec<u16>,
 }
 
+/// Text in one style; `\n` forces a line break. An `image` span stands for the image it names, with the alt text as
+/// its text where nothing better can be drawn.
+#[derive(Debug, Clone)]
+struct Span {
+    style: Style,
+    text: String,
+    image: Option<ImageTarget>,
+}
+
+/// One line of a laid-out paragraph: fragments in their styles.
+#[derive(Default)]
+struct Line {
+    frags: Vec<(Style, String)>,
+    width: f32,
+    /// the style that sets the line's height and baseline
+    lead: Option<Style>,
+}
+
+impl Line {
+    fn push(&mut self, style: Style, text: &str, width: f32) {
+        match self.frags.last_mut() {
+            Some((last, existing)) if *last == style => existing.push_str(text),
+            _ => self.frags.push((style, text.to_string())),
+        }
+        self.width += width;
+        self.touch(style);
+    }
+
+    fn touch(&mut self, style: Style) {
+        if self.lead.is_none_or(|lead| style.line_height() > lead.line_height()) {
+            self.lead = Some(style);
+        }
+    }
+}
+
+/// Pixels of a note image, ready for the PDF: 8 bit RGB and, when the image is not opaque, an 8 bit alpha mask.
+struct PdfImage {
+    width: u32,
+    height: u32,
+    rgb: Vec<u8>,
+    alpha: Option<Vec<u8>>,
+}
+
+/// Decodes for display only; the stored bytes are never touched. `None` for data that does not decode (truncated,
+/// corrupt, or too large to hold in memory).
+fn decode(image: &NoteImage) -> Option<PdfImage> {
+    let mut reader = ImageReader::new(Cursor::new(&image.bytes)).with_guessed_format().ok()?;
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    if decoded.color().has_alpha() {
+        let rgba = decoded.to_rgba8();
+        let alpha: Vec<u8> = rgba.pixels().map(|pixel| pixel[3]).collect();
+        let rgb: Vec<u8> = rgba.pixels().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+        let opaque = alpha.iter().all(|a| *a == 255);
+        return Some(PdfImage {
+            width,
+            height,
+            rgb,
+            alpha: (!opaque).then_some(alpha),
+        });
+    }
+    Some(PdfImage {
+        width,
+        height,
+        rgb: decoded.to_rgb8().into_raw(),
+        alpha: None,
+    })
+}
+
 struct Writer {
     fonts: Vec<Font>,
     pages: Vec<String>,
+    /// the images drawn so far, each once; `/Im<index>` on the pages
+    images: Vec<PdfImage>,
+    /// file name (hash of the bytes) -> index in `images`, `None` when the image does not decode
+    image_index: HashMap<String, Option<usize>>,
     /// the page drawing goes to
     current: usize,
     y: f32,
@@ -136,6 +215,8 @@ impl Writer {
         let mut writer = Self {
             fonts,
             pages: Vec::new(),
+            images: Vec::new(),
+            image_index: HashMap::new(),
             current: 0,
             y: 0.0,
         };
@@ -351,6 +432,250 @@ impl Writer {
         }
     }
 
+    /// Draws spans as a wrapped block: words wrap across style borders without being split, a `\n` breaks the line.
+    fn rich_paragraph(&mut self, spans: &[Span], indent: f32) {
+        for line in self.rich_lines(spans, CONTENT_WIDTH - indent) {
+            let Some(lead) = line.lead.or_else(|| spans.first().map(|span| span.style)) else {
+                continue;
+            };
+            self.ensure(lead.line_height());
+            let baseline = self.y - lead.size * 1.05;
+            let mut x = MARGIN_X + indent;
+            for (style, text) in &line.frags {
+                self.draw_text(style, text, x, baseline);
+                x += self.width(style, text);
+            }
+            self.y -= lead.line_height();
+        }
+    }
+
+    /// Breaks spans into lines of at most width, like `wrap` but over styled text.
+    fn rich_lines(&self, spans: &[Span], width: f32) -> Vec<Line> {
+        enum Token {
+            Word(Vec<(Style, String)>),
+            Break(Style),
+        }
+        let mut tokens: Vec<Token> = Vec::new();
+        for span in spans {
+            for c in span.text.chars().filter(|c| *c != '\r') {
+                if c == '\n' {
+                    tokens.push(Token::Break(span.style));
+                    continue;
+                }
+                // a word keeps its trailing spaces and ends where a non-space follows them
+                match tokens.last_mut() {
+                    Some(Token::Word(frags)) if c == ' ' || !frags.last().is_some_and(|f| f.1.ends_with(' ')) => {
+                        match frags.last_mut() {
+                            Some((style, text)) if *style == span.style => text.push(c),
+                            _ => frags.push((span.style, c.to_string())),
+                        }
+                    }
+                    _ => tokens.push(Token::Word(vec![(span.style, c.to_string())])),
+                }
+            }
+        }
+        let mut lines = Vec::new();
+        let mut line = Line::default();
+        for token in tokens {
+            let frags = match token {
+                Token::Break(style) => {
+                    line.touch(style);
+                    lines.push(std::mem::take(&mut line));
+                    continue;
+                }
+                Token::Word(frags) => frags,
+            };
+            let word_width: f32 = frags.iter().map(|(style, text)| self.width(style, text)).sum();
+            let (last_style, last_text) = frags.last().expect("a word has a character");
+            let visible_width = word_width - self.width(last_style, &last_text[last_text.trim_end().len()..]);
+            let push_word = |line: &mut Line| {
+                for (style, text) in &frags {
+                    line.push(*style, text, self.width(style, text));
+                }
+            };
+            if line.width + visible_width <= width || line.frags.is_empty() && word_width <= width {
+                push_word(&mut line);
+                continue;
+            }
+            if !line.frags.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+            if visible_width <= width {
+                push_word(&mut line);
+                continue;
+            }
+            // a word longer than the line (hashes, URLs): break it between characters
+            for (style, text) in &frags {
+                for c in text.chars() {
+                    let char_width = self.char_width(style, c);
+                    if line.width + char_width > width && !line.frags.is_empty() {
+                        lines.push(std::mem::take(&mut line));
+                    }
+                    line.push(*style, c.encode_utf8(&mut [0; 4]), char_width);
+                }
+            }
+        }
+        lines.push(line);
+        lines
+    }
+
+    /// Decodes an image once per distinct content. The key is the hash of the bytes, never the stored `sha256`.
+    fn embed(&mut self, image: &NoteImage) -> Option<usize> {
+        let key = image.file_name();
+        if let Some(index) = self.image_index.get(&key) {
+            return *index;
+        }
+        let index = decode(image).map(|decoded| {
+            self.images.push(decoded);
+            self.images.len() - 1
+        });
+        self.image_index.insert(key, index);
+        index
+    }
+
+    /// Draws embedded image `index` at its natural size (96 dpi), shrunk to the content area.
+    fn image(&mut self, index: usize, indent: f32) {
+        let (pixel_width, pixel_height) = (self.images[index].width as f32, self.images[index].height as f32);
+        let scale = (CONTENT_WIDTH - indent)
+            .min(pixel_width * 0.75)
+            .min((PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM) * pixel_width / pixel_height)
+            / pixel_width;
+        let (width, height) = (pixel_width * scale, pixel_height * scale);
+        self.ensure(height);
+        let (x, y) = (MARGIN_X + indent, self.y - height);
+        let _ = writeln!(
+            self.page(),
+            "q {width:.2} 0 0 {height:.2} {x:.2} {y:.2} cm /Im{index} Do Q"
+        );
+        self.y -= height + 3.0;
+    }
+
+    /// A paragraph of inline content; images that can be shown are drawn between the lines around them.
+    fn inlines(&mut self, inlines: &[Inline], images: &[NoteImage], style: Style, indent: f32) {
+        let mut pending: Vec<Span> = Vec::new();
+        for span in spans(inlines, style) {
+            let text = match &span.image {
+                None => {
+                    pending.push(span);
+                    continue;
+                }
+                Some(ImageTarget::External(url)) => format!("[external image {url} not loaded]"),
+                Some(ImageTarget::Note(id)) => match images::find(images, id).filter(|image| image.is_embeddable()) {
+                    None => format!("[image {id} missing]"),
+                    Some(image) => match self.embed(image) {
+                        None => format!("[image {id} could not be shown]"),
+                        Some(index) => {
+                            self.flush_spans(&mut pending, indent);
+                            self.image(index, indent);
+                            continue;
+                        }
+                    },
+                },
+            };
+            pending.push(Span {
+                style: span.style,
+                text,
+                image: None,
+            });
+        }
+        self.flush_spans(&mut pending, indent);
+    }
+
+    fn flush_spans(&mut self, spans: &mut Vec<Span>, indent: f32) {
+        // breaks around a drawn image are not content
+        if let Some(first) = spans.first_mut() {
+            first.text = first.text.trim_start_matches([' ', '\n']).to_string();
+        }
+        if let Some(last) = spans.last_mut() {
+            last.text = last.text.trim_end_matches([' ', '\n']).to_string();
+        }
+        if spans.iter().any(|span| !span.text.is_empty()) {
+            self.rich_paragraph(spans, indent);
+        }
+        spans.clear();
+    }
+
+    /// A note's Markdown: headings, lists, quotes, code blocks, images and styled text.
+    fn markup(&mut self, text: &str, images: &[NoteImage], body: Style) {
+        self.blocks(&markup::parse(text), images, body, 0.0);
+    }
+
+    fn blocks(&mut self, blocks: &[Block], images: &[NoteImage], body: Style, indent: f32) {
+        let gap = body.size * 0.3;
+        for block in blocks {
+            match block {
+                Block::Paragraph(content) => {
+                    self.inlines(content, images, body, indent);
+                    self.y -= gap;
+                }
+                // the report's own headings are 14 pt and larger, so a note's stay below them
+                Block::Heading(level, content) => {
+                    let size = body.size + [2.0, 1.0, 0.0][usize::from(level.saturating_sub(1).min(2))];
+                    let style = Style {
+                        font: FontId::Bold,
+                        size,
+                        ..body
+                    };
+                    self.ensure(size * 3.0);
+                    self.y -= size * 0.4;
+                    self.inlines(content, images, style, indent);
+                    self.y -= gap;
+                }
+                Block::List { start, items } => {
+                    let markers: Vec<String> = (0..items.len())
+                        .map(|number| start.map_or("•".to_string(), |first| format!("{}.", first + number as u64)))
+                        .collect();
+                    let step = markers
+                        .iter()
+                        .map(|marker| self.width(&body, marker) + 4.0)
+                        .fold(14.0, f32::max);
+                    for (marker, item) in markers.iter().zip(items) {
+                        self.ensure(body.line_height() * 1.5);
+                        let baseline = self.y - body.size * 1.05;
+                        self.draw_text(&body, marker, MARGIN_X + indent + 2.0, baseline);
+                        self.blocks(item, images, body, indent + step);
+                    }
+                }
+                Block::Quote(inner) => {
+                    let quoted = Style {
+                        color: SECONDARY,
+                        ..body
+                    };
+                    let (first_page, top) = (self.current, self.y);
+                    self.blocks(inner, images, quoted, indent + 12.0);
+                    self.quote_bar(indent, first_page, top);
+                }
+                Block::Code(code) => {
+                    let style = Style {
+                        leading: 1.3,
+                        ..Style::new(FontId::Mono, body.size * 0.85, TEXT)
+                    };
+                    self.paragraph_with_background(style, code, indent, Some(CODE_BACKGROUND));
+                    self.y -= gap;
+                }
+            }
+        }
+    }
+
+    /// The bar left of a quote that began at top on first_page and ends at the current position.
+    fn quote_bar(&mut self, indent: f32, first_page: usize, top: f32) {
+        let last_page = self.current;
+        let end = self.y;
+        for page in first_page..=last_page {
+            let from = if page == first_page {
+                top
+            } else {
+                PAGE_HEIGHT - MARGIN_TOP
+            };
+            let to = if page == last_page { end } else { MARGIN_BOTTOM };
+            if from > to {
+                self.current = page;
+                self.fill_rect(BORDER, MARGIN_X + indent + 2.0, to, 1.5, from - to);
+            }
+        }
+        self.current = last_page;
+    }
+
     fn heading(&mut self, text: &str, size: f32, rule: bool) {
         let style = Style::new(FontId::Bold, size, TEXT);
         self.ensure(size * 4.0); // a heading never ends a page alone
@@ -475,8 +800,70 @@ impl Writer {
     }
 
     fn finish(self, title: &str) -> Vec<u8> {
-        serialize(&self.fonts, &self.pages, title)
+        serialize(&self.fonts, &self.images, &self.pages, title)
     }
+}
+
+/// The inline content as styled spans: strong is bold, emphasis italic (bold stays bold), code monospace; a link is
+/// its text followed by its address (unless the text is the address), never a clickable target; a line break is
+/// `\n`. Images are spans that carry their target.
+fn spans(inlines: &[Inline], body: Style) -> Vec<Span> {
+    fn push(out: &mut Vec<Span>, style: Style, text: &str) {
+        match out.last_mut() {
+            Some(last) if last.style == style && last.image.is_none() => last.text.push_str(text),
+            _ => out.push(Span {
+                style,
+                text: text.to_string(),
+                image: None,
+            }),
+        }
+    }
+    fn walk(inlines: &[Inline], style: Style, out: &mut Vec<Span>) {
+        for inline in inlines {
+            match inline {
+                Inline::Text(text) => push(out, style, text),
+                Inline::Emphasis(inner) => {
+                    let font = if style.font == FontId::Sans {
+                        FontId::Italic
+                    } else {
+                        style.font
+                    };
+                    walk(inner, Style { font, ..style }, out);
+                }
+                Inline::Strong(inner) => {
+                    let font = if matches!(style.font, FontId::Sans | FontId::Italic) {
+                        FontId::Bold
+                    } else {
+                        style.font
+                    };
+                    walk(inner, Style { font, ..style }, out);
+                }
+                Inline::Code(code) => {
+                    let mono = Style {
+                        font: FontId::Mono,
+                        size: style.size * 0.9,
+                        ..style
+                    };
+                    push(out, mono, code);
+                }
+                Inline::LineBreak => push(out, style, "\n"),
+                Inline::Link { text, url } => {
+                    walk(text, style, out);
+                    if markup::shows_address(text, url) {
+                        push(out, style, &format!(" ({url})"));
+                    }
+                }
+                Inline::Image { alt, target } => out.push(Span {
+                    style,
+                    text: alt.clone(),
+                    image: Some(target.clone()),
+                }),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(inlines, body, &mut out);
+    out
 }
 
 fn compress(data: &[u8]) -> Vec<u8> {
@@ -544,7 +931,7 @@ fn to_unicode(used: &BTreeMap<u16, char>) -> String {
     cmap
 }
 
-fn serialize(fonts: &[Font], pages: &[String], title: &str) -> Vec<u8> {
+fn serialize(fonts: &[Font], images: &[PdfImage], pages: &[String], title: &str) -> Vec<u8> {
     let mut objects = Objects {
         out: b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n".to_vec(),
         offsets: Vec::new(),
@@ -615,6 +1002,32 @@ fn serialize(fonts: &[Font], pages: &[String], title: &str) -> Vec<u8> {
         objects.stream(unicode, "", to_unicode(&font.used).as_bytes());
     }
 
+    let mut xobjects = String::new();
+    for (index, image) in images.iter().enumerate() {
+        let id = objects.reserve();
+        let mask = image.alpha.as_ref().map(|_| objects.reserve());
+        let _ = write!(xobjects, "/Im{index} {id} 0 R ");
+        let size = format!("/Width {} /Height {} /BitsPerComponent 8", image.width, image.height);
+        let smask = mask.map(|mask| format!(" /SMask {mask} 0 R")).unwrap_or_default();
+        objects.stream(
+            id,
+            &format!("/Type /XObject /Subtype /Image {size} /ColorSpace /DeviceRGB{smask}"),
+            &image.rgb,
+        );
+        if let (Some(mask), Some(alpha)) = (mask, &image.alpha) {
+            objects.stream(
+                mask,
+                &format!("/Type /XObject /Subtype /Image {size} /ColorSpace /DeviceGray"),
+                alpha,
+            );
+        }
+    }
+    let xobjects = if xobjects.is_empty() {
+        String::new()
+    } else {
+        format!(" /XObject << {xobjects}>>")
+    };
+
     let mut kids = String::new();
     for content in pages {
         let page = objects.reserve();
@@ -624,7 +1037,7 @@ fn serialize(fonts: &[Font], pages: &[String], title: &str) -> Vec<u8> {
             page,
             format!(
                 "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {PAGE_WIDTH} {PAGE_HEIGHT}] \
-                 /Resources << /Font << {font_refs}>> >> /Contents {stream} 0 R >>"
+                 /Resources << /Font << {font_refs}>>{xobjects} >> /Contents {stream} 0 R >>"
             )
             .as_bytes(),
         );
@@ -706,7 +1119,7 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
             0.0,
         );
         pdf.space(2.0);
-        pdf.paragraph(body, &item.text, 0.0);
+        pdf.markup(&item.text, &item.images, body);
         if item.status == Level::Fail {
             pdf.paragraph(Style::new(FontId::Bold, 9.5, FAIL), ALERT, 0.0);
         }
@@ -812,6 +1225,7 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markup::{Block, Inline};
 
     #[test]
     fn wrap_breaks_long_words_and_keeps_newlines() {
@@ -828,5 +1242,212 @@ mod tests {
         let writer = Writer::new();
         assert_eq!(writer.glyph(FontId::Sans, '✓').0, FontId::Mono);
         assert_eq!(writer.glyph(FontId::Sans, 'ü').0, FontId::Sans);
+    }
+
+    fn rgba_image(width: u32, height: u32, alpha: u8) -> NoteImage {
+        let pixels: Vec<u8> = (0..width * height)
+            .flat_map(|n| [(n % 12) as u8 * 20, 80, 160, alpha])
+            .collect();
+        NoteImage::from_rgba(width, height, &pixels).unwrap()
+    }
+
+    fn line_texts(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.frags.iter().map(|(_, text)| text.as_str()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn rich_paragraph_wraps_across_styles() {
+        let writer = Writer::new();
+        let bold = Style::new(FontId::Bold, 11.0, TEXT);
+        let regular = Style::new(FontId::Sans, 11.0, TEXT);
+        // the first n where "start" + "end" no longer fits behind the prefix
+        let mut prefix = String::new();
+        while writer.width(&bold, &format!("{prefix}startend")) <= CONTENT_WIDTH {
+            prefix += "w ";
+        }
+        assert!(writer.width(&bold, &format!("{prefix}start")) <= CONTENT_WIDTH);
+        let spans = [
+            Span {
+                style: bold,
+                text: format!("{prefix}start"),
+                image: None,
+            },
+            Span {
+                style: regular,
+                text: "end".into(),
+                image: None,
+            },
+        ];
+        let lines = writer.rich_lines(&spans, CONTENT_WIDTH);
+        // "startend" is one word, so it moves to the next line as a whole
+        assert_eq!(line_texts(&lines), [prefix.clone(), "startend".to_string()]);
+        let fonts: Vec<FontId> = lines[1].frags.iter().map(|(style, _)| style.font).collect();
+        assert_eq!(fonts, [FontId::Bold, FontId::Sans]);
+    }
+
+    #[test]
+    fn rich_lines_break_on_newlines_and_split_overlong_words() {
+        let writer = Writer::new();
+        let style = Style::new(FontId::Mono, 10.0, TEXT);
+        let long = "a".repeat(200);
+        let spans = [Span {
+            style,
+            text: format!("one\n{long}"),
+            image: None,
+        }];
+        let lines = writer.rich_lines(&spans, 200.0);
+        let texts = line_texts(&lines);
+        assert_eq!(texts[0], "one");
+        assert!(texts.len() >= 3 && texts[1..].concat() == long);
+        assert!(lines.iter().all(|line| line.width <= 200.5));
+    }
+
+    #[test]
+    fn spans_carry_styles_and_link_addresses() {
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        let inlines = match markup::parse("**b** *i* `c` [l](https://x.test)").remove(0) {
+            Block::Paragraph(inlines) => inlines,
+            other => panic!("{other:?}"),
+        };
+        let spans = spans(&inlines, body);
+        let text: String = spans.iter().map(|span| span.text.as_str()).collect();
+        assert_eq!(text, "b i c l (https://x.test)");
+        let font_of = |word: &str| {
+            let span = spans.iter().find(|span| span.text.contains(word)).unwrap();
+            span.style.font
+        };
+        assert_eq!(font_of("b"), FontId::Bold);
+        assert_eq!(font_of("i"), FontId::Italic);
+        assert_eq!(font_of("c"), FontId::Mono);
+        assert_eq!(font_of("https://x.test"), FontId::Sans);
+        // an address that is the link text is not repeated
+        let same = match markup::parse("[https://x.test](https://x.test)").remove(0) {
+            Block::Paragraph(inlines) => inlines,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(spans_text(&same, body), "https://x.test");
+    }
+
+    fn spans_text(inlines: &[Inline], body: Style) -> String {
+        spans(inlines, body).iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn nested_strong_in_emphasis_stays_bold() {
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        for text in ["*a **b** c*", "**a *b* c**"] {
+            let Block::Paragraph(inlines) = markup::parse(text).remove(0) else {
+                panic!()
+            };
+            let spans = spans(&inlines, body);
+            let b = spans.iter().find(|span| span.text.contains('b')).unwrap();
+            assert_eq!(b.style.font, FontId::Bold, "{text}");
+        }
+    }
+
+    #[test]
+    fn markup_draws_bold_runs() {
+        let mut writer = Writer::new();
+        writer.markup("**b** a", &[], Style::new(FontId::Sans, 11.0, TEXT));
+        let page = &writer.pages[writer.current];
+        assert!(page.contains("/F1 ") && page.contains("/F0 "), "{page}");
+    }
+
+    #[test]
+    fn markup_lays_out_blocks_downwards_and_across_pages() {
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        let mut writer = Writer::new();
+        let start = writer.y;
+        writer.markup(
+            "# Title\n\n- one\n  - two\n- three\n\n3. x\n\n> quoted\n\n```\ncode\n```",
+            &[],
+            body,
+        );
+        assert!(writer.y < start - 100.0 && writer.pages.len() == 1);
+        let long = "- item\n".repeat(120);
+        writer.markup(&format!("> {}", "quoted text\n> ".repeat(120)), &[], body);
+        writer.markup(&long, &[], body);
+        assert!(writer.pages.len() > 2);
+    }
+
+    #[test]
+    fn truncated_images_do_not_decode() {
+        let image = rgba_image(8, 8, 255);
+        let decoded = decode(&image).unwrap();
+        assert_eq!((decoded.width, decoded.height), (8, 8));
+        assert!(decoded.alpha.is_none(), "an opaque image needs no mask");
+        let truncated = NoteImage {
+            bytes: image.bytes[..image.bytes.len() / 2].to_vec(),
+            ..image
+        };
+        assert!(decode(&truncated).is_none());
+    }
+
+    #[test]
+    fn images_are_stored_once_by_their_recomputed_hash() {
+        let mut writer = Writer::new();
+        let image = rgba_image(3, 2, 255);
+        // the stored hash and id are untrusted: equal bytes are one image, whatever they claim
+        let relabelled = NoteImage {
+            sha256: "0".repeat(64),
+            id: "000000000000".into(),
+            ..image.clone()
+        };
+        assert_eq!(writer.embed(&image), writer.embed(&relabelled));
+        assert_eq!(writer.images.len(), 1);
+        // different bytes are different images even when they claim the same hash
+        let other = NoteImage {
+            sha256: image.sha256.clone(),
+            ..rgba_image(2, 2, 255)
+        };
+        assert_ne!(writer.embed(&image), writer.embed(&other));
+        assert_eq!(writer.images.len(), 2);
+        // an undecodable image has no entry
+        let broken = NoteImage {
+            bytes: image.bytes[..20].to_vec(),
+            ..image
+        };
+        assert_eq!(writer.embed(&broken), None);
+        assert_eq!(writer.images.len(), 2);
+    }
+
+    #[test]
+    fn images_are_scaled_to_the_content_and_get_a_mask_when_translucent() {
+        let mut writer = Writer::new();
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        let tiny = rgba_image(3, 2, 255);
+        let wide = rgba_image(2000, 10, 128);
+        let (tiny_ref, wide_ref) = (tiny.reference("t"), wide.reference("w"));
+        writer.markup(&format!("{tiny_ref}\n\n{wide_ref}"), &[tiny, wide], body);
+        let page = writer.pages[writer.current].clone();
+        // 3 px wide is 2.25 pt, 2000 px is capped at the content width
+        assert!(page.contains("2.25 0 0 1.50 "), "{page}");
+        assert!(
+            page.contains(&format!("{CONTENT_WIDTH:.2} 0 0 {:.2} ", CONTENT_WIDTH / 200.0)),
+            "{page}"
+        );
+        let bytes = writer.finish("t");
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("/Subtype /Image").count(), 3);
+        assert_eq!(text.matches("/SMask").count(), 1);
+        assert!(text.contains("/XObject << /Im0 "));
+    }
+
+    #[test]
+    fn tall_images_fit_on_a_page() {
+        let mut writer = Writer::new();
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        let tall = rgba_image(100, 3000, 255);
+        let reference = tall.reference("t");
+        writer.markup(&reference, &[tall], body);
+        assert_eq!(writer.pages.len(), 1);
+        let page = &writer.pages[0];
+        assert!(
+            page.contains(&format!(" 0 0 {:.2} ", PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM)),
+            "{page}"
+        );
     }
 }
