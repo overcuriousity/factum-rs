@@ -58,6 +58,12 @@ pub struct ContainerSummary {
     pub path: Option<PathBuf>,
     /// no file at the remembered path
     pub missing: bool,
+    /// the evidence item it belongs to (containers from before 2.8 may have none)
+    pub evidence_id: Option<i64>,
+    /// the newest close is signed, when it was made or later
+    pub signed: bool,
+    /// the newest close was a close as damaged
+    pub damaged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,15 +315,7 @@ impl Factum<'_> {
         (!stored.is_empty()).then(|| PathBuf::from(stored))
     }
 
-    fn summary(
-        &self,
-        id: i64,
-        case_id: i64,
-        uuid: String,
-        name: String,
-        open: bool,
-        file_count: u64,
-    ) -> ContainerSummary {
+    fn summary(&self, id: i64, case_id: i64, uuid: String, name: String, evidence_id: Option<i64>) -> ContainerSummary {
         let path = self.container_path(&uuid);
         let missing = path.as_ref().is_none_or(|p| !p.is_file());
         ContainerSummary {
@@ -325,18 +323,27 @@ impl Factum<'_> {
             case_id,
             uuid,
             name,
-            open,
-            file_count,
+            open: true,
+            file_count: 0,
             path,
             missing,
+            evidence_id,
+            signed: false,
+            damaged: false,
         }
     }
 
     /// The containers of a case, read from the log without its file lists.
     pub fn list_containers(&self, case_id: i64) -> Result<Vec<ContainerSummary>> {
         let mut statement = self.db.conn.prepare_cached(
-            "SELECT id, (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END), (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.container_id') END), \
-             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END), (CASE WHEN json_valid(payload_json) THEN json_array_length(payload_json, '$.files') END) \
+            "SELECT id, (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.container_id') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_array_length(payload_json, '$.files') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.evidence_id') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.signatures.gpg') IS NOT NULL \
+                OR json_extract(payload_json, '$.signatures.x509') IS NOT NULL ELSE 0 END), \
+             (CASE WHEN json_valid(payload_json) THEN json_type(payload_json, '$.damaged') IS NOT NULL ELSE 0 END) \
              FROM entries WHERE case_id = ? AND kind = 'system' \
              AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END) LIKE 'container\\_%' ESCAPE '\\' ORDER BY leaf_index",
         )?;
@@ -347,30 +354,35 @@ impl Factum<'_> {
                 row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, bool>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         })?;
-        // (id, uuid, name, open, files) in creation order
-        let mut containers: Vec<(i64, String, String, bool, u64)> = Vec::new();
+        // in creation order
+        let mut containers: Vec<ContainerSummary> = Vec::new();
         for row in rows {
-            let (entry_id, event, uuid, name, files) = row?;
+            let (entry_id, event, uuid, name, files, evidence_id, signed, damaged) = row?;
             if event == "container_created" {
-                containers.push((entry_id, uuid, name.unwrap_or_default(), true, 0));
+                containers.push(self.summary(entry_id, case_id, uuid, name.unwrap_or_default(), evidence_id));
                 continue;
             }
-            let Some(container) = containers.iter_mut().find(|c| c.1 == uuid) else {
+            let Some(container) = containers.iter_mut().find(|c| c.uuid == uuid) else {
                 continue;
             };
             match event.as_str() {
-                "container_files_added" => container.4 += files.unwrap_or(0).max(0) as u64,
-                "container_closed" => container.3 = false,
-                "container_reopened" => container.3 = true,
+                "container_files_added" => container.file_count += files.unwrap_or(0).max(0) as u64,
+                "container_closed" => {
+                    container.open = false;
+                    container.signed = signed;
+                    container.damaged = damaged;
+                }
+                "container_signed" => container.signed = true,
+                "container_reopened" => container.open = true,
                 _ => {}
             }
         }
-        Ok(containers
-            .into_iter()
-            .map(|(id, uuid, name, open, files)| self.summary(id, case_id, uuid, name, open, files))
-            .collect())
+        Ok(containers)
     }
 
     pub fn open_containers(&self, case_id: i64) -> Result<Vec<ContainerSummary>> {
@@ -407,7 +419,13 @@ impl Factum<'_> {
         };
         let uuid = created.text("container_id");
         let mut detail = ContainerDetail {
-            summary: self.summary(id, entry.case_id, uuid.clone(), created.text("name"), true, 0),
+            summary: self.summary(
+                id,
+                entry.case_id,
+                uuid.clone(),
+                created.text("name"),
+                created.payload.get("evidence_id").and_then(Value::as_i64),
+            ),
             evidence_id: created.payload.get("evidence_id").and_then(Value::as_i64),
             file_name: created.text("file_name"),
             base_path: created.text("base_path"),
@@ -489,6 +507,8 @@ impl Factum<'_> {
             }
         }
         detail.summary.file_count = detail.adds.iter().map(|a| a.files.len() as u64).sum();
+        detail.summary.signed =
+            !detail.last_closed_without_file() && detail.closes.last().is_some_and(CloseEvent::is_signed);
         Ok(detail)
     }
 
@@ -497,7 +517,7 @@ impl Factum<'_> {
         &self,
         case_id: i64,
         name: &str,
-        evidence_id: Option<i64>,
+        evidence_id: i64,
         path: &Path,
         base_path: &str,
     ) -> Result<i64> {
@@ -507,16 +527,13 @@ impl Factum<'_> {
         }
         let case = self.require_case(case_id)?;
         ensure_case_open(&self.db.conn, case_id)?;
-        let evidence = match evidence_id {
-            Some(evidence_id) => match self.get_evidence(evidence_id)? {
-                Some(e) if !e.is_deleted() && e.case_id == case_id => Some((e.id, e.description, e.details)),
-                _ => {
-                    return Err(FactumError::general(format!(
-                        "Evidence #{evidence_id} does not exist in this case."
-                    )));
-                }
-            },
-            None => None,
+        let evidence = match self.get_evidence(evidence_id)? {
+            Some(e) if !e.is_deleted() && e.case_id == case_id => Some((e.id, e.description, e.details)),
+            _ => {
+                return Err(FactumError::general(format!(
+                    "Evidence #{evidence_id} does not exist in this case."
+                )));
+            }
         };
         let path = std::path::absolute(path)?;
         let file_name = path
@@ -568,6 +585,28 @@ impl Factum<'_> {
         };
         log::info!("Container #{id} created: {}", path.display());
         Ok(id)
+    }
+
+    /// A new evidence item and a container for it, named alike: two log entries, as if made one after the other.
+    /// Returns (evidence id, container id); the evidence stays when the container cannot be created.
+    pub fn create_evidence_with_container(
+        &self,
+        case_id: i64,
+        name: &str,
+        hash: &str,
+        details: &str,
+        path: &Path,
+        base_path: &str,
+    ) -> Result<(i64, i64)> {
+        let evidence_id = self.create_evidence(case_id, name, hash, details)?;
+        let container_id = self
+            .create_container(case_id, name, evidence_id, path, base_path)
+            .map_err(|e| {
+                FactumError::general(format!(
+                    "Evidence #{evidence_id} was created, but its container was not: {e}"
+                ))
+            })?;
+        Ok((evidence_id, container_id))
     }
 
     /// Opens the container file of a container the log knows, checking that it is that container.

@@ -1409,7 +1409,13 @@ impl Fixture {
         std::fs::write(source.join("notes.txt"), b"notes").unwrap();
         let path = fixture._dir.path().join("fs01.aff4l");
         let id = factum
-            .create_container(case_id, "FS01 preserved", None, &path, &source.display().to_string())
+            .create_container(
+                case_id,
+                "FS01 preserved",
+                factum.create_evidence(case_id, "usb", "", "").unwrap(),
+                &path,
+                &source.display().to_string(),
+            )
             .unwrap();
         let mut volume = factum.open_container_for_add(id).unwrap();
         let options = AddOptions {

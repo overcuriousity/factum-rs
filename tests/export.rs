@@ -637,7 +637,7 @@ fn container_case(factum: &Factum, dir: &Path) -> (i64, String, Vec<(String, Str
         .create_container(
             case_id,
             "FS01 preserved",
-            Some(evidence_id),
+            evidence_id,
             &dir.join("fs01.aff4l"),
             &source.display().to_string(),
         )
@@ -763,7 +763,7 @@ fn reports_mark_files_whose_content_is_not_stored() {
         .create_container(
             case_id,
             "Marks",
-            None,
+            factum.create_evidence(case_id, "disk", "", "").unwrap(),
             &f.path().join("m.aff4l"),
             &source.display().to_string(),
         )

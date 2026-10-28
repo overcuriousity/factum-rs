@@ -1842,7 +1842,14 @@ impl FactumApp {
                 path,
                 base,
             } => {
-                let result = self.factum().create_container(case_id, &name, evidence, &path, &base);
+                // replaced by the evidence-based dialogs (containers as evidence)
+                let result = match evidence {
+                    Some(evidence) => self.factum().create_container(case_id, &name, evidence, &path, &base),
+                    None => self
+                        .factum()
+                        .create_evidence_with_container(case_id, &name, "", "", &path, &base)
+                        .map(|(_, id)| id),
+                };
                 if let Some(id) = self.run(result) {
                     self.select_container(id);
                 }

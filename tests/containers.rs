@@ -60,7 +60,7 @@ impl Setup {
             .create_container(
                 self.case_id,
                 "FS01 preserved",
-                Some(self.evidence_id),
+                self.evidence_id,
                 &self.container_path(),
                 &self.source.display().to_string(),
             )
@@ -242,12 +242,16 @@ fn create_refuses_existing_file_and_unknown_evidence() {
     let s = Setup::new();
     s.create();
     let factum = s.f.factum();
-    let again = factum.create_container(s.case_id, "x", None, &s.container_path(), "/");
+    let again = factum.create_container(s.case_id, "x", s.evidence_id, &s.container_path(), "/");
     assert!(again.is_err());
     let other = s.f.path().join("other.aff4l");
-    assert!(factum.create_container(s.case_id, "x", Some(999), &other, "/").is_err());
+    assert!(factum.create_container(s.case_id, "x", 999, &other, "/").is_err());
     assert!(!other.exists());
-    assert!(factum.create_container(s.case_id, "  ", None, &other, "/").is_err());
+    assert!(
+        factum
+            .create_container(s.case_id, "  ", s.evidence_id, &other, "/")
+            .is_err()
+    );
 }
 
 #[test]
@@ -440,7 +444,13 @@ fn sign_later_keeps_what_was_signed_when_signing_fails() {
     for name in ["one", "two", "three"] {
         let id =
             s.f.factum()
-                .create_container(s.case_id, name, None, &s.f.path().join(format!("{name}.aff4l")), "/")
+                .create_container(
+                    s.case_id,
+                    name,
+                    s.evidence_id,
+                    &s.f.path().join(format!("{name}.aff4l")),
+                    "/",
+                )
                 .unwrap();
         s.f.factum().close_container(id).unwrap();
         ids.push(id);
@@ -482,7 +492,7 @@ fn sign_later_goes_on_after_a_broken_container() {
     drop_history_1(&s.container_path());
     let other =
         s.f.factum()
-            .create_container(s.case_id, "Other", None, &s.f.path().join("other.aff4l"), "/")
+            .create_container(s.case_id, "Other", s.evidence_id, &s.f.path().join("other.aff4l"), "/")
             .unwrap();
     s.f.factum().close_container(other).unwrap();
     s.f.signer.set_active(true);
@@ -596,7 +606,9 @@ fn locate_refuses_other_container() {
     let id = s.create();
     let other = s.f.path().join("other.aff4l");
     let factum = s.f.factum();
-    factum.create_container(s.case_id, "Other", None, &other, "/").unwrap();
+    factum
+        .create_container(s.case_id, "Other", s.evidence_id, &other, "/")
+        .unwrap();
     let moved = s.f.path().join("moved.aff4l");
     std::fs::rename(s.container_path(), &moved).unwrap();
     let summary = &factum.list_containers(s.case_id).unwrap()[0];
@@ -1264,7 +1276,13 @@ mod script {
         .unwrap();
         let path = dir.path().join("c.aff4l");
         let id = factum
-            .create_container(case_id, "C", None, &path, &source.display().to_string())
+            .create_container(
+                case_id,
+                "C",
+                factum.create_evidence(case_id, "disk", "", "").unwrap(),
+                &path,
+                &source.display().to_string(),
+            )
             .unwrap();
         let options = AddOptions {
             base: source.clone(),
@@ -1600,4 +1618,93 @@ mod script {
         };
         assert_eq!(code, 1, "{output}");
     }
+}
+
+#[test]
+fn create_requires_evidence_of_the_case() {
+    let s = Setup::new();
+    let factum = s.f.factum();
+    let other_case = factum.create_case("C-2", "Other", "").unwrap();
+    let foreign = factum.create_evidence(other_case, "foreign", "", "").unwrap();
+    let path = s.f.path().join("x.aff4l");
+    let error = factum.create_container(s.case_id, "x", foreign, &path, "").unwrap_err();
+    assert!(error.to_string().contains("does not exist in this case"), "{error}");
+    let empty = factum.create_evidence(s.case_id, "empty", "", "").unwrap();
+    factum.delete_evidence(empty).unwrap();
+    assert!(factum.create_container(s.case_id, "x", empty, &path, "").is_err());
+    assert!(!path.exists());
+}
+
+#[test]
+fn two_containers_on_one_evidence() {
+    let s = Setup::new();
+    s.create();
+    let factum = s.f.factum();
+    factum
+        .create_container(s.case_id, "second", s.evidence_id, &s.f.path().join("second.aff4l"), "")
+        .unwrap();
+    let containers = factum.list_containers(s.case_id).unwrap();
+    assert_eq!(containers.len(), 2);
+    assert!(containers.iter().all(|c| c.evidence_id == Some(s.evidence_id)));
+}
+
+#[test]
+fn case_level_create_logs_evidence_then_container() {
+    let s = Setup::new();
+    let factum = s.f.factum();
+    let path = s.f.path().join("usb2.aff4l");
+    let (evidence_id, container_id) = factum
+        .create_evidence_with_container(s.case_id, "USB 2", "abc", "seized", &path, "")
+        .unwrap();
+    let evidence = factum.get_evidence(evidence_id).unwrap().unwrap();
+    assert_eq!(
+        (evidence.description.as_str(), evidence.details.as_str()),
+        ("USB 2", "seized")
+    );
+    let created = s.events("container_created");
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0]["evidence_id"], evidence_id);
+    assert_eq!(created[0]["name"], "USB 2");
+    assert!(
+        s.events("evidence_created")
+            .iter()
+            .any(|e| e["evidence_id"] == evidence_id)
+    );
+    let evidence_entry: i64 =
+        s.f.db
+            .conn
+            .query_row(
+                "SELECT id FROM entries WHERE json_extract(payload_json, '$.event') = 'evidence_created' \
+             AND json_extract(payload_json, '$.evidence_id') = ?",
+                [evidence_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert!(evidence_entry < container_id);
+    assert!(path.is_file());
+    let summary = &factum.list_containers(s.case_id).unwrap()[0];
+    assert_eq!(summary.evidence_id, Some(evidence_id));
+}
+
+#[test]
+fn evidence_with_container_cannot_be_deleted() {
+    let s = Setup::new();
+    s.create();
+    let error = s.f.factum().delete_evidence(s.evidence_id).unwrap_err();
+    assert!(error.to_string().contains("has containers"), "{error}");
+}
+
+#[test]
+fn summary_says_signed() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    s.f.factum().close_container(id).unwrap();
+    assert!(s.f.factum().list_containers(s.case_id).unwrap()[0].signed);
+
+    let unsigned = Setup::with_signer(FakeSigner::new(false));
+    let id = unsigned.create();
+    unsigned.add(id, &[unsigned.file("a.txt")]);
+    unsigned.f.factum().close_container(id).unwrap();
+    assert!(!unsigned.f.factum().list_containers(unsigned.case_id).unwrap()[0].signed);
 }
