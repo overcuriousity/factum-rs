@@ -2,7 +2,7 @@
 //! ZIP member) up to the limit, an ImageStream (AFF4 Standard v1.0: zlib chunks in bevies with an index) above it.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use sha2::Digest;
@@ -166,6 +166,9 @@ pub fn store_image_stream(
     };
     let mut hasher = Hasher::new();
     let mut chunk = vec![0u8; CHUNK_SIZE as usize];
+    // one compressor and one output buffer for every chunk, reset in between
+    let mut compressor = flate2::Compress::new(flate2::Compression::fast(), true);
+    let mut compressed = Vec::with_capacity(CHUNK_SIZE as usize);
     let (mut bevy, mut index) = (Vec::new(), Vec::new());
     let (mut size, mut chunks, mut bevy_number, mut in_bevy) = (0u64, 0u64, 0u64, 0u64);
     let flush = |app: &mut Appender, bevy: &mut Vec<u8>, index: &mut Vec<u8>, number: u64| -> io::Result<()> {
@@ -183,11 +186,15 @@ pub fn store_image_stream(
         let data = &chunk[..read];
         hasher.update(data);
         size += read as u64;
-        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-        encoder.write_all(data)?;
-        let compressed = encoder.finish()?;
+        // compressed into at most CHUNK_SIZE - 16 bytes, or not at all: a chunk that does not fit is stored raw
+        compressor.reset();
+        compressed.clear();
+        let fits = matches!(
+            compressor.compress_vec(data, &mut compressed, flate2::FlushCompress::Finish),
+            Ok(flate2::Status::StreamEnd)
+        ) && (compressed.len() as u64) < CHUNK_SIZE - 16;
         let offset = bevy.len() as u64;
-        let length = if (compressed.len() as u64) < CHUNK_SIZE - 16 {
+        let length = if fits {
             bevy.extend(&compressed);
             compressed.len()
         } else {

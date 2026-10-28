@@ -412,6 +412,8 @@ pub struct Appender {
     out: BufWriter<File>,
     position: u64,
     entries: Vec<CdEntry>,
+    /// read buffer of `add_member`, kept for the next member
+    buffer: Vec<u8>,
 }
 
 impl Appender {
@@ -425,6 +427,7 @@ impl Appender {
             out,
             position: start,
             entries: existing,
+            buffer: Vec::new(),
         })
     }
 
@@ -475,37 +478,35 @@ impl Appender {
         self.out.write_all(&header)?;
         let mut crc = crc32fast::Hasher::new();
         let mut size = 0u64;
-        let mut buffer = vec![0; BUFFER];
-        let compressed_size = {
-            let mut counting = Counting {
-                inner: &mut self.out,
-                count: 0,
-            };
-            {
-                let mut sink: Box<dyn Write + '_> = if method == 8 {
-                    Box::new(flate2::write::DeflateEncoder::new(
-                        &mut counting,
-                        flate2::Compression::fast(),
-                    ))
-                } else {
-                    Box::new(&mut counting)
-                };
-                loop {
-                    let read = match data.read(&mut buffer) {
-                        Ok(0) => break,
-                        Ok(read) => read,
-                        Err(e) => return Err(e),
-                    };
-                    let chunk = &buffer[..read];
-                    observe(chunk);
-                    crc.update(chunk);
-                    size += read as u64;
-                    sink.write_all(chunk)?;
-                }
-                sink.flush()?;
-            }
-            counting.count
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.resize(BUFFER, 0);
+        let mut counting = Counting {
+            inner: &mut self.out,
+            count: 0,
         };
+        let mut feed = |sink: &mut dyn Write| -> io::Result<()> {
+            loop {
+                let read = data.read(&mut buffer)?;
+                if read == 0 {
+                    return Ok(());
+                }
+                let chunk = &buffer[..read];
+                observe(chunk);
+                crc.update(chunk);
+                size += read as u64;
+                sink.write_all(chunk)?;
+            }
+        };
+        let fed = if method == 8 {
+            // finished here, not when dropped: an error writing its last bytes is an error of the member
+            let mut encoder = flate2::write::DeflateEncoder::new(&mut counting, flate2::Compression::fast());
+            feed(&mut encoder).and_then(|()| encoder.finish().map(drop))
+        } else {
+            feed(&mut counting)
+        };
+        let compressed_size = counting.count;
+        self.buffer = buffer;
+        fed?;
         let crc32 = crc.finalize();
         let data_end = header_offset + header.len() as u64 + compressed_size;
         self.out.flush()?;
