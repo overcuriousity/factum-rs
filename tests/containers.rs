@@ -1228,7 +1228,12 @@ mod script {
         let carried = member(container, "verify_container.py").unwrap_or_else(|| VERIFY_CONTAINER_PY.to_vec());
         std::fs::write(&script, carried).unwrap();
         let mut command = Command::new(python);
-        command.arg("-I").arg(&script).arg(container).args(flags);
+        // UTF-8 output whatever the console's code page (Windows pipes default to it), so the ✓ ⚠ ✗ are checked
+        command
+            .args(["-I", "-X", "utf8"])
+            .arg(&script)
+            .arg(container)
+            .args(flags);
         if let Some(home) = gnupg_home {
             command.env("GNUPGHOME", home);
         }
