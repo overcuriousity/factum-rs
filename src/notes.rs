@@ -36,9 +36,21 @@ pub struct Entry {
     pub late_signature: Option<LateSignature>,
 }
 
+/// The columns [`Entry::from_row`] reads, in its order, with `$payload` in the place of the payload.
+macro_rules! entry_columns {
+    ($payload:literal) => {
+        concat!(
+            "id, case_id, leaf_index, kind, evidence_id, text, ",
+            $payload,
+            ", corrects_id, created_utc, leaf_hash, tree_size, root_hash, signature, is_pinned, format"
+        )
+    };
+}
+
 impl Entry {
-    pub const COLUMNS: &'static str = "id, case_id, leaf_index, kind, evidence_id, text, payload_json, corrects_id, \
-        created_utc, leaf_hash, tree_size, root_hash, signature, is_pinned, format";
+    pub const COLUMNS: &'static str = entry_columns!("payload_json");
+    /// [`Self::COLUMNS`] with `NULL` for the payload, which may hold megabytes of images.
+    const COLUMNS_WITHOUT_PAYLOAD: &'static str = entry_columns!("NULL");
 
     pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -271,7 +283,7 @@ impl Factum<'_> {
     /// [`Self::get_entry`] with `payload_json` left out (`None`), for views that show the text: a note's payload
     /// may hold megabytes of images.
     pub fn get_entry_without_payload(&self, entry_id: i64) -> Result<Option<Entry>> {
-        self.read_entry(entry_id, &Entry::COLUMNS.replace("payload_json", "NULL"))
+        self.read_entry(entry_id, Entry::COLUMNS_WITHOUT_PAYLOAD)
     }
 
     fn read_entry(&self, entry_id: i64, columns: &str) -> Result<Option<Entry>> {

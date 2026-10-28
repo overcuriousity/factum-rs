@@ -1205,11 +1205,16 @@ impl Dialog {
                 let changed = !strip(text).is_empty() && strip(text) != strip(original);
                 let (ok, cancel) = buttons(ui, "Add corrected version", changed);
                 if ok && changed {
-                    return Some(DialogResult::Correct {
-                        entry_id: *entry_id,
-                        text: strip(text).to_string(),
-                        images: images.clone(),
-                    });
+                    match note_editor::check_shown(strip(text), images) {
+                        Ok(()) => {
+                            return Some(DialogResult::Correct {
+                                entry_id: *entry_id,
+                                text: strip(text).to_string(),
+                                images: images.clone(),
+                            });
+                        }
+                        Err(e) => *error = Some(e.to_string()),
+                    }
                 }
                 cancel.then_some(DialogResult::Cancel)
             }

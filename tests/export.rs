@@ -951,7 +951,8 @@ fn markdown_report_renders_blocks_literally() {
         "\n3. x\n4. y\n",
         "\n> quoted\\\n> more\n",
         "\n````\nlet a = \"```\";\n````\n",
-        "\n\\- not a list\n",
+        // the escape stays as typed: the report shows "\- not a list", never a list
+        "\n\\\\- not a list\n",
         "https://y.test",
     ] {
         assert!(markdown.contains(expected), "{expected:?} in {markdown}");

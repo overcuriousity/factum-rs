@@ -126,13 +126,18 @@ fn paragraph_lines(inlines: &[Inline], images: &[NoteImage], image_dir: &str) ->
         .collect()
 }
 
+/// The lines behind a quote's or list item's prefix. Only an empty line loses the prefix's trailing space: the
+/// lines are code too, whose whitespace is content.
 fn prefixed(lines: Vec<String>, first: &str, rest: &str) -> Vec<String> {
     lines
         .into_iter()
         .enumerate()
         .map(|(index, line)| {
             let prefix = if index == 0 { first } else { rest };
-            format!("{prefix}{line}").trim_end().to_string()
+            match line.is_empty() {
+                true => prefix.trim_end().to_string(),
+                false => format!("{prefix}{line}"),
+            }
         })
         .collect()
 }
@@ -197,14 +202,14 @@ fn markup_markdown(text: &str, images: &[NoteImage], image_dir: &str) -> Vec<Str
 
 /// The images the report links to, as `(file name, bytes)`: those of the notes shown, each file once. The name is
 /// computed from the bytes, so nothing a stored payload says can choose where a file is written.
-pub fn image_files(model: &ReportModel) -> Vec<(String, Vec<u8>)> {
+pub fn image_files(model: &ReportModel) -> Vec<(String, &[u8])> {
     let mut seen = HashSet::new();
     let mut files = Vec::new();
     for note in model.notes() {
         for image in note.images.iter().filter(|image| image.is_embeddable()) {
             let name = image.file_name();
             if seen.insert(name.clone()) {
-                files.push((name, image.bytes.clone()));
+                files.push((name, image.bytes.as_slice()));
             }
         }
     }
@@ -389,6 +394,25 @@ mod tests {
         for note in markup::deeply_nested_notes() {
             assert!(markup_markdown(&note, &[], "images").concat().contains('x'));
         }
+    }
+
+    #[test]
+    fn code_in_quotes_and_items_keeps_its_whitespace() {
+        let lines = markup_markdown(
+            "> ```\n> key = 'v'   \n>\t\n> ```\n\n- ```\n  a\t\n  ```",
+            &[],
+            "images",
+        );
+        assert!(lines.contains(&"> key = 'v'   ".to_string()), "{lines:?}");
+        assert!(lines.contains(&"  a\t".to_string()), "{lines:?}");
+        // an empty line behind a prefix has no trailing space
+        assert_eq!(markup_markdown("> a\n>\n> b", &[], "images"), vec!["> a", ">", "> b"]);
+    }
+
+    #[test]
+    fn escapes_in_notes_survive_the_markdown_report() {
+        let lines = markup_markdown(r"C:\$Recycle.Bin \\fs01 R&amp;D", &[], "images");
+        assert_eq!(lines, vec![r"C:\\$Recycle.Bin \\\\fs01 R\&amp;D"]);
     }
 
     #[test]

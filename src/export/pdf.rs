@@ -31,6 +31,8 @@ const MARGIN_BOTTOM: f32 = 60.0;
 const CONTENT_WIDTH: f32 = PAGE_WIDTH - 2.0 * MARGIN_X;
 /// Nested lists and quotes stop moving right here, so deeply nested note text keeps a usable width.
 const MAX_INDENT: f32 = CONTENT_WIDTH * 0.6;
+/// Space around the text of a block with a background.
+const CODE_PADDING: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FontId {
@@ -157,16 +159,20 @@ impl Line {
     }
 }
 
-/// Pixels of a note image, ready for the PDF: 8 bit RGB and, when the image is not opaque, an 8 bit alpha mask.
+/// A note image as a PDF image stream, already encoded: a JPEG as its own bytes, anything else as Flate-compressed
+/// 8 bit RGB with, when the image is not opaque, a Flate-compressed 8 bit alpha mask. Only the encoded streams are
+/// kept until the file is written, never the pixels.
 struct PdfImage {
     width: u32,
     height: u32,
-    rgb: Vec<u8>,
+    color_space: &'static str,
+    filter: &'static str,
+    data: Vec<u8>,
     alpha: Option<Vec<u8>>,
 }
 
 /// Decodes for display only; the stored bytes are never touched. `None` for data that does not decode (truncated,
-/// corrupt, or too large to hold in memory).
+/// corrupt, or too large to hold in memory). A JPEG is decoded too, as the check that it can be shown.
 fn decode(image: &NoteImage) -> Option<PdfImage> {
     let mut reader = ImageReader::new(Cursor::new(&image.bytes)).with_guessed_format().ok()?;
     let mut limits = Limits::default();
@@ -174,6 +180,17 @@ fn decode(image: &NoteImage) -> Option<PdfImage> {
     reader.limits(limits);
     let decoded = reader.decode().ok()?;
     let (width, height) = (decoded.width(), decoded.height());
+    if let Some(color_space) = jpeg_color_space(&image.bytes) {
+        return Some(PdfImage {
+            width,
+            height,
+            color_space,
+            filter: "/DCTDecode",
+            data: image.bytes.clone(),
+            alpha: None,
+        });
+    }
+    let flate = |data: Vec<u8>| compress(&data);
     if decoded.color().has_alpha() {
         // no copy of the pixels when the decoder already produced RGBA; rgb and alpha are split in one pass
         let rgba = decoded.into_rgba8().into_raw();
@@ -188,16 +205,62 @@ fn decode(image: &NoteImage) -> Option<PdfImage> {
         return Some(PdfImage {
             width,
             height,
-            rgb,
-            alpha: (!opaque).then_some(alpha),
+            color_space: "/DeviceRGB",
+            filter: "/FlateDecode",
+            data: flate(rgb),
+            alpha: (!opaque).then(|| flate(alpha)),
         });
     }
     Some(PdfImage {
         width,
         height,
-        rgb: decoded.into_rgb8().into_raw(),
+        color_space: "/DeviceRGB",
+        filter: "/FlateDecode",
+        data: flate(decoded.into_rgb8().into_raw()),
         alpha: None,
     })
+}
+
+/// The colour space of a JPEG a PDF reader shows as it is: 8 bit baseline, extended or progressive, grey or
+/// three components. `None` for anything else (CMYK, 12 bit, lossless, arithmetic coding; not a JPEG at all),
+/// which is embedded as decoded pixels instead.
+fn jpeg_color_space(bytes: &[u8]) -> Option<&'static str> {
+    if !bytes.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut at = 2;
+    loop {
+        // fill bytes may stand before a marker
+        while *bytes.get(at)? == 0xFF && *bytes.get(at + 1)? == 0xFF {
+            at += 1;
+        }
+        if *bytes.get(at)? != 0xFF {
+            return None;
+        }
+        let marker = *bytes.get(at + 1)?;
+        let length = || {
+            Some(usize::from(u16::from_be_bytes([
+                *bytes.get(at + 2)?,
+                *bytes.get(at + 3)?,
+            ])))
+        };
+        match marker {
+            0xC0..=0xC2 => {
+                let precision = *bytes.get(at + 4)?;
+                let components = *bytes.get(at + 9)?;
+                return match (precision, components) {
+                    (8, 1) => Some("/DeviceGray"),
+                    (8, 3) => Some("/DeviceRGB"),
+                    _ => None,
+                };
+            }
+            // other frame types, or the scan began without a frame
+            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xDA | 0xD9 => return None,
+            // markers without a length
+            0x01 | 0xD0..=0xD7 => at += 2,
+            _ => at += 2 + length()?,
+        }
+    }
 }
 
 struct Writer {
@@ -398,7 +461,7 @@ impl Writer {
     }
 
     fn paragraph_with_background(&mut self, style: Style, text: &str, indent: f32, background: Option<Rgb>) {
-        let padding = if background.is_some() { 5.0 } else { 0.0 };
+        let padding = if background.is_some() { CODE_PADDING } else { 0.0 };
         let width = CONTENT_WIDTH - indent - 2.0 * padding;
         let lines = self.wrap(&style, text, width);
         let height = style.line_height();
@@ -541,14 +604,19 @@ impl Writer {
         index
     }
 
-    /// Draws embedded image `index` at its natural size (96 dpi), shrunk to the content area.
-    fn image(&mut self, index: usize, indent: f32) {
+    /// The size embedded image `index` is drawn at: its natural size (96 dpi), shrunk to the content area.
+    fn image_size(&self, index: usize, indent: f32) -> (f32, f32) {
         let (pixel_width, pixel_height) = (self.images[index].width as f32, self.images[index].height as f32);
         let scale = (CONTENT_WIDTH - indent)
             .min(pixel_width * 0.75)
             .min((PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM) * pixel_width / pixel_height)
             / pixel_width;
-        let (width, height) = (pixel_width * scale, pixel_height * scale);
+        (pixel_width * scale, pixel_height * scale)
+    }
+
+    /// Draws embedded image `index`.
+    fn image(&mut self, index: usize, indent: f32) {
+        let (width, height) = self.image_size(index, indent);
         self.ensure(height);
         let (x, y) = (MARGIN_X + indent, self.y - height);
         let _ = writeln!(
@@ -556,6 +624,59 @@ impl Writer {
             "q {width:.2} 0 0 {height:.2} {x:.2} {y:.2} cm /Im{index} Do Q"
         );
         self.y -= height + 3.0;
+    }
+
+    /// The embedded image a span draws, or the text that stands for it.
+    fn shown_image(&mut self, target: &ImageTarget, images: &[NoteImage]) -> std::result::Result<usize, String> {
+        match target {
+            ImageTarget::External(url) => Err(format!("[external image {url} not loaded]")),
+            ImageTarget::Note(id) => match images::find(images, id).filter(|image| image.is_embeddable()) {
+                None => Err(format!("[image {id} missing]")),
+                Some(image) => self
+                    .embed(image)
+                    .ok_or_else(|| format!("[image {id} could not be shown]")),
+            },
+        }
+    }
+
+    /// The height the first thing `blocks` draws needs on its page, so what goes in front of it (a list marker,
+    /// the top of a quote bar) moves to the next page with it.
+    fn lead(&mut self, blocks: &[Block], images: &[NoteImage], body: Style, indent: f32) -> f32 {
+        let Some(first) = blocks.first() else {
+            return 0.0;
+        };
+        match first {
+            Block::Paragraph(content) => self.inlines_lead(content, images, body, indent),
+            Block::Heading(level, content) => {
+                let style = heading_style(body, *level);
+                (style.size * 3.0).max(style.size * 0.4 + self.inlines_lead(content, images, style, indent))
+            }
+            Block::List { start, items } => {
+                let step = self.list_step(body, *start, items.len());
+                let item = items.first().map_or(&[][..], Vec::as_slice);
+                let inner = self.lead(item, images, body, (indent + step).min(MAX_INDENT));
+                (body.line_height() * 1.5).max(inner)
+            }
+            Block::Quote(inner) => self.lead(inner, images, quote_style(body), (indent + 12.0).min(MAX_INDENT)),
+            Block::Code(_) => code_style(body).line_height() + 2.0 * CODE_PADDING,
+        }
+    }
+
+    /// What the first line of a paragraph needs: the text in front of the first image, or that image.
+    fn inlines_lead(&mut self, inlines: &[Inline], images: &[NoteImage], style: Style, indent: f32) -> f32 {
+        let mut text = 0.0f32;
+        for span in spans(inlines, style) {
+            match &span.image {
+                Some(target) => match self.shown_image(target, images) {
+                    Ok(index) if text == 0.0 => return self.image_size(index, indent).1,
+                    Ok(_) => return text,
+                    Err(_) => text = text.max(span.style.line_height()),
+                },
+                None if !span.text.trim_matches([' ', '\n']).is_empty() => text = text.max(span.style.line_height()),
+                None => {}
+            }
+        }
+        text
     }
 
     /// A paragraph of inline content; images that can be shown are drawn between the lines around them.
@@ -567,17 +688,13 @@ impl Writer {
                     pending.push(span);
                     continue;
                 }
-                Some(ImageTarget::External(url)) => format!("[external image {url} not loaded]"),
-                Some(ImageTarget::Note(id)) => match images::find(images, id).filter(|image| image.is_embeddable()) {
-                    None => format!("[image {id} missing]"),
-                    Some(image) => match self.embed(image) {
-                        None => format!("[image {id} could not be shown]"),
-                        Some(index) => {
-                            self.flush_spans(&mut pending, indent);
-                            self.image(index, indent);
-                            continue;
-                        }
-                    },
+                Some(target) => match self.shown_image(target, images) {
+                    Err(text) => text,
+                    Ok(index) => {
+                        self.flush_spans(&mut pending, indent);
+                        self.image(index, indent);
+                        continue;
+                    }
                 },
             };
             pending.push(Span {
@@ -616,53 +733,47 @@ impl Writer {
                     self.inlines(content, images, body, indent);
                     self.y -= gap;
                 }
-                // the report's own headings are 14 pt and larger, so a note's stay below them
                 Block::Heading(level, content) => {
-                    let size = body.size + [2.0, 1.0, 0.0][usize::from(level.saturating_sub(1).min(2))];
-                    let style = Style {
-                        font: FontId::Bold,
-                        size,
-                        ..body
-                    };
-                    self.ensure(size * 3.0);
-                    self.y -= size * 0.4;
+                    let style = heading_style(body, *level);
+                    self.ensure(style.size * 3.0);
+                    self.y -= style.size * 0.4;
                     self.inlines(content, images, style, indent);
                     self.y -= gap;
                 }
                 Block::List { start, items } => {
-                    let markers: Vec<String> = (0..items.len())
-                        .map(|number| start.map_or("•".to_string(), |first| format!("{}.", first + number as u64)))
-                        .collect();
-                    let step = markers
-                        .iter()
-                        .map(|marker| self.width(&body, marker) + 4.0)
-                        .fold(14.0, f32::max);
-                    for (marker, item) in markers.iter().zip(items) {
-                        self.ensure(body.line_height() * 1.5);
+                    let step = self.list_step(body, *start, items.len());
+                    let inner = (indent + step).min(MAX_INDENT);
+                    for (number, item) in items.iter().enumerate() {
+                        // the marker goes where the item's content starts, on this page or the next
+                        let lead = self.lead(item, images, body, inner);
+                        self.ensure((body.line_height() * 1.5).max(lead));
                         let baseline = self.y - body.size * 1.05;
-                        self.draw_text(&body, marker, MARGIN_X + indent + 2.0, baseline);
-                        self.blocks(item, images, body, (indent + step).min(MAX_INDENT));
+                        self.draw_text(&body, &list_marker(*start, number), MARGIN_X + indent + 2.0, baseline);
+                        self.blocks(item, images, body, inner);
                     }
                 }
                 Block::Quote(inner) => {
-                    let quoted = Style {
-                        color: SECONDARY,
-                        ..body
-                    };
+                    let (quoted, inner_indent) = (quote_style(body), (indent + 12.0).min(MAX_INDENT));
+                    // the bar starts where the quote's content does
+                    let lead = self.lead(inner, images, quoted, inner_indent);
+                    self.ensure(lead);
                     let (first_page, top) = (self.current, self.y);
-                    self.blocks(inner, images, quoted, (indent + 12.0).min(MAX_INDENT));
+                    self.blocks(inner, images, quoted, inner_indent);
                     self.quote_bar(indent, first_page, top);
                 }
                 Block::Code(code) => {
-                    let style = Style {
-                        leading: 1.3,
-                        ..Style::new(FontId::Mono, body.size * 0.85, TEXT)
-                    };
-                    self.paragraph_with_background(style, code, indent, Some(CODE_BACKGROUND));
+                    self.paragraph_with_background(code_style(body), code, indent, Some(CODE_BACKGROUND));
                     self.y -= gap;
                 }
             }
         }
+    }
+
+    /// How far a list's items are indented: room for its widest marker.
+    fn list_step(&self, body: Style, start: Option<u64>, count: usize) -> f32 {
+        (0..count)
+            .map(|number| self.width(&body, &list_marker(start, number)) + 4.0)
+            .fold(14.0, f32::max)
     }
 
     /// The bar left of a quote that began at top on first_page and ends at the current position.
@@ -812,6 +923,33 @@ impl Writer {
     }
 }
 
+/// The report's own headings are 14 pt and larger, so a note's stay below them.
+fn heading_style(body: Style, level: u8) -> Style {
+    Style {
+        font: FontId::Bold,
+        size: body.size + [2.0, 1.0, 0.0][usize::from(level.saturating_sub(1).min(2))],
+        ..body
+    }
+}
+
+fn quote_style(body: Style) -> Style {
+    Style {
+        color: SECONDARY,
+        ..body
+    }
+}
+
+fn code_style(body: Style) -> Style {
+    Style {
+        leading: 1.3,
+        ..Style::new(FontId::Mono, body.size * 0.85, TEXT)
+    }
+}
+
+fn list_marker(start: Option<u64>, number: usize) -> String {
+    start.map_or("•".to_string(), |first| format!("{}.", first + number as u64))
+}
+
 /// The inline content as styled spans: strong is bold, emphasis italic (bold stays bold), code monospace; a link is
 /// its text followed by its address (unless the text is the address), never a clickable target; a line break is
 /// `\n`. Images are spans that carry their target.
@@ -907,13 +1045,13 @@ impl Objects {
     }
 
     fn stream(&mut self, id: usize, dictionary: &str, data: &[u8]) {
-        let compressed = compress(data);
-        let mut body = format!(
-            "<< {dictionary} /Filter /FlateDecode /Length {} >>\nstream\n",
-            compressed.len()
-        )
-        .into_bytes();
-        body.extend_from_slice(&compressed);
+        self.encoded_stream(id, dictionary, "/FlateDecode", &compress(data));
+    }
+
+    /// A stream whose data is encoded already, with the filter that decodes it.
+    fn encoded_stream(&mut self, id: usize, dictionary: &str, filter: &str, data: &[u8]) {
+        let mut body = format!("<< {dictionary} /Filter {filter} /Length {} >>\nstream\n", data.len()).into_bytes();
+        body.extend_from_slice(data);
         body.extend_from_slice(b"\nendstream");
         self.write(id, &body);
     }
@@ -1017,15 +1155,20 @@ fn serialize(fonts: &[Font], images: &[PdfImage], pages: &[String], title: &str)
         let _ = write!(xobjects, "/Im{index} {id} 0 R ");
         let size = format!("/Width {} /Height {} /BitsPerComponent 8", image.width, image.height);
         let smask = mask.map(|mask| format!(" /SMask {mask} 0 R")).unwrap_or_default();
-        objects.stream(
+        objects.encoded_stream(
             id,
-            &format!("/Type /XObject /Subtype /Image {size} /ColorSpace /DeviceRGB{smask}"),
-            &image.rgb,
+            &format!(
+                "/Type /XObject /Subtype /Image {size} /ColorSpace {}{smask}",
+                image.color_space
+            ),
+            image.filter,
+            &image.data,
         );
         if let (Some(mask), Some(alpha)) = (mask, &image.alpha) {
-            objects.stream(
+            objects.encoded_stream(
                 mask,
                 &format!("/Type /XObject /Subtype /Image {size} /ColorSpace /DeviceGray"),
+                "/FlateDecode",
                 alpha,
             );
         }
@@ -1442,6 +1585,82 @@ mod tests {
         assert_eq!(text.matches("/Subtype /Image").count(), 3);
         assert_eq!(text.matches("/SMask").count(), 1);
         assert!(text.contains("/XObject << /Im0 "));
+    }
+
+    /// A writer with only `room` left on its first page.
+    fn writer_near_the_bottom(room: f32) -> Writer {
+        let mut writer = Writer::new();
+        writer.y = MARGIN_BOTTOM + room;
+        writer
+    }
+
+    #[test]
+    fn a_list_marker_moves_to_the_next_page_with_its_item() {
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        let image = rgba_image(100, 300, 255);
+        let reference = image.reference("shot");
+        for note in [
+            format!("- {reference}"),
+            "- # Heading".to_string(),
+            format!("1. > {reference}"),
+        ] {
+            // room for a line, not for a heading or the image
+            let mut writer = writer_near_the_bottom(30.0);
+            writer.markup(&note, std::slice::from_ref(&image), body);
+            assert_eq!(writer.pages.len(), 2, "{note}");
+            assert!(writer.pages[0].is_empty(), "{note}: {}", writer.pages[0]);
+        }
+    }
+
+    #[test]
+    fn a_quote_bar_starts_on_the_page_its_content_does() {
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        let image = rgba_image(100, 300, 255);
+        let mut writer = writer_near_the_bottom(40.0);
+        writer.markup(&format!("> {}", image.reference("shot")), &[image], body);
+        assert_eq!(writer.pages.len(), 2);
+        assert!(writer.pages[0].is_empty(), "{}", writer.pages[0]);
+        assert!(writer.pages[1].contains(" re f"));
+        // a quote that fits begins where it is
+        let mut writer = writer_near_the_bottom(40.0);
+        writer.markup("> short", &[], body);
+        assert_eq!(writer.pages.len(), 1);
+    }
+
+    fn jpeg(color: image::ExtendedColorType, pixels: &[u8], width: u32, height: u32) -> NoteImage {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(pixels, width, height, color)
+            .unwrap();
+        NoteImage::from_bytes(bytes, None).unwrap()
+    }
+
+    #[test]
+    fn jpegs_are_embedded_as_they_are() {
+        let rgb = jpeg(image::ExtendedColorType::Rgb8, &[200; 8 * 4 * 3], 8, 4);
+        let grey = jpeg(image::ExtendedColorType::L8, &[90; 8 * 4], 8, 4);
+        assert_eq!(jpeg_color_space(&rgb.bytes), Some("/DeviceRGB"));
+        assert_eq!(jpeg_color_space(&grey.bytes), Some("/DeviceGray"));
+        assert_eq!(jpeg_color_space(&rgba_image(2, 2, 255).bytes), None);
+        assert_eq!(jpeg_color_space(&rgb.bytes[..20]), None);
+        let mut writer = Writer::new();
+        writer.markup(
+            &format!("{} {}", rgb.reference("a"), grey.reference("b")),
+            &[rgb.clone(), grey.clone()],
+            Style::new(FontId::Sans, 11.0, TEXT),
+        );
+        let bytes = writer.finish("t");
+        let text = String::from_utf8_lossy(&bytes);
+        assert_eq!(text.matches("/Filter /DCTDecode").count(), 2);
+        assert!(text.contains("/ColorSpace /DeviceGray /Filter /DCTDecode"));
+        for image in [&rgb, &grey] {
+            assert!(bytes.windows(image.bytes.len()).any(|w| w == image.bytes.as_slice()));
+        }
+        // a JPEG that does not decode is not embedded
+        let mut broken = rgb.bytes.clone();
+        broken.truncate(broken.len() / 2);
+        let broken = NoteImage { bytes: broken, ..rgb };
+        assert_eq!(Writer::new().embed(&broken), None);
     }
 
     #[test]

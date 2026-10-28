@@ -201,6 +201,10 @@ pub struct Card {
     pub archived: bool,
     /// the images in the note's payload, decoded from base64 once per entry (shared by its cards and rebuilds)
     pub images: std::sync::Arc<[NoteImage]>,
+    /// the note's Markdown, parsed once when the card is built, not on every frame
+    pub blocks: std::sync::Arc<[markup::Block]>,
+    /// the note on one line, for the compact view
+    pub plain: String,
 }
 
 impl Card {
@@ -482,13 +486,9 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                     };
                     if view.compact {
                         let text = ui.add(
-                            egui::Label::new(
-                                RichText::new(markup::to_plain(&entry.text))
-                                    .size(NOTE_SIZE)
-                                    .color(p.text),
-                            )
-                            .selectable(true)
-                            .wrap(),
+                            egui::Label::new(RichText::new(&card.plain).size(NOTE_SIZE).color(p.text))
+                                .selectable(true)
+                                .wrap(),
                         );
                         on_body(&text, actions);
                     } else if source_on {
@@ -497,7 +497,7 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                     } else if let Some(image) = markup_view::note_body_with(
                         ui,
                         entry.id,
-                        &entry.text,
+                        &card.blocks,
                         &card.images,
                         NOTE_SIZE,
                         p.text,

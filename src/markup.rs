@@ -142,7 +142,7 @@ pub fn parse(text: &str) -> Vec<Block> {
             Event::End(_) => end_frame(&mut stack),
             Event::Text(s) => match stack.last_mut() {
                 Some(Frame::Code(c) | Frame::Html(c)) => c.push_str(&s),
-                _ => push_text(&mut stack, &s),
+                _ => push_text(&mut stack, source_text(text, range)),
             },
             Event::Code(s) => push_inline(&mut stack, Inline::Code(s.into_string())),
             Event::SoftBreak | Event::HardBreak => push_inline(&mut stack, Inline::LineBreak),
@@ -184,6 +184,19 @@ pub fn parse(text: &str) -> Vec<Block> {
         blocks.push(Block::Paragraph(text_lines(source)));
     }
     blocks
+}
+
+/// The source of a text event as typed: the parser decodes entity references (`&amp;`) and drops the backslash of
+/// an escape (`\$`), which would change paths and names. An escape's backslash is the one right before the text,
+/// when an odd number of them stand there.
+fn source_text(text: &str, range: Range<usize>) -> &str {
+    let backslashes = text[..range.start].bytes().rev().take_while(|b| *b == b'\\').count();
+    let start = if backslashes % 2 == 1 {
+        range.start - 1
+    } else {
+        range.start
+    };
+    &text[start..range.end]
 }
 
 fn start_frame(tag: &Tag) -> Option<Frame> {
@@ -395,8 +408,13 @@ pub fn shows_address(text: &[Inline], url: &str) -> bool {
 
 /// The whole note on one line of text, for list rows and the like. Links keep their address.
 pub fn to_plain(text: &str) -> String {
+    blocks_to_plain(&parse(text))
+}
+
+/// [`to_plain`] of a note parsed already.
+pub fn blocks_to_plain(blocks: &[Block]) -> String {
     let mut parts = Vec::new();
-    collect(&parse(text), &mut parts);
+    collect(blocks, &mut parts);
     parts.join(" ")
 }
 
@@ -637,6 +655,32 @@ mod tests {
                 items: vec![vec![para("a <i>b")]],
             }]
         );
+    }
+
+    #[test]
+    fn escapes_and_entities_stay_as_typed() {
+        assert_eq!(
+            parse(r"share \\fs01\cases, C:\$Recycle.Bin, R&amp;D &copy; &#35; \*x \\*y*"),
+            vec![Block::Paragraph(vec![
+                t(r"share \\fs01\cases, C:\$Recycle.Bin, R&amp;D &copy; &#35; \*x \\"),
+                Inline::Emphasis(vec![t("y")]),
+            ])]
+        );
+        assert_eq!(parse(r"\# not a heading"), vec![para(r"\# not a heading")]);
+        assert_eq!(parse(r"# a \# b"), vec![Block::Heading(1, vec![t(r"a \# b")])]);
+        assert_eq!(
+            parse(r"[a\]b](u)"),
+            vec![Block::Paragraph(vec![Inline::Link {
+                text: vec![t(r"a\]b")],
+                url: "u".into(),
+            }])]
+        );
+        // code keeps its own literal content
+        assert_eq!(
+            parse(r"`a\*b &amp;`"),
+            vec![Block::Paragraph(vec![Inline::Code(r"a\*b &amp;".into())])]
+        );
+        assert_eq!(to_plain(r"x \_y\_ &lt;b&gt;"), r"x \_y\_ &lt;b&gt;");
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
 use crate::images::{self, NoteImage};
+use crate::markup;
 use crate::notes::{Entry, EntryFilter};
 use crate::pystr::{strip, tail};
 use crate::seals::{REASON_CHECKPOINT, SEAL_DIR_SETTING};
@@ -663,7 +664,10 @@ impl FactumApp {
                 history.push(old);
             }
         }
+        let blocks: Arc<[markup::Block]> = markup::parse(&entry.text).into();
         Ok(Card {
+            plain: markup::blocks_to_plain(&blocks),
+            blocks,
             tags: crate::tags::get_tags_for_entry(&self.db.conn, entry.id)?,
             history,
             // the card names its evidence only when the view does not already say it
@@ -1627,9 +1631,10 @@ impl FactumApp {
         if text.is_empty() {
             return;
         }
-        let result = self
-            .factum()
-            .create_note_with_images(&text, &self.composer_images, self.evidence_id, case.id);
+        let result = note_editor::check_shown(&text, &self.composer_images).and_then(|()| {
+            self.factum()
+                .create_note_with_images(&text, &self.composer_images, self.evidence_id, case.id)
+        });
         if self.run(result).is_some() {
             self.composer.clear();
             self.composer_images.clear();
@@ -1764,10 +1769,11 @@ impl FactumApp {
             }
             CardAction::Focus(entry_id) => self.focused_card = Some(entry_id),
             CardAction::OpenImage(entry_id, image_id) => {
+                // the card's images are decoded already
+                let factum = self.factum();
                 let image = self
-                    .factum()
-                    .get_entry(entry_id)
-                    .map(|entry| entry.and_then(|entry| images::find(&entry.images(), &image_id).cloned()));
+                    .card_images(&factum, entry_id)
+                    .map(|images| images::find(&images, &image_id).cloned());
                 match self.run(image) {
                     Some(Some(image)) => self.image_viewer = Some((entry_id, image)),
                     Some(None) => log::warn!("Image {image_id} of entry #{entry_id} not found."),

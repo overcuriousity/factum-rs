@@ -10,7 +10,7 @@ use egui::{Id, Sense, TextEdit, Vec2};
 use super::widgets::IconButton;
 use super::{icons, markup_view, theme};
 use crate::error::{FactumError, Result};
-use crate::images::{MAX_IMAGE_BYTES, NoteImage};
+use crate::images::{self, MAX_IMAGE_BYTES, NoteImage};
 
 /// Thumbnails of images not yet saved are this high.
 pub const THUMBNAIL_HEIGHT: f32 = 64.0;
@@ -344,11 +344,36 @@ fn insert_from_files(ctx: &egui::Context, editor_id: Id, text: &mut String, imag
 
 // ---- thumbnails
 
+/// Images the text does not show: their reference sits in code, is escaped or was edited. Saving would leave them
+/// out ([`images::referenced_ids`]).
+pub fn unshown<'a>(text: &str, images: &'a [NoteImage]) -> Vec<&'a NoteImage> {
+    let shown = images::referenced_ids(text);
+    images.iter().filter(|image| !shown.contains(&image.id)).collect()
+}
+
+/// Refuses a note that would silently lose an attached image.
+pub fn check_shown(text: &str, images: &[NoteImage]) -> Result<()> {
+    match unshown(text, images).first() {
+        None => Ok(()),
+        Some(image) => Err(FactumError::general(format!(
+            "Image {} is not shown in the note: its reference is in code, escaped or changed. Fix the reference \
+             or remove the image, so it is not left out.",
+            label(image)
+        ))),
+    }
+}
+
+fn label(image: &NoteImage) -> String {
+    image.name.clone().unwrap_or_else(|| image.id.clone())
+}
+
 /// The images that will be saved with the note, small, each with a button that takes it out (and its references).
+/// One the text does not show is marked: it would not be saved.
 pub fn thumbnails(ui: &mut egui::Ui, text: &mut String, images: &mut Vec<NoteImage>) {
     if images.is_empty() {
         return;
     }
+    let unshown: Vec<String> = unshown(text, images).iter().map(|image| image.id.clone()).collect();
     let mut removed = None;
     egui::ScrollArea::horizontal()
         .id_salt("composer-thumbnails")
@@ -356,7 +381,7 @@ pub fn thumbnails(ui: &mut egui::Ui, text: &mut String, images: &mut Vec<NoteIma
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 for image in images.iter() {
-                    if thumbnail(ui, image) {
+                    if thumbnail(ui, image, !unshown.contains(&image.id)) {
                         removed = Some(image.id.clone());
                     }
                 }
@@ -368,7 +393,7 @@ pub fn thumbnails(ui: &mut egui::Ui, text: &mut String, images: &mut Vec<NoteIma
 }
 
 /// One thumbnail; true when its remove button was clicked.
-fn thumbnail(ui: &mut egui::Ui, image: &NoteImage) -> bool {
+fn thumbnail(ui: &mut egui::Ui, image: &NoteImage, shown: bool) -> bool {
     let p = *theme::current(ui.ctx());
     // pending images are not an entry's: they are cached under entry 0
     let texture = markup_view::texture(ui.ctx(), 0, image);
@@ -381,7 +406,10 @@ fn thumbnail(ui: &mut egui::Ui, image: &NoteImage) -> bool {
         None => Vec2::splat(THUMBNAIL_HEIGHT),
     };
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    let label = image.name.clone().unwrap_or_else(|| image.id.clone());
+    let label = match shown {
+        true => label(image),
+        false => format!("{}: not shown in the note, will not be saved", label(image)),
+    };
     match &texture {
         Some(texture) => egui::Image::new((texture.id(), size)).paint_at(ui, rect),
         None => {
@@ -395,12 +423,15 @@ fn thumbnail(ui: &mut egui::Ui, image: &NoteImage) -> bool {
             );
         }
     }
-    ui.painter().rect_stroke(
-        rect,
-        3.0,
-        ui.visuals().widgets.inactive.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
+    let stroke = match shown {
+        true => ui.visuals().widgets.inactive.bg_stroke,
+        false => {
+            ui.painter()
+                .rect_filled(rect, 3.0, ui.visuals().window_fill().gamma_multiply(0.6));
+            egui::Stroke::new(2.0, p.fail)
+        }
+    };
+    ui.painter().rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Inside);
     response.on_hover_text(label);
     let button = egui::Rect::from_min_size(rect.right_top() + egui::vec2(-24.0, 2.0), egui::vec2(22.0, 22.0));
     ui.painter()

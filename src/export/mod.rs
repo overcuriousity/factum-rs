@@ -50,6 +50,7 @@ impl Factum<'_> {
             compact_utc(&exported_utc)
         );
         let html = html::render_html(&model, false).into_bytes();
+        // borrowed from the model: nothing is copied for formats that do not write image files
         let images = markdown::image_files(&model);
         let image_dir = format!("{stem}_images");
         let pdf = if unique.contains(&"pdf") || unique.contains(&"bundle") {
@@ -80,6 +81,7 @@ impl Factum<'_> {
             }
         }
         if unique.contains(&"bundle") {
+            // not the .md report's text: the bundle links its images under images/
             let markdown = markdown::render_markdown(&model, "images").into_bytes();
             let reports = [("report.html", html), ("report.pdf", pdf), ("report.md", markdown)];
             written.push(self.build_bundle(&model, &reports, &images, &out_dir.join(format!("{stem}.zip")))?);

@@ -161,14 +161,15 @@ pub fn note_body(
     size: f32,
     color: Color32,
 ) -> Option<String> {
-    note_body_with(ui, entry_id, text, images, size, color, &mut |_| {})
+    note_body_with(ui, entry_id, &markup::parse(text), images, size, color, &mut |_| {})
 }
 
-/// [`note_body`], also handing every text and image widget it adds to `each` (for a context menu on the note).
+/// [`note_body`] from the parsed note, also handing every text and image widget it adds to `each` (for a context
+/// menu on the note).
 pub fn note_body_with(
     ui: &mut egui::Ui,
     entry_id: i64,
-    text: &str,
+    blocks: &[Block],
     images: &[NoteImage],
     size: f32,
     color: Color32,
@@ -183,7 +184,7 @@ pub fn note_body_with(
         clicked: None,
         nested: 0,
     };
-    body.blocks(ui, &markup::parse(text), size);
+    body.blocks(ui, blocks, size);
     body.clicked
 }
 

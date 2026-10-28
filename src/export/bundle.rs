@@ -1,5 +1,6 @@
 //! The verification bundle: a self-contained ZIP that anyone can verify without factum (verify.py).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -169,7 +170,7 @@ impl Factum<'_> {
         &self,
         model: &ReportModel,
         reports: &[(&str, Vec<u8>)],
-        images: &[(String, Vec<u8>)],
+        images: &[(String, &[u8])],
         out_path: &Path,
     ) -> Result<PathBuf> {
         let (data, signatures) = self.case_data(model)?;
@@ -181,22 +182,23 @@ impl Factum<'_> {
             .collect();
         fingerprints.sort();
         fingerprints.dedup();
-        let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        files.insert("README.md".into(), BUNDLE_README.as_bytes().to_vec());
-        files.insert("verify.py".into(), VERIFY_PY.to_vec());
-        files.insert("case.json".into(), pretty_json(&data).into_bytes());
+        // borrowed where the content exists already: reports and images can be large
+        let mut files: BTreeMap<String, Cow<[u8]>> = BTreeMap::new();
+        files.insert("README.md".into(), Cow::Borrowed(BUNDLE_README.as_bytes()));
+        files.insert("verify.py".into(), Cow::Borrowed(VERIFY_PY));
+        files.insert("case.json".into(), Cow::Owned(pretty_json(&data).into_bytes()));
         files.insert(
             "public-keys.asc".into(),
-            self.signer.export_public_keys(&fingerprints).into_bytes(),
+            Cow::Owned(self.signer.export_public_keys(&fingerprints).into_bytes()),
         );
         for (name, content) in reports {
-            files.insert(name.to_string(), content.clone());
+            files.insert(name.to_string(), Cow::Borrowed(content));
         }
         for (name, content) in images {
-            files.insert(format!("images/{name}"), content.clone());
+            files.insert(format!("images/{name}"), Cow::Borrowed(content));
         }
         for (name, text) in signatures {
-            files.insert(name, text.into_bytes());
+            files.insert(name, Cow::Owned(text.into_bytes()));
         }
         let manifest: String = files
             .iter()

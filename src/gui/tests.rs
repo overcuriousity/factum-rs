@@ -2428,6 +2428,85 @@ fn correction_dialog_keeps_the_images() {
 }
 
 #[test]
+fn clicking_an_image_opens_it_from_the_cards_images() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(
+        &fixture,
+        &format!("see {}", image.reference("x")),
+        std::slice::from_ref(&image),
+    );
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // the log decoded the note's images for its card
+    assert!(harness.state().note_images.borrow().contains_key(&note));
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::OpenImage(note, image.id.clone()), &ctx);
+    harness.run_ok();
+    assert_eq!(harness.state().image_viewer, Some((note, image)));
+}
+
+#[test]
+fn an_image_the_text_does_not_show_is_not_lost() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let image = test_image(4, 4);
+    // pasted inside a code fence, the reference is code, not an image
+    let text = format!("```\n{}\n```", image.reference("screenshot"));
+    harness.state_mut().composer = text.clone();
+    harness.state_mut().composer_images = vec![image.clone()];
+    harness.run_ok();
+    assert_eq!(note_editor::unshown(&text, std::slice::from_ref(&image)), vec![&image]);
+    harness.state_mut().submit_note();
+    harness.run_ok();
+    assert_eq!(harness.state().composer, text);
+    assert_eq!(harness.state().composer_images, vec![image.clone()]);
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    for id in factum.list_entries(case_id, &EntryFilter::notes()).unwrap() {
+        assert!(!factum.get_entry(id).unwrap().unwrap().text.contains(&image.id));
+    }
+}
+
+#[test]
+fn a_correction_that_hides_an_image_is_refused() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(
+        &fixture,
+        &format!("see {}", image.reference("x")),
+        std::slice::from_ref(&image),
+    );
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+    match harness.state_mut().dialogs.last_mut() {
+        Some(Dialog::Correct { text, .. }) => *text = format!("see `{}`", image.reference("x")),
+        _ => panic!("no correction dialog"),
+    }
+    harness.run_ok();
+    harness.get_by_label("Add corrected version").click();
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::Correct { error, .. }) => {
+            assert!(
+                error.as_deref().is_some_and(|e| e.contains("not shown in the note")),
+                "{error:?}"
+            )
+        }
+        _ => panic!("the correction dialog closed"),
+    }
+    let factum = harness.state().factum();
+    assert_eq!(factum.latest_version_id(note).unwrap(), note);
+}
+
+#[test]
 fn the_toolbar_formats_the_selection() {
     let fixture = Fixture::new();
     let mut harness = fixture.harness();
