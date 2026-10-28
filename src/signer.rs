@@ -564,6 +564,8 @@ pub struct FakeSigner {
     pub active_key_id: RefCell<Option<String>>,
     pub trust: RefCell<String>,
     pub fail_next: Cell<bool>,
+    /// detached signatures still made before one fails (once)
+    pub fail_detached_after: Cell<Option<u32>>,
     pub last_failed: Cell<bool>,
     /// armor as gpg writes it on Windows
     pub crlf: Cell<bool>,
@@ -585,6 +587,7 @@ impl FakeSigner {
             active_key_id: RefCell::new(active.then(|| "FAKEKEY1".to_string())),
             trust: RefCell::new(trust.to_string()),
             fail_next: Cell::new(false),
+            fail_detached_after: Cell::new(None),
             last_failed: Cell::new(false),
             crlf: Cell::new(false),
             before_sign: RefCell::new(None),
@@ -635,6 +638,14 @@ impl Signer for FakeSigner {
     fn sign_detached(&self, data: &[u8]) -> Option<String> {
         use sha2::Digest;
         self.active_key_id.borrow().as_ref()?;
+        match self.fail_detached_after.get() {
+            Some(0) => {
+                self.fail_detached_after.set(None);
+                return None;
+            }
+            Some(n) => self.fail_detached_after.set(Some(n - 1)),
+            None => {}
+        }
         Some(format!("FAKE DETACHED {}", hex::encode(sha2::Sha256::digest(data))))
     }
     fn export_public_keys(&self, _fingerprints: &[String]) -> String {

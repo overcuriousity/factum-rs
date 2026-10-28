@@ -451,11 +451,22 @@ impl Factum<'_> {
                 "container_signed" => {
                     let (gpg, x509) = event.signatures();
                     let sha = event.text("turtle_sha256");
-                    if let Some(close) = detail
-                        .closes
-                        .iter_mut()
-                        .find(|c| c.turtle_sha256 == sha && c.signed_later.is_none())
-                    {
+                    // the close it names; identical states (close, reopen, close) share a hash, so the hash only
+                    // picks among the closes that were not signed
+                    let named = event
+                        .payload
+                        .get("close")
+                        .and_then(Value::as_u64)
+                        .and_then(|n| detail.closes.get_mut((n as usize).checked_sub(1)?))
+                        .filter(|c| c.turtle_sha256 == sha && !c.is_signed());
+                    let close = match named {
+                        Some(close) => Some(close),
+                        None => detail
+                            .closes
+                            .iter_mut()
+                            .find(|c| c.turtle_sha256 == sha && !c.is_signed()),
+                    };
+                    if let Some(close) = close {
                         close.signed_later = Some(event.entry_id);
                     }
                     detail.late_signatures.push((event.entry_id, sha, gpg, x509));
@@ -858,8 +869,20 @@ impl Factum<'_> {
         }
         let gpgsm = self.gpgsm();
         let (mut count, mut skipped) = (0, Vec::new());
-        for (detail, n, close) in pending {
+        let mut pending = pending.into_iter();
+        while let Some((detail, n, close)) = pending.next() {
             let id = detail.summary.id;
+            // after a signing failure (a cancelled passphrase prompt, say) the rest is not tried; what was signed
+            // stays signed and is counted
+            let mut stop = |skipped: &mut Vec<String>, reason: String| {
+                skipped.push(format!("Container #{id}: {reason}"));
+                for (detail, ..) in pending.by_ref() {
+                    skipped.push(format!(
+                        "Container #{}: not tried after the failure above.",
+                        detail.summary.id
+                    ));
+                }
+            };
             let mut volume = match self.open_volume(&detail) {
                 Ok(volume) => volume,
                 Err(e) => {
@@ -884,7 +907,13 @@ impl Factum<'_> {
             }
             let SignedState {
                 signatures, gpg, x509, ..
-            } = self.sign_state(&turtle, &gpgsm, "GPG signing failed — nothing was signed.")?;
+            } = match self.sign_state(&turtle, &gpgsm, "GPG signing failed; not signed.") {
+                Ok(signed) => signed,
+                Err(e) => {
+                    stop(&mut skipped, e.to_string());
+                    break;
+                }
+            };
             let mark = volume.mark();
             let uuid = detail.summary.uuid.clone();
             let result = {
@@ -900,7 +929,7 @@ impl Factum<'_> {
                     &format!("Container #{id} signed"),
                     Append {
                         payload: Some(json!({"event": "container_signed", "case_id": case_id,
-                                             "container_id": detail.summary.uuid,
+                                             "container_id": detail.summary.uuid, "close": n,
                                              "turtle_sha256": close.turtle_sha256,
                                              "signatures": signatures_json(&gpg, &x509), "signed_utc": utc_now()})),
                         on_commit: Some(&add),
@@ -911,8 +940,11 @@ impl Factum<'_> {
                 )
             };
             if let Err(e) = result {
-                let _ = volume.rollback_to(mark);
-                return Err(e);
+                if let Err(rollback) = volume.rollback_to(mark) {
+                    log::error!("Container #{id} could not be restored after a failed signature: {rollback}");
+                }
+                stop(&mut skipped, format!("{e}; not signed."));
+                break;
             }
             count += 1;
         }

@@ -152,7 +152,9 @@ default; compatibility with other tools' X.509 checks is an open risk (8).
 
 Without an active GPG key, a container can still be closed, unsigned, and **signed later** (like entries and seals
 today, through the existing Sign Unsigned action): the close entry then records no signatures and a later
-`container_signed` entry (payload: `turtle_sha256`, `signatures`, `signed_utc`) records them.
+`container_signed` entry (payload: `close` (the close number n), `turtle_sha256`, `signatures`, `signed_utc`) records
+them. Closing, reopening and closing again with nothing added gives two closes of the same state: `close` says which
+one was signed.
 
 **X.509 configuration** (in the GUI's settings, stored in the `settings` table): the signing certificate, picked
 from the certificates with a secret key that `gpgsm --list-secret-keys` reports (smart cards included); optionally

@@ -380,6 +380,60 @@ fn close_without_key_then_sign_later() {
 }
 
 #[test]
+fn sign_later_signs_the_unsigned_close_of_identical_states() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let first = factum.close_container(id).unwrap();
+    assert!(first.gpg.is_some());
+    factum.reopen_container(id).unwrap();
+    s.f.signer.set_active(false);
+    let second = factum.close_container(id).unwrap();
+    // nothing was added in between: both closes signed the same state
+    assert_eq!(first.turtle_sha256, second.turtle_sha256);
+    assert!(second.gpg.is_none());
+    s.f.signer.set_active(true);
+    let (count, skipped) = factum.sign_unsigned_containers(s.case_id).unwrap();
+    assert_eq!((count, skipped.len()), (1, 0), "{skipped:?}");
+    let detail = factum.container(id).unwrap();
+    assert!(detail.closes[0].signed_later.is_none());
+    assert!(detail.closes[1].signed_later.is_some());
+    assert_eq!(s.events("container_signed")[0]["close"], 2);
+    assert_eq!(factum.sign_unsigned_containers(s.case_id).unwrap().0, 0);
+    assert_eq!(s.events("container_signed").len(), 1);
+}
+
+#[test]
+fn sign_later_keeps_what_was_signed_when_signing_fails() {
+    let s = Setup::with_signer(FakeSigner::new(false));
+    let mut ids = Vec::new();
+    for name in ["one", "two", "three"] {
+        let id =
+            s.f.factum()
+                .create_container(s.case_id, name, None, &s.f.path().join(format!("{name}.aff4l")), "/")
+                .unwrap();
+        s.f.factum().close_container(id).unwrap();
+        ids.push(id);
+    }
+    s.f.signer.set_active(true);
+    // the second signature fails (a cancelled passphrase prompt)
+    s.f.signer.fail_detached_after.set(Some(1));
+    let (count, skipped) = s.f.factum().sign_unsigned_containers(s.case_id).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(s.events("container_signed").len(), 1);
+    assert_eq!(skipped.len(), 2, "{skipped:?}");
+    assert!(
+        skipped[0].contains(&format!("#{}", ids[1])) && skipped[0].contains("GPG"),
+        "{}",
+        skipped[0]
+    );
+    assert!(skipped[1].contains(&format!("#{}", ids[2])), "{}", skipped[1]);
+    // the rest is signed on the next run
+    assert_eq!(s.f.factum().sign_unsigned_containers(s.case_id).unwrap().0, 2);
+}
+
+#[test]
 fn sign_later_works_in_an_archived_case() {
     let s = Setup::with_signer(FakeSigner::new(false));
     let id = s.create();
