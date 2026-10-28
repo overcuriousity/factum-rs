@@ -126,7 +126,7 @@ pub fn parse(text: &str) -> Vec<Block> {
                 Some(Frame::Html(c)) => c.push_str(&s),
                 _ => literal(&mut stack, &s),
             },
-            Event::InlineHtml(s) => literal(&mut stack, &s),
+            Event::InlineHtml(s) => literal_inline(&mut stack, &s),
             // rules and everything else a plain-CommonMark parse should not produce
             _ => literal(&mut stack, &text[range]),
         }
@@ -266,12 +266,23 @@ fn append(v: &mut Vec<Inline>, inline: Inline) {
     v.push(inline);
 }
 
-/// Source text kept as it is, in line context or as a paragraph of its own.
+/// Inline source text kept as it is.
+fn literal_inline(stack: &mut [Frame], source: &str) {
+    for inline in text_lines(source.trim_end_matches(['\n', '\r'])) {
+        push_inline(stack, inline);
+    }
+}
+
+/// Source of a block-level element kept as it is: a paragraph of its own, or, inside an inline container,
+/// the same text in line. A tight item takes it as a block so it never merges with the item's text.
 fn literal(stack: &mut [Frame], source: &str) {
     let lines = text_lines(source.trim_end_matches(['\n', '\r']));
-    match stack.last_mut().and_then(Frame::inlines) {
-        Some(v) => lines.into_iter().for_each(|i| append(v, i)),
-        None => push_block(stack, Block::Paragraph(lines)),
+    match stack.last_mut() {
+        Some(Frame::Item { .. }) | None => push_block(stack, Block::Paragraph(lines)),
+        Some(frame) => match frame.inlines() {
+            Some(v) => lines.into_iter().for_each(|i| append(v, i)),
+            None => push_block(stack, Block::Paragraph(lines)),
+        },
     }
 }
 
@@ -471,6 +482,35 @@ mod tests {
             ]
         );
         assert_eq!(parse("[r]: https://evil"), vec![para("[r]: https://evil")]);
+    }
+
+    #[test]
+    fn rules_in_tight_items_stay_separate_blocks() {
+        assert_eq!(
+            parse("- a\n  ***\n  b"),
+            vec![Block::List {
+                start: None,
+                items: vec![vec![para("a"), para("***"), para("b")]],
+            }]
+        );
+        assert_eq!(
+            parse("- a\n  ***"),
+            vec![Block::List {
+                start: None,
+                items: vec![vec![para("a"), para("***")]],
+            }]
+        );
+    }
+
+    #[test]
+    fn inline_html_in_a_tight_item_stays_in_the_text() {
+        assert_eq!(
+            parse("- a <i>b"),
+            vec![Block::List {
+                start: None,
+                items: vec![vec![para("a <i>b")]],
+            }]
+        );
     }
 
     #[test]
