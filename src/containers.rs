@@ -722,7 +722,8 @@ impl Factum<'_> {
         };
         let payload = json!({"event": "container_files_added", "case_id": detail.summary.case_id,
                              "container_id": detail.summary.uuid, "files": files, "folders": folders,
-                             "not_added": not_added, "added_utc": utc_now()});
+                             "not_added": not_added, "added_utc": utc_now(),
+                             "base_path": staged.base().display().to_string(), "keep_path": staged.keep_path});
         let mark = staged.mark();
         let result = {
             let cell = RefCell::new(&mut *volume);

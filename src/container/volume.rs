@@ -45,13 +45,16 @@ pub struct VolumeInfo {
 }
 
 /// The choices of one Add operation (spec 4.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddOptions {
+    /// removed from the sources' paths; empty: the full paths are kept
     pub base: PathBuf,
     pub keep_path: bool,
     pub metadata_only: bool,
     /// from (inclusive) and to (exclusive) byte offset, for a single file
     pub excerpt: Option<(u64, u64)>,
+    /// (source path, ARN): copies this operation adds again, replacing the ARN's damaged copy
+    pub replaces: Vec<(PathBuf, String)>,
 }
 
 /// One file as the log records it (`container_files_added`).
@@ -66,6 +69,8 @@ pub struct FileRecord {
     pub metadata_only: bool,
     pub excerpt: Option<(u64, u64)>,
     pub link: Option<String>,
+    /// the absolute path it was read from (not recorded before 2.8)
+    pub source: Option<String>,
 }
 
 impl FileRecord {
@@ -74,6 +79,7 @@ impl FileRecord {
             "arn": self.arn, "path": self.path, "size": self.size, "md5": self.md5, "sha1": self.sha1,
             "sha256": self.sha256, "metadata_only": self.metadata_only,
             "excerpt": self.excerpt.map(|(from, to)| json!([from, to])), "link": self.link,
+            "source": self.source,
         })
     }
 
@@ -94,6 +100,7 @@ impl FileRecord {
             metadata_only: value.get("metadata_only")?.as_bool()?,
             excerpt,
             link: text("link"),
+            source: text("source"),
         })
     }
 }
@@ -155,6 +162,7 @@ pub struct Staged {
     graph: Graph,
     task_arn: String,
     base: PathBuf,
+    pub keep_path: bool,
     mark: Mark,
 }
 
@@ -166,6 +174,11 @@ impl Staged {
 
     pub fn bytes(&self) -> u64 {
         self.records.iter().filter(|r| !r.metadata_only).map(|r| r.size).sum()
+    }
+
+    /// The base path the sources' paths were stored below; empty: full paths.
+    pub fn base(&self) -> &Path {
+        &self.base
     }
 }
 
@@ -289,6 +302,7 @@ pub fn file_records(graph: &Graph) -> Vec<FileRecord> {
                 metadata_only: value(factum("metadataOnly")).as_deref() == Some("true"),
                 excerpt,
                 link: value(factum("symlinkTarget")),
+                source: value(factum("sourcePath")),
             }
         })
         .collect()
@@ -764,8 +778,11 @@ impl Volume {
         }
         let mut errors = Vec::new();
         let mut items = Vec::new();
+        // a container inside the folder being added never adds itself
+        let own = std::fs::canonicalize(&self.path).ok();
         for walked in source::walk(sources) {
             match walked {
+                Ok(item) if own.is_some() && std::fs::canonicalize(&item.0).ok() == own => {}
                 Ok(item) => items.push(item),
                 Err((path, e)) => errors.push((path.display().to_string(), e.to_string())),
             }
@@ -849,6 +866,7 @@ impl Volume {
                     name_and_meta(&mut graph, &arn, &name, stored, meta);
                     graph.add(&arn, &aff4("size"), typed(0, "long"));
                     graph.add(&arn, &factum("symlinkTarget"), plain(&target));
+                    graph.add(&arn, &factum("sourcePath"), plain(&display));
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     records.push(FileRecord {
                         arn,
@@ -860,6 +878,7 @@ impl Volume {
                         metadata_only: false,
                         excerpt: None,
                         link: Some(target),
+                        source: Some(display.clone()),
                     });
                     progress.files.fetch_add(1, Ordering::Relaxed);
                 }
@@ -936,6 +955,7 @@ impl Volume {
                         graph.add(&arn, &factum("excerptEnd"), typed(to, "long"));
                         graph.add(&arn, &factum("originalSize"), typed(meta.size, "long"));
                     }
+                    graph.add(&arn, &factum("sourcePath"), plain(&display));
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     done_bytes += read_size;
                     progress.bytes.store(done_bytes, Ordering::Relaxed);
@@ -950,6 +970,7 @@ impl Volume {
                         metadata_only: options.metadata_only,
                         excerpt: options.excerpt,
                         link: None,
+                        source: Some(display.clone()),
                     });
                 }
             }
@@ -963,6 +984,7 @@ impl Volume {
             graph,
             task_arn,
             base: options.base.clone(),
+            keep_path: options.keep_path,
             mark,
         })
     }
@@ -977,8 +999,13 @@ impl Volume {
         graph.extend(staged.graph.clone());
         let task = &staged.task_arn;
         graph.add(task, &rdf_type(), Term::Iri(aff4l("LogicalAcquisitionTask")));
-        let root = encode_name(&os_bytes(staged.base.as_os_str()));
-        graph.add(task, &aff4l("filesystemRoot"), plain(root.text));
+        // without a base path the full paths are stored: below / on Unix, with the drive on Windows
+        let root = if staged.base.as_os_str().is_empty() {
+            if cfg!(windows) { String::new() } else { "/".to_string() }
+        } else {
+            encode_name(&os_bytes(staged.base.as_os_str())).text
+        };
+        graph.add(task, &aff4l("filesystemRoot"), plain(root));
         graph.add(task, &aff4l("pathSeparator"), plain(std::path::MAIN_SEPARATOR_STR));
         graph.add(task, &factum("logEntry"), typed(entry_id, "long"));
         self.commit(graph, &[], &SIGNATURE_MEMBERS)
@@ -1148,6 +1175,7 @@ mod tests {
                 keep_path: true,
                 metadata_only: false,
                 excerpt: None,
+                replaces: Vec::new(),
             }
         }
     }
@@ -1771,6 +1799,7 @@ mod tests {
             metadata_only: false,
             excerpt: Some((1, 3)),
             link: None,
+            source: Some("/mnt/x".into()),
         };
         let json = record.to_json();
         assert_eq!(json["excerpt"], serde_json::json!([1, 3]));

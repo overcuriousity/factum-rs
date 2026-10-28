@@ -926,6 +926,7 @@ impl Dialog {
                             keep_path: *keep_path,
                             metadata_only: *metadata_only,
                             excerpt: excerpt.ok().flatten(),
+                            replaces: Vec::new(),
                         },
                     });
                 }

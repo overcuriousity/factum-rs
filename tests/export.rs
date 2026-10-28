@@ -648,6 +648,7 @@ fn container_case(factum: &Factum, dir: &Path) -> (i64, String, Vec<(String, Str
         keep_path: true,
         metadata_only: false,
         excerpt: None,
+        replaces: Vec::new(),
     };
     let staged = volume
         .stage_add(
@@ -775,6 +776,7 @@ fn reports_mark_files_whose_content_is_not_stored() {
             keep_path: true,
             metadata_only,
             excerpt,
+            replaces: Vec::new(),
         };
         let staged = volume
             .stage_add(

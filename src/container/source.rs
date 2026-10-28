@@ -147,6 +147,13 @@ pub fn os_bytes(name: &OsStr) -> Vec<u8> {
 /// The path stored for a source: below `base`, joined with the platform's separator, or only the file name.
 /// The base itself has an empty path (it is the root of the acquisition).
 pub fn stored_path(path: &Path, base: &Path, keep_path: bool) -> Result<Vec<u8>, String> {
+    if base.as_os_str().is_empty() {
+        return Ok(if keep_path {
+            full_path(path)
+        } else {
+            path.file_name().map(os_bytes).unwrap_or_default()
+        });
+    }
     let relative = path.strip_prefix(base).map_err(|_| {
         format!(
             "{} is not below the base path {}. Choose a base path that contains every source.",
@@ -168,6 +175,25 @@ pub fn stored_path(path: &Path, base: &Path, keep_path: bool) -> Result<Vec<u8>,
         out.extend(os_bytes(name));
     }
     Ok(out)
+}
+
+/// A full path as stored without a base path: on Unix without the leading separator, on Windows starting with
+/// the drive or share (`C:\Users\x`, `\\server\share\x`).
+fn full_path(path: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for component in path.components() {
+        let part = match component {
+            Component::Prefix(prefix) => prefix.as_os_str(),
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => std::ffi::OsStr::new(".."),
+            Component::Normal(name) => name,
+        };
+        if !out.is_empty() {
+            out.extend(std::path::MAIN_SEPARATOR_STR.as_bytes());
+        }
+        out.extend(os_bytes(part));
+    }
+    out
 }
 
 /// Every source and, for folders, everything below them: depth-first, a folder before its contents, the entries
@@ -285,6 +311,26 @@ mod tests {
         assert!(error.contains("/mnt/b/x"), "{error}");
         // a name that only starts like the base is not below it
         assert!(stored_path(Path::new("/mnt/ab/x"), Path::new("/mnt/a"), true).is_err());
+    }
+
+    #[test]
+    fn stored_path_without_base_keeps_full_path() {
+        #[cfg(unix)]
+        assert_eq!(
+            stored_path(Path::new("/mnt/x/a.txt"), Path::new(""), true).unwrap(),
+            b"mnt/x/a.txt".to_vec()
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                stored_path(Path::new(r"C:\Users\x\a.txt"), Path::new(""), true).unwrap(),
+                br"C:\Users\x\a.txt".to_vec()
+            );
+            assert_eq!(
+                stored_path(Path::new(r"\\server\share\x\a.txt"), Path::new(""), true).unwrap(),
+                br"\\server\share\x\a.txt".to_vec()
+            );
+        }
     }
 
     #[test]

@@ -1423,6 +1423,7 @@ impl Fixture {
             keep_path: true,
             metadata_only: false,
             excerpt: None,
+            replaces: Vec::new(),
         };
         let staged = volume
             .stage_add(
@@ -1642,6 +1643,7 @@ fn cancel_adds_nothing() {
         keep_path: true,
         metadata_only: false,
         excerpt: None,
+        replaces: Vec::new(),
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     harness.state_mut().start_add(id, vec![source], options, cancel);

@@ -71,8 +71,7 @@ impl Setup {
         AddOptions {
             base: self.source.clone(),
             keep_path: true,
-            metadata_only: false,
-            excerpt: None,
+            ..Default::default()
         }
     }
 
@@ -1289,6 +1288,7 @@ mod script {
             keep_path: true,
             metadata_only: false,
             excerpt: None,
+            replaces: Vec::new(),
         };
         for (index, name) in ["small.txt", "big.bin"].iter().enumerate() {
             if index > 0 {
@@ -1707,4 +1707,77 @@ fn summary_says_signed() {
     unsigned.add(id, &[unsigned.file("a.txt")]);
     unsigned.f.factum().close_container(id).unwrap();
     assert!(!unsigned.f.factum().list_containers(unsigned.case_id).unwrap()[0].signed);
+}
+
+#[test]
+fn add_without_base_from_two_folders() {
+    let s = Setup::new();
+    let factum = s.f.factum();
+    let id = factum
+        .create_container(s.case_id, "anywhere", s.evidence_id, &s.container_path(), "")
+        .unwrap();
+    let elsewhere = s.f.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("z.txt"), "zz").unwrap();
+    let options = AddOptions {
+        base: PathBuf::new(),
+        keep_path: true,
+        ..Default::default()
+    };
+    for source in [s.file("a.txt"), elsewhere.join("z.txt")] {
+        let mut volume = factum.open_container_for_add(id).unwrap();
+        let staged = volume
+            .stage_add(&[source], &options, &AddProgress::default(), &AtomicBool::new(false))
+            .unwrap();
+        factum.commit_container_add(id, &mut volume, staged).unwrap();
+    }
+    let added = s.events("container_files_added");
+    assert_eq!(added.len(), 2);
+    for (event, source) in added.iter().zip([s.file("a.txt"), elsewhere.join("z.txt")]) {
+        assert_eq!(event["base_path"], "");
+        assert_eq!(event["keep_path"], true);
+        let record = &event["files"][0];
+        assert_eq!(record["source"], source.display().to_string());
+        let full = source.display().to_string();
+        let path = record["path"].as_str().unwrap();
+        assert!(full.ends_with(path) && path.len() + 1 >= full.len(), "{path} vs {full}");
+    }
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    assert!(factum.compare_with_log(id, &volume).unwrap().is_empty());
+    let records = factum::container::volume::file_records(volume.graph());
+    assert!(records.iter().all(|r| r.source.is_some()));
+    drop(volume.archive());
+}
+
+#[test]
+fn acquire_skips_the_container_itself() {
+    let s = Setup::new();
+    let factum = s.f.factum();
+    let inside = s.source.join("preserved.aff4l");
+    let id = factum
+        .create_container(
+            s.case_id,
+            "inside",
+            s.evidence_id,
+            &inside,
+            &s.source.display().to_string(),
+        )
+        .unwrap();
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    let staged = volume
+        .stage_add(
+            std::slice::from_ref(&s.source),
+            &s.options(),
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        staged
+            .records
+            .iter()
+            .all(|r| r.source.as_deref() != Some(&*inside.display().to_string()))
+    );
+    assert_eq!(staged.records.len(), 5);
+    factum.commit_container_add(id, &mut volume, staged).unwrap();
 }
