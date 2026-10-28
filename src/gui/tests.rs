@@ -1667,7 +1667,7 @@ fn locate_accepts_the_moved_file() {
 }
 
 #[test]
-fn new_container_dialog_creates_file_and_selects_it() {
+fn case_new_container_creates_evidence_and_container() {
     let fixture = Fixture::new();
     let mut harness = fixture.harness();
     select_case(&mut harness);
@@ -1676,26 +1676,108 @@ fn new_container_dialog_creates_file_and_selects_it() {
     harness.run_ok();
     let folder = fixture._dir.path().to_path_buf();
     if let Some(Dialog::NewContainer {
-        folder: field, base, ..
+        folder: field,
+        evidence,
+        ..
     }) = harness.state_mut().dialogs.last_mut()
     {
+        assert!(evidence.is_none(), "the case dialog creates the evidence item");
         *field = folder.display().to_string();
-        *base = folder.display().to_string();
     } else {
         panic!("the New Container dialog is not open");
     }
-    type_into(&mut harness, "Name", "FS01 preserved");
-    screenshot(&mut harness, "new_container_dialog");
+    assert!(harness.query_by_label("Evidence hash (optional)").is_some());
+    type_into(&mut harness, "Name", "USB 2");
+    screenshot(&mut harness, "new_container_case");
     click_label(&mut harness, "Create");
-    let path = folder.join("FS01-preserved.aff4l");
+    let path = folder.join("USB-2.aff4l");
     assert!(path.is_file());
     let app = harness.state();
-    let shown = app
-        .view
-        .containers
-        .first()
-        .expect("the new container's evidence is selected");
-    assert_eq!(shown.summary.path.as_deref(), Some(path.as_path()));
+    let evidence = app.view.evidence.as_ref().expect("the new evidence item is selected");
+    assert_eq!(evidence.description, "USB 2");
+    assert_eq!(app.view.containers.len(), 1);
+    assert_eq!(app.view.containers[0].summary.path.as_deref(), Some(path.as_path()));
+}
+
+#[test]
+fn evidence_new_container_prefills_name() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    let mut harness = fixture.harness();
+    harness.state_mut().open_new_container_for(evidence_id);
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::NewContainer {
+            evidence: Some((e, _)),
+            name,
+            ..
+        }) => assert_eq!((*e, name.as_str()), (evidence_id, "usb 2")),
+        _ => panic!("the evidence's New Container dialog is not open"),
+    }
+    assert!(harness.query_by_label("New Container for usb").is_some());
+    assert!(harness.query_by_label("Evidence hash (optional)").is_none());
+}
+
+#[test]
+fn acquire_adds_the_folder_in_one_step() {
+    let fixture = Fixture::new();
+    let acquire = fixture._dir.path().join("mounted");
+    std::fs::create_dir_all(acquire.join("Users")).unwrap();
+    std::fs::write(acquire.join("Users/a.txt"), b"a").unwrap();
+    std::fs::write(acquire.join("b.txt"), b"bb").unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().open_new_container(case_id);
+    harness.run_ok();
+    if let Some(Dialog::NewContainer {
+        folder, acquire: field, ..
+    }) = harness.state_mut().dialogs.last_mut()
+    {
+        *folder = fixture._dir.path().display().to_string();
+        *field = acquire.display().to_string();
+    }
+    type_into(&mut harness, "Name", "Mounted");
+    click_label(&mut harness, "Create");
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    let detail = harness.state().view.containers[0].clone();
+    assert_eq!(detail.summary.file_count, 2);
+    assert_eq!(detail.base_path, acquire.display().to_string());
+}
+
+#[test]
+fn add_dialog_accepts_empty_base() {
+    let (fixture, id, _) = Fixture::with_container();
+    let elsewhere = fixture._dir.path().join("elsewhere.txt");
+    std::fs::write(&elsewhere, b"elsewhere").unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().select(None, None);
+    harness.state_mut().open_add_to_container(id, vec![elsewhere.clone()]);
+    if let Some(Dialog::AddToContainer { base, .. }) = harness.state_mut().dialogs.last_mut() {
+        base.clear();
+    }
+    harness.run_ok();
+    click_label(&mut harness, "Add");
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    let detail = harness.state().factum().container(id).unwrap();
+    let stored = &detail.adds[1].files[0].path;
+    assert!(
+        elsewhere.display().to_string().ends_with(stored.as_str()) && stored.contains("elsewhere.txt"),
+        "{stored}"
+    );
+    assert!(stored.len() > "elsewhere.txt".len());
+}
+
+#[test]
+fn evidence_menu_has_new_container_and_delete_disabled() {
+    let (fixture, _, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness.get_all_by_label("usb").next().unwrap().click_secondary();
+    harness.run_ok();
+    assert!(harness.query_by_label("New Container…").is_some());
+    use egui_kittest::kittest::NodeT as _;
+    let delete = harness.get_by_label("Delete Evidence…");
+    assert!(delete.accesskit_node().is_disabled());
 }
 
 #[test]
@@ -1713,14 +1795,12 @@ fn new_container_dialog_validates() {
         name,
         folder,
         file_name,
-        base,
         ..
     }) = harness.state_mut().dialogs.last_mut()
     {
         *name = "Again".into();
         *folder = path.parent().unwrap().display().to_string();
         *file_name = "fs01.aff4l".into();
-        *base = "/".into();
     }
     harness.run_ok();
     click_label(&mut harness, "Create");
@@ -2082,21 +2162,6 @@ fn verify_container_can_be_cancelled() {
     harness.run_ok();
     assert!(harness.state().container_verify_windows.is_empty());
     assert!(harness.query_by_label("Verification cancelled.").is_some());
-}
-
-#[test]
-fn add_dialog_needs_a_base_path() {
-    let (fixture, id, _) = Fixture::with_container();
-    let mut harness = fixture.harness();
-    let source = fixture._dir.path().join("mnt/evil.exe");
-    harness.state_mut().open_add_to_container(id, vec![source]);
-    if let Some(Dialog::AddToContainer { base, .. }) = harness.state_mut().dialogs.last_mut() {
-        base.clear();
-    }
-    harness.run_ok();
-    click_label(&mut harness, "Add");
-    assert!(harness.state().add_job.is_none());
-    assert!(harness.query_by_label_contains("Choose the base path").is_some());
 }
 
 #[test]

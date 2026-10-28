@@ -137,14 +137,17 @@ pub enum Dialog {
     },
     NewContainer {
         case_id: i64,
+        /// (id, name) of the evidence item it is for; None: the case's dialog, which creates the evidence item
+        evidence: Option<(i64, String)>,
         name: String,
-        evidence: Option<i64>,
-        /// (id, name) of the case's evidence
-        evidence_choices: Vec<(i64, String)>,
+        /// the new evidence item's hash and description (the case's dialog only)
+        hash: String,
+        details: String,
+        /// a folder copied in right away (scenario 1); empty: none
+        acquire: String,
         folder: String,
         /// empty: the name, made safe, with .aff4l
         file_name: String,
-        base: String,
         error: Option<String>,
     },
     X509 {
@@ -162,6 +165,8 @@ pub enum Dialog {
         metadata_only: bool,
         excerpt_from: String,
         excerpt_to: String,
+        /// Windows, and a source on a writable volume: access times may change (a documented limitation)
+        writable_hint: bool,
         error: Option<String>,
     },
 }
@@ -196,10 +201,13 @@ pub enum DialogResult {
     Confirmed(Pending),
     NewContainer {
         case_id: i64,
+        /// None: create the evidence item too
+        evidence_id: Option<i64>,
         name: String,
-        evidence: Option<i64>,
+        hash: String,
+        details: String,
         path: PathBuf,
-        base: String,
+        acquire: Option<PathBuf>,
     },
     AddToContainer {
         container_id: i64,
@@ -740,43 +748,48 @@ impl Dialog {
             }
             Dialog::NewContainer {
                 case_id,
-                name,
                 evidence,
-                evidence_choices,
+                name,
+                hash,
+                details,
+                acquire,
                 folder,
                 file_name,
-                base,
                 error,
             } => {
-                title(ui, "New Container");
-                note(
-                    ui,
-                    "An AFF4-L evidence container for files preserved from this case; every addition, close and \
-                     reopen is a signed entry in the case log.",
-                );
+                match evidence {
+                    None => {
+                        title(ui, "New Container");
+                        note(
+                            ui,
+                            "Creates a new evidence item with an AFF4-L container. Every addition, close and reopen \
+                             is a signed entry in the case log.",
+                        );
+                    }
+                    Some((_, evidence_name)) => {
+                        title(ui, &format!("New Container for {evidence_name}"));
+                        note(
+                            ui,
+                            "Every addition, close and reopen is a signed entry in the case log.",
+                        );
+                    }
+                }
                 ui.add_space(4.0);
                 let first = field(ui, "Name", name, "e.g. FS01 preserved", true);
-                let chosen = evidence
-                    .and_then(|id| evidence_choices.iter().find(|(e, _)| *e == id))
-                    .map_or("None".to_string(), |(_, n)| n.clone());
-                egui::ComboBox::from_label("From evidence")
-                    .selected_text(chosen)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(evidence, None, "None");
-                        for (id, label) in evidence_choices.iter() {
-                            ui.selectable_value(evidence, Some(*id), label);
-                        }
-                    });
+                if evidence.is_none() {
+                    field(ui, "Evidence hash (optional)", hash, "e.g. the image's SHA-256", false);
+                    description_field(ui, details, "Description (optional)");
+                }
+                let acquire_label = ui.label("Acquire (optional)");
+                folder_field(ui, acquire, Some(acquire_label.id));
+                note(
+                    ui,
+                    "Copied in right away, e.g. the read-only mount point. Leave empty to add files later.",
+                );
                 let folder_label = ui.label("Folder");
                 folder_field(ui, folder, Some(folder_label.id));
                 let default_name = format!("{}.aff4l", crate::seals::safe_filename(strip(name)));
                 field(ui, "File name", file_name, &default_name, false);
-                let base_label = ui.label("Base path");
-                folder_field(ui, base, Some(base_label.id));
-                note(
-                    ui,
-                    "Removed from the sources' paths, e.g. the mount point of the image.",
-                );
                 error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Create", true);
                 if ok || (enter_pressed(ui) && first.lost_focus()) {
@@ -792,8 +805,8 @@ impl Dialog {
                         Some(format!("The folder {} does not exist.", strip(folder)))
                     } else if path.exists() {
                         Some(format!("{} exists already.", path.display()))
-                    } else if !Path::new(strip(base)).is_dir() {
-                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into())
+                    } else if !strip(acquire).is_empty() && !Path::new(strip(acquire)).is_dir() {
+                        Some(format!("The folder {} does not exist.", strip(acquire)))
                     } else {
                         None
                     };
@@ -802,10 +815,12 @@ impl Dialog {
                     }
                     return Some(DialogResult::NewContainer {
                         case_id: *case_id,
+                        evidence_id: evidence.as_ref().map(|(id, _)| *id),
                         name: strip(name).to_string(),
-                        evidence: *evidence,
+                        hash: strip(hash).to_string(),
+                        details: strip(details).to_string(),
                         path,
-                        base: strip(base).to_string(),
+                        acquire: Some(PathBuf::from(strip(acquire))).filter(|a| !a.as_os_str().is_empty()),
                     });
                 }
                 cancel.then_some(DialogResult::Cancel)
@@ -862,6 +877,7 @@ impl Dialog {
                 metadata_only,
                 excerpt_from,
                 excerpt_to,
+                writable_hint,
                 error,
             } => {
                 title(ui, "Add to Container");
@@ -871,9 +887,20 @@ impl Dialog {
                     listed += &format!("\n… and {} more", sources.len() - shown.len());
                 }
                 ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE)).wrap());
+                if *writable_hint {
+                    ui.label(
+                        RichText::new("Windows may update access times on this writable volume.")
+                            .size(SMALL_SIZE)
+                            .color(p.warn),
+                    );
+                }
                 ui.add_space(4.0);
-                let base_label = ui.label("Base path");
+                let base_label = ui.label("Base path (optional)");
                 folder_field(ui, base, Some(base_label.id));
+                note(
+                    ui,
+                    "Removed from the sources' paths, e.g. the mount point. Empty: full paths are kept.",
+                );
                 ui.checkbox(keep_path, "Keep the path below the base path");
                 ui.checkbox(metadata_only, "Metadata only (hash the content, do not store it)");
                 let single_file = sources.len() == 1 && sources[0].is_file();
@@ -890,12 +917,11 @@ impl Dialog {
                 }
                 error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Add", !sources.is_empty());
-                if ok && strip(base).is_empty() {
-                    *error =
-                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into());
-                } else if ok {
+                if ok {
                     let base_path = PathBuf::from(strip(base));
-                    let outside = sources.iter().find(|s| !s.starts_with(&base_path));
+                    let outside = sources
+                        .iter()
+                        .find(|s| !base_path.as_os_str().is_empty() && !s.starts_with(&base_path));
                     let number = |text: &str| strip(text).parse::<u64>().ok();
                     // the excerpt fields count only while they are shown
                     let excerpt = match (strip(excerpt_from), strip(excerpt_to)) {

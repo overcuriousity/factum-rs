@@ -1165,29 +1165,44 @@ impl FactumApp {
         self.run(result);
     }
 
+    /// The case's New Container dialog: a new evidence item with a container.
     fn open_new_container(&mut self, case_id: i64) {
-        let evidence_choices: Vec<(i64, String)> = self
-            .view
-            .tree
+        self.push_new_container(case_id, None, String::new());
+    }
+
+    /// New Container for an evidence item; its name is the evidence's, numbered from the second container on.
+    fn open_new_container_for(&mut self, evidence_id: i64) {
+        let Ok(Some(evidence)) = self.factum().get_evidence(evidence_id) else {
+            return;
+        };
+        let held = self
+            .factum()
+            .list_containers(evidence.case_id)
+            .unwrap_or_default()
             .iter()
-            .filter(|node| node.case.id == case_id)
-            .flat_map(|node| node.evidence.iter().map(|(e, _)| (e.id, e.description.clone())))
-            .collect();
-        let evidence = self
-            .evidence_id
-            .filter(|id| evidence_choices.iter().any(|(e, _)| e == id));
+            .filter(|c| c.evidence_id == Some(evidence_id))
+            .count();
+        let name = match held {
+            0 => evidence.description.clone(),
+            n => format!("{} {}", evidence.description, n + 1),
+        };
+        self.push_new_container(evidence.case_id, Some((evidence_id, evidence.description)), name);
+    }
+
+    fn push_new_container(&mut self, case_id: i64, evidence: Option<(i64, String)>, name: String) {
         let folder = Some(self.db.get_setting(EXPORT_DIR_SETTING).unwrap_or_default())
             .filter(|f| !f.is_empty())
             .or_else(|| dirs::home_dir().map(|h| h.display().to_string()))
             .unwrap_or_default();
         self.dialogs.push(Dialog::NewContainer {
             case_id,
-            name: String::new(),
             evidence,
-            evidence_choices,
+            name,
+            hash: String::new(),
+            details: String::new(),
+            acquire: String::new(),
             folder,
             file_name: String::new(),
-            base: String::new(),
             error: None,
         });
     }
@@ -1196,6 +1211,11 @@ impl FactumApp {
         let Ok(detail) = self.factum().container(id) else {
             return;
         };
+        // a documented limitation: Windows may update the access times of sources on a writable volume
+        let writable_hint = cfg!(windows)
+            && crate::container::mounts::mounts_for(&sources)
+                .iter()
+                .any(|m| m.read_only == Some(false));
         self.dialogs.push(Dialog::AddToContainer {
             container_id: id,
             sources,
@@ -1204,6 +1224,7 @@ impl FactumApp {
             metadata_only: false,
             excerpt_from: String::new(),
             excerpt_to: String::new(),
+            writable_hint,
             error: None,
         });
     }
@@ -1862,21 +1883,34 @@ impl FactumApp {
             DialogResult::Confirmed(pending) => self.carry_out(pending),
             DialogResult::NewContainer {
                 case_id,
+                evidence_id,
                 name,
-                evidence,
+                hash,
+                details,
                 path,
-                base,
+                acquire,
             } => {
-                // replaced by the evidence-based dialogs (containers as evidence)
-                let result = match evidence {
-                    Some(evidence) => self.factum().create_container(case_id, &name, evidence, &path, &base),
+                let base = acquire.as_ref().map(|a| a.display().to_string()).unwrap_or_default();
+                let result = match evidence_id {
+                    Some(evidence_id) => self
+                        .factum()
+                        .create_container(case_id, &name, evidence_id, &path, &base)
+                        .map(|id| (evidence_id, id)),
                     None => self
                         .factum()
-                        .create_evidence_with_container(case_id, &name, "", "", &path, &base)
-                        .map(|(_, id)| id),
+                        .create_evidence_with_container(case_id, &name, &hash, &details, &path, &base),
                 };
-                if let Some(id) = self.run(result) {
-                    self.select_container(id);
+                if let Some((evidence_id, id)) = self.run(result) {
+                    self.select(Some(case_id), Some(evidence_id));
+                    if let Some(acquire) = acquire {
+                        let options = crate::container::volume::AddOptions {
+                            base: acquire.clone(),
+                            keep_path: true,
+                            ..Default::default()
+                        };
+                        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        self.start_add(id, vec![acquire], options, cancel);
+                    }
                 }
             }
             DialogResult::X509 {
@@ -2655,11 +2689,16 @@ impl FactumApp {
                             if ui.button("Edit Description…").clicked() {
                                 menu_action = Some(TreeAction::EditEvidence(evidence.id));
                             }
+                            if ui.button("New Container…").clicked() {
+                                menu_action = Some(TreeAction::NewContainerFor(evidence.id));
+                            }
                             ui.separator();
-                            let empty = *count == 0 && !self.factum().has_entries(evidence.id).unwrap_or(true);
+                            let empty = *count == 0
+                                && held.is_empty()
+                                && !self.factum().has_entries(evidence.id).unwrap_or(true);
                             if ui
                                 .add_enabled(empty, egui::Button::new("Delete Evidence…"))
-                                .on_disabled_hover_text("Only evidence without notes")
+                                .on_disabled_hover_text("Only evidence without notes or containers")
                                 .clicked()
                             {
                                 menu_action = Some(TreeAction::DeleteEvidence(evidence.id));
@@ -2770,6 +2809,7 @@ impl FactumApp {
                 self.select(Some(case_id), None);
                 self.open_new_container(case_id);
             }
+            TreeAction::NewContainerFor(evidence_id) => self.open_new_container_for(evidence_id),
             TreeAction::Container(action) => self.container_action(action, ctx),
         }
     }
@@ -3384,6 +3424,8 @@ enum TreeAction {
     DeleteEvidence(i64),
     EditEvidence(i64),
     NewContainer(i64),
+    /// New Container for an evidence item
+    NewContainerFor(i64),
     Container(ContainerAction),
 }
 
