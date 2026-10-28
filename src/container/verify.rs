@@ -501,7 +501,8 @@ struct Parsed {
     current: bool,
     turtle: Vec<u8>,
     hashes: Option<Vec<u8>>,
-    graph: Graph,
+    /// None when information.turtle cannot be parsed: its hashes and signatures are still checked
+    graph: Option<Graph>,
 }
 
 /// Checks a container file. `progress` gets (bytes checked, bytes to check).
@@ -672,26 +673,31 @@ pub fn verify_file(
     }
     let mut states = Vec::new();
     for (close, current, turtle, hashes) in parsed {
-        match turtle::parse(&String::from_utf8_lossy(&turtle)) {
+        let label = close.map_or("current".to_string(), |n| format!("close {n}"));
+        // metadata that cannot be parsed is a failure; the state's hashes and signatures are still checked below
+        let graph = match turtle::parse(&String::from_utf8_lossy(&turtle)) {
             Ok(mut graph) => {
-                let label = close.map_or("current".to_string(), |n| format!("close {n}"));
                 let uuid = report.uuid.clone().unwrap_or_default();
                 let findings = resolve_imports(&mut file, &archive, &mut graph, &uuid, &label);
                 report.findings.extend(findings);
-                states.push(Parsed {
-                    close,
-                    current,
-                    turtle,
-                    hashes,
-                    graph,
-                })
+                Some(graph)
             }
-            Err(e) => report.finding(
-                Level::Warn,
-                "not_checked",
-                format!("The metadata of a state cannot be read ({e}); its files were not checked."),
-            ),
-        }
+            Err(e) => {
+                report.finding(
+                    Level::Fail,
+                    "turtle_hash",
+                    format!("{label}: information.turtle cannot be read ({e}); its files were not checked."),
+                );
+                None
+            }
+        };
+        states.push(Parsed {
+            close,
+            current,
+            turtle,
+            hashes,
+            graph,
+        });
     }
 
     // the signatures and hashes of each state
@@ -706,7 +712,7 @@ pub fn verify_file(
             close: state.close,
             current: state.current,
             turtle_sha256: hex::encode(sha2::Sha256::digest(&state.turtle)),
-            files: file_records(&state.graph).len(),
+            files: state.graph.as_ref().map_or(0, |g| file_records(g).len()),
             gpg: None,
             x509: None,
             findings: check_turtle_hashes(&state.turtle, state.hashes.as_deref(), &label),
@@ -771,22 +777,25 @@ pub fn verify_file(
         report.states.push(result);
     }
 
+    // the states whose metadata could be read; the others failed above
+    let newest_readable = states.last().is_some_and(|s| s.graph.is_some());
+    let states: Vec<(&Parsed, &Graph)> = states.iter().filter_map(|s| s.graph.as_ref().map(|g| (s, g))).collect();
     // a closed state's files are the same files, described alike (storage included), in every later state
-    if let Some(newest) = states.last() {
-        let listed: HashMap<String, FileRecord> = file_records(&newest.graph)
+    if let Some(&(newest, newest_graph)) = states.last() {
+        let listed: HashMap<String, FileRecord> = file_records(newest_graph)
             .into_iter()
             .map(|r| (r.arn.clone(), r))
             .collect();
-        for state in &states[..states.len() - 1] {
+        for &(state, graph) in &states[..states.len() - 1] {
             let Some(n) = state.close else { continue };
-            for record in file_records(&state.graph) {
+            for record in file_records(graph) {
                 if !listed.contains_key(&record.arn) {
                     report.finding(
                         Level::Fail,
                         "history",
                         format!("{} (close {n}) is no longer listed in the newest state.", record.path),
                     );
-                } else if state.graph.about(&record.arn) != newest.graph.about(&record.arn) {
+                } else if graph.about(&record.arn) != newest_graph.about(&record.arn) {
                     report.finding(
                         Level::Fail,
                         "history",
@@ -803,9 +812,9 @@ pub fn verify_file(
             let closed = states
                 .iter()
                 .rev()
-                .find(|s| s.close.is_some())
-                .map(|s| file_records(&s.graph).len());
-            let open = file_records(&newest.graph).len();
+                .find(|(s, _)| s.close.is_some())
+                .map(|(_, g)| file_records(g).len());
+            let open = file_records(newest_graph).len();
             let message = match closed {
                 Some(closed) => {
                     let added = open.saturating_sub(closed);
@@ -826,8 +835,7 @@ pub fn verify_file(
     }
 
     // every stored stream, once, against the hashes its newest state gives
-    if let Some(state) = states.last() {
-        let graph = &state.graph;
+    if let Some(&(_, graph)) = states.last() {
         let stored: Vec<FileRecord> = file_records(graph);
         let total: u64 = stored
             .iter()
@@ -916,7 +924,9 @@ pub fn verify_file(
             done += record.size;
         }
         progress(total, total);
-        report.graph = Some(state.graph.clone());
+        if newest_readable {
+            report.graph = Some(graph.clone());
+        }
     }
     Ok(report)
 }

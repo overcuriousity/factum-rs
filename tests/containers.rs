@@ -797,6 +797,35 @@ mod verify {
     }
 
     #[test]
+    fn unparsable_metadata_of_a_signed_close_fails_and_is_still_checked() {
+        let s = Setup::new();
+        closed_with_files(&s);
+        let copy = s.f.path().join("received.aff4l");
+        std::fs::copy(s.container_path(), &copy).unwrap();
+        // a forged hash, hidden from the parser by a line it refuses
+        let turtle = String::from_utf8(member(&copy, TURTLE).unwrap()).unwrap();
+        let sha256 = hex::encode(sha2::Sha256::digest(b"a"));
+        assert!(turtle.contains(&sha256));
+        let forged = turtle.replace(&sha256, &"0".repeat(64)) + "@base <x> .\n";
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&copy).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let mut app = Appender::new(file, len, archive.entries).unwrap();
+        app.add_bytes(TURTLE, 8, forged.as_bytes()).unwrap();
+        app.add_bytes(&history_member(1, TURTLE), 8, forged.as_bytes()).unwrap();
+        app.finish(&[], &archive.comment).unwrap();
+        let report = verify(&s, &copy);
+        assert_eq!(report.overall(), Level::Fail, "{:?}", report.findings);
+        let fails = codes(&report, Level::Fail);
+        assert!(fails.contains(&"turtle_hash"), "{fails:?}");
+        assert!(
+            fails.contains(&"signature_mismatch") || fails.contains(&"signature_invalid"),
+            "the signature is still checked: {fails:?}"
+        );
+        assert_eq!(report.states.len(), 1);
+    }
+
+    #[test]
     fn duplicate_member_names_fail() {
         let s = Setup::new();
         let id = closed_with_files(&s);
