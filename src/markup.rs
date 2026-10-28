@@ -172,7 +172,7 @@ pub fn parse(text: &str) -> Vec<Block> {
     covered.extend(spans.iter().cloned());
     covered.sort_by_key(|r| r.start);
     let mut at = 0;
-    for range in covered.into_iter().chain([text.len()..text.len()]) {
+    for range in covered.into_iter().chain(std::iter::once(text.len()..text.len())) {
         if range.start > at && !text[at..range.start].trim().is_empty() {
             spans.push(at..range.start);
         }

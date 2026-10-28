@@ -962,7 +962,7 @@ fn a_correction_does_not_sign_tampered_images_again() {
     // the same from the correction dialog and the composer, which pass the images on
     assert!(
         factum
-            .correct_note_with_images(note, &text, &[swapped.clone()])
+            .correct_note_with_images(note, &text, std::slice::from_ref(&swapped))
             .is_err()
     );
     assert!(
