@@ -1,3 +1,6 @@
 src/container/verify_container.py text eol=lf
 src/container/README.txt text eol=lf
 src/export/verify.py text eol=lf
+*.aff4l binary
+samples/container/*.pem text eol=lf
+samples/container/*.asc text eol=lf
