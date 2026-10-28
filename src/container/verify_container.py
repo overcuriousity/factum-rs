@@ -381,7 +381,9 @@ def armored_der(text):
             break
         elif inside and line and ":" not in line:
             body.append(line)
-    return base64.b64decode("".join(body))
+    if not inside:
+        raise ValueError("no PEM block")
+    return base64.b64decode("".join(body), validate=True)
 
 
 def check_x509(label, signature, chain, data, ca, workdir):
@@ -392,18 +394,26 @@ def check_x509(label, signature, chain, data, ca, workdir):
     if not certificates:
         fail("%s: the X.509 certificate chain is missing." % label)
         return
+    try:
+        der = armored_der(signature.decode("utf-8", "replace"))
+    except ValueError as e:  # binascii.Error included
+        fail("%s: the X.509 signature cannot be read (%s)." % (label, e))
+        return
     paths = {}
-    for name, content in (("sig.der", armored_der(signature.decode("utf-8", "replace"))), ("data", data),
-                          ("chain.pem", "".join(certificates).encode()),
-                          ("root.pem", certificates[-1].encode())):
-        paths[name] = os.path.join(workdir, name)
-        with open(paths[name], "wb") as handle:
-            handle.write(content)
-    trusted_root = ca or paths["root.pem"]
-    result = subprocess.run(["openssl", "cms", "-verify", "-binary", "-inform", "DER", "-in", paths["sig.der"],
-                             "-content", paths["data"], "-CAfile", trusted_root, "-certfile", paths["chain.pem"],
-                             "-purpose", "any", "-out", os.devnull],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for name, content in (("sig.der", der), ("data", data), ("chain.pem", "".join(certificates).encode()),
+                              ("root.pem", certificates[-1].encode())):
+            paths[name] = os.path.join(workdir, name)
+            with open(paths[name], "wb") as handle:
+                handle.write(content)
+        trusted_root = ca or paths["root.pem"]
+        result = subprocess.run(["openssl", "cms", "-verify", "-binary", "-inform", "DER", "-in", paths["sig.der"],
+                                 "-content", paths["data"], "-CAfile", trusted_root, "-certfile",
+                                 paths["chain.pem"], "-purpose", "any", "-out", os.devnull],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        fail("%s: the X.509 signature could not be checked (%s)." % (label, e))
+        return
     if result.returncode != 0:
         fail("%s: X.509 signature invalid (%s)." % (label, result.stderr.decode("utf-8", "replace").strip()[:200]))
         return

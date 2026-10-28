@@ -1510,6 +1510,42 @@ mod script {
     }
 
     #[test]
+    fn script_fails_a_malformed_x509_signature_without_a_traceback() {
+        if Command::new("openssl").arg("version").output().is_err() {
+            eprintln!("skipped: openssl is not installed");
+            return;
+        }
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        s.f.factum().close_container(id).unwrap();
+        let path = s.container_path();
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let mut app = Appender::new(file, len, archive.entries).unwrap();
+        let signature = "-----BEGIN SIGNED MESSAGE-----\nnot base64 at all!\n-----END SIGNED MESSAGE-----\n";
+        let chain = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        app.add_bytes(
+            &history_member(1, "information.turtle.factum.sig"),
+            0,
+            signature.as_bytes(),
+        )
+        .unwrap();
+        app.add_bytes(&history_member(1, "information.turtle.factum.cer"), 0, chain.as_bytes())
+            .unwrap();
+        app.finish(&[], &archive.comment).unwrap();
+        let Some((code, output)) = run(&path, &[], None) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(!output.contains("Traceback"), "{output}");
+        assert!(output.contains("the X.509 signature cannot be read"), "{output}");
+        // the files were still checked
+        assert!(output.contains("1 file(s) checked"), "{output}");
+    }
+
+    #[test]
     fn script_x509_with_and_without_ca() {
         let Some(home) = common::GpgsmHome::new() else {
             eprintln!("skipped: gpgsm or openssl is not installed");
