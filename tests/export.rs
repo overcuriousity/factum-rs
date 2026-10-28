@@ -10,7 +10,7 @@ use std::process::Command;
 use common::Fixture;
 use factum::Factum;
 use factum::export::html::render_html;
-use factum::export::markdown::{inline, prose, render_markdown};
+use factum::export::markdown::{image_files, inline, render_markdown};
 use factum::export::model::ReportModel;
 use factum::images::NoteImage;
 use factum::signer::{FakeSigner, GnupgSigner, Signer};
@@ -66,7 +66,7 @@ fn reports_show_the_evidence_description() {
     factum.update_evidence_details(evidence_id, "seized at desk 4").unwrap();
     let seal_id = factum.seal(case_id, "export").unwrap();
     let model = build(&factum, case_id, seal_id, None);
-    for text in [render_html(&model, false), render_markdown(&model)] {
+    for text in [render_html(&model, false), render_markdown(&model, "images")] {
         assert!(text.contains("disk — seized at desk 4"), "{text}");
     }
 }
@@ -106,7 +106,7 @@ fn print_variant_expands_the_appendix() {
 fn notes_come_first_and_technical_data_last() {
     let f = Fixture::new();
     let model = model(&f);
-    for text in [render_html(&model, false), render_markdown(&model)] {
+    for text in [render_html(&model, false), render_markdown(&model, "images")] {
         let notes = text.find("Notes (2)").unwrap();
         let corrected = text.find("first, corrected").unwrap();
         let activity = text.find("Case activity").unwrap();
@@ -127,8 +127,13 @@ fn notes_come_first_and_technical_data_last() {
 #[test]
 fn markdown_note_text_is_literal_prose() {
     let f = Fixture::new();
-    let markdown = render_markdown(&model(&f));
-    assert!(markdown.contains(&prose(TRICKY).join("\n")));
+    let markdown = render_markdown(&model(&f), "images");
+    // through the tree: a line of raw HTML stays literal text, and a line start that could open a list is escaped
+    assert!(
+        markdown.contains(r"\<script\>alert(1)\</script\> \*\*bold\*\* \`\`\`fence\`\`\`"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("\n\\-----BEGIN PGP SIGNATURE-----\n"), "{markdown}");
     assert!(!markdown.contains("<script>"));
     assert!(markdown.contains("## Integrity appendix"));
     assert!(markdown.contains("Labels (not signed): review"));
@@ -149,7 +154,7 @@ fn failing_case_shows_fail_banner() {
     // the failure is visible at the top and on the note itself, not only in the technical part
     assert!(html.find("status-FAIL").unwrap() < html.find("Notes (").unwrap());
     assert!(html.contains("This note failed the integrity check"));
-    let markdown = render_markdown(&failing);
+    let markdown = render_markdown(&failing, "images");
     assert!(markdown.find("> **FAIL**").unwrap() < markdown.find("## Notes").unwrap());
     assert!(markdown.contains("**Result: FAIL**") && markdown.contains("This note failed the integrity check"));
 }
@@ -346,7 +351,9 @@ fn make_bundle(db: &factum::Db, signer: &dyn Signer, seal_dir: &Path, out_dir: &
         .iter()
         .map(|(name, content)| (*name, content.to_vec()))
         .collect();
-    factum.build_bundle(&model, &reports, &out_dir.join("C-1.zip")).unwrap()
+    factum
+        .build_bundle(&model, &reports, &[], &out_dir.join("C-1.zip"))
+        .unwrap()
 }
 
 fn read_zip(path: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -478,7 +485,7 @@ fn bundle_carries_evidence_details_and_verify_py_checks_them() {
     let model = build(&factum, case_id, seal_id, None);
     let reports: Vec<(&str, Vec<u8>)> = REPORTS.iter().map(|(n, c)| (*n, c.to_vec())).collect();
     let bundle = factum
-        .build_bundle(&model, &reports, &f.path().join("C-9.zip"))
+        .build_bundle(&model, &reports, &[], &f.path().join("C-9.zip"))
         .unwrap();
     let mut data = case_json(&bundle);
     assert_eq!(data["evidence"][0]["details"], "seized at desk 4");
@@ -606,7 +613,9 @@ fn verify_py_accepts_seals_made_before_a_rename() {
         .iter()
         .map(|(name, content)| (*name, content.to_vec()))
         .collect();
-    let bundle = factum.build_bundle(&model, &reports, &f.path().join("b.zip")).unwrap();
+    let bundle = factum
+        .build_bundle(&model, &reports, &[], &f.path().join("b.zip"))
+        .unwrap();
     let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
         return;
     };
@@ -674,7 +683,7 @@ fn reports_list_containers() {
         "{}",
         model.containers[0].signatures
     );
-    let mut texts = vec![render_html(&model, false), render_markdown(&model)];
+    let mut texts = vec![render_html(&model, false), render_markdown(&model, "images")];
     if which::which("pdftotext").is_ok() {
         let pdf = f.path().join("report.pdf");
         std::fs::write(&pdf, factum::export::pdf::render_pdf(&model)).unwrap();
@@ -705,7 +714,7 @@ fn reports_without_containers_have_no_section() {
     let model = model(&f);
     assert!(model.containers.is_empty());
     assert!(!render_html(&model, false).contains("<h2>Containers"));
-    assert!(!render_markdown(&model).contains("## Containers"));
+    assert!(!render_markdown(&model, "images").contains("## Containers"));
 }
 
 #[test]
@@ -779,7 +788,7 @@ fn reports_mark_files_whose_content_is_not_stored() {
     }
     let seal_id = factum.seal(case_id, "export").unwrap();
     let model = build(&factum, case_id, seal_id, None);
-    for text in [render_html(&model, false), render_markdown(&model)] {
+    for text in [render_html(&model, false), render_markdown(&model, "images")] {
         assert!(text.contains("huge.img (metadata only, not stored)"), "{text}");
         assert!(text.contains("part.bin (excerpt, bytes 2–5)"), "{text}");
     }
@@ -910,4 +919,251 @@ fn html_report_never_trusts_a_stored_mime() {
     assert!(html.contains(&format!("[image {} missing]", image.id)), "{html}");
     assert!(!html.contains("data:image"), "{html}");
     assert!(!html.contains("onerror=\""), "{html}");
+}
+
+/// The Markdown report of a case with one note carrying `text` and the given images.
+fn markdown_of_note(f: &Fixture, text: &str, images: &[NoteImage]) -> String {
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note_with_images(text, images, None, case_id).unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    render_markdown(&build(&factum, case_id, seal_id, None), "images")
+}
+
+#[test]
+fn markdown_report_renders_through_the_tree() {
+    let f = Fixture::new();
+    let markdown = markdown_of_note(&f, "**b** <b>x</b> [l](https://x.test)", &[]);
+    assert!(markdown.contains("**b**"), "{markdown}");
+    assert!(markdown.contains(r"\<b\>x\</b\>"), "{markdown}");
+    assert!(markdown.contains("l (`https://x.test`)"), "{markdown}");
+    assert!(!markdown.contains("](https://x.test)"), "{markdown}");
+}
+
+#[test]
+fn markdown_report_renders_blocks_literally() {
+    let f = Fixture::new();
+    let text = "# Title\n\n- one\n  - two\n- `a` *e*\n\n3. x\n4. y\n\n> quoted\n> more\n\n````\nlet a = \"```\";\n````\n\n\\- not a list\n\n<https://y.test> and [https://z.test](https://z.test)";
+    let markdown = markdown_of_note(&f, text, &[]);
+    for expected in [
+        "\n#### Title\n",
+        "\n- one\n  - two\n- `a` *e*\n",
+        "\n3. x\n4. y\n",
+        "\n> quoted\\\n> more\n",
+        "\n````\nlet a = \"```\";\n````\n",
+        "\n\\- not a list\n",
+        "https://y.test",
+    ] {
+        assert!(markdown.contains(expected), "{expected:?} in {markdown}");
+    }
+    assert!(!markdown.contains("(`https://z.test`)"), "{markdown}");
+}
+
+#[test]
+fn markdown_report_marks_missing_and_external_images() {
+    let f = Fixture::new();
+    let image = red_pixel();
+    let text = format!("{} ![out](https://x.test/a.png)", image.reference("x"));
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let id = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    f.db.conn
+        .execute("UPDATE entries SET payload_json = NULL WHERE id = ?", [id])
+        .unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let markdown = render_markdown(&build(&factum, case_id, seal_id, None), "images");
+    assert!(
+        markdown.contains(&format!("[image {} missing]", image.id)),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("[external image https://x.test/a.png not loaded]"),
+        "{markdown}"
+    );
+    assert!(!markdown.contains("!["), "{markdown}");
+}
+
+/// A case with two notes that both show `image`; returns the written paths of the export in `out`.
+fn export_two_notes_with(f: &Fixture, image: &NoteImage, formats: &[&str], out: &Path) -> Vec<PathBuf> {
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    for alt in ["first", "second"] {
+        factum
+            .create_note_with_images(&image.reference(alt), std::slice::from_ref(image), None, case_id)
+            .unwrap();
+    }
+    factum.export(case_id, formats, out).unwrap()
+}
+
+#[test]
+fn markdown_export_writes_image_files() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = red_pixel();
+    factum
+        .create_note_with_images(&image.reference("login"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let out = f.path().join("out");
+    let paths = factum.export(case_id, &["md"], &out).unwrap();
+    let report = &paths[0];
+    let stem = report.file_stem().unwrap().to_string_lossy().into_owned();
+    let relative = format!("{stem}_images/{}.png", image.sha256);
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[1], out.join(&relative));
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), image.bytes);
+    let markdown = std::fs::read_to_string(report).unwrap();
+    assert!(markdown.contains(&format!("![login]({relative})")), "{markdown}");
+}
+
+#[test]
+fn export_without_images_writes_no_image_folder() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = export_case(&factum);
+    let out = f.path().join("out");
+    let paths = factum.export(case_id, &["md"], &out).unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+}
+
+#[test]
+fn same_image_twice_is_written_once() {
+    let f = Fixture::new();
+    let image = red_pixel();
+    let out = f.path().join("out");
+    let paths = export_two_notes_with(&f, &image, &["md"], &out);
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    let stem = paths[0].file_stem().unwrap().to_string_lossy().into_owned();
+    let markdown = std::fs::read_to_string(&paths[0]).unwrap();
+    let relative = format!("{stem}_images/{}.png", image.sha256);
+    assert_eq!(markdown.matches(&relative).count(), 2, "{markdown}");
+    assert_eq!(
+        std::fs::read_dir(out.join(format!("{stem}_images"))).unwrap().count(),
+        1
+    );
+}
+
+#[test]
+fn image_file_names_come_from_the_bytes_not_the_stored_hash() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = red_pixel();
+    let id = factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let json: String =
+        f.db.conn
+            .query_row("SELECT payload_json FROM entries WHERE id = ?", [id], |r| r.get(0))
+            .unwrap();
+    let tampered = json.replace(&image.sha256, "../../x");
+    assert_ne!(tampered, json);
+    f.db.conn
+        .execute(
+            "UPDATE entries SET payload_json = ? WHERE id = ?",
+            rusqlite::params![tampered, id],
+        )
+        .unwrap();
+    let out = f.path().join("a").join("b").join("out");
+    let paths = factum.export(case_id, &["md", "bundle"], &out).unwrap();
+    let stem = paths[0].file_stem().unwrap().to_string_lossy().into_owned();
+    let name = format!("{}.png", image.sha256);
+    assert_eq!(paths[1], out.join(format!("{stem}_images")).join(&name));
+    assert_eq!(std::fs::read(&paths[1]).unwrap(), image.bytes);
+    assert!(!f.path().join("a").join("x").exists() && !f.path().join("x").exists());
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 3); // .md, _images, .zip
+    let markdown = std::fs::read_to_string(&paths[0]).unwrap();
+    assert!(!markdown.contains("../../x"), "{markdown}");
+    let files = read_zip(paths.last().unwrap());
+    assert!(files.contains_key(&format!("images/{name}")));
+    assert!(files.keys().all(|n| !n.contains("..")), "{:?}", files.keys());
+}
+
+#[test]
+fn images_with_a_foreign_stored_type_are_not_written() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = red_pixel();
+    let id = factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    f.db.conn
+        .execute(
+            "UPDATE entries SET payload_json = replace(payload_json, 'image/png', 'image/svg+xml') WHERE id = ?",
+            [id],
+        )
+        .unwrap();
+    let out = f.path().join("out");
+    let paths = factum.export(case_id, &["md"], &out).unwrap();
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    let markdown = std::fs::read_to_string(&paths[0]).unwrap();
+    assert!(
+        markdown.contains(&format!("[image {} missing]", image.id)),
+        "{markdown}"
+    );
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    assert!(image_files(&build(&factum, case_id, seal_id, None)).is_empty());
+}
+
+#[test]
+fn bundle_carries_images_in_the_manifest() {
+    let f = Fixture::new();
+    let image = red_pixel();
+    let out = f.path().join("out");
+    let paths = export_two_notes_with(&f, &image, &["bundle"], &out);
+    assert_eq!(paths.len(), 1);
+    let files = read_zip(&paths[0]);
+    let name = format!("images/{}.png", image.sha256);
+    assert_eq!(files[&name], image.bytes);
+    assert_eq!(files.keys().filter(|n| n.starts_with("images/")).count(), 1);
+    let manifest = String::from_utf8(files["MANIFEST.sha256"].clone()).unwrap();
+    assert!(
+        manifest.contains(&format!(
+            "{}  {name}\n",
+            hex::encode(sha2::Sha256::digest(&image.bytes))
+        )),
+        "{manifest}"
+    );
+    let report = String::from_utf8(files["report.md"].clone()).unwrap();
+    assert!(report.contains(&format!("]({name})")), "{report}");
+    assert!(
+        String::from_utf8(files["README.md"].clone())
+            .unwrap()
+            .contains("`images/`")
+    );
+    if let Some((_, output)) = run_verify(&paths[0], None, &[]) {
+        assert!(!output.contains("images/"), "{output}");
+    }
+}
+
+#[test]
+fn verify_py_accepts_a_bundle_with_images_and_detects_a_swapped_one() {
+    let home = require_gpg!("Factum Test <test@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &home);
+    let factum = Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = red_pixel();
+    factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let paths = factum.export(case_id, &["bundle"], &f.path().join("out")).unwrap();
+    let Some((code, output)) = run_verify(&paths[0], Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    rewrite_zip(
+        &paths[0],
+        &[(&format!("images/{}.png", image.sha256), b"not the image".to_vec())],
+    );
+    let (code, output) = run_verify(&paths[0], Some(&home.path()), &[]).unwrap();
+    assert_eq!(code, 1, "{output}");
+    assert!(
+        output.contains(&format!("images/{}.png was modified after export", image.sha256)),
+        "{output}"
+    );
 }

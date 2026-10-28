@@ -50,23 +50,18 @@ fn row(label: &str, value: &str) -> String {
     format!("<tr><td><b>{}</b></td><td>{}</td></tr>", escape(label), escape(value))
 }
 
-/// Only these types become a `data:` URI; a stored `mime` is untrusted data.
-const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-
 fn image_html(alt: &str, target: &ImageTarget, images: &[NoteImage]) -> String {
     match target {
         ImageTarget::External(url) => format!("[external image {} not loaded]", escape(url)),
-        ImageTarget::Note(id) => {
-            match images::find(images, id).filter(|image| IMAGE_TYPES.contains(&image.mime.as_str())) {
-                Some(image) => format!(
-                    "<img src='data:{};base64,{}' alt='{}'>",
-                    escape(&image.mime),
-                    STANDARD.encode(&image.bytes),
-                    escape(alt)
-                ),
-                None => format!("[image {} missing]", escape(id)),
-            }
-        }
+        ImageTarget::Note(id) => match images::find(images, id).filter(|image| image.is_embeddable()) {
+            Some(image) => format!(
+                "<img src='data:{};base64,{}' alt='{}'>",
+                escape(&image.mime),
+                STANDARD.encode(&image.bytes),
+                escape(alt)
+            ),
+            None => format!("[image {} missing]", escape(id)),
+        },
     }
 }
 

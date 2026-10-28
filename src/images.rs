@@ -17,6 +17,8 @@ use crate::error::{FactumError, Result};
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 /// URL scheme of an image reference inside note text
 pub const SCHEME: &str = "factum-image:";
+/// The only types a report embeds or writes out; a stored `mime` is untrusted data.
+pub const MIME_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoteImage {
@@ -73,9 +75,15 @@ impl NoteImage {
         }
     }
 
-    /// `<sha256>.<ext>`, the name used in exports
+    /// Whether reports may show this image: its type is one of [`MIME_TYPES`].
+    pub fn is_embeddable(&self) -> bool {
+        MIME_TYPES.contains(&self.mime.as_str())
+    }
+
+    /// `<sha256>.<ext>`, the name used in exports. The hash is computed from the bytes: a stored payload is untrusted,
+    /// and a tampered `sha256` such as `../../x` must never reach a file path.
     pub fn file_name(&self) -> String {
-        format!("{}.{}", self.sha256, self.extension())
+        format!("{}.{}", hex::encode(Sha256::digest(&self.bytes)), self.extension())
     }
 
     /// The Markdown that embeds this image; brackets would end the alt text early and are dropped.
@@ -184,6 +192,17 @@ mod tests {
         assert_eq!(image.id, image.sha256[..12]);
         assert_eq!(image.file_name(), format!("{}.png", image.sha256));
         assert_eq!(image.reference("a [b]"), format!("![a b](factum-image:{})", image.id));
+    }
+
+    #[test]
+    fn file_name_ignores_a_tampered_stored_hash() {
+        let mut image = NoteImage::from_bytes(png(2, 2), None).unwrap();
+        let real = image.sha256.clone();
+        image.sha256 = "../../x".into();
+        assert_eq!(image.file_name(), format!("{real}.png"));
+        assert!(image.is_embeddable());
+        image.mime = "image/svg+xml".into();
+        assert!(!image.is_embeddable());
     }
 
     #[test]

@@ -43,6 +43,7 @@ hash to compare with the manifest.
   `late-seal-<id>.asc`
 - `public-keys.asc` — public keys of all signers
 - `report.html`, `report.pdf`, `report.md` — readable reports
+- `images/` — images of notes, named by their SHA-256 (also in `case.json`)
 - `MANIFEST.sha256` (+ `.asc`) — SHA-256 of every file above, detached-signed
 
 ## Format (version 1)
@@ -163,7 +164,14 @@ impl Factum<'_> {
         Ok((data, signatures))
     }
 
-    pub fn build_bundle(&self, model: &ReportModel, reports: &[(&str, Vec<u8>)], out_path: &Path) -> Result<PathBuf> {
+    /// `images` are `(file name, bytes)` as `markdown::image_files` returns them; they go under `images/`.
+    pub fn build_bundle(
+        &self,
+        model: &ReportModel,
+        reports: &[(&str, Vec<u8>)],
+        images: &[(String, Vec<u8>)],
+        out_path: &Path,
+    ) -> Result<PathBuf> {
         let (data, signatures) = self.case_data(model)?;
         let mut fingerprints: Vec<String> = model
             .report
@@ -183,6 +191,9 @@ impl Factum<'_> {
         );
         for (name, content) in reports {
             files.insert(name.to_string(), content.clone());
+        }
+        for (name, content) in images {
+            files.insert(format!("images/{name}"), content.clone());
         }
         for (name, text) in signatures {
             files.insert(name, text.into_bytes());
