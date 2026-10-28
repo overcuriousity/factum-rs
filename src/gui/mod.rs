@@ -5,6 +5,7 @@
 mod companion_dialogs;
 mod companion_panel;
 mod companion_windows;
+mod containers;
 mod dialogs;
 mod icons;
 mod tag_completion;
@@ -37,6 +38,7 @@ use crate::verifier::{CaseReport, Level, SignatureCheck};
 use companion_dialogs::CompanionSettingsDialog;
 use companion_panel::{CompanionView, PanelAction};
 use companion_windows::{CompanionWindow, WindowAction};
+use containers::ContainerAction;
 use dialogs::{Dialog, DialogResult, NoGpgChoice, Pending, VerifyAction, VerifyWindow};
 use theme::{MAX_CARD_WIDTH, SMALL_SIZE, THEMES};
 use widgets::{Card, CardAction, CardView, CheckView, IconButton};
@@ -108,6 +110,7 @@ struct CaseNode {
     case: Case,
     notes: usize,
     evidence: Vec<(Evidence, usize)>,
+    containers: Vec<crate::containers::ContainerSummary>,
 }
 
 enum Item {
@@ -151,6 +154,30 @@ struct View {
     case_status: Option<CaseStatus>,
     /// the Questions section: present while the companion is configured and a case is selected
     companion: Option<CompanionView>,
+    /// the selected container, shown in place of the log
+    container: Option<crate::containers::ContainerDetail>,
+    /// its files' last-written times, by ARN, from the container file
+    container_times: HashMap<String, String>,
+}
+
+/// A container file's times as last read: (file, its length then, last-written time by ARN).
+type TimesCache = (PathBuf, u64, HashMap<String, String>);
+
+/// Files being added to a container, on a worker thread.
+struct AddJob {
+    container_id: i64,
+    name: String,
+    worker: workers::Worker<workers::AddResult>,
+    progress: Arc<crate::container::volume::AddProgress>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A container file being verified.
+struct ContainerVerifyJob {
+    worker: workers::Worker<workers::ContainerVerifyResult>,
+    progress: Arc<workers::Progress>,
+    started: Instant,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct VerifyJob {
@@ -161,12 +188,16 @@ struct VerifyJob {
 
 struct FactumApp {
     db: Db,
+    /// for worker threads that repaint when they are done
+    egui_ctx: egui::Context,
     // one signing service for everything, so the active key and the pinentry state are shared
     signer: GnupgSigner,
     env_seal_dir: Option<PathBuf>,
     // what is selected in the tree; when evidence is selected, case_id is None (like the case tree items)
     case_id: Option<i64>,
     evidence_id: Option<i64>,
+    /// a selected container (its case is case_id then)
+    container_id: Option<i64>,
     filter: String,
     pinned_scope_evidence: bool,
     show_archived: bool,
@@ -193,6 +224,11 @@ struct FactumApp {
     signature_worker: Option<workers::Worker<workers::SignatureChecks>>,
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
+    add_job: Option<AddJob>,
+    /// the selected container's file times: (file, its logged end (else its length) when read, times)
+    container_times_cache: std::cell::RefCell<Option<TimesCache>>,
+    container_verify_job: Option<ContainerVerifyJob>,
+    container_verify_windows: Vec<containers::ContainerVerifyWindow>,
     /// each case's last verification in this session: outcome, time and the tree size it covered
     verified: HashMap<i64, (Level, String, i64)>,
     dialogs: Vec<Dialog>,
@@ -267,10 +303,12 @@ impl FactumApp {
             .unwrap_or_default();
         let mut app = Self {
             db,
+            egui_ctx: ctx.clone(),
             signer,
             env_seal_dir: crate::config::settings().seal_dir.clone(),
             case_id: None,
             evidence_id: None,
+            container_id: None,
             filter: String::new(),
             pinned_scope_evidence: false,
             show_archived: false,
@@ -294,6 +332,10 @@ impl FactumApp {
             signature_worker: None,
             signature_check_pending: false,
             verify_job: None,
+            add_job: None,
+            container_times_cache: std::cell::RefCell::new(None),
+            container_verify_job: None,
+            container_verify_windows: Vec::new(),
             verified: HashMap::new(),
             dialogs: Vec::new(),
             verify_windows: Vec::new(),
@@ -349,6 +391,21 @@ impl FactumApp {
             default_seal_folder: self.factum().default_seal_dir().display().to_string(),
             seal_env: self.env_seal_dir.clone(),
             theme: self.theme.clone(),
+            x509_certs: crate::container::x509::Gpgsm::new(self.signer.gpg_home()).list_secret_certs(),
+            x509: Some(
+                self.db
+                    .get_setting(crate::container::x509::X509_CERT_SETTING)
+                    .unwrap_or_default(),
+            )
+            .filter(|s| !s.is_empty()),
+            x509_chain: self
+                .db
+                .get_setting(crate::container::x509::X509_CHAIN_SETTING)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .filter(|l| !l.trim().is_empty())
+                .collect(),
         });
         self.dialogs.push(Dialog::Wizard(Box::new(wizard)));
     }
@@ -359,6 +416,9 @@ impl FactumApp {
             && self.signer.set_active_key(&self.db, &key)
         {
             self.update_gpg_status();
+        }
+        if let Some((certificate, chain_files)) = choices.x509 {
+            self.save_x509(certificate, chain_files);
         }
         match choices.seal_folder.as_deref() {
             Some("") => {
@@ -602,7 +662,13 @@ impl FactumApp {
                     evidence.push((item, factum.list_entries(case_id, &filter)?.len()));
                 }
             }
-            view.tree.push(CaseNode { case, notes, evidence });
+            let containers = factum.list_containers(case_id)?;
+            view.tree.push(CaseNode {
+                case,
+                notes,
+                evidence,
+                containers,
+            });
         }
         let case_id = self.current_case_id();
         view.case = match case_id {
@@ -626,8 +692,13 @@ impl FactumApp {
                 pinned_only: false,
                 search: search.as_deref(),
             };
-            let entry_ids = factum.list_entries(case.id, &filter)?;
-            if entry_ids.is_empty() {
+            // a selected container is shown in place of the log
+            let entry_ids = if self.container_id.is_some() {
+                Vec::new()
+            } else {
+                factum.list_entries(case.id, &filter)?
+            };
+            if entry_ids.is_empty() && self.container_id.is_none() {
                 view.empty_text = Some(if let Some(tag) = &tag {
                     format!("No notes with a tag matching '{tag}'.")
                 } else if let Some(search) = &search {
@@ -728,6 +799,20 @@ impl FactumApp {
                 None => case.case_name,
             };
         }
+        view.container = match self.container_id {
+            Some(id) => factum
+                .container(id)
+                .inspect_err(|e| log::error!("Container #{id} cannot be read: {e}"))
+                .ok(),
+            None => None,
+        };
+        view.container_times = view
+            .container
+            .as_ref()
+            .filter(|detail| !detail.summary.missing)
+            .and_then(|detail| Some((detail.summary.path.clone()?, detail)))
+            .map(|(path, detail)| self.container_times(&path, &detail.summary.uuid, detail.summary.id))
+            .unwrap_or_default();
         view.companion = match (&self.companion_db, &view.case) {
             (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
                 CompanionView::read(&factum, cdb, case.id)
@@ -801,6 +886,31 @@ impl FactumApp {
                 Err(message) => self.message("Factum", format!("Verification failed: {message}")),
             }
         }
+        if let Some(job) = self.container_verify_job.as_mut()
+            && let Some(result) = job.worker.poll()
+        {
+            self.container_verify_job = None;
+            match result {
+                Ok(report) => {
+                    self.next_window_id += 1;
+                    self.container_verify_windows.push(containers::ContainerVerifyWindow {
+                        id: self.next_window_id,
+                        report,
+                        open: true,
+                    });
+                }
+                Err(message) if message.contains("cancelled") => self.message("Factum", "Verification cancelled."),
+                Err(message) => self.message("Factum", format!("Verification failed: {message}")),
+            }
+        }
+        if let Some(job) = self.add_job.as_mut() {
+            if let Some(result) = job.worker.poll() {
+                let job = self.add_job.take().expect("polled");
+                self.finish_add(job.container_id, result);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
         let mut finished = Vec::new();
         self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll() {
             Some(result) => {
@@ -871,13 +981,314 @@ impl FactumApp {
     }
 
     fn select(&mut self, case_id: Option<i64>, evidence_id: Option<i64>) {
-        if (self.case_id, self.evidence_id) != (case_id, evidence_id) {
+        if (self.case_id, self.evidence_id) != (case_id, evidence_id) || self.container_id.is_some() {
+            self.container_id = None;
             self.case_id = case_id;
             self.evidence_id = evidence_id;
             self.focused_card = None;
             self.dirty = true;
             self.send_companion(Command::Selected(self.current_case_id()));
         }
+    }
+
+    /// Shows a container in place of the log; its case becomes the current case.
+    fn select_container(&mut self, id: i64) {
+        let Ok(detail) = self.factum().container(id) else {
+            return;
+        };
+        self.case_id = Some(detail.summary.case_id);
+        self.evidence_id = None;
+        self.container_id = Some(id);
+        self.focused_card = None;
+        self.dirty = true;
+        self.send_companion(Command::Selected(self.current_case_id()));
+    }
+
+    /// Verifies a container file in the background; the result opens in a window.
+    fn verify_container_file(&mut self, path: PathBuf) {
+        self.start_container_verification(path, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    }
+
+    /// `cancel` stops it (the progress dialog's Cancel sets it).
+    fn start_container_verification(&mut self, path: PathBuf, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        if self
+            .container_verify_job
+            .as_ref()
+            .is_some_and(|job| job.worker.is_running())
+        {
+            self.message("Factum", "A verification is already running.");
+            return;
+        }
+        let ctx = self.egui_ctx.clone();
+        let (worker, progress) =
+            workers::verify_container(&ctx, self.db.path.clone(), self.signer.gpg_home(), path, cancel.clone());
+        self.container_verify_job = Some(ContainerVerifyJob {
+            worker,
+            progress,
+            started: Instant::now(),
+            cancel,
+        });
+    }
+
+    fn open_x509(&mut self) {
+        let gpgsm = crate::container::x509::Gpgsm::new(self.signer.gpg_home());
+        let setting = |key: &str| self.db.get_setting(key).unwrap_or_default();
+        self.dialogs.push(Dialog::X509 {
+            available: gpgsm.available(),
+            certs: gpgsm.list_secret_certs(),
+            selected: Some(setting(crate::container::x509::X509_CERT_SETTING)).filter(|s| !s.is_empty()),
+            chain_files: setting(crate::container::x509::X509_CHAIN_SETTING)
+                .lines()
+                .map(str::to_string)
+                .filter(|l| !l.trim().is_empty())
+                .collect(),
+        });
+    }
+
+    /// The X.509 certificate that signs containers, and the chain files; None and empty remove them.
+    fn save_x509(&mut self, certificate: Option<String>, chain_files: Vec<String>) {
+        use crate::container::x509::{X509_CERT_SETTING, X509_CHAIN_SETTING};
+        let result = match certificate {
+            Some(fingerprint) => self.db.set_setting(X509_CERT_SETTING, &fingerprint),
+            None => self.db.delete_setting(X509_CERT_SETTING),
+        }
+        .and_then(|_| {
+            if chain_files.is_empty() {
+                self.db.delete_setting(X509_CHAIN_SETTING)
+            } else {
+                self.db.set_setting(X509_CHAIN_SETTING, &chain_files.join("\n"))
+            }
+        });
+        self.run(result);
+    }
+
+    /// The container's file times, read from the file only when its logged state changed since the last read (an
+    /// addition being written changes the file, not its logged state).
+    fn container_times(&self, path: &std::path::Path, uuid: &str, id: i64) -> HashMap<String, String> {
+        let end: Option<u64> = self
+            .db
+            .get_setting(&crate::containers::end_setting(uuid))
+            .ok()
+            .and_then(|end| end.parse().ok());
+        let mut cache = self.container_times_cache.borrow_mut();
+        let cached = cache.as_ref().filter(|(cached, ..)| cached == path);
+        let busy = self.add_job.as_ref().is_some_and(|job| job.container_id == id);
+        // without a logged end (after Locate…), finding the state means searching the file: not while it grows
+        let key = match end {
+            Some(end) => end,
+            None if busy => return cached.map(|(.., times)| times.clone()).unwrap_or_default(),
+            None => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        };
+        if let Some((_, cached_key, times)) = cached
+            && *cached_key == key
+        {
+            return times.clone();
+        }
+        let times = crate::container::volume::read_graph(path, end)
+            .map(|graph| crate::container::volume::modified_times(&graph))
+            .inspect_err(|e| log::warn!("{e}"))
+            .unwrap_or_default();
+        *cache = Some((path.to_path_buf(), key, times.clone()));
+        times
+    }
+
+    fn locate_container(&mut self, id: i64, path: &std::path::Path) {
+        let result = self.factum().locate_container(id, path);
+        self.run(result);
+    }
+
+    fn open_new_container(&mut self, case_id: i64) {
+        let evidence_choices: Vec<(i64, String)> = self
+            .view
+            .tree
+            .iter()
+            .filter(|node| node.case.id == case_id)
+            .flat_map(|node| node.evidence.iter().map(|(e, _)| (e.id, e.description.clone())))
+            .collect();
+        let evidence = self
+            .evidence_id
+            .filter(|id| evidence_choices.iter().any(|(e, _)| e == id));
+        let folder = Some(self.db.get_setting(EXPORT_DIR_SETTING).unwrap_or_default())
+            .filter(|f| !f.is_empty())
+            .or_else(|| dirs::home_dir().map(|h| h.display().to_string()))
+            .unwrap_or_default();
+        self.dialogs.push(Dialog::NewContainer {
+            case_id,
+            name: String::new(),
+            evidence,
+            evidence_choices,
+            folder,
+            file_name: String::new(),
+            base: String::new(),
+            error: None,
+        });
+    }
+
+    fn open_add_to_container(&mut self, id: i64, sources: Vec<PathBuf>) {
+        let Ok(detail) = self.factum().container(id) else {
+            return;
+        };
+        self.dialogs.push(Dialog::AddToContainer {
+            container_id: id,
+            sources,
+            base: detail.base_path,
+            keep_path: true,
+            metadata_only: false,
+            excerpt_from: String::new(),
+            excerpt_to: String::new(),
+            error: None,
+        });
+    }
+
+    /// Starts an addition on a worker thread; its progress shows in the status bar.
+    fn start_add(
+        &mut self,
+        id: i64,
+        sources: Vec<PathBuf>,
+        options: crate::container::volume::AddOptions,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        if self.add_job.is_some() {
+            self.message(
+                "Factum",
+                "Files are being added already. Wait for it, or cancel it in the status bar.",
+            );
+            return;
+        }
+        let result = self.factum().open_container_for_add(id);
+        let Some(volume) = self.run(result) else { return };
+        let name = self.factum().container(id).map(|d| d.summary.name).unwrap_or_default();
+        let ctx = self.egui_ctx.clone();
+        let (worker, progress) = workers::add_to_container(&ctx, volume, sources, options, cancel.clone());
+        self.add_job = Some(AddJob {
+            container_id: id,
+            name,
+            worker,
+            progress,
+            cancel,
+        });
+    }
+
+    /// Logs and lists what the worker staged, and says what happened.
+    fn finish_add(&mut self, id: i64, result: workers::AddResult) {
+        self.dirty = true;
+        let (mut volume, staged) = match result {
+            Ok(done) => done,
+            Err(e) if e.contains("nothing was added") => return self.message("Factum", "Nothing was added."),
+            Err(e) => return self.message("Factum", e),
+        };
+        let mut notes = Vec::new();
+        if !staged.skipped.is_empty() {
+            let lines: Vec<String> = staged
+                .skipped
+                .iter()
+                .map(|(path, why)| format!("  {path}: {why}"))
+                .collect();
+            notes.push(format!("Skipped:\n{}", lines.join("\n")));
+        }
+        if !staged.errors.is_empty() {
+            let lines: Vec<String> = staged
+                .errors
+                .iter()
+                .map(|(path, why)| format!("  {path}: {why}"))
+                .collect();
+            notes.push(format!("Errors:\n{}", lines.join("\n")));
+        }
+        let (count, bytes, folders) = (staged.records.len(), staged.bytes(), staged.folders.len());
+        let result = self.factum().commit_container_add(id, &mut volume, staged);
+        drop(volume);
+        let head = match result {
+            Ok(_) if count == 0 => format!("{folders} folder{} added.", if folders == 1 { "" } else { "s" }),
+            Ok(_) => format!(
+                "{count} file{} added ({}).",
+                if count == 1 { "" } else { "s" },
+                crate::containers::human_size(bytes)
+            ),
+            Err(e) => e.to_string(),
+        };
+        notes.insert(0, head);
+        self.message("Factum", notes.join("\n\n"));
+    }
+
+    fn container_action(&mut self, action: ContainerAction, _ctx: &egui::Context) {
+        let summary = |app: &Self, id: i64| app.factum().container(id).ok().map(|d| d.summary);
+        // a running addition holds the container's lock: changing it has to wait
+        let changes = matches!(
+            action,
+            ContainerAction::AddFiles(_)
+                | ContainerAction::AddFolder(_)
+                | ContainerAction::Close(_)
+                | ContainerAction::Reopen(_)
+        );
+        if let Some(job) = self.add_job.as_ref().filter(|_| changes) {
+            let message = format!(
+                "Files are being added to \"{}\". Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
+        match action {
+            ContainerAction::ShowEntry(entry_id) => self.jump_to_entry(entry_id),
+            ContainerAction::Locate(id) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("AFF4-L container", &["aff4l"])
+                    .pick_file()
+                {
+                    self.locate_container(id, &path);
+                }
+            }
+            ContainerAction::ShowInFolder(id) => {
+                if let Some(path) = summary(self, id).and_then(|s| s.path)
+                    && let Err(e) = containers::show_in_folder(&path)
+                {
+                    self.message("Factum", format!("The folder cannot be opened: {e}"));
+                }
+            }
+            ContainerAction::Close(id) => {
+                let result = self.factum().close_container(id);
+                if let Some(close) = self.run(result)
+                    && let Some(reason) = close.x509_refused
+                {
+                    self.message(
+                        "Container closed",
+                        format!("Container #{id} was closed and signed with GPG only. X.509: {reason}"),
+                    );
+                }
+            }
+            ContainerAction::CloseWithoutFile(id) => {
+                self.dialogs.push(Dialog::Confirm {
+                    message: format!(
+                        "The file of container #{id} is missing. Close the container without it? The case log \
+                         records that it was closed while its file was missing; nothing is signed or written. If \
+                         you can find the file, use Locate… and close it as usual instead."
+                    ),
+                    then: Pending::CloseContainerWithoutFile(id),
+                });
+            }
+            ContainerAction::Reopen(id) => {
+                let result = self.factum().reopen_container(id);
+                self.run(result);
+            }
+            ContainerAction::AddFiles(id) | ContainerAction::AddFolder(id) => {
+                let base = self.factum().container(id).map(|d| d.base_path).unwrap_or_default();
+                let dialog = rfd::FileDialog::new().set_directory(&base);
+                let picked = if matches!(action, ContainerAction::AddFiles(_)) {
+                    dialog.pick_files().unwrap_or_default()
+                } else {
+                    dialog.pick_folder().into_iter().collect()
+                };
+                if !picked.is_empty() {
+                    self.open_add_to_container(id, picked);
+                }
+            }
+            ContainerAction::Verify(id) => {
+                if let Some(path) = summary(self, id).and_then(|s| s.path) {
+                    self.verify_container_file(path);
+                }
+            }
+        }
+        self.dirty = true;
     }
 
     /// Before sealing without a key, ask once per GUI session whether to configure one.
@@ -896,6 +1307,25 @@ impl FactumApp {
                 let result = self.factum().archive_case(case_id);
                 self.run(result); // the case is archived even when sealing failed
                 self.select(None, None);
+            }
+            Pending::CloseContainersAndArchive(case_id) => {
+                for container in self.factum().open_containers(case_id).unwrap_or_default() {
+                    let closed = if container.missing {
+                        let result = self.factum().close_container_without_file(container.id);
+                        self.run(result).is_some()
+                    } else {
+                        let result = self.factum().close_container(container.id);
+                        self.run(result).is_some()
+                    };
+                    if !closed {
+                        return;
+                    }
+                }
+                self.carry_out(Pending::Archive(case_id));
+            }
+            Pending::CloseContainerWithoutFile(id) => {
+                let result = self.factum().close_container_without_file(id);
+                self.run(result);
             }
             Pending::DeleteEvidence(evidence_id) => {
                 let result = self.factum().delete_evidence(evidence_id);
@@ -1028,6 +1458,52 @@ impl FactumApp {
         let Ok(Some(case)) = self.factum().get_case(case_id) else {
             return;
         };
+        let open = self.factum().open_containers(case_id).unwrap_or_default();
+        if let Some(job) = self
+            .add_job
+            .as_ref()
+            .filter(|job| open.iter().any(|c| c.id == job.container_id))
+        {
+            let message = format!(
+                "Files are being added to \"{}\" in this case. Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
+        if !open.is_empty() {
+            let names: Vec<String> = open.iter().map(|c| format!("#{} \"{}\"", c.id, c.name)).collect();
+            let missing: Vec<String> = open
+                .iter()
+                .filter(|c| c.missing)
+                .map(|c| format!("#{}", c.id))
+                .collect();
+            let missing = match missing.len() {
+                0 => String::new(),
+                1 => format!(
+                    " The file of {} is missing: it is closed without its file (the log records that; nothing is \
+                     signed).",
+                    missing[0]
+                ),
+                _ => format!(
+                    " The files of {} are missing: they are closed without their files (the log records that; \
+                     nothing is signed).",
+                    missing.join(", ")
+                ),
+            };
+            self.dialogs.push(Dialog::Confirm {
+                message: format!(
+                    "Container{} {} {} open. Close {} (each close is signed) and archive the case '{}'?{missing}",
+                    if open.len() == 1 { "" } else { "s" },
+                    names.join(", "),
+                    if open.len() == 1 { "is" } else { "are" },
+                    if open.len() == 1 { "it" } else { "them" },
+                    case.case_name
+                ),
+                then: Pending::CloseContainersAndArchive(case_id),
+            });
+            return;
+        }
         self.dialogs.push(Dialog::Confirm {
             message: format!(
                 "Archive the case '{}'? It becomes read-only and a seal is created. You can reopen it later.",
@@ -1081,9 +1557,17 @@ impl FactumApp {
 
     fn sign_all_unsigned(&mut self, case_id: i64) {
         let result = self.factum().sign_all_unsigned(case_id);
-        if let Some(count) = self.run(result) {
-            self.message("Factum", format!("Signed {count} item(s)."));
+        let Some(count) = self.run(result) else { return };
+        // the entries are signed already: say so even when the containers are not
+        let (containers, skipped) = match self.factum().sign_unsigned_containers(case_id) {
+            Ok(done) => done,
+            Err(e) => (0, vec![format!("Containers: {e}")]),
+        };
+        let mut text = format!("Signed {} item(s).", count + containers);
+        if !skipped.is_empty() {
+            text += &format!("\n\nNot signed:\n{}", skipped.join("\n"));
         }
+        self.message("Factum", text);
     }
 
     fn set_cli_active_case(&mut self, case_id: i64) {
@@ -1251,8 +1735,35 @@ impl FactumApp {
                 let result = crate::tags::add_label(&self.db, entry_id, &label);
                 self.run(result);
             }
-            DialogResult::Confirmed(Pending::Archive(case_id)) => self.with_key_check(Pending::Archive(case_id)),
+            // archiving seals the case; closing its containers first signs them: both ask about a missing key
+            DialogResult::Confirmed(pending @ (Pending::Archive(_) | Pending::CloseContainersAndArchive(_))) => {
+                self.with_key_check(pending)
+            }
             DialogResult::Confirmed(pending) => self.carry_out(pending),
+            DialogResult::NewContainer {
+                case_id,
+                name,
+                evidence,
+                path,
+                base,
+            } => {
+                let result = self.factum().create_container(case_id, &name, evidence, &path, &base);
+                if let Some(id) = self.run(result) {
+                    self.select_container(id);
+                }
+            }
+            DialogResult::X509 {
+                certificate,
+                chain_files,
+            } => self.save_x509(certificate, chain_files),
+            DialogResult::AddToContainer {
+                container_id,
+                sources,
+                options,
+            } => {
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                self.start_add(container_id, sources, options, cancel);
+            }
             DialogResult::TypedConfirmed { case_id, typed } => {
                 let result = self.factum().delete_case_permanently(case_id, &typed);
                 if self.run(result).is_some()
@@ -1683,6 +2194,9 @@ impl FactumApp {
                 if ui.button("Signing Key…").clicked() {
                     self.open_gpg_keys();
                 }
+                if ui.button("X.509 Certificate…").clicked() {
+                    self.open_x509();
+                }
                 if ui
                     .add_enabled(
                         self.signer.active_key().is_some(),
@@ -1771,6 +2285,9 @@ impl FactumApp {
         {
             self.open_edit_evidence(self.evidence_id.unwrap());
         }
+        if ui.add_enabled(is_open, egui::Button::new("New Container…")).clicked() {
+            self.open_new_container(case_id.unwrap());
+        }
         ui.separator();
         if ui
             .add_enabled(
@@ -1780,6 +2297,13 @@ impl FactumApp {
             .clicked()
         {
             self.verify_case(ctx, case_id.unwrap());
+        }
+        if ui.button("Verify Container…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("AFF4-L container", &["aff4l", "aff4"])
+                .pick_file()
+        {
+            self.verify_container_file(path);
         }
         if ui
             .add_enabled(case_id.is_some(), egui::Button::new("Seal Now"))
@@ -1890,11 +2414,12 @@ impl FactumApp {
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             let mut clicked: Option<(Option<i64>, Option<i64>)> = None;
+            let mut clicked_container: Option<i64> = None;
             let mut menu_action: Option<TreeAction> = None;
             let new_evidence = ctx.format_shortcut(&NEW_EVIDENCE);
             for node in &self.view.tree {
                 let case = &node.case;
-                let selected = self.case_id == Some(case.id);
+                let selected = self.case_id == Some(case.id) && self.container_id.is_none();
                 let (name, color) = if case.is_archived() {
                     (format!("{}  {}", case.case_name, icons::ARCHIVE), p.muted)
                 } else {
@@ -1904,9 +2429,10 @@ impl FactumApp {
                     ui,
                     selected,
                     RichText::new(name).family(theme::bold()).color(color),
-                    node.notes,
+                    (node.notes, "note"),
                     4.0,
                     (!case.is_archived()).then_some(new_evidence.as_str()),
+                    None,
                 );
                 let response = response.on_hover_text(format!(
                     "{} — {}{}",
@@ -1929,6 +2455,9 @@ impl FactumApp {
                         }
                         if ui.button("Edit Case…").clicked() {
                             menu_action = Some(TreeAction::Edit(case.id));
+                        }
+                        if ui.button("New Container…").clicked() {
+                            menu_action = Some(TreeAction::NewContainer(case.id));
                         }
                         if ui.button("Set as CLI Active Case").clicked() {
                             menu_action = Some(TreeAction::CliCase(case.id));
@@ -1964,8 +2493,9 @@ impl FactumApp {
                         ui,
                         selected,
                         RichText::new(&evidence.description).color(color),
-                        *count,
+                        (*count, "note"),
                         20.0,
+                        None,
                         None,
                     );
                     let response = response.on_hover_text(if evidence.details.is_empty() {
@@ -1996,6 +2526,34 @@ impl FactumApp {
                         }
                     });
                 }
+                for summary in &node.containers {
+                    let selected = self.container_id == Some(summary.id);
+                    let color = if case.is_archived() { p.muted } else { p.secondary };
+                    let (response, _) = tree_row(
+                        ui,
+                        selected,
+                        RichText::new(containers::tree_label(summary)).color(color),
+                        (summary.file_count as usize, "file"),
+                        20.0,
+                        None,
+                        summary.missing.then_some(("⚠", "File missing")),
+                    );
+                    let response = response.on_hover_text(match &summary.path {
+                        Some(path) if !summary.missing => path.display().to_string(),
+                        _ => "File missing — Locate…".to_string(),
+                    });
+                    if response.clicked() {
+                        clicked_container = Some(summary.id);
+                    }
+                    response.context_menu(|ui| {
+                        let mut actions = Vec::new();
+                        let busy = self.add_job.as_ref().is_some_and(|job| job.container_id == summary.id);
+                        containers::menu(ui, summary, case.is_archived(), busy, &mut actions);
+                        if let Some(action) = actions.pop() {
+                            menu_action = Some(TreeAction::Container(action));
+                        }
+                    });
+                }
             }
             // archived cases are hidden by default; the list says how many there are
             if self.view.archived_cases > 0 {
@@ -2021,6 +2579,9 @@ impl FactumApp {
             }
             if let Some((case_id, evidence_id)) = clicked {
                 self.select(case_id, evidence_id);
+            }
+            if let Some(id) = clicked_container {
+                self.select_container(id);
             }
             if let Some(action) = menu_action {
                 self.tree_action(action, ctx);
@@ -2056,6 +2617,11 @@ impl FactumApp {
             TreeAction::Archive(case_id) => self.archive(case_id),
             TreeAction::DeleteEvidence(evidence_id) => self.delete_evidence(evidence_id),
             TreeAction::EditEvidence(evidence_id) => self.open_edit_evidence(evidence_id),
+            TreeAction::NewContainer(case_id) => {
+                self.select(Some(case_id), None);
+                self.open_new_container(case_id);
+            }
+            TreeAction::Container(action) => self.container_action(action, ctx),
         }
     }
 
@@ -2084,7 +2650,7 @@ impl FactumApp {
                 if toggle.clicked() {
                     self.side_panel = !self.side_panel;
                 }
-                if self.view.case.is_some() {
+                if self.view.case.is_some() && self.view.container.is_none() {
                     ui.add_space(8.0);
                     ui.label(RichText::new(&self.view.note_count).size(SMALL_SIZE).color(p.muted));
                 }
@@ -2093,6 +2659,38 @@ impl FactumApp {
             });
         });
         ui.separator();
+
+        // a selected container is shown in place of the log and the note input
+        if let Some(detail) = self.view.container.clone() {
+            let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
+            let evidence = detail.evidence_id.and_then(|id| {
+                self.view
+                    .tree
+                    .iter()
+                    .flat_map(|node| &node.evidence)
+                    .find(|(e, _)| e.id == id)
+                    .map(|(e, _)| e.description.clone())
+            });
+            let mut container_actions = Vec::new();
+            let times = std::mem::take(&mut self.view.container_times);
+            let busy = self
+                .add_job
+                .as_ref()
+                .is_some_and(|job| job.container_id == detail.summary.id);
+            containers::container_view(
+                ui,
+                &detail,
+                &times,
+                evidence.as_deref(),
+                (archived, busy),
+                &mut container_actions,
+            );
+            self.view.container_times = times;
+            for action in container_actions {
+                self.container_action(action, ctx);
+            }
+            return;
+        }
 
         // the composer at the bottom, resizable at its top edge; the log takes the rest
         match self.view.case.clone() {
@@ -2483,8 +3081,13 @@ impl FactumApp {
         let small = |text: &str, color| RichText::new(text).size(SMALL_SIZE).color(color);
         let now = chrono::Utc::now();
         ui.horizontal(|ui| {
-            // the selected case: its size, its newest seal and, once verified in this session, the outcome
-            if let (Some(case), Some(status)) = (&self.view.case, &self.view.case_status) {
+            // files being added to a container take the place of the case's status
+            if let Some(job) = &self.add_job {
+                ui.label(small(&containers::add_status(&job.progress, &job.name), p.secondary));
+                if IconButton::new(icons::CLOSE, "Cancel").show(ui).clicked() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            } else if let (Some(case), Some(status)) = (&self.view.case, &self.view.case_status) {
                 let entries = format!(
                     "{} entr{}",
                     status.entries,
@@ -2548,20 +3151,41 @@ impl FactumApp {
     }
 
     fn verification_progress(&mut self, ctx: &egui::Context) {
-        let Some(job) = &self.verify_job else { return };
-        if job.started.elapsed() < Duration::from_millis(300) {
+        let (started, progress, text, cancel) = match (&self.verify_job, &self.container_verify_job) {
+            (Some(job), _) => (job.started, job.progress.clone(), "Verifying case…", None),
+            (None, Some(job)) => (
+                job.started,
+                job.progress.clone(),
+                "Verifying container…",
+                Some(job.cancel.clone()),
+            ),
+            (None, None) => return,
+        };
+        if started.elapsed() < Duration::from_millis(300) {
             ctx.request_repaint_after(Duration::from_millis(100));
             return;
         }
-        let done = job.progress.done.load(Ordering::Relaxed);
-        let total = job.progress.total.load(Ordering::Relaxed);
+        let done = progress.done.load(Ordering::Relaxed);
+        let total = progress.total.load(Ordering::Relaxed);
+        // entries for a case, bytes for a container
+        let counted = if self.verify_job.is_some() {
+            format!("{done} / {total}")
+        } else {
+            let size = |n: usize| crate::containers::human_size(n as u64);
+            format!("{} / {}", size(done), size(total))
+        };
         egui::Modal::new(egui::Id::unique("verify-progress"))
             .frame(theme::dialog_frame(ctx))
             .show(ctx, |ui| {
                 ui.set_width(320.0);
-                ui.label("Verifying case…");
+                ui.label(text);
                 let fraction = if total == 0 { 0.0 } else { done as f32 / total as f32 };
-                ui.add(egui::ProgressBar::new(fraction).text(format!("{done} / {total}")));
+                ui.add(egui::ProgressBar::new(fraction).text(counted));
+                if let Some(cancel) = &cancel
+                    && ui.button("Cancel").clicked()
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
             });
     }
 }
@@ -2581,6 +3205,8 @@ enum TreeAction {
     Archive(i64),
     DeleteEvidence(i64),
     EditEvidence(i64),
+    NewContainer(i64),
+    Container(ContainerAction),
 }
 
 fn capitalize(text: &str) -> String {
@@ -2623,15 +3249,17 @@ fn ioc_row(ui: &mut egui::Ui, ctx: &egui::Context, value: &str) {
     }
 }
 
-/// A row of the case tree: the name, and the number of notes on the right. With `add` (the shortcut), a + for new
-/// evidence shows under the pointer; the second value is true when it was clicked.
+/// A row of the case tree: the name, and the number of notes (or files) on the right; `mark` is an icon with its
+/// tooltip. With `add` (the shortcut), a + for new evidence shows under the pointer; the second value is true when
+/// it was clicked.
 fn tree_row(
     ui: &mut egui::Ui,
     selected: bool,
     text: RichText,
-    count: usize,
+    (count, unit): (usize, &str),
     indent: f32,
     add: Option<&str>,
+    mark: Option<(&str, &str)>,
 ) -> (egui::Response, bool) {
     let p = *theme::current(ui.ctx());
     let width = ui.available_width();
@@ -2658,7 +3286,13 @@ fn tree_row(
     let added = child
         .with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(RichText::new(count_text).size(SMALL_SIZE).color(p.muted))
-                .on_hover_text(format!("{count} note{}", if count == 1 { "" } else { "s" }));
+                .on_hover_text(format!("{count} {unit}{}", if count == 1 { "" } else { "s" }));
+            if let Some((icon, tip)) = mark {
+                let mark = ui
+                    .label(RichText::new(icon).size(SMALL_SIZE).color(p.warn))
+                    .on_hover_text(tip);
+                mark.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, tip));
+            }
             let added = match add {
                 Some(shortcut) if hovered => IconButton::new(icons::PLUS, "New evidence")
                     .shortcut(shortcut)
@@ -2736,6 +3370,16 @@ impl eframe::App for FactumApp {
                         self.message("Factum", format!("Seal #{tree_head_id} signed."));
                     }
                 }
+            }
+        }
+        let mut container_verify_actions = Vec::new();
+        for window in &mut self.container_verify_windows {
+            window.show(&ctx, &mut container_verify_actions);
+        }
+        self.container_verify_windows.retain(|w| w.open);
+        for action in container_verify_actions {
+            if let VerifyAction::ShowEntry(entry_id) = action {
+                self.jump_to_entry(entry_id);
             }
         }
         let mut window_actions = Vec::new();

@@ -7,6 +7,8 @@ pub mod canonical;
 pub mod cases;
 pub mod cli;
 pub mod companion;
+pub mod container;
+pub mod containers;
 
 pub mod config;
 pub mod db;

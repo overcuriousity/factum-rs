@@ -87,6 +87,8 @@ pub trait Signer {
     fn sign_detached(&self, data: &[u8]) -> Option<String>;
     fn export_public_keys(&self, fingerprints: &[String]) -> String;
     fn verify_signature(&self, clearsigned: &str) -> VerifyResult;
+    /// Checks an armored detached signature over data; `signed_text` stays None.
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult;
     fn last_sign_failed(&self) -> bool;
     fn gpg_home(&self) -> Option<PathBuf>;
 }
@@ -101,14 +103,14 @@ pub fn gpg_error(stderr: &str) -> String {
         .join("; ")
 }
 
-struct GpgOutput {
-    stdout: Vec<u8>,
-    stderr: String,
-    status: Vec<(String, Vec<String>)>,
+pub(crate) struct GpgOutput {
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: String,
+    pub(crate) status: Vec<(String, Vec<String>)>,
 }
 
 impl GpgOutput {
-    fn has(&self, keyword: &str) -> bool {
+    pub(crate) fn has(&self, keyword: &str) -> bool {
         self.status.iter().any(|(key, _)| key == keyword)
     }
 }
@@ -127,8 +129,13 @@ fn run_gpg(binary: &Path, home: Option<&Path>, args: &[&str], input: &[u8]) -> s
     if let Some(home) = home {
         command.arg("--homedir").arg(home);
     }
+    command.args(args);
+    run_program(command, input)
+}
+
+/// Runs a GnuPG program with `input` on stdin; its status lines are read from stderr (`--status-fd 2`).
+pub(crate) fn run_program(mut command: Command, input: &[u8]) -> std::io::Result<GpgOutput> {
     command
-        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -460,6 +467,31 @@ impl Signer for GnupgSigner {
         }
     }
 
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
+        let error = |message: String| {
+            log::error!("Error verifying a detached signature: {message}");
+            VerifyResult {
+                status: format!("error: {message}"),
+                ..Default::default()
+            }
+        };
+        // the signature goes through a file, the data through stdin
+        let file = match tempfile::NamedTempFile::new().and_then(|mut f| f.write_all(signature.as_bytes()).map(|_| f)) {
+            Ok(file) => file,
+            Err(e) => return error(e.to_string()),
+        };
+        let path = file.path().display().to_string();
+        match self.run(&["--verify", &path, "-"], data) {
+            None => error("gpg is not installed or not on the PATH".into()),
+            Some(Err(e)) => error(e.to_string()),
+            Some(Ok(output)) => {
+                let mut result = verify_result(&output);
+                result.signed_text = None;
+                result
+            }
+        }
+    }
+
     fn last_sign_failed(&self) -> bool {
         self.last_sign_failed.get()
     }
@@ -516,6 +548,9 @@ impl Signer for LazySigner<'_> {
     fn verify_signature(&self, clearsigned: &str) -> VerifyResult {
         self.get().verify_signature(clearsigned)
     }
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
+        self.get().verify_detached(signature, data)
+    }
     fn last_sign_failed(&self) -> bool {
         self.inner.get().is_some_and(|signer| signer.last_sign_failed())
     }
@@ -529,6 +564,8 @@ pub struct FakeSigner {
     pub active_key_id: RefCell<Option<String>>,
     pub trust: RefCell<String>,
     pub fail_next: Cell<bool>,
+    /// detached signatures still made before one fails (once)
+    pub fail_detached_after: Cell<Option<u32>>,
     pub last_failed: Cell<bool>,
     /// armor as gpg writes it on Windows
     pub crlf: Cell<bool>,
@@ -550,6 +587,7 @@ impl FakeSigner {
             active_key_id: RefCell::new(active.then(|| "FAKEKEY1".to_string())),
             trust: RefCell::new(trust.to_string()),
             fail_next: Cell::new(false),
+            fail_detached_after: Cell::new(None),
             last_failed: Cell::new(false),
             crlf: Cell::new(false),
             before_sign: RefCell::new(None),
@@ -600,6 +638,14 @@ impl Signer for FakeSigner {
     fn sign_detached(&self, data: &[u8]) -> Option<String> {
         use sha2::Digest;
         self.active_key_id.borrow().as_ref()?;
+        match self.fail_detached_after.get() {
+            Some(0) => {
+                self.fail_detached_after.set(None);
+                return None;
+            }
+            Some(n) => self.fail_detached_after.set(Some(n - 1)),
+            None => {}
+        }
         Some(format!("FAKE DETACHED {}", hex::encode(sha2::Sha256::digest(data))))
     }
     fn export_public_keys(&self, _fingerprints: &[String]) -> String {
@@ -612,6 +658,20 @@ impl Signer for FakeSigner {
             valid: ok,
             status: if ok { "signature valid" } else { "bad signature" }.into(),
             signed_text: ok.then(|| signature[Self::PREFIX.len()..signature.len() - Self::SUFFIX.len()].to_string()),
+            key_id: Some("FAKEKEY1".into()),
+            fingerprint: Some("FAKEFINGERPRINT1".into()),
+            username: Some("Fake Signer".into()),
+            signature_timestamp: None,
+            trust: Some(self.trust.borrow().clone()),
+        }
+    }
+    fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
+        use sha2::Digest;
+        let ok = signature == format!("FAKE DETACHED {}", hex::encode(sha2::Sha256::digest(data)));
+        VerifyResult {
+            valid: ok,
+            status: if ok { "signature valid" } else { "bad signature" }.into(),
+            signed_text: None,
             key_id: Some("FAKEKEY1".into()),
             fingerprint: Some("FAKEFINGERPRINT1".into()),
             username: Some("Fake Signer".into()),

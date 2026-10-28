@@ -187,6 +187,28 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
         }
         parts.push("</table>".into());
     }
+    if !model.containers.is_empty() {
+        parts.push("<h2>Containers</h2>".into());
+        for container in &model.containers {
+            parts.push(format!(
+                "<h3>#{} {}</h3><table class='meta'>",
+                container.id,
+                escape(&container.name)
+            ));
+            parts.extend(container.rows().iter().map(|(label, value)| row(label, value)));
+            parts.push("</table>".into());
+            if container.files.is_empty() {
+                parts.push("<p>No files.</p>".into());
+                continue;
+            }
+            parts.push("<table class='grid'><tr><th>Path</th><th>Size</th><th>SHA-256</th></tr>".into());
+            for cells in container.file_cells() {
+                let cells: String = cells.iter().map(|cell| format!("<td>{}</td>", escape(cell))).collect();
+                parts.push(format!("<tr>{cells}</tr>"));
+            }
+            parts.push("</table>".into());
+        }
+    }
     parts.push("<h2>Case activity</h2><ul class='activity'>".into());
     for item in model.activity() {
         let flag = if item.status == Level::Fail {

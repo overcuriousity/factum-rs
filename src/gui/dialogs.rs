@@ -1,5 +1,7 @@
 //! Dialogs: each one is a state that is drawn every frame until it returns a result.
 
+use std::path::{Path, PathBuf};
+
 use egui::{Align, Id, Layout, RichText, TextEdit};
 
 use super::companion_dialogs::CompanionSettingsDialog;
@@ -8,6 +10,8 @@ use super::theme::{self, MONO_SIZE, SMALL_SIZE};
 use super::widgets::{IconButton, actions_shown, remember_shown, visible_ui};
 use super::wizard::{SEAL_EXPLAINED, SEAL_FOLDER_EXPLAINED, Wizard, WizardChoices};
 use crate::companion::Settings;
+use crate::container::volume::AddOptions;
+use crate::container::x509::X509Cert;
 use crate::pystr::{head, splitlines, strip};
 use crate::signer::GpgKey;
 use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, SignatureCheck};
@@ -16,6 +20,10 @@ use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, Signa
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pending {
     Archive(i64),
+    /// close the case's open containers, then archive it
+    CloseContainersAndArchive(i64),
+    /// close an open container whose file is missing
+    CloseContainerWithoutFile(i64),
     DeleteEvidence(i64),
     Seal(i64),
     Export {
@@ -122,6 +130,35 @@ pub enum Dialog {
         case_id: i64,
         goal: String,
     },
+    NewContainer {
+        case_id: i64,
+        name: String,
+        evidence: Option<i64>,
+        /// (id, name) of the case's evidence
+        evidence_choices: Vec<(i64, String)>,
+        folder: String,
+        /// empty: the name, made safe, with .aff4l
+        file_name: String,
+        base: String,
+        error: Option<String>,
+    },
+    X509 {
+        /// gpgsm is installed
+        available: bool,
+        certs: Vec<X509Cert>,
+        selected: Option<String>,
+        chain_files: Vec<String>,
+    },
+    AddToContainer {
+        container_id: i64,
+        sources: Vec<PathBuf>,
+        base: String,
+        keep_path: bool,
+        metadata_only: bool,
+        excerpt_from: String,
+        excerpt_to: String,
+        error: Option<String>,
+    },
 }
 
 pub enum DialogResult {
@@ -152,6 +189,22 @@ pub enum DialogResult {
         label: String,
     },
     Confirmed(Pending),
+    NewContainer {
+        case_id: i64,
+        name: String,
+        evidence: Option<i64>,
+        path: PathBuf,
+        base: String,
+    },
+    AddToContainer {
+        container_id: i64,
+        sources: Vec<PathBuf>,
+        options: AddOptions,
+    },
+    X509 {
+        certificate: Option<String>,
+        chain_files: Vec<String>,
+    },
     TypedConfirmed {
         case_id: i64,
         typed: String,
@@ -241,6 +294,59 @@ pub(super) fn folder_field(ui: &mut egui::Ui, folder: &mut String, label: Option
             }
         });
     });
+}
+
+/// The signing certificates (one radio row each) and the chain files: the X.509 dialog and the setup wizard.
+pub fn x509_fields(
+    ui: &mut egui::Ui,
+    certs: &[X509Cert],
+    selected: &mut Option<String>,
+    chain_files: &mut Vec<String>,
+) {
+    let p = *theme::current(ui.ctx());
+    for cert in certs {
+        let chosen = selected.as_deref() == Some(cert.fingerprint.as_str());
+        let row = ui.radio(chosen, &cert.subject).on_hover_text(format!(
+            "{}\nIssued by {}\nValid {} to {}",
+            grouped_fingerprint(&cert.fingerprint),
+            cert.issuer,
+            cert.not_before.get(..10).unwrap_or(&cert.not_before),
+            cert.not_after.get(..10).unwrap_or(&cert.not_after)
+        ));
+        if row.clicked() {
+            *selected = (!chosen).then(|| cert.fingerprint.clone());
+        }
+    }
+    if certs.is_empty() && selected.is_none() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Chain files").size(SMALL_SIZE).color(p.muted));
+        if IconButton::new(icons::PLUS, "Add chain file").show(ui).clicked()
+            && let Some(files) = rfd::FileDialog::new()
+                .add_filter("PEM certificates", &["pem", "crt", "cer"])
+                .pick_files()
+        {
+            chain_files.extend(files.into_iter().map(|f| f.display().to_string()));
+        }
+    });
+    let mut remove = None;
+    for (index, file) in chain_files.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(file).size(SMALL_SIZE).color(p.secondary));
+            if IconButton::new(icons::CLOSE, "Remove").show(ui).clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        chain_files.remove(index);
+    }
+    note(
+        ui,
+        "Intermediate and root certificates (PEM), only if gpgsm does not have them.",
+    );
 }
 
 /// Anything to offer beyond what was typed?
@@ -537,7 +643,7 @@ fn first_line(text: &str) -> String {
         .unwrap_or_default()
 }
 
-fn verdict_color(ui: &egui::Ui, level: Level) -> egui::Color32 {
+pub(super) fn verdict_color(ui: &egui::Ui, level: Level) -> egui::Color32 {
     let p = theme::current(ui.ctx());
     match level {
         Level::Ok => p.ok,
@@ -547,7 +653,7 @@ fn verdict_color(ui: &egui::Ui, level: Level) -> egui::Color32 {
 }
 
 /// ✓, ⚠ or ✗: a status is never told by its colour alone.
-fn verdict_mark(level: Level) -> &'static str {
+pub(super) fn verdict_mark(level: Level) -> &'static str {
     match level {
         Level::Ok => "✓",
         Level::Warn => "⚠",
@@ -588,6 +694,7 @@ impl Dialog {
                     | Dialog::Correct { .. }
                     | Dialog::Shortcuts { .. }
                     | Dialog::CompanionSettings(_)
+                    | Dialog::X509 { .. }
                     | Dialog::Wizard(_) => 560.0,
                     _ => 460.0,
                 });
@@ -621,6 +728,199 @@ impl Dialog {
                     return Some(DialogResult::CaseGoal {
                         case_id: *case_id,
                         goal: strip(goal).to_string(),
+                    });
+                }
+                cancel.then_some(DialogResult::Cancel)
+            }
+            Dialog::NewContainer {
+                case_id,
+                name,
+                evidence,
+                evidence_choices,
+                folder,
+                file_name,
+                base,
+                error,
+            } => {
+                title(ui, "New Container");
+                note(
+                    ui,
+                    "An AFF4-L evidence container for files preserved from this case; every addition, close and \
+                     reopen is a signed entry in the case log.",
+                );
+                ui.add_space(4.0);
+                let first = field(ui, "Name", name, "e.g. FS01 preserved", true);
+                let chosen = evidence
+                    .and_then(|id| evidence_choices.iter().find(|(e, _)| *e == id))
+                    .map_or("None".to_string(), |(_, n)| n.clone());
+                egui::ComboBox::from_label("From evidence")
+                    .selected_text(chosen)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(evidence, None, "None");
+                        for (id, label) in evidence_choices.iter() {
+                            ui.selectable_value(evidence, Some(*id), label);
+                        }
+                    });
+                let folder_label = ui.label("Folder");
+                folder_field(ui, folder, Some(folder_label.id));
+                let default_name = format!("{}.aff4l", crate::seals::safe_filename(strip(name)));
+                field(ui, "File name", file_name, &default_name, false);
+                let base_label = ui.label("Base path");
+                folder_field(ui, base, Some(base_label.id));
+                note(
+                    ui,
+                    "Removed from the sources' paths, e.g. the mount point of the image.",
+                );
+                error_line(ui, error);
+                let (ok, cancel) = buttons(ui, "Create", true);
+                if ok || (enter_pressed(ui) && first.lost_focus()) {
+                    let file = if strip(file_name).is_empty() {
+                        default_name
+                    } else {
+                        strip(file_name).to_string()
+                    };
+                    let path = Path::new(strip(folder)).join(&file);
+                    *error = if strip(name).is_empty() {
+                        Some("A container name is required.".into())
+                    } else if !Path::new(strip(folder)).is_dir() {
+                        Some(format!("The folder {} does not exist.", strip(folder)))
+                    } else if path.exists() {
+                        Some(format!("{} exists already.", path.display()))
+                    } else if !Path::new(strip(base)).is_dir() {
+                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into())
+                    } else {
+                        None
+                    };
+                    if error.is_some() {
+                        return None;
+                    }
+                    return Some(DialogResult::NewContainer {
+                        case_id: *case_id,
+                        name: strip(name).to_string(),
+                        evidence: *evidence,
+                        path,
+                        base: strip(base).to_string(),
+                    });
+                }
+                cancel.then_some(DialogResult::Cancel)
+            }
+            Dialog::X509 {
+                available,
+                certs,
+                selected,
+                chain_files,
+            } => {
+                title(ui, "X.509 Certificate");
+                note(
+                    ui,
+                    "Signs evidence containers in addition to GPG; the case log stays GPG-signed.",
+                );
+                ui.add_space(4.0);
+                if !*available {
+                    ui.label(RichText::new("gpgsm is not installed or not on the PATH.").color(p.warn));
+                    return close_button(ui, "Close").then_some(DialogResult::Cancel);
+                }
+                if certs.is_empty() {
+                    note(
+                        ui,
+                        "gpgsm has no certificate with a private key that can sign. Import one (gpgsm --import), \
+                         then open this again.",
+                    );
+                }
+                x509_fields(ui, certs, selected, chain_files);
+                let mut result = None;
+                button_row(ui, |ui| {
+                    if primary_button(ui, "Save", true, false) {
+                        result = Some(DialogResult::X509 {
+                            certificate: selected.clone(),
+                            chain_files: chain_files.clone(),
+                        });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(DialogResult::Cancel);
+                    }
+                    if ui.button("Clear").on_hover_text("Sign with GPG only").clicked() {
+                        result = Some(DialogResult::X509 {
+                            certificate: None,
+                            chain_files: Vec::new(),
+                        });
+                    }
+                });
+                result
+            }
+            Dialog::AddToContainer {
+                container_id,
+                sources,
+                base,
+                keep_path,
+                metadata_only,
+                excerpt_from,
+                excerpt_to,
+                error,
+            } => {
+                title(ui, "Add to Container");
+                let shown: Vec<String> = sources.iter().take(4).map(|s| s.display().to_string()).collect();
+                let mut listed = shown.join("\n");
+                if sources.len() > shown.len() {
+                    listed += &format!("\n… and {} more", sources.len() - shown.len());
+                }
+                ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE)).wrap());
+                ui.add_space(4.0);
+                let base_label = ui.label("Base path");
+                folder_field(ui, base, Some(base_label.id));
+                ui.checkbox(keep_path, "Keep the path below the base path");
+                ui.checkbox(metadata_only, "Metadata only (hash the content, do not store it)");
+                let single_file = sources.len() == 1 && sources[0].is_file();
+                if single_file && !*metadata_only {
+                    ui.horizontal(|ui| {
+                        let from = ui.label("Excerpt: from byte");
+                        ui.add(TextEdit::singleline(excerpt_from).desired_width(90.0))
+                            .labelled_by(from.id);
+                        let to = ui.label("to");
+                        ui.add(TextEdit::singleline(excerpt_to).desired_width(90.0))
+                            .labelled_by(to.id);
+                    });
+                    note(ui, "Empty: the whole file.");
+                }
+                error_line(ui, error);
+                let (ok, cancel) = buttons(ui, "Add", !sources.is_empty());
+                if ok && strip(base).is_empty() {
+                    *error =
+                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into());
+                } else if ok {
+                    let base_path = PathBuf::from(strip(base));
+                    let outside = sources.iter().find(|s| !s.starts_with(&base_path));
+                    let number = |text: &str| strip(text).parse::<u64>().ok();
+                    // the excerpt fields count only while they are shown
+                    let excerpt = match (strip(excerpt_from), strip(excerpt_to)) {
+                        _ if !single_file || *metadata_only => Ok(None),
+                        ("", "") => Ok(None),
+                        (from, to) => match (number(from), number(to)) {
+                            (Some(from), Some(to)) if from < to => Ok(Some((from, to))),
+                            _ => Err("The excerpt needs two byte offsets, the end after the start."),
+                        },
+                    };
+                    *error = match (&excerpt, outside) {
+                        (_, Some(outside)) => Some(format!(
+                            "{} is not below the base path {}.",
+                            outside.display(),
+                            base_path.display()
+                        )),
+                        (Err(message), _) => Some(message.to_string()),
+                        _ => None,
+                    };
+                    if error.is_some() {
+                        return None;
+                    }
+                    return Some(DialogResult::AddToContainer {
+                        container_id: *container_id,
+                        sources: sources.clone(),
+                        options: AddOptions {
+                            base: base_path,
+                            keep_path: *keep_path,
+                            metadata_only: *metadata_only,
+                            excerpt: excerpt.ok().flatten(),
+                        },
                     });
                 }
                 cancel.then_some(DialogResult::Cancel)
@@ -820,6 +1120,8 @@ impl Dialog {
             Dialog::Confirm { message, then } => {
                 let (heading, verb) = match then {
                     Pending::Archive(_) => ("Archive Case?", "Archive"),
+                    Pending::CloseContainersAndArchive(_) => ("Archive Case?", "Close and Archive"),
+                    Pending::CloseContainerWithoutFile(_) => ("Close Without File?", "Close Without File"),
                     Pending::DeleteEvidence(_) => ("Delete Evidence?", "Delete"),
                     Pending::Seal(_) => ("Seal Case?", "Seal"),
                     Pending::Export { .. } => ("Export Case?", "Export"),
@@ -1123,7 +1425,7 @@ pub(super) fn report_window(
         });
 }
 
-fn plural(count: usize, word: &str) -> String {
+pub(super) fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
 

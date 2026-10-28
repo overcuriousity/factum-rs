@@ -3,13 +3,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use crate::companion::ask::Answer;
 use crate::companion::llm::Client;
 use crate::companion::{CompanionDb, Settings};
+use crate::container::volume::{AddOptions, AddProgress, Staged, Volume};
 use crate::db::Db;
 use crate::services::Factum;
 use crate::signer::GnupgSigner;
@@ -144,4 +145,60 @@ pub fn ask(
         let client = Client::new(settings);
         crate::companion::ask::ask(&db, &cdb, &client, case_id, &question).map_err(|e| e.to_string())
     })
+}
+
+pub type AddResult = Result<(Volume, Staged), String>;
+
+/// Copies and hashes sources into a container on a thread of its own; the open, locked volume comes back with the
+/// staged addition, to be logged and listed on the GUI thread. Cancelled or failed, nothing stays in the file.
+pub fn add_to_container(
+    ctx: &egui::Context,
+    volume: Volume,
+    sources: Vec<PathBuf>,
+    options: AddOptions,
+    cancel: Arc<AtomicBool>,
+) -> (Worker<AddResult>, Arc<AddProgress>) {
+    let progress = Arc::new(AddProgress::default());
+    let shared = progress.clone();
+    let worker = Worker::spawn(ctx, move || {
+        let mut volume = volume;
+        match volume.stage_add(&sources, &options, &shared, &cancel) {
+            Ok(staged) => Ok((volume, staged)),
+            Err(e) => Err(e.to_string()),
+        }
+    });
+    (worker, progress)
+}
+
+pub type ContainerVerifyResult = Result<crate::container::verify::ContainerReport, String>;
+
+/// Verifies a container file on a thread of its own; progress in bytes.
+pub fn verify_container(
+    ctx: &egui::Context,
+    db_path: PathBuf,
+    gpg_home: Option<PathBuf>,
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+) -> (Worker<ContainerVerifyResult>, Arc<Progress>) {
+    let progress = Arc::new(Progress {
+        done: AtomicUsize::new(0),
+        total: AtomicUsize::new(0),
+    });
+    let shared = progress.clone();
+    let repaint = ctx.clone();
+    let worker = Worker::spawn(ctx, move || {
+        let db = Db::open(&db_path).map_err(|e| e.to_string())?;
+        let signer = GnupgSigner::without_key(gpg_home.clone());
+        let factum = Factum::new(&db, &signer);
+        let gpgsm = crate::container::x509::Gpgsm::new(gpg_home);
+        let report_progress = |done: u64, total: u64| {
+            shared.done.store(done as usize, Ordering::Relaxed);
+            shared.total.store(total as usize, Ordering::Relaxed);
+            repaint.request_repaint();
+        };
+        factum
+            .verify_container_file(&path, &gpgsm, &report_progress, &cancel)
+            .map_err(|e| e.to_string())
+    });
+    (worker, progress)
 }

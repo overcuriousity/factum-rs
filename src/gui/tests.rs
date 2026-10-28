@@ -1396,3 +1396,609 @@ fn without_signing_the_wizard_leaves_out_key_and_seal_folder() {
     assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
 }
+
+// --- evidence containers
+
+impl Fixture {
+    /// The usual case, plus an open container "FS01 preserved" with two files; returns its id and file.
+    fn with_container() -> (Self, i64, PathBuf) {
+        use crate::container::volume::{AddOptions, AddProgress};
+        let fixture = Self::new();
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let case_id = factum.list_cases(false).unwrap()[0];
+        let source = fixture._dir.path().join("mnt");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("evil.exe"), b"MZ").unwrap();
+        std::fs::write(source.join("notes.txt"), b"notes").unwrap();
+        let path = fixture._dir.path().join("fs01.aff4l");
+        let id = factum
+            .create_container(case_id, "FS01 preserved", None, &path, &source.display().to_string())
+            .unwrap();
+        let mut volume = factum.open_container_for_add(id).unwrap();
+        let options = AddOptions {
+            base: source.clone(),
+            keep_path: true,
+            metadata_only: false,
+            excerpt: None,
+        };
+        let staged = volume
+            .stage_add(
+                &[source.join("evil.exe"), source.join("notes.txt")],
+                &options,
+                &AddProgress::default(),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+        factum.commit_container_add(id, &mut volume, staged).unwrap();
+        (fixture, id, path)
+    }
+}
+
+fn close_container(fixture: &Fixture, id: i64) {
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    Factum::with_seal_dir(&db, &signer, None).close_container(id).unwrap();
+}
+
+#[test]
+fn tree_lists_container_with_count_and_state() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let node = &harness.state().view.tree[0];
+    assert_eq!(node.containers.len(), 1);
+    assert_eq!((node.containers[0].id, node.containers[0].file_count), (id, 2));
+    assert!(harness.query_by_label_contains("FS01 preserved · open").is_some());
+    close_container(&fixture, id);
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("FS01 preserved").is_some());
+    assert!(harness.query_by_label_contains("FS01 preserved · open").is_none());
+}
+
+#[test]
+fn selecting_container_shows_its_files() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.run_ok();
+    let app = harness.state();
+    assert_eq!(app.container_id, Some(id));
+    assert!(app.case_id.is_some(), "the case of the container is the current case");
+    assert!(app.view.items.is_empty());
+    assert_eq!(app.view.container.as_ref().map(|c| c.summary.id), Some(id));
+    assert!(harness.query_by_label("evil.exe").is_some());
+    assert!(harness.query_by_label("notes.txt").is_some());
+    screenshot(&mut harness, "container_view");
+    // selecting the case again leaves the container
+    let case_id = harness.state().case_id;
+    harness.state_mut().select(case_id, None);
+    harness.run_ok();
+    assert!(harness.state().container_id.is_none());
+    assert!(harness.state().view.container.is_none());
+}
+
+#[test]
+fn jump_to_entry_leaves_the_container_view() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.run_ok();
+    harness.state_mut().jump_to_entry(id);
+    harness.run_ok();
+    assert!(harness.state().container_id.is_none());
+    assert!(harness.state().view.items.iter().any(|i| i.entry().id == id));
+}
+
+#[test]
+fn missing_file_is_marked_and_locate_enabled() {
+    let (fixture, id, path) = Fixture::with_container();
+    std::fs::remove_file(&path).unwrap();
+    let mut harness = fixture.harness();
+    harness.run_ok();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    assert!(summary.missing);
+    assert!(harness.query_by_label("File missing").is_some());
+    let items = containers::menu_items(&summary, false, false);
+    let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(enabled("Locate…"));
+    assert!(!enabled("Add Files…") && !enabled("Show in Folder") && !enabled("Verify Container…"));
+    let _ = id;
+}
+
+#[test]
+fn add_disabled_while_closed() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    let items = containers::menu_items(&summary, false, false);
+    let enabled =
+        |items: &[(&str, ContainerAction, bool)], label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(enabled(&items, "Add Files…") && enabled(&items, "Close Container"));
+    assert!(!enabled(&items, "Reopen Container") && !enabled(&items, "Locate…"));
+    close_container(&fixture, id);
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    let items = containers::menu_items(&summary, false, false);
+    assert!(!enabled(&items, "Add Files…") && !enabled(&items, "Add Folder…") && !enabled(&items, "Close Container"));
+    assert!(enabled(&items, "Reopen Container"));
+    // an archived case takes nothing and reopens nothing
+    let items = containers::menu_items(&summary, true, false);
+    assert!(!enabled(&items, "Reopen Container") && enabled(&items, "Verify Container…"));
+}
+
+#[test]
+fn locate_accepts_the_moved_file() {
+    let (fixture, id, path) = Fixture::with_container();
+    let moved = fixture._dir.path().join("moved.aff4l");
+    std::fs::rename(&path, &moved).unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().locate_container(id, &moved);
+    harness.run_ok();
+    assert!(!harness.state().view.tree[0].containers[0].missing);
+    assert!(harness.state().dialogs.is_empty());
+    // another file is refused with a message
+    std::fs::write(fixture._dir.path().join("x.aff4l"), b"no").unwrap();
+    harness
+        .state_mut()
+        .locate_container(id, &fixture._dir.path().join("x.aff4l"));
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+}
+
+#[test]
+fn new_container_dialog_creates_file_and_selects_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().open_new_container(case_id);
+    harness.run_ok();
+    let folder = fixture._dir.path().to_path_buf();
+    if let Some(Dialog::NewContainer {
+        folder: field, base, ..
+    }) = harness.state_mut().dialogs.last_mut()
+    {
+        *field = folder.display().to_string();
+        *base = folder.display().to_string();
+    } else {
+        panic!("the New Container dialog is not open");
+    }
+    type_into(&mut harness, "Name", "FS01 preserved");
+    screenshot(&mut harness, "new_container_dialog");
+    click_label(&mut harness, "Create");
+    let path = folder.join("FS01-preserved.aff4l");
+    assert!(path.is_file());
+    let app = harness.state();
+    let id = app.container_id.expect("the new container is selected");
+    assert_eq!(
+        app.factum().container(id).unwrap().summary.path.as_deref(),
+        Some(path.as_path())
+    );
+}
+
+#[test]
+fn new_container_dialog_validates() {
+    let (fixture, _, path) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().open_new_container(case_id);
+    harness.run_ok();
+    click_label(&mut harness, "Create");
+    assert!(harness.query_by_label("A container name is required.").is_some());
+    // an existing file is not overwritten
+    if let Some(Dialog::NewContainer {
+        name,
+        folder,
+        file_name,
+        base,
+        ..
+    }) = harness.state_mut().dialogs.last_mut()
+    {
+        *name = "Again".into();
+        *folder = path.parent().unwrap().display().to_string();
+        *file_name = "fs01.aff4l".into();
+        *base = "/".into();
+    }
+    harness.run_ok();
+    click_label(&mut harness, "Create");
+    assert!(harness.query_by_label_contains("exists already").is_some());
+}
+
+#[test]
+fn add_runs_in_background_and_commits() {
+    let (fixture, id, _) = Fixture::with_container();
+    let more = fixture._dir.path().join("mnt/more");
+    std::fs::create_dir_all(&more).unwrap();
+    for name in ["1", "2", "3"] {
+        std::fs::write(more.join(name), name.repeat(10)).unwrap();
+    }
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.state_mut().open_add_to_container(id, vec![more.clone()]);
+    harness.run_ok();
+    screenshot(&mut harness, "add_to_container_dialog");
+    click_label(&mut harness, "Add");
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    let detail = harness.state().factum().container(id).unwrap();
+    assert_eq!(detail.adds.len(), 2);
+    assert_eq!(detail.adds[1].files.len(), 3);
+    assert!(harness.query_by_label_contains("Adding to").is_none());
+    assert!(harness.query_by_label_contains("3 files added (30 B).").is_some());
+}
+
+#[test]
+fn cancel_adds_nothing() {
+    let (fixture, id, path) = Fixture::with_container();
+    let before = std::fs::read(&path).unwrap();
+    let mut harness = fixture.harness();
+    let source = fixture._dir.path().join("mnt");
+    let options = crate::container::volume::AddOptions {
+        base: source.clone(),
+        keep_path: true,
+        metadata_only: false,
+        excerpt: None,
+    };
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    harness.state_mut().start_add(id, vec![source], options, cancel);
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    assert_eq!(harness.state().factum().container(id).unwrap().adds.len(), 1);
+    assert!(harness.query_by_label_contains("Nothing was added.").is_some());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn add_status_line() {
+    let progress = crate::container::volume::AddProgress::default();
+    use std::sync::atomic::Ordering::Relaxed;
+    progress.files.store(1, Relaxed);
+    progress.total_files.store(3, Relaxed);
+    progress.bytes.store(2_000, Relaxed);
+    progress.total_bytes.store(7_000_000, Relaxed);
+    assert_eq!(
+        containers::add_status(&progress, "FS01"),
+        "Adding to \"FS01\": 1 / 3 files · 2.0 kB / 7.0 MB"
+    );
+}
+
+#[test]
+fn archive_with_open_container_asks_to_close() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().archive(case_id);
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::Confirm {
+            message,
+            then: Pending::CloseContainersAndArchive(_),
+        }) => assert!(
+            message.contains(&format!("#{id} \"FS01 preserved\" is open")),
+            "{message}"
+        ),
+        _ => panic!("no confirmation"),
+    }
+    click_label(&mut harness, "Close and Archive");
+    // no key is active: the closes would be unsigned, so it asks first, as a plain Archive does
+    assert!(matches!(
+        harness.state().dialogs.last(),
+        Some(Dialog::NoGpgKey {
+            then: Pending::CloseContainersAndArchive(_)
+        })
+    ));
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+    click_label(&mut harness, "Continue unsigned");
+    let factum = harness.state().factum();
+    assert!(!factum.container(id).unwrap().summary.open);
+    assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
+}
+
+#[test]
+fn archive_closes_a_container_whose_file_is_missing_without_it() {
+    let (fixture, id, path) = Fixture::with_container();
+    std::fs::remove_file(&path).unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().no_gpg_key_prompted = true;
+    harness.state_mut().archive(case_id);
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::Confirm { message, .. }) => {
+            assert!(message.contains(&format!("The file of #{id} is missing")), "{message}")
+        }
+        _ => panic!("no confirmation"),
+    }
+    click_label(&mut harness, "Close and Archive");
+    let factum = harness.state().factum();
+    let detail = factum.container(id).unwrap();
+    assert!(!detail.summary.open && detail.closes.is_empty());
+    assert_eq!(detail.closed_without_file.len(), 1);
+    assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
+}
+
+#[test]
+fn close_without_file_from_the_menu() {
+    let (fixture, id, path) = Fixture::with_container();
+    std::fs::remove_file(&path).unwrap();
+    let mut harness = fixture.harness();
+    let summary = harness.state().factum().container(id).unwrap().summary;
+    let items = containers::menu_items(&summary, false, false);
+    let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(enabled("Close Without File…") && !enabled("Close Container"));
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .container_action(ContainerAction::CloseWithoutFile(id), &ctx);
+    harness.run_ok();
+    click_label(&mut harness, "Close Without File");
+    assert!(!harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn close_and_reopen_from_the_menu() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().container_action(ContainerAction::Close(id), &ctx);
+    harness.run_ok();
+    assert!(!harness.state().factum().container(id).unwrap().summary.open);
+    harness.state_mut().container_action(ContainerAction::Reopen(id), &ctx);
+    harness.run_ok();
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn verify_container_opens_report_window() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().container_action(ContainerAction::Verify(id), &ctx);
+    run_until(&mut harness, |h| !h.state().container_verify_windows.is_empty());
+    harness.run_ok();
+    assert!(
+        harness
+            .query_all_by_label("Verify Container FS01 preserved")
+            .next()
+            .is_some()
+    );
+    // open and never closed: nothing fails, but nothing is signed either
+    assert!(harness.query_by_label_contains("\u{26a0} 1 warning").is_some());
+    assert!(harness.query_by_label_contains("never closed").is_some());
+    screenshot(&mut harness, "verify_container");
+}
+
+fn x509_cert(fingerprint: &str, subject: &str) -> crate::container::x509::X509Cert {
+    crate::container::x509::X509Cert {
+        fingerprint: fingerprint.into(),
+        subject: subject.into(),
+        issuer: "CN=Root".into(),
+        issuer_fingerprint: "R".into(),
+        not_before: "2026-01-01T00:00:00Z".into(),
+        not_after: "2027-01-01T00:00:00Z".into(),
+        can_sign: true,
+        has_secret: true,
+    }
+}
+
+#[test]
+fn x509_dialog_without_gpgsm_says_so() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::X509 {
+        available: false,
+        certs: Vec::new(),
+        selected: None,
+        chain_files: Vec::new(),
+    });
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("gpgsm is not installed").is_some());
+}
+
+#[test]
+fn x509_result_saves_and_clears_settings() {
+    use crate::container::x509::{X509_CERT_SETTING, X509_CHAIN_SETTING};
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::X509 {
+        available: true,
+        certs: vec![x509_cert("ABC", "CN=Examiner One")],
+        selected: None,
+        chain_files: vec!["/certs/intermediate.pem".into()],
+    });
+    harness.run_ok();
+    click_label(&mut harness, "CN=Examiner One");
+    click_label(&mut harness, "Save");
+    let db = fixture.db();
+    assert_eq!(db.get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+    assert_eq!(db.get_setting(X509_CHAIN_SETTING).unwrap(), "/certs/intermediate.pem");
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_dialog_result(
+        DialogResult::X509 {
+            certificate: None,
+            chain_files: Vec::new(),
+        },
+        &ctx,
+    );
+    let db = fixture.db();
+    assert_eq!(db.get_setting(X509_CERT_SETTING).unwrap(), "");
+    assert_eq!(db.get_setting(X509_CHAIN_SETTING).unwrap(), "");
+}
+
+fn with_wizard_certs(harness: &mut Harness<'_, FactumApp>, certs: Vec<crate::container::x509::X509Cert>) {
+    if let Some(Dialog::Wizard(wizard)) = harness.state_mut().dialogs.last_mut() {
+        wizard.x509_certs = certs;
+    }
+    harness.run_ok();
+}
+
+#[test]
+fn wizard_hides_x509_without_certificates() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    with_wizard_certs(&mut harness, Vec::new());
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    assert!(harness.query_by_label("X.509 certificate (optional)").is_none());
+    wizard_to(&mut harness, "Next", Step::Summary);
+    assert!(harness.query_by_label("X.509 certificate").is_none());
+}
+
+#[test]
+fn wizard_x509_choice_applied_on_finish() {
+    use crate::container::x509::X509_CERT_SETTING;
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    with_wizard_certs(&mut harness, vec![x509_cert("ABC", "CN=Examiner One")]);
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    assert!(harness.query_by_label("X.509 certificate (optional)").is_some());
+    click_label(&mut harness, "CN=Examiner One");
+    screenshot(&mut harness, "wizard_x509");
+    wizard_to(&mut harness, "Next", Step::Summary);
+    assert!(harness.query_by_label("CN=Examiner One").is_some());
+    click_label(&mut harness, "Finish");
+    assert_eq!(fixture.db().get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+}
+
+#[test]
+fn wizard_prefills_and_keeps_x509() {
+    use crate::container::x509::{X509_CERT_SETTING, X509_CHAIN_SETTING};
+    let fixture = Fixture::new();
+    let db = fixture.db();
+    db.set_setting(X509_CERT_SETTING, "ABC").unwrap();
+    db.set_setting(X509_CHAIN_SETTING, "/certs/root.pem").unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().open_wizard();
+    harness.run_ok();
+    with_wizard_certs(&mut harness, vec![x509_cert("ABC", "CN=Examiner One")]);
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    let db = fixture.db();
+    assert_eq!(db.get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+    assert_eq!(db.get_setting(X509_CHAIN_SETTING).unwrap(), "/certs/root.pem");
+}
+
+#[test]
+fn not_now_leaves_x509_unchanged() {
+    use crate::container::x509::X509_CERT_SETTING;
+    let fixture = Fixture::empty();
+    fixture.db().set_setting(X509_CERT_SETTING, "ABC").unwrap();
+    let mut harness = fixture.harness();
+    with_wizard_certs(&mut harness, vec![x509_cert("XYZ", "CN=Other")]);
+    click_label(&mut harness, "Not now: skip signing and seals");
+    wizard_to(&mut harness, "Next", Step::Summary);
+    click_label(&mut harness, "Finish");
+    assert_eq!(fixture.db().get_setting(X509_CERT_SETTING).unwrap(), "ABC");
+}
+
+#[test]
+fn container_view_shows_modified_times() {
+    let (fixture, id, _) = Fixture::with_container();
+    let source = fixture._dir.path().join("mnt/evil.exe");
+    let modified = crate::container::source::xsd_time(std::fs::metadata(&source).unwrap().modified().unwrap());
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.run_ok();
+    assert_eq!(harness.state().view.container_times.len(), 2);
+    let shown = containers::short_time(&modified);
+    assert!(shown.ends_with(" UTC") && shown.as_bytes()[10] == b' ', "{shown}");
+    assert!(harness.query_all_by_label(&shown).next().is_some(), "{shown}");
+}
+
+/// An addition to container `id` that is still running (its worker waits).
+fn running_add_job(harness: &mut Harness<'_, FactumApp>, id: i64) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wait = release.clone();
+    let ctx = harness.ctx.clone();
+    let worker = workers::Worker::spawn(&ctx, move || {
+        while !wait.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err("cancelled — nothing was added".to_string())
+    });
+    harness.state_mut().add_job = Some(AddJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress: Default::default(),
+        cancel: Default::default(),
+    });
+    release
+}
+
+#[test]
+fn a_running_addition_blocks_its_container() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let summary = harness.state().view.tree[0].containers[0].clone();
+    let items = containers::menu_items(&summary, false, true);
+    let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
+    assert!(!enabled("Add Files…") && !enabled("Close Container") && !enabled("Reopen Container"));
+    assert!(enabled("Verify Container…"));
+    let release = running_add_job(&mut harness, id);
+    let ctx = harness.ctx.clone();
+    let started = std::time::Instant::now();
+    harness.state_mut().container_action(ContainerAction::Close(id), &ctx);
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().archive(case_id);
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("being added").is_some());
+    release.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn verify_container_can_be_cancelled() {
+    let (fixture, _, path) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    harness.state_mut().start_container_verification(path, cancel);
+    run_until(&mut harness, |h| h.state().container_verify_job.is_none());
+    harness.run_ok();
+    assert!(harness.state().container_verify_windows.is_empty());
+    assert!(harness.query_by_label("Verification cancelled.").is_some());
+}
+
+#[test]
+fn add_dialog_needs_a_base_path() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let source = fixture._dir.path().join("mnt/evil.exe");
+    harness.state_mut().open_add_to_container(id, vec![source]);
+    if let Some(Dialog::AddToContainer { base, .. }) = harness.state_mut().dialogs.last_mut() {
+        base.clear();
+    }
+    harness.run_ok();
+    click_label(&mut harness, "Add");
+    assert!(harness.state().add_job.is_none());
+    assert!(harness.query_by_label_contains("Choose the base path").is_some());
+}
+
+#[test]
+fn hidden_excerpt_fields_do_not_block_a_metadata_only_add() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let source = fixture._dir.path().join("mnt/evil.exe");
+    harness.state_mut().open_add_to_container(id, vec![source]);
+    if let Some(Dialog::AddToContainer {
+        metadata_only,
+        excerpt_from,
+        ..
+    }) = harness.state_mut().dialogs.last_mut()
+    {
+        // typed while shown, then hidden by ticking Metadata only
+        *excerpt_from = "10".into();
+        *metadata_only = true;
+    }
+    harness.run_ok();
+    click_label(&mut harness, "Add");
+    assert!(harness.query_by_label_contains("The excerpt needs").is_none());
+    assert!(!matches!(
+        harness.state().dialogs.last(),
+        Some(Dialog::AddToContainer { .. })
+    ));
+}

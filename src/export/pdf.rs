@@ -739,6 +739,24 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
         );
     }
 
+    if !model.containers.is_empty() {
+        pdf.heading("Containers", 14.0, true);
+        for container in &model.containers {
+            pdf.heading(&format!("#{} {}", container.id, container.name), 11.5, false);
+            pdf.meta_table(&container.rows(), FontId::Sans, 9.5);
+            pdf.space(4.0);
+            if container.files.is_empty() {
+                pdf.paragraph(body, "No files.", 0.0);
+            } else {
+                pdf.grid(
+                    &["Path", "Size", "SHA-256"],
+                    &container.file_cells(),
+                    &[0.42, 0.12, 0.46],
+                );
+            }
+        }
+    }
+
     pdf.heading("Case activity", 14.0, true);
     for item in model.activity() {
         let flag = if item.status == Level::Fail { " ⚠ FAIL" } else { "" };

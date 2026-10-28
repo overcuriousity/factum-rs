@@ -108,9 +108,47 @@ impl ReportEntry {
     }
 }
 
+/// An evidence container of the case, as the reports list it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerRow {
+    pub id: i64,
+    pub name: String,
+    pub file_name: String,
+    pub uuid: String,
+    /// "Evidence #2 disk"
+    pub evidence: Option<String>,
+    /// open or closed
+    pub state: String,
+    /// who signed the newest close, or "unsigned" / "not closed"
+    pub signatures: String,
+    /// (path, size, SHA-256)
+    pub files: Vec<(String, u64, String)>,
+}
+
+impl ContainerRow {
+    /// The key/value lines above a container's file list.
+    pub fn rows(&self) -> Vec<(&'static str, String)> {
+        let mut rows = vec![("File", self.file_name.clone()), ("UUID", self.uuid.clone())];
+        if let Some(evidence) = &self.evidence {
+            rows.push(("Evidence", evidence.clone()));
+        }
+        rows.push(("State", self.state.clone()));
+        rows.push(("Signatures", self.signatures.clone()));
+        rows
+    }
+
+    pub fn file_cells(&self) -> Vec<Vec<String>> {
+        self.files
+            .iter()
+            .map(|(path, size, sha256)| vec![path.clone(), size.to_string(), sha256.clone()])
+            .collect()
+    }
+}
+
 pub struct ReportModel {
     pub case: Case,
     pub evidence: Vec<EvidenceRow>,
+    pub containers: Vec<ContainerRow>,
     pub exported_utc: String,
     pub exporting_key: Option<String>,
     pub seal: TreeHead,
@@ -226,6 +264,63 @@ impl Factum<'_> {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The case's containers, read from its log.
+    pub fn container_rows(&self, case_id: i64, evidence_names: &HashMap<i64, String>) -> Result<Vec<ContainerRow>> {
+        let mut rows = Vec::new();
+        for summary in self.list_containers(case_id)? {
+            let detail = self.container(summary.id)?;
+            let signatures = match detail.closes.last() {
+                _ if detail.last_closed_without_file() => "none: closed while its file was missing".to_string(),
+                None => "not closed".to_string(),
+                Some(close) => {
+                    let (gpg, x509) = match close.signed_later {
+                        Some(entry) => detail
+                            .late_signatures
+                            .iter()
+                            .find(|(id, ..)| *id == entry)
+                            .map(|(_, _, gpg, x509)| (gpg.clone(), x509.clone()))
+                            .unwrap_or_default(),
+                        None => (close.gpg.clone(), close.x509.clone()),
+                    };
+                    let mut parts = Vec::new();
+                    if let Some(gpg) = gpg {
+                        parts.push(format!("GPG {gpg}"));
+                    }
+                    if let Some(x509) = x509 {
+                        parts.push(format!("X.509 {x509}"));
+                    }
+                    if close.signed_later.is_some() && !parts.is_empty() {
+                        parts.push("signed later".into());
+                    }
+                    if parts.is_empty() {
+                        "unsigned".to_string()
+                    } else {
+                        parts.join(" · ")
+                    }
+                }
+            };
+            rows.push(ContainerRow {
+                id: summary.id,
+                name: summary.name.clone(),
+                file_name: detail.file_name.clone(),
+                uuid: summary.uuid.clone(),
+                evidence: detail.evidence_id.and_then(|id| evidence_names.get(&id).cloned()),
+                state: match (summary.open, detail.last_closed_without_file()) {
+                    (true, _) => "open",
+                    (false, true) => "closed (file missing)",
+                    (false, false) => "closed",
+                }
+                .to_string(),
+                signatures,
+                files: detail
+                    .files()
+                    .map(|(_, f)| (report_path(f), f.size, f.sha256.clone()))
+                    .collect(),
+            });
+        }
+        Ok(rows)
+    }
+
     pub fn build_model(
         &self,
         report: CaseReport,
@@ -314,9 +409,11 @@ impl Factum<'_> {
                 line
             })
             .collect();
+        let containers = self.container_rows(case_id, &names)?;
         Ok(ReportModel {
             case: report.case.clone(),
             evidence,
+            containers,
             exported_utc: exported_utc.to_string(),
             exporting_key,
             seal,
@@ -324,6 +421,19 @@ impl Factum<'_> {
             timeline,
             appendix,
         })
+    }
+}
+
+/// A container file's path as reports show it: marked when its content is not (fully) stored.
+fn report_path(file: &crate::container::volume::FileRecord) -> String {
+    if file.metadata_only {
+        format!("{} (metadata only, not stored)", file.path)
+    } else if let Some((from, to)) = file.excerpt {
+        format!("{} (excerpt, bytes {from}–{to})", file.path)
+    } else if let Some(target) = &file.link {
+        format!("{} (link to {target})", file.path)
+    } else {
+        file.path.clone()
     }
 }
 
