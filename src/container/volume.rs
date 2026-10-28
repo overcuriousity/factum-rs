@@ -467,11 +467,25 @@ impl Volume {
             .create_new(true)
             .open(path)
             .map_err(|e| FactumError::general(format!("The container {} cannot be created: {e}", path.display())))?;
+        // the file is new: one that could not be written whole is removed, so the name can be used again
+        Self::fill_new(file, path, uuid, info).inspect_err(|_| {
+            if let Err(e) = std::fs::remove_file(path) {
+                log::error!("{} could not be removed after a failed create: {e}", path.display());
+            }
+        })
+    }
+
+    /// The first state of a new container; the file is closed again when it fails.
+    fn fill_new(file: File, path: &Path, uuid: &str, info: &VolumeInfo) -> Result<Volume> {
         lock(&file)?;
         let arn = format!("aff4://{uuid}");
         let mut app = Appender::new(file, 0, Vec::new()).map_err(|e| io_error(path, e))?;
         let version = format!("major=2\nminor=1\ntool=factum {}\n", crate::VERSION);
         let write = |app: &mut Appender| -> io::Result<()> {
+            #[cfg(test)]
+            if tests::FAIL_CREATE.with(|fail| fail.replace(false)) {
+                return Err(io::Error::other("no space left on device (test)"));
+            }
             app.add_bytes("version.txt", 0, version.as_bytes())?;
             app.add_bytes("container.description", 0, arn.as_bytes())?;
             app.add_bytes("verify_container.py", 8, VERIFY_CONTAINER_PY)?;
@@ -1037,6 +1051,24 @@ mod tests {
     use super::*;
     use crate::container::zip64::{find_last_end, read_archive};
     use std::sync::atomic::AtomicBool;
+
+    thread_local! {
+        /// the next create fails while writing its first members
+        pub static FAIL_CREATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    #[test]
+    fn a_failed_create_leaves_no_file() {
+        let setup = Setup::new();
+        FAIL_CREATE.with(|fail| fail.set(true));
+        let error = Volume::create(&setup.path(), "x", &VolumeInfo::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("no space left"), "{error}");
+        assert!(!setup.path().exists());
+        // the name can be used again
+        setup.create();
+    }
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
