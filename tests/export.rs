@@ -710,6 +710,58 @@ fn reports_list_containers() {
 }
 
 #[test]
+fn report_lists_container_sources_and_damaged_state() {
+    use factum::container::volume::{AddOptions, AddProgress};
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-9", "Damaged", "").unwrap();
+    let source = f.path().join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.txt"), b"a").unwrap();
+    let (_, id) = factum
+        .create_evidence_with_container(case_id, "disk", "", "", &f.path().join("d.aff4l"), "")
+        .unwrap();
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    let options = AddOptions {
+        keep_path: true,
+        ..Default::default()
+    };
+    let staged = volume
+        .stage_add(
+            &[source.join("a.txt")],
+            &options,
+            &AddProgress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+    let record = staged.records[0].clone();
+    factum.commit_container_add(id, &mut volume, staged).unwrap();
+    drop(volume);
+    factum.close_container_damaged(id, &[record]).unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let model = build(&factum, case_id, seal_id, None);
+    let row = &model.containers[0];
+    assert_eq!(row.state, "closed as damaged");
+    let mount = factum::container::mounts::mount_line(&factum.container(id).unwrap().adds[0].mounts[0]);
+    let rows = row.rows();
+    assert!(
+        rows.iter().any(|(k, v)| *k == "Base path" && v == "full paths"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(k, v)| *k == "Source" && v.contains(&mount)),
+        "{rows:?}"
+    );
+    for text in [render_html(&model, false), render_markdown(&model, "images")] {
+        assert!(text.contains("closed as damaged"), "{text}");
+        assert!(
+            text.contains(&mount) || text.contains(&mount.replace('·', "&middot;")),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn reports_without_containers_have_no_section() {
     let f = Fixture::new();
     let model = model(&f);
