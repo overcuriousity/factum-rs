@@ -225,7 +225,7 @@ struct FactumApp {
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
     add_job: Option<AddJob>,
-    /// the selected container's file times: (file, its length when read, times)
+    /// the selected container's file times: (file, its logged end (else its length) when read, times)
     container_times_cache: std::cell::RefCell<Option<TimesCache>>,
     container_verify_job: Option<ContainerVerifyJob>,
     container_verify_windows: Vec<containers::ContainerVerifyWindow>,
@@ -809,8 +809,9 @@ impl FactumApp {
         view.container_times = view
             .container
             .as_ref()
-            .and_then(|detail| detail.summary.path.clone().filter(|_| !detail.summary.missing))
-            .map(|path| self.container_times(&path))
+            .filter(|detail| !detail.summary.missing)
+            .and_then(|detail| Some((detail.summary.path.clone()?, detail)))
+            .map(|(path, detail)| self.container_times(&path, &detail.summary.uuid, detail.summary.id))
             .unwrap_or_default();
         view.companion = match (&self.companion_db, &view.case) {
             (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
@@ -1061,21 +1062,33 @@ impl FactumApp {
         self.run(result);
     }
 
-    /// The container's file times, read from the file only when it changed since the last read.
-    fn container_times(&self, path: &std::path::Path) -> HashMap<String, String> {
-        let length = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    /// The container's file times, read from the file only when its logged state changed since the last read (an
+    /// addition being written changes the file, not its logged state).
+    fn container_times(&self, path: &std::path::Path, uuid: &str, id: i64) -> HashMap<String, String> {
+        let end: Option<u64> = self
+            .db
+            .get_setting(&crate::containers::end_setting(uuid))
+            .ok()
+            .and_then(|end| end.parse().ok());
         let mut cache = self.container_times_cache.borrow_mut();
-        if let Some((cached, cached_length, times)) = cache.as_ref()
-            && cached == path
-            && *cached_length == length
+        let cached = cache.as_ref().filter(|(cached, ..)| cached == path);
+        let busy = self.add_job.as_ref().is_some_and(|job| job.container_id == id);
+        // without a logged end (after Locate…), finding the state means searching the file: not while it grows
+        let key = match end {
+            Some(end) => end,
+            None if busy => return cached.map(|(.., times)| times.clone()).unwrap_or_default(),
+            None => std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        };
+        if let Some((_, cached_key, times)) = cached
+            && *cached_key == key
         {
             return times.clone();
         }
-        let times = crate::container::volume::read_graph(path)
+        let times = crate::container::volume::read_graph(path, end)
             .map(|graph| crate::container::volume::modified_times(&graph))
             .inspect_err(|e| log::warn!("{e}"))
             .unwrap_or_default();
-        *cache = Some((path.to_path_buf(), length, times.clone()));
+        *cache = Some((path.to_path_buf(), key, times.clone()));
         times
     }
 

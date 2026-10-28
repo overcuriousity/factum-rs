@@ -12,7 +12,9 @@ use sha2::Digest;
 use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_bytes, read_meta, stored_path};
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
-use super::zip64::{Appender, Archive, CdEntry, find_last_end, member_bytes, member_reader, member_text, read_archive};
+use super::zip64::{
+    Appender, Archive, CdEntry, find_last_end, find_newest_end, member_bytes, member_reader, member_text, read_archive,
+};
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS, RDF_NS, XSD_NS, ZIP_SEGMENT_LIMIT, member_name};
 use crate::error::{FactumError, Result};
 
@@ -232,11 +234,12 @@ fn io_error(path: &Path, e: io::Error) -> FactumError {
     FactumError::general(format!("The container {} could not be written: {e}", path.display()))
 }
 
-/// The metadata of a container file's newest complete state, read without changing the file.
-pub fn read_graph(path: &Path) -> Result<Graph> {
+/// The metadata of a container file's newest complete state, read without changing the file. `end`, where the
+/// logged state ends, spares the search for it while an addition is being written after it.
+pub fn read_graph(path: &Path, end: Option<u64>) -> Result<Graph> {
     let not_container = |why: String| FactumError::general(format!("{} cannot be read: {why}", path.display()));
     let mut file = File::open(path).map_err(|e| not_container(e.to_string()))?;
-    let end = find_last_end(&mut file, None)
+    let end = find_last_end(&mut file, end)
         .map_err(|e| not_container(e.to_string()))?
         .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
     let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
@@ -490,8 +493,9 @@ impl Volume {
     }
 
     /// Opens a container for writing. An interrupted Add left bytes after the last complete state: they are cut
-    /// off (never a complete state); the second value says how many.
-    pub fn open(path: &Path) -> Result<(Volume, u64)> {
+    /// off (never a complete state); the second value says how many. `known` is where a complete state ends (the
+    /// case log's), from which the newest one is found quickly.
+    pub fn open(path: &Path, known: Option<u64>) -> Result<(Volume, u64)> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -501,7 +505,7 @@ impl Volume {
         let not_container =
             |why: String| FactumError::general(format!("{} is not a factum container: {why}", path.display()));
         let len = file.seek(SeekFrom::End(0)).map_err(|e| io_error(path, e))?;
-        let end = find_last_end(&mut file, None)
+        let end = find_newest_end(&mut file, known)
             .map_err(|e| not_container(e.to_string()))?
             .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
         let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
@@ -1217,10 +1221,24 @@ mod tests {
             )
             .unwrap();
         drop(volume); // the process died before finalize
-        let (volume, discarded) = Volume::open(&setup.path()).unwrap();
+        let (volume, discarded) = Volume::open(&setup.path(), None).unwrap();
         assert!(discarded > 0);
         assert_eq!(volume.archive(), &before);
         assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), before.end);
+    }
+
+    #[test]
+    fn read_graph_at_the_logged_end_skips_an_addition_being_written() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        let (end, graph) = (volume.end(), volume.graph().clone());
+        drop(volume);
+        // an addition in progress: bytes after the logged state, no directory yet
+        let mut file = OpenOptions::new().append(true).open(setup.path()).unwrap();
+        std::io::Write::write_all(&mut file, &vec![0x50; 3 << 20]).unwrap();
+        assert_eq!(read_graph(&setup.path(), Some(end)).unwrap(), graph);
+        assert_eq!(read_graph(&setup.path(), None).unwrap(), graph);
     }
 
     #[test]
@@ -1496,13 +1514,13 @@ mod tests {
     fn second_open_is_refused_while_locked() {
         let setup = Setup::new();
         let volume = setup.create();
-        let error = Volume::open(&setup.path()).err().unwrap();
+        let error = Volume::open(&setup.path(), None).err().unwrap();
         assert!(
             error.to_string().contains("in use by another factum process"),
             "{error}"
         );
         drop(volume);
-        Volume::open(&setup.path()).unwrap();
+        Volume::open(&setup.path(), None).unwrap();
     }
 
     #[test]
@@ -1648,7 +1666,7 @@ mod tests {
         assert_eq!(progress.files.load(std::sync::atomic::Ordering::Relaxed), 5000);
         assert_eq!(progress.total_bytes.load(std::sync::atomic::Ordering::Relaxed), 50_000);
         drop(volume);
-        let (volume, discarded) = Volume::open(&setup.path()).unwrap();
+        let (volume, discarded) = Volume::open(&setup.path(), None).unwrap();
         assert_eq!((discarded, file_records(volume.graph()).len()), (0, 5000));
         // adding, reopening and listing stay well below a second per thousand files, even in a debug build
         assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());

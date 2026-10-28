@@ -634,7 +634,7 @@ fn crash_between_container_write_and_log_commit_is_set_aside() {
     let id = s.create();
     s.add(id, &[s.file("a.txt")]);
     // the container was written, the process died before the log entry was committed
-    let (mut volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (mut volume, _) = Volume::open(&s.container_path(), None).unwrap();
     let staged = volume
         .stage_add(
             &[s.file("b.txt")],
@@ -653,7 +653,7 @@ fn crash_between_container_write_and_log_commit_is_set_aside() {
     let paths: Vec<String> = detail.files().map(|(_, f)| f.path.clone()).collect();
     assert_eq!(paths.len(), 2, "{paths:?}");
     assert!(!paths.iter().any(|p| p.ends_with("b.txt")));
-    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
     assert!(s.f.factum().compare_with_log(id, &volume).unwrap().is_empty());
 }
 
@@ -663,7 +663,7 @@ fn crash_after_close_before_log_commit_is_set_aside() {
     let s = Setup::new();
     let id = s.create();
     s.add(id, &[s.file("a.txt")]);
-    let (mut volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (mut volume, _) = Volume::open(&s.container_path(), None).unwrap();
     volume.close(&Signatures::default()).unwrap();
     drop(volume);
     s.f.factum().close_container(id).unwrap();
@@ -696,7 +696,7 @@ fn stale_end_setting_never_cuts_committed_data() {
     std::fs::write(s.container_path(), bytes).unwrap();
     s.add(id, &[s.file("b.txt")]);
     assert_eq!(s.f.factum().container(id).unwrap().summary.file_count, 2);
-    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
     assert!(s.f.factum().compare_with_log(id, &volume).unwrap().is_empty());
 }
 
@@ -740,12 +740,12 @@ fn an_empty_folder_alone_is_added_and_logged() {
     assert_eq!(detail.adds[0].files.len(), 0);
     assert_eq!(detail.adds[0].folders.len(), 1);
     assert_eq!(detail.adds[0].folders[0].path, "void");
-    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
     assert!(s.f.factum().compare_with_log(id, &volume).unwrap().is_empty());
     drop(volume);
     // a folder the log does not record is a difference
     s.f.exec("UPDATE entries SET payload_json = replace(payload_json, '\"folders\":[{', '\"folders\":[],\"x\":[{')");
-    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
     let findings = s.f.factum().compare_with_log(id, &volume).unwrap();
     assert!(findings.iter().any(|f| f.message.contains("void")), "{findings:?}");
 }
@@ -757,12 +757,12 @@ fn container_differing_from_the_log_is_not_written() {
     s.add(id, &[s.file("a.txt")]);
     // the log entry of the addition disappears (another database, say): the container lists a file the log lacks
     let factum = s.f.factum();
-    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
     let findings = factum.compare_with_log(id, &volume).unwrap();
     assert!(findings.is_empty(), "{findings:?}");
     drop(volume);
     s.f.exec("UPDATE entries SET payload_json = replace(payload_json, 'container_files_added', 'something_else')");
-    let (volume, _) = Volume::open(&s.container_path()).unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
     let findings = factum.compare_with_log(id, &volume).unwrap();
     assert!(findings.iter().any(|f| f.code == "log_mismatch"), "{findings:?}");
     drop(volume);

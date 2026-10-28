@@ -587,7 +587,7 @@ impl Factum<'_> {
             .get_setting(&end_setting(&detail.summary.uuid))
             .ok()
             .and_then(|end| end.parse().ok());
-        let (mut volume, discarded) = Volume::open(&path)?;
+        let (mut volume, discarded) = Volume::open(&path, hint)?;
         if volume.uuid() != detail.summary.uuid {
             return Err(FactumError::general(format!(
                 "{} is not container #{id} (it is {}).",

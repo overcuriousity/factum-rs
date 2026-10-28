@@ -259,6 +259,83 @@ pub fn find_last_end(file: &mut File, hint: Option<u64>) -> io::Result<Option<u6
     Ok(None)
 }
 
+/// The end of the newest complete state, knowing that one ends at `known` (where the case log's state ends): the
+/// file's length if it ends with one, else the newest state found by walking the members written after `known`.
+/// The walk reads local headers only, so an interrupted addition of any size is passed quickly; without a usable
+/// `known`, the file is searched backwards (`find_last_end`).
+pub fn find_newest_end(file: &mut File, known: Option<u64>) -> io::Result<Option<u64>> {
+    let len = file.seek(SeekFrom::End(0))?;
+    if read_archive(file, len).is_ok() {
+        return Ok(Some(len));
+    }
+    match known.filter(|k| *k <= len) {
+        Some(known) if read_archive(file, known).is_ok() => walk_states(file, known, len).map(Some),
+        _ => find_last_end(file, None),
+    }
+}
+
+/// Walks the members after the state ending at `start`, member by member (each local header gives its size), and
+/// returns the end of the last complete state it passes. An interrupted member (its sizes never written) ends it.
+fn walk_states(file: &mut File, start: u64, len: u64) -> io::Result<u64> {
+    let mut newest = start;
+    let mut pos = start;
+    while pos + 4 <= len {
+        match u32_at(&read_at(file, pos, 4)?, 0) {
+            LOCAL_SIG if pos + 30 <= len => {
+                let header = read_at(file, pos, 30)?;
+                let (name_len, extra_len) = (u16_at(&header, 26) as u64, u16_at(&header, 28) as u64);
+                let mut compressed = u32_at(&header, 18) as u64;
+                if compressed == 0xFFFF_FFFF {
+                    if pos + 30 + name_len + extra_len > len {
+                        break;
+                    }
+                    let extra = read_at(file, pos + 30 + name_len, extra_len as usize)?;
+                    let mut entry = CdEntry {
+                        name: Vec::new(),
+                        method: 0,
+                        crc32: 0,
+                        compressed_size: 0xFFFF_FFFF,
+                        size: 0xFFFF_FFFF,
+                        header_offset: 0,
+                    };
+                    apply_zip64_extra(&mut entry, &extra);
+                    compressed = entry.compressed_size;
+                }
+                match (pos + 30 + name_len + extra_len).checked_add(compressed) {
+                    Some(next) if next <= len && compressed != 0xFFFF_FFFF => pos = next,
+                    _ => break,
+                }
+            }
+            CENTRAL_SIG => {
+                // a central directory: the state ends after it and its end records
+                let mut at = pos;
+                while at + 46 <= len {
+                    let entry = read_at(file, at, 46)?;
+                    if u32_at(&entry, 0) != CENTRAL_SIG {
+                        break;
+                    }
+                    at += 46 + u16_at(&entry, 28) as u64 + u16_at(&entry, 30) as u64 + u16_at(&entry, 32) as u64;
+                }
+                if at + 4 <= len && u32_at(&read_at(file, at, 4)?, 0) == EOCD64_SIG {
+                    at += EOCD64_LEN + LOCATOR_LEN;
+                }
+                if at + EOCD_LEN > len {
+                    break;
+                }
+                let record = read_at(file, at, EOCD_LEN as usize)?;
+                let end = at + EOCD_LEN + u16_at(&record, 20) as u64;
+                if u32_at(&record, 0) != EOCD_SIG || end > len || read_archive(file, end).is_err() {
+                    break;
+                }
+                newest = end;
+                pos = end;
+            }
+            _ => break,
+        }
+    }
+    Ok(newest)
+}
+
 /// The uncompressed content of a member.
 pub fn member_reader<'f>(file: &'f mut File, entry: &CdEntry) -> io::Result<Box<dyn Read + 'f>> {
     let header = read_at(file, entry.header_offset, 30)?;
@@ -719,6 +796,40 @@ mod tests {
         assert!(error.to_string().contains("larger than"), "{error}");
         entry.size = 4 << 20;
         assert_eq!(member_bytes_up_to(&mut file, &entry, 4 << 20).unwrap().len(), 4 << 20);
+    }
+
+    #[test]
+    fn the_newest_state_is_found_by_walking_from_a_known_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
+        app.add_bytes("a", 8, b"first state").unwrap();
+        let end1 = app.finish(&[], b"aff4://x").unwrap();
+        // a state written after it (never logged), then an interrupted member whose content looks like headers
+        app.add_bytes("b", 0, &pattern(300 << 10)).unwrap();
+        let end2 = app.finish(&[], b"aff4://x").unwrap();
+        let mut junk = b"PK\x01\x02".to_vec();
+        junk.extend(pattern(2 << 20));
+        junk[100_000..100_004].copy_from_slice(b"PK\x05\x06");
+        app.add_bytes("c", 0, &junk).unwrap();
+        drop(app);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join("c.aff4l"))
+            .unwrap();
+        // the sizes of c were written: cut them back to the placeholder of a member never finished
+        let len = file.seek(SeekFrom::End(0)).unwrap();
+        file.set_len(len - 1000).unwrap();
+        assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end2));
+        assert_eq!(find_newest_end(&mut file, Some(end2)).unwrap(), Some(end2));
+        assert_eq!(find_newest_end(&mut file, None).unwrap(), Some(end2));
+        // a known end that is no end falls back to the search
+        assert_eq!(find_newest_end(&mut file, Some(end1 + 1)).unwrap(), Some(end2));
+        // c's sizes never written: the placeholder its header starts with
+        let at = end2 + 30 + 1 + 4;
+        file.seek(SeekFrom::Start(at)).unwrap();
+        std::io::Write::write_all(&mut file, &[0u8; 16]).unwrap();
+        assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end2));
     }
 
     #[test]
