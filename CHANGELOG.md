@@ -5,6 +5,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A container's file list shortens long paths in the middle, so the file name stays visible: files whose names
+  differ only at the end (`photo.png`, `photo.jpg`, `photo-1.png`) no longer look alike. A shortened path shows one
+  tooltip with the whole path, not two
+
 ## [2.7.0] - 2026-10-28
 
 ### Added
