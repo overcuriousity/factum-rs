@@ -1258,6 +1258,30 @@ mod script {
         Some((output.status.code().unwrap_or(-1), text))
     }
 
+    #[test]
+    fn verify_container_py_warns_on_replaced_copy() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let (id, recheck) = damaged(&s);
+        add_again(&s, id, &recheck);
+        s.f.factum().close_container(id).unwrap();
+        // unsigned (a fake key): the signature check fails, the content checks are what is looked at here
+        let Some((_, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert!(
+            output
+                .lines()
+                .any(|l| l.starts_with('⚠') && l.contains("replaced by a copy added again")),
+            "{output}"
+        );
+        assert!(
+            !output
+                .lines()
+                .any(|l| l.starts_with('✗') && l.contains("does not match")),
+            "{output}"
+        );
+    }
+
     /// A container signed with a real gpg key: two closes, one file stored as an ImageStream.
     fn signed_container(dir: &tempfile::TempDir, home: &common::GpgHome) -> PathBuf {
         let db = Db::open(&dir.path().join("factum.db")).unwrap();
@@ -1910,4 +1934,99 @@ fn close_with_missing_file_fails_cleanly() {
     assert!(s.f.factum().close_container(id).is_err());
     assert!(s.events("container_closed").is_empty());
     assert!(s.f.factum().container(id).unwrap().summary.open);
+}
+
+/// Damages the first file of a fresh container with two files; returns the container id and the re-check.
+fn damaged(s: &Setup) -> (i64, factum::container::volume::Recheck) {
+    let id = s.create();
+    s.add(id, &[s.file("a.txt"), s.file("d.txt")]);
+    damage_content(&s.container_path(), &first_arn(s, id));
+    let recheck = s.f.factum().recheck_container(id).unwrap();
+    assert_eq!(recheck.mismatches.len(), 1);
+    (id, recheck)
+}
+
+/// Adds the failed files again as `add_again_plan` says.
+fn add_again(s: &Setup, id: i64, recheck: &factum::container::volume::Recheck) -> i64 {
+    let factum = s.f.factum();
+    let mut entry = 0;
+    for (sources, options) in factum.add_again_plan(id, &recheck.mismatches).unwrap() {
+        let mut volume = factum.open_container_for_add(id).unwrap();
+        let staged = volume
+            .stage_add(&sources, &options, &AddProgress::default(), &AtomicBool::new(false))
+            .unwrap();
+        entry = factum.commit_container_add(id, &mut volume, staged).unwrap();
+    }
+    entry
+}
+
+#[test]
+fn damaged_close_logs_and_writes_nothing() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    let length = std::fs::metadata(s.container_path()).unwrap().len();
+    let factum = s.f.factum();
+    let entry = factum.close_container_damaged(id, &recheck.mismatches).unwrap();
+    let event = &s.events("container_closed")[0];
+    assert_eq!(event["damaged"], serde_json::json!([recheck.mismatches[0].path]));
+    assert!(event.get("signatures").is_none());
+    assert!(
+        s.entry_text(entry).contains("closed as damaged"),
+        "{}",
+        s.entry_text(entry)
+    );
+    assert_eq!(std::fs::metadata(s.container_path()).unwrap().len(), length);
+    let summary = &factum.list_containers(s.case_id).unwrap()[0];
+    assert!(summary.damaged && !summary.open && !summary.signed);
+    assert_eq!(factum.container(id).unwrap().damaged_closes.len(), 1);
+    let (signed, _) = factum.sign_unsigned_containers(s.case_id).unwrap();
+    assert_eq!(signed, 0);
+}
+
+#[test]
+fn reopen_after_damaged_close_rechecks_again() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    let factum = s.f.factum();
+    factum.close_container_damaged(id, &recheck.mismatches).unwrap();
+    factum.reopen_container(id).unwrap();
+    let input = factum.recheck_input(id).unwrap();
+    assert!(input.records.iter().any(|r| r.arn == recheck.mismatches[0].arn));
+}
+
+#[test]
+fn add_again_replaces_and_closes_signed() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    let factum = s.f.factum();
+    let plan = factum.add_again_plan(id, &recheck.mismatches).unwrap();
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].0, vec![s.file("a.txt")]);
+    assert_eq!(plan[0].1.base, s.source);
+    add_again(&s, id, &recheck);
+    let added = s.events("container_files_added");
+    assert_eq!(added[1]["replaces"][0]["arn"], recheck.mismatches[0].arn);
+    factum.close_container(id).unwrap();
+    let report = factum
+        .verify_container_file(
+            &s.container_path(),
+            &factum.gpgsm(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let codes: Vec<&str> = report.findings.iter().map(|f| f.code).collect();
+    assert_eq!(codes.iter().filter(|c| **c == "replaced_copy").count(), 1, "{codes:?}");
+    assert!(!codes.contains(&"stream_hash"), "{:?}", report.findings);
+    assert!(!codes.contains(&"log_mismatch"), "{:?}", report.findings);
+}
+
+#[test]
+fn add_again_needs_a_recorded_source() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    let mut unknown = recheck.mismatches.clone();
+    unknown[0].source = None;
+    let error = s.f.factum().add_again_plan(id, &unknown).unwrap_err();
+    assert!(error.to_string().contains("its source is not recorded"), "{error}");
 }

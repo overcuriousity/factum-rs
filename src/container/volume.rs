@@ -174,6 +174,8 @@ pub struct Staged {
     pub errors: Vec<(String, String)>,
     /// the mounts the sources lie on
     pub mounts: Vec<Mount>,
+    /// (ARN, ARN of its copy added again by this operation)
+    pub replaced: Vec<(String, String)>,
     graph: Graph,
     task_arn: String,
     base: PathBuf,
@@ -1113,10 +1115,20 @@ impl Volume {
                 }
             }
         }
+        let replaced = options
+            .replaces
+            .iter()
+            .filter_map(|(source, old)| {
+                let source = source.display().to_string();
+                let new = records.iter().find(|r| r.source.as_deref() == Some(source.as_str()))?;
+                Some((old.clone(), new.arn.clone()))
+            })
+            .collect();
         Ok(Staged {
             start,
             records,
             folders,
+            replaced,
             skipped,
             errors,
             graph,
@@ -1147,6 +1159,9 @@ impl Volume {
         graph.add(task, &aff4l("filesystemRoot"), plain(root));
         graph.add(task, &aff4l("pathSeparator"), plain(std::path::MAIN_SEPARATOR_STR));
         graph.add(task, &factum("logEntry"), typed(entry_id, "long"));
+        for (old, new) in &staged.replaced {
+            graph.add(old, &factum("replacedBy"), Term::Iri(new.clone()));
+        }
         let mount_arns: Vec<String> = staged.mounts.iter().map(|_| new_arn()).collect();
         // the task's triples first: the file lists them by subject, in the order subjects first appear
         for arn in &mount_arns {
