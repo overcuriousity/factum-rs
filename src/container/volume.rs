@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use serde_json::{Value, json};
 use sha2::Digest;
 
+use super::mounts::Mount;
 use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_bytes, read_meta, stored_path};
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
@@ -159,6 +160,8 @@ pub struct Staged {
     pub skipped: Vec<(String, String)>,
     /// (path, reason): files that could not be read or changed while they were read
     pub errors: Vec<(String, String)>,
+    /// the mounts the sources lie on
+    pub mounts: Vec<Mount>,
     graph: Graph,
     task_arn: String,
     base: PathBuf,
@@ -386,6 +389,38 @@ fn name_and_meta(graph: &mut Graph, arn: &str, name: &[u8], stored: &[u8], meta:
     }
     if let Some(mode) = meta.mode {
         graph.add(arn, &aff4l("fileMode"), typed(mode, "long"));
+    }
+}
+
+/// A mount as its own subject `arn`, and the FUSE mount behind it as another.
+fn mount_triples(graph: &mut Graph, arn: &str, mount: &Mount) {
+    graph.add(arn, &rdf_type(), Term::Iri(factum("Mount")));
+    if mount.is_unknown() {
+        graph.add(arn, &factum("unknown"), typed("true", "boolean"));
+    }
+    if !mount.mount_point.is_empty() {
+        graph.add(arn, &factum("mountPoint"), plain(&mount.mount_point));
+    }
+    for (property, value) in [
+        ("device", &mount.device),
+        ("fileSystem", &mount.fs_type),
+        ("mountOptions", &mount.options),
+        ("image", &mount.image),
+        ("volumeSerial", &mount.volume_serial),
+        ("volumeLabel", &mount.volume_label),
+        ("volumeGuid", &mount.volume_guid),
+    ] {
+        if let Some(value) = value {
+            graph.add(arn, &factum(property), plain(value));
+        }
+    }
+    if let Some(read_only) = mount.read_only {
+        graph.add(arn, &factum("readOnly"), typed(read_only, "boolean"));
+    }
+    if let Some(backing) = &mount.backing {
+        let backing_arn = new_arn();
+        graph.add(arn, &factum("backingMount"), Term::Iri(backing_arn.clone()));
+        mount_triples(graph, &backing_arn, backing);
     }
 }
 
@@ -821,6 +856,7 @@ impl Volume {
         progress.files.store(0, Ordering::Relaxed);
         progress.bytes.store(0, Ordering::Relaxed);
 
+        let mounts = crate::container::mounts::mounts_for(sources);
         let mark = self.mark();
         let start = mark.write_pos;
         let volume_arn = self.arn();
@@ -982,6 +1018,7 @@ impl Volume {
             skipped,
             errors,
             graph,
+            mounts,
             task_arn,
             base: options.base.clone(),
             keep_path: options.keep_path,
@@ -1008,6 +1045,14 @@ impl Volume {
         graph.add(task, &aff4l("filesystemRoot"), plain(root));
         graph.add(task, &aff4l("pathSeparator"), plain(std::path::MAIN_SEPARATOR_STR));
         graph.add(task, &factum("logEntry"), typed(entry_id, "long"));
+        let mount_arns: Vec<String> = staged.mounts.iter().map(|_| new_arn()).collect();
+        // the task's triples first: the file lists them by subject, in the order subjects first appear
+        for arn in &mount_arns {
+            graph.add(task, &factum("mount"), Term::Iri(arn.clone()));
+        }
+        for (arn, mount) in mount_arns.iter().zip(&staged.mounts) {
+            mount_triples(&mut graph, arn, mount);
+        }
         self.commit(graph, &[], &SIGNATURE_MEMBERS)
     }
 

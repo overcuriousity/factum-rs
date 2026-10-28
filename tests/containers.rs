@@ -1742,11 +1742,10 @@ fn add_without_base_from_two_folders() {
         let path = record["path"].as_str().unwrap();
         assert!(full.ends_with(path) && path.len() + 1 >= full.len(), "{path} vs {full}");
     }
-    let mut volume = factum.open_container_for_add(id).unwrap();
+    let volume = factum.open_container_for_add(id).unwrap();
     assert!(factum.compare_with_log(id, &volume).unwrap().is_empty());
     let records = factum::container::volume::file_records(volume.graph());
     assert!(records.iter().all(|r| r.source.is_some()));
-    drop(volume.archive());
 }
 
 #[test]
@@ -1780,4 +1779,27 @@ fn acquire_skips_the_container_itself() {
     );
     assert_eq!(staged.records.len(), 5);
     factum.commit_container_add(id, &mut volume, staged).unwrap();
+}
+
+#[test]
+fn add_logs_sources() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt"), s.file("b.txt")]);
+    let event = &s.events("container_files_added")[0];
+    let sources = event["sources"].as_array().expect("sources are logged");
+    assert!(!sources.is_empty());
+    let paths: Vec<&str> = sources
+        .iter()
+        .flat_map(|m| m["paths"].as_array().unwrap())
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&&*s.file("a.txt").display().to_string()));
+    assert!(paths.contains(&&*s.file("b.txt").display().to_string()));
+    let detail = s.f.factum().container(id).unwrap();
+    let logged: Vec<_> = sources
+        .iter()
+        .filter_map(factum::container::mounts::Mount::from_json)
+        .collect();
+    assert_eq!(detail.adds[0].mounts, logged);
 }

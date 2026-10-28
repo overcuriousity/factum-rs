@@ -2,6 +2,7 @@
 //! (and optionally X.509). This module reads and writes the container file; `crate::containers` ties it to the
 //! case log.
 
+pub mod mounts;
 pub mod source;
 pub mod stream;
 pub mod turtle;

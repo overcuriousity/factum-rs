@@ -72,6 +72,8 @@ pub struct AddEvent {
     pub utc: String,
     pub files: Vec<FileRecord>,
     pub folders: Vec<FolderRecord>,
+    /// the mounts the sources were read from (not recorded before 2.8)
+    pub mounts: Vec<crate::container::mounts::Mount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,11 +453,23 @@ impl Factum<'_> {
                         .and_then(Value::as_array)
                         .map(|folders| folders.iter().filter_map(FolderRecord::from_json).collect())
                         .unwrap_or_default();
+                    let mounts = event
+                        .payload
+                        .get("sources")
+                        .and_then(Value::as_array)
+                        .map(|mounts| {
+                            mounts
+                                .iter()
+                                .filter_map(crate::container::mounts::Mount::from_json)
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     detail.adds.push(AddEvent {
                         entry_id: event.entry_id,
                         utc: event.utc,
                         files,
                         folders,
+                        mounts,
                     });
                 }
                 "container_closed" if event.payload.get("file_missing") == Some(&Value::Bool(true)) => {
@@ -723,7 +737,8 @@ impl Factum<'_> {
         let payload = json!({"event": "container_files_added", "case_id": detail.summary.case_id,
                              "container_id": detail.summary.uuid, "files": files, "folders": folders,
                              "not_added": not_added, "added_utc": utc_now(),
-                             "base_path": staged.base().display().to_string(), "keep_path": staged.keep_path});
+                             "base_path": staged.base().display().to_string(), "keep_path": staged.keep_path,
+                             "sources": staged.mounts.iter().map(crate::container::mounts::Mount::to_json).collect::<Vec<_>>()});
         let mark = staged.mark();
         let result = {
             let cell = RefCell::new(&mut *volume);
