@@ -5,6 +5,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Markdown in notes: a toolbar above the note field and the correction dialog (bold, italic, code, link, heading,
+  list, quote); notes are shown formatted in the log and in HTML, Markdown and PDF reports, with a source toggle on
+  each note in the log
+- Images in notes: paste a screenshot (when the clipboard has no text), drop image files on the window or insert them
+  with Image…; thumbnails show what the note will be saved with. The images are part of the note's signed payload,
+  shown inline in the log and exported with the reports. Correcting a note keeps its images; `--correct` on the
+  command line keeps the ones the new text still refers to
+
 ## [2.6.0] - 2026-10-28
 
 ### Added

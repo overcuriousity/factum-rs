@@ -99,6 +99,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   behind its version chip (v2, v3, …). Tags, IOCs, labels and pins follow the newest version
 - `#tags` in the note text are covered by the signature; **labels** added by hand are not signed and look different.
   Typing a `#tag` and Add Label suggest the tags and labels in use, tolerating a typo
+- Notes are Markdown (toolbar in the note field; the log and the reports show it formatted, with a source toggle in the
+  log). Images can be pasted, dropped or inserted; they are signed with the note and shown inline and in the reports
 - Pin/unpin notes, filter by tag or label (substring match)
 - Entry IDs are never reused
 

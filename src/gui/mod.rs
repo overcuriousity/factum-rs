@@ -9,6 +9,7 @@ mod containers;
 mod dialogs;
 mod icons;
 mod markup_view;
+mod note_editor;
 mod tag_completion;
 mod theme;
 mod widgets;
@@ -215,6 +216,8 @@ struct FactumApp {
     /// the scrolled height of the pinned notes in the last frame, for splitting the side panel
     pinned_height: f32,
     composer: String,
+    /// the images pasted, dropped or inserted into the composer; saved with the note that refers to them
+    composer_images: Vec<NoteImage>,
     tag_completion: tag_completion::TagCompletion,
     view: View,
     dirty: bool,
@@ -326,6 +329,7 @@ impl FactumApp {
             questions_open: true,
             pinned_height: 0.0,
             composer: String::new(),
+            composer_images: Vec::new(),
             tag_completion: Default::default(),
             view: View::default(),
             dirty: true,
@@ -1594,9 +1598,12 @@ impl FactumApp {
         if text.is_empty() {
             return;
         }
-        let result = self.factum().create_note(&text, self.evidence_id, case.id);
+        let result = self
+            .factum()
+            .create_note_with_images(&text, &self.composer_images, self.evidence_id, case.id);
         if self.run(result).is_some() {
             self.composer.clear();
+            self.composer_images.clear();
         }
     }
 
@@ -1695,7 +1702,9 @@ impl FactumApp {
                     self.dialogs.push(Dialog::Correct {
                         entry_id: newest.id,
                         original: newest.text.clone(),
+                        images: newest.images(),
                         text: newest.text,
+                        error: None,
                     });
                 }
             }
@@ -1829,8 +1838,8 @@ impl FactumApp {
                 }
                 self.select(None, None);
             }
-            DialogResult::Correct { entry_id, text } => {
-                let result = self.factum().correct_note(entry_id, &text);
+            DialogResult::Correct { entry_id, text, images } => {
+                let result = self.factum().correct_note_with_images(entry_id, &text, &images);
                 self.run(result);
             }
             DialogResult::Export {
@@ -2764,14 +2773,24 @@ impl FactumApp {
                     });
             }
             Some(_) => {
-                let max_composer = (ui.available_height() - 120.0).max(MIN_COMPOSER_HEIGHT);
-                let composer = egui::Panel::bottom("composer-panel")
-                    .resizable(true)
-                    .default_size(self.composer_height.clamp(MIN_COMPOSER_HEIGHT, max_composer))
-                    .size_range(MIN_COMPOSER_HEIGHT..=max_composer)
-                    .frame(egui::Frame::new().inner_margin(Margin { top: 6, ..Margin::ZERO }))
-                    .show(ui, |ui| self.composer(ui, ctx));
-                self.composer_height = composer.response.rect.height();
+                // with thumbnails the panel is taller; it keeps a size of its own, and the saved height is without
+                let strip = if self.composer_images.is_empty() {
+                    0.0
+                } else {
+                    note_editor::THUMBNAIL_STRIP
+                };
+                let max_composer = (ui.available_height() - 120.0).max(MIN_COMPOSER_HEIGHT + strip);
+                let composer = egui::Panel::bottom(if strip > 0.0 {
+                    "composer-panel-images"
+                } else {
+                    "composer-panel"
+                })
+                .resizable(true)
+                .default_size((self.composer_height + strip).clamp(MIN_COMPOSER_HEIGHT + strip, max_composer))
+                .size_range(MIN_COMPOSER_HEIGHT + strip..=max_composer)
+                .frame(egui::Frame::new().inner_margin(Margin { top: 6, ..Margin::ZERO }))
+                .show(ui, |ui| self.composer(ui, ctx));
+                self.composer_height = composer.response.rect.height() - strip;
             }
         }
         let now = chrono::Utc::now();
@@ -2933,8 +2952,27 @@ impl FactumApp {
                 });
                 ui.add_space(6.0);
             });
-        // a longer note scrolls inside the frame, which keeps its place
         let id = egui::Id::unique("composer");
+        if !self.composer_images.is_empty() {
+            egui::Panel::bottom("composer-thumbnails")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.inner_margin(Margin { top: 6, ..Margin::ZERO }))
+                .show(ui, |ui| {
+                    note_editor::thumbnails(ui, &mut self.composer, &mut self.composer_images)
+                });
+        }
+        // run() marks the view for a rebuild: only for an error to show
+        let toolbar = note_editor::toolbar(ui, id, &mut self.composer, &mut self.composer_images);
+        let input = if self.dialogs.is_empty() {
+            note_editor::handle_input(ctx, id, &mut self.composer, &mut self.composer_images)
+        } else {
+            Ok(())
+        };
+        if toolbar.is_err() || input.is_err() {
+            self.run(toolbar.and(input));
+        }
+        // a longer note scrolls inside the frame, which keeps its place
         let stroke = if ui.memory(|m| m.has_focus(id)) {
             ui.visuals().selection.stroke
         } else {

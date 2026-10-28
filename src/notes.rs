@@ -205,8 +205,13 @@ impl Factum<'_> {
         )
     }
 
+    /// Text only: the images of the newest version stay for the references the new text still has.
     pub fn correct_note(&self, note_id: i64, new_text: &str) -> Result<i64> {
-        self.correct_note_with_images(note_id, new_text, &[])
+        let images = match self.get_entry(self.latest_version_id(note_id)?)? {
+            Some(newest) if newest.is_note() => newest.images(),
+            _ => Vec::new(), // refused below as not a note
+        };
+        self.correct_note_with_images(note_id, new_text, &images)
     }
 
     /// Images are not carried over from the corrected version: the correction holds the ones passed here.

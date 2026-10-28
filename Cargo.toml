@@ -23,7 +23,7 @@ path = "src/main.rs"
 [features]
 default = ["gui"]
 # the GUI can be left out for headless servers: cargo build --no-default-features
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:ureq", "dep:serde"]
+gui = ["dep:arboard", "dep:eframe", "dep:egui", "dep:rfd", "dep:ureq", "dep:serde"]
 
 [dependencies]
 base64 = "0.23"
@@ -49,6 +49,8 @@ uuid = { version = "1", features = ["v4"] }
 which = "8"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
+# the image on the clipboard, which egui does not hand over unchanged (it premultiplies the alpha)
+arboard = { version = "3", optional = true }
 eframe = { version = "0.37", optional = true, default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
 egui = { version = "0.37", optional = true }
 rfd = { version = "0.17", optional = true }

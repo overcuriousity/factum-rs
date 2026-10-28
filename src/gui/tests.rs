@@ -825,13 +825,8 @@ fn a_long_note_scrolls_inside_the_composer() {
     let height = harness.state().composer_height;
     assert!((height - DEFAULT_COMPOSER_HEIGHT).abs() < 1.0, "{height}");
     // dragging the panel's top edge up makes it taller
-    // the panel's top edge, just above the editor
-    let top = harness
-        .get_by_role(egui::accesskit::Role::MultilineTextInput)
-        .rect()
-        .min
-        .y
-        - 6.0;
+    // the panel's top edge, just above the toolbar
+    let top = harness.get_by_label("Bold").rect().min.y - 6.0;
     let pointer = |harness: &mut Harness<'_, FactumApp>, event: egui::Event| {
         harness.input_mut().events.push(event);
         harness.step();
@@ -2220,4 +2215,287 @@ fn an_image_that_does_not_decode_says_so_where_it_stands() {
             .query_by_label_contains(&format!("[image {} could not be shown]", image.id))
             .is_some()
     );
+}
+
+// ---- composer and correction dialog: Markdown toolbar, images
+
+fn composer_id() -> egui::Id {
+    egui::Id::unique("composer")
+}
+
+fn png(width: u32, height: u32) -> Vec<u8> {
+    test_image(width, height).bytes
+}
+
+/// A file dropped on the window, in memory.
+#[derive(Debug)]
+struct DroppedBytes {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl egui::DroppedFile for DroppedBytes {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn bytes(&self) -> std::result::Result<Vec<u8>, String> {
+        Ok(self.bytes.clone())
+    }
+}
+
+fn drop_file(harness: &mut Harness<'_, FactumApp>, name: &str, bytes: Vec<u8>) {
+    let file = DroppedBytes {
+        path: PathBuf::from("/nonexistent").join(name),
+        bytes,
+    };
+    harness.input_mut().dropped_files.push(Arc::new(file));
+    harness.run_ok();
+}
+
+fn paste_image(harness: &mut Harness<'_, FactumApp>) {
+    let pixels = egui::ColorImage::new([2, 2], vec![egui::Color32::from_rgb(10, 20, 30); 4]);
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PasteImage(Arc::new(pixels)));
+    harness.run_ok();
+}
+
+#[test]
+fn composer_saves_a_pasted_image() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let image = test_image(4, 4);
+    harness.state_mut().composer = format!("look: {}", image.reference("screenshot"));
+    harness.state_mut().composer_images = vec![image.clone()];
+    harness.state_mut().submit_note();
+    harness.run_ok();
+    assert!(harness.state().composer.is_empty());
+    assert!(harness.state().composer_images.is_empty());
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    let newest = *factum
+        .list_entries(case_id, &EntryFilter::notes())
+        .unwrap()
+        .last()
+        .unwrap();
+    let entry = factum.get_entry(newest).unwrap().unwrap();
+    assert_eq!(entry.images(), vec![image]);
+}
+
+#[test]
+fn a_note_that_fails_to_save_keeps_its_images() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let image = test_image(4, 4);
+    // the reference is to an image that is not attached
+    harness.state_mut().composer = image.reference("gone");
+    harness.state_mut().submit_note();
+    harness.run_ok();
+    assert!(!harness.state().composer.is_empty());
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+}
+
+#[test]
+fn correction_dialog_keeps_the_images() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(
+        &fixture,
+        &format!("see {}", image.reference("x")),
+        std::slice::from_ref(&image),
+    );
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+    match harness.state_mut().dialogs.last_mut() {
+        Some(Dialog::Correct { text, images, .. }) => {
+            assert_eq!(*images, vec![image.clone()]);
+            text.push_str(" and more");
+        }
+        _ => panic!("no correction dialog"),
+    }
+    harness.run_ok();
+    harness.get_by_label("Add corrected version").click();
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+    let factum = harness.state().factum();
+    let newest = factum
+        .get_entry(factum.latest_version_id(note).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_ne!(newest.id, note);
+    assert!(newest.text.ends_with(" and more"));
+    assert_eq!(newest.images(), vec![image]);
+}
+
+#[test]
+fn the_toolbar_formats_the_selection() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    type_into_composer(&mut harness, "hello world");
+    // "world" selected
+    let mut state = egui::TextEdit::load_state(&harness.ctx, composer_id()).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::new(egui::text::CharIndex(6)),
+        egui::text::CCursor::new(egui::text::CharIndex(11)),
+    )));
+    state.store(&harness.ctx, composer_id());
+    harness.run_ok();
+    harness.get_by_label("Bold").click();
+    harness.run_ok();
+    assert_eq!(harness.state().composer, "hello **world**");
+    // the editor keeps the focus and the inside is selected: typing replaces it
+    assert!(
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .is_focused()
+    );
+    harness.input_mut().events.push(egui::Event::Text("there".into()));
+    harness.run_ok();
+    assert_eq!(harness.state().composer, "hello **there**");
+    for name in ["Italic", "Code", "Link", "Heading", "List", "Quote", "Image…"] {
+        assert!(harness.query_by_label(name).is_some(), "{name}");
+    }
+}
+
+#[test]
+fn a_pasted_image_goes_into_the_focused_composer() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    type_into_composer(&mut harness, "see ");
+    paste_image(&mut harness);
+    let app = harness.state();
+    assert_eq!(app.composer_images.len(), 1);
+    assert_eq!(
+        app.composer,
+        format!("see {}", app.composer_images[0].reference("screenshot"))
+    );
+    // a second paste of the same pixels adds the reference, not the image
+    paste_image(&mut harness);
+    assert_eq!(harness.state().composer_images.len(), 1);
+    assert_eq!(images::referenced_ids(&harness.state().composer).len(), 1);
+    assert_eq!(harness.state().composer.matches("](factum-image:").count(), 2);
+    harness.get_by_label("Add").click();
+    harness.run_ok();
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    let newest = *factum
+        .list_entries(case_id, &EntryFilter::notes())
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(factum.get_entry(newest).unwrap().unwrap().images().len(), 1);
+}
+
+#[test]
+fn an_image_is_not_pasted_while_the_composer_is_not_focused() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    paste_image(&mut harness);
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+}
+
+#[test]
+fn a_dropped_image_goes_into_the_composer() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    drop_file(&mut harness, "login page.png", png(3, 3));
+    screenshot(&mut harness, "composer-image");
+    let app = harness.state();
+    assert_eq!(app.composer_images.len(), 1);
+    assert_eq!(app.composer_images[0].name.as_deref(), Some("login page.png"));
+    assert_eq!(app.composer, app.composer_images[0].reference("login page"));
+    // its thumbnail has a button that takes it out again, with its reference
+    harness.get_by_label("Remove image").click();
+    harness.run_ok();
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+    assert!(harness.query_by_label("Remove image").is_none());
+}
+
+#[test]
+fn a_dropped_file_that_is_no_image_is_reported() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    drop_file(&mut harness, "notes.png", b"not a picture".to_vec());
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+}
+
+#[test]
+fn images_are_added_to_a_correction_not_to_the_composer_behind_it() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "plain", &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+    drop_file(&mut harness, "a.png", png(3, 3));
+    screenshot(&mut harness, "correct-image");
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+    let Some(Dialog::Correct { text, images, .. }) = harness.state().dialogs.last() else {
+        panic!()
+    };
+    assert_eq!(images.len(), 1);
+    assert!(text.starts_with("plain") || text.contains("factum-image:"), "{text}");
+    // pasted into the correction's editor
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::MultilineTextInput,
+            &format!("Correct Note #{note}"),
+        )
+        .focus();
+    harness.run_ok();
+    paste_image(&mut harness);
+    let Some(Dialog::Correct { images, .. }) = harness.state().dialogs.last() else {
+        panic!()
+    };
+    assert_eq!(images.len(), 2);
+    harness.get_by_label("Add corrected version").click();
+    harness.run_ok();
+    let factum = harness.state().factum();
+    let newest = factum
+        .get_entry(factum.latest_version_id(note).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(newest.images().len(), 2);
+}
+
+#[test]
+fn thumbnails_sit_between_the_editor_and_the_buttons() {
+    let fixture = Fixture::new();
+    let height = format!("{MIN_COMPOSER_HEIGHT}");
+    fixture.db().set_setting(COMPOSER_HEIGHT_SETTING, &height).unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    drop_file(&mut harness, "a.png", png(120, 30));
+    harness.run_ok();
+    let editor = harness.get_by_role(egui::accesskit::Role::MultilineTextInput).rect();
+    let remove = harness.get_by_label("Remove image").rect();
+    let add = harness.get_by_label("Add").rect();
+    let bold = harness.get_by_label("Bold").rect();
+    assert!(bold.max.y <= editor.min.y, "{bold:?} {editor:?}");
+    assert!(editor.max.y <= remove.min.y + 4.0, "{editor:?} {remove:?}");
+    assert!(remove.max.y <= add.min.y, "{remove:?} {add:?}");
+    assert!(editor.height() >= 60.0, "{editor:?}");
+    // the panel with images has a size of its own; the saved height is without the strip
+    assert!((harness.state().composer_height - MIN_COMPOSER_HEIGHT).abs() < 1.0);
+    harness.get_by_label("Remove image").click();
+    harness.run_ok();
+    assert!((harness.state().composer_height - MIN_COMPOSER_HEIGHT).abs() < 1.0);
 }

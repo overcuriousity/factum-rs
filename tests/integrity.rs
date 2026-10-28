@@ -856,3 +856,27 @@ fn garbage_payload_still_lists_the_note() {
     assert!(factum.get_entry(id).unwrap().unwrap().images().is_empty());
     assert!(factum.list_entries(case_id, &Default::default()).unwrap().contains(&id));
 }
+
+#[test]
+fn a_text_only_correction_keeps_the_images_it_still_refers_to() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (kept, dropped) = (test_image(10), test_image(20));
+    let text = format!("a {} b {}", kept.reference("one"), dropped.reference("two"));
+    let first = factum
+        .create_note_with_images(&text, &[kept.clone(), dropped], None, case_id)
+        .unwrap();
+    // the newest version's images are the source, also when the correction starts from an older id
+    let second = factum
+        .correct_note(first, &format!("a {} b, fixed", kept.reference("one")))
+        .unwrap();
+    assert_eq!(factum.get_entry(second).unwrap().unwrap().images(), vec![kept.clone()]);
+    let third = factum
+        .correct_note(first, &format!("a {} b, fixed again", kept.reference("one")))
+        .unwrap();
+    assert_eq!(factum.get_entry(third).unwrap().unwrap().images(), vec![kept]);
+    factum.seal(case_id, "checkpoint").unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+}

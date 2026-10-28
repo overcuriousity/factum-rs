@@ -6,12 +6,14 @@ use egui::{Align, Id, Layout, RichText, TextEdit};
 
 use super::companion_dialogs::CompanionSettingsDialog;
 use super::icons;
+use super::note_editor;
 use super::theme::{self, MONO_SIZE, SMALL_SIZE};
 use super::widgets::{IconButton, actions_shown, remember_shown, visible_ui};
 use super::wizard::{SEAL_EXPLAINED, SEAL_FOLDER_EXPLAINED, Wizard, WizardChoices};
 use crate::companion::Settings;
 use crate::container::volume::AddOptions;
 use crate::container::x509::X509Cert;
+use crate::images::NoteImage;
 use crate::pystr::{head, splitlines, strip};
 use crate::signer::GpgKey;
 use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, SignatureCheck};
@@ -96,6 +98,9 @@ pub enum Dialog {
         entry_id: i64,
         original: String,
         text: String,
+        /// the images the correction is saved with: those of the version, and those added since
+        images: Vec<NoteImage>,
+        error: Option<String>,
     },
     Export {
         case_id: i64,
@@ -212,6 +217,7 @@ pub enum DialogResult {
     Correct {
         entry_id: i64,
         text: String,
+        images: Vec<NoteImage>,
     },
     Export {
         case_id: i64,
@@ -1171,25 +1177,38 @@ impl Dialog {
                 entry_id,
                 original,
                 text,
+                images,
+                error,
             } => {
                 let heading = title(ui, &format!("Correct Note #{entry_id}"));
                 note(
                     ui,
                     "The original stays in the log; the corrected text is added as a new, signed version.",
                 );
+                let editor = Id::unique("correct-editor");
+                if let Err(e) = note_editor::toolbar(ui, editor, text, images) {
+                    *error = Some(e.to_string());
+                }
+                if let Err(e) = note_editor::handle_input(ui.ctx(), editor, text, images) {
+                    *error = Some(e.to_string());
+                }
                 ui.add(
                     TextEdit::multiline(text)
+                        .id(editor)
                         .font(egui::FontId::proportional(theme::NOTE_SIZE))
                         .desired_rows(8)
                         .desired_width(f32::INFINITY),
                 )
                 .labelled_by(heading.id);
+                note_editor::thumbnails(ui, text, images);
+                error_line(ui, error);
                 let changed = !strip(text).is_empty() && strip(text) != strip(original);
                 let (ok, cancel) = buttons(ui, "Add corrected version", changed);
                 if ok && changed {
                     return Some(DialogResult::Correct {
                         entry_id: *entry_id,
                         text: strip(text).to_string(),
+                        images: images.clone(),
                     });
                 }
                 cancel.then_some(DialogResult::Cancel)
