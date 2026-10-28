@@ -363,7 +363,8 @@ mod tests {
         let at = |secs: u64, nanos: u32| std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos);
         assert_eq!(xsd_time(at(1_599_435_382, 0)), "2020-09-06T23:36:22Z");
         assert_eq!(xsd_time(at(1_599_435_382, 120_000_000)), "2020-09-06T23:36:22.12Z");
-        assert_eq!(xsd_time(at(1_599_435_382, 1)), "2020-09-06T23:36:22.000000001Z");
+        // 100 ns: the finest a Windows file time holds
+        assert_eq!(xsd_time(at(1_599_435_382, 100)), "2020-09-06T23:36:22.0000001Z");
     }
 
     #[test]

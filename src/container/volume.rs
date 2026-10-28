@@ -414,11 +414,51 @@ pub(crate) fn hashes_bytes(uuid: &str, turtle: &[u8]) -> Vec<u8> {
     turtle::write(&graph, &[("aff4", AFF4_NS)]).into_bytes()
 }
 
+/// Takes the writer's lock without blocking. On Windows a lock is mandatory: locking the file's bytes would stop
+/// every other handle, the verifier's and the view's included, from reading them. So one byte far beyond any
+/// content is locked there instead; it excludes another writer all the same.
+#[cfg(windows)]
+fn try_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    const LOCK_BYTE: u64 = i64::MAX as u64 - 1;
+    // SAFETY: OVERLAPPED is plain data, valid when zeroed; the handle stays open for the call
+    let locked = unsafe {
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        overlapped.Anonymous.Anonymous.Offset = LOCK_BYTE as u32;
+        overlapped.Anonymous.Anonymous.OffsetHigh = (LOCK_BYTE >> 32) as u32;
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Err(std::fs::TryLockError::WouldBlock)
+    } else {
+        Err(std::fs::TryLockError::Error(error))
+    }
+}
+
+#[cfg(not(windows))]
+fn try_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    file.try_lock()
+}
+
 /// Locks the file for this process. A lock held for a moment (a child process between fork and exec still shares
 /// the open file) is waited for, briefly.
 fn lock(file: &File) -> Result<()> {
     for attempt in 0..20 {
-        match file.try_lock() {
+        match try_lock(file) {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) if attempt < 19 => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
