@@ -217,6 +217,23 @@ def check_files(archive, graph, volume):
     checked = 0
     for arn in file_images(graph):
         name = display(graph, arn)
+        replaced_by = first_factum(graph, arn, "replacedBy")
+
+        def fail_or_replaced(message, name=name, arn=arn, replaced_by=replaced_by):
+            # a damaged copy that was added again (Add Again) is a known, logged fact: a warning, not a failure,
+            # but only when the replacement is a file of this state with the same hashes and size
+            same = (replaced_by in file_images(graph)
+                    and hashes_of(graph, replaced_by) == hashes_of(graph, arn)
+                    and first(graph, replaced_by, "size") == first(graph, arn, "size"))
+            if replaced_by and same:
+                warn("%s: the content does not match its hashes; replaced by a copy added again (%s)."
+                     % (name, display(graph, replaced_by)))
+            elif replaced_by:
+                fail("%s: the content does not match its hashes; replaced by a copy with different content (%s)."
+                     % (name, display(graph, replaced_by)))
+            else:
+                fail(message)
+
         if has_type(graph, arn, "ZipSegment"):
             blocks = zip_segment(archive, arn, volume)
         elif has_type(graph, arn, "ImageStream"):
@@ -224,7 +241,7 @@ def check_files(archive, graph, volume):
         elif first_factum(graph, arn, "metadataOnly") == "true" or first_factum(graph, arn, "symlinkTarget"):
             continue  # metadata only, or a link: nothing stored
         else:
-            fail("%s: no stored content, though it is neither metadata only nor a link." % name)
+            fail_or_replaced("%s: no stored content, though it is neither metadata only nor a link." % name)
             continue
         digests = {"MD5": hashlib.md5(), "SHA1": hashlib.sha1(), "SHA256": hashlib.sha256()}
         size = 0
@@ -237,16 +254,16 @@ def check_files(archive, graph, volume):
             warn("%s: not checked (%s)." % (name, e))
             continue
         except (KeyError, zlib.error, zipfile.BadZipFile, ValueError) as e:
-            fail("%s: its content cannot be read (%s)." % (name, e))
+            fail_or_replaced("%s: its content cannot be read (%s)." % (name, e))
             continue
         expected = hashes_of(graph, arn)
         compared = [a for a in digests if a in expected]
         bad = [a for a in compared if digests[a].hexdigest() != expected[a]]
         listed = first(graph, arn, "size")
         if bad:
-            fail("%s: the content does not match its %s." % (name, ", ".join(bad)))
+            fail_or_replaced("%s: the content does not match its %s." % (name, ", ".join(bad)))
         elif listed is not None and int(listed) != size:
-            fail("%s: %d bytes stored, %s listed." % (name, size, listed))
+            fail_or_replaced("%s: %d bytes stored, %s listed." % (name, size, listed))
         elif not compared:
             warn("%s: no hash to check it against." % name)
         else:

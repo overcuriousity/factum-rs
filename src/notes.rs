@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use crate::db::ensure_entry_case_open;
 use crate::error::{FactumError, Result};
+use crate::images::{self, NoteImage};
 use crate::log_service::{Append, KIND_NOTE};
 use crate::pystr::strip;
 use crate::services::Factum;
@@ -35,9 +36,21 @@ pub struct Entry {
     pub late_signature: Option<LateSignature>,
 }
 
+/// The columns [`Entry::from_row`] reads, in its order, with `$payload` in the place of the payload.
+macro_rules! entry_columns {
+    ($payload:literal) => {
+        concat!(
+            "id, case_id, leaf_index, kind, evidence_id, text, ",
+            $payload,
+            ", corrects_id, created_utc, leaf_hash, tree_size, root_hash, signature, is_pinned, format"
+        )
+    };
+}
+
 impl Entry {
-    pub const COLUMNS: &'static str = "id, case_id, leaf_index, kind, evidence_id, text, payload_json, corrects_id, \
-        created_utc, leaf_hash, tree_size, root_hash, signature, is_pinned, format";
+    pub const COLUMNS: &'static str = entry_columns!("payload_json");
+    /// [`Self::COLUMNS`] with `NULL` for the payload, which may hold megabytes of images.
+    const COLUMNS_WITHOUT_PAYLOAD: &'static str = entry_columns!("NULL");
 
     pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
         Ok(Self {
@@ -64,6 +77,11 @@ impl Entry {
     /// hashes it as it is and reports it.
     pub fn payload(&self) -> Value {
         parse_payload(self.payload_json.as_deref())
+    }
+
+    /// The images in the payload; none when the payload has none or is not the expected shape.
+    pub fn images(&self) -> Vec<NoteImage> {
+        images::from_payload(&self.payload())
     }
 
     pub fn is_note(&self) -> bool {
@@ -132,8 +150,40 @@ impl EntryFilter<'_> {
     }
 }
 
+/// The images the text refers to, in order of reference; unreferenced ones are dropped. Each is rebuilt from its
+/// bytes, so what is signed is checked like a new image: a stored payload (a correction carries one on) is
+/// untrusted, and its type, hash or size must not be signed again unchecked.
+fn referenced_images(text: &str, images: &[NoteImage]) -> Result<Vec<NoteImage>> {
+    images::referenced_ids(text)
+        .iter()
+        .map(|id| {
+            let image = images::find(images, id).ok_or_else(|| {
+                FactumError::general(format!("The note refers to image {id}, which is not attached."))
+            })?;
+            let checked = NoteImage::from_bytes(image.bytes.clone(), image.name.clone())?;
+            if checked.id != *id {
+                return Err(FactumError::general(format!(
+                    "Image {id} does not match its contents (they hash to {}); it cannot be saved.",
+                    checked.id
+                )));
+            }
+            Ok(checked)
+        })
+        .collect()
+}
+
 impl Factum<'_> {
     pub fn create_note(&self, note_text: &str, evidence_id: Option<i64>, case_id: i64) -> Result<i64> {
+        self.create_note_with_images(note_text, &[], evidence_id, case_id)
+    }
+
+    pub fn create_note_with_images(
+        &self,
+        note_text: &str,
+        images: &[NoteImage],
+        evidence_id: Option<i64>,
+        case_id: i64,
+    ) -> Result<i64> {
         if strip(note_text).is_empty() {
             return Err(FactumError::general("The note is empty."));
         }
@@ -164,18 +214,30 @@ impl Factum<'_> {
                 Some((_, None)) => {}
             }
         }
+        let kept = referenced_images(note_text, images)?;
         self.append(
             case_id,
             KIND_NOTE,
             note_text,
             Append {
                 evidence_id,
+                payload: images::to_payload(&kept),
                 ..Default::default()
             },
         )
     }
 
+    /// Text only: the images of the newest version stay for the references the new text still has.
     pub fn correct_note(&self, note_id: i64, new_text: &str) -> Result<i64> {
+        let images = match self.get_entry(self.latest_version_id(note_id)?)? {
+            Some(newest) if newest.is_note() => newest.images(),
+            _ => Vec::new(), // refused below as not a note
+        };
+        self.correct_note_with_images(note_id, new_text, &images)
+    }
+
+    /// Images are not carried over from the corrected version: the correction holds the ones passed here.
+    pub fn correct_note_with_images(&self, note_id: i64, new_text: &str, images: &[NoteImage]) -> Result<i64> {
         if strip(new_text).is_empty() {
             return Err(FactumError::general("The corrected note is empty."));
         }
@@ -187,6 +249,7 @@ impl Factum<'_> {
                 )));
             }
         };
+        let kept = referenced_images(new_text, images)?;
         // versions never branch: a correction always attaches to the newest version of the line
         let newest = self.latest_version_id(note_id)?;
         // the pin and the labels follow the newest version
@@ -205,6 +268,7 @@ impl Factum<'_> {
             new_text,
             Append {
                 evidence_id: entry.evidence_id,
+                payload: images::to_payload(&kept),
                 corrects_id: Some(newest),
                 on_commit: Some(&move_pin_and_labels),
                 ..Default::default()
@@ -213,10 +277,20 @@ impl Factum<'_> {
     }
 
     pub fn get_entry(&self, entry_id: i64) -> Result<Option<Entry>> {
+        self.read_entry(entry_id, Entry::COLUMNS)
+    }
+
+    /// [`Self::get_entry`] with `payload_json` left out (`None`), for views that show the text: a note's payload
+    /// may hold megabytes of images.
+    pub fn get_entry_without_payload(&self, entry_id: i64) -> Result<Option<Entry>> {
+        self.read_entry(entry_id, Entry::COLUMNS_WITHOUT_PAYLOAD)
+    }
+
+    fn read_entry(&self, entry_id: i64, columns: &str) -> Result<Option<Entry>> {
         let conn = &self.db.conn;
         let entry = conn
             .query_row(
-                &format!("SELECT {} FROM entries WHERE id = ?", Entry::COLUMNS),
+                &format!("SELECT {columns} FROM entries WHERE id = ?"),
                 [entry_id],
                 Entry::from_row,
             )

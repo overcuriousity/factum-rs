@@ -87,18 +87,48 @@ pub fn add_status(progress: &AddProgress, name: &str) -> String {
     )
 }
 
+/// The status bar while a close re-checks the container.
+pub fn recheck_status(progress: &AddProgress, name: &str) -> String {
+    add_status(progress, name).replacen("Adding to", "Re-checking", 1)
+}
+
 /// An xsd:dateTime as the view shows it: 2026-10-27 21:10:04 UTC.
 pub fn short_time(xsd: &str) -> String {
     let seconds = xsd.trim_end_matches('Z').split('.').next().unwrap_or(xsd);
     format!("{} UTC", seconds.replace('T', " "))
 }
 
-/// The tree row's text: the name, and that it is open.
-pub fn tree_label(summary: &ContainerSummary) -> String {
-    if summary.open {
-        format!("{} · open", summary.name)
-    } else {
-        summary.name.clone()
+/// A container's state in a word or three: open, closed · signed, closed · damaged, file missing.
+pub fn state_text(summary: &ContainerSummary) -> &'static str {
+    match summary {
+        s if s.missing && s.open => "file missing",
+        s if s.open => "open",
+        s if s.damaged => "closed · damaged",
+        s if s.signed => "closed · signed",
+        _ => "closed · unsigned",
+    }
+}
+
+/// The hover text of the container symbol on an evidence row.
+pub fn symbol_hover(summaries: &[&ContainerSummary]) -> String {
+    match summaries {
+        [one] => format!("Container · {}", state_text(one)),
+        many => {
+            let open = many.iter().filter(|s| s.open).count();
+            format!("{} containers · {open} open", many.len())
+        }
+    }
+}
+
+/// The hover text of a row of its own (a container without a live evidence item): its file, and why it has a row.
+pub fn row_hover(summary: &ContainerSummary, evidence_deleted: bool) -> String {
+    let file = match &summary.path {
+        Some(path) if !summary.missing => path.display().to_string(),
+        _ => "File missing — Locate…".to_string(),
+    };
+    match summary.evidence_id {
+        Some(id) if evidence_deleted => format!("{file}\nEvidence #{id} (deleted)"),
+        _ => file,
     }
 }
 
@@ -146,32 +176,31 @@ fn history_row(ui: &mut egui::Ui, utc: &str, entry_id: i64, text: &str, actions:
     });
 }
 
-/// The view of one container, in place of the log: what it is, what happened to it, its files.
-pub fn container_view(
+/// One container below its evidence's notes: what it is, what happened to it, its files.
+pub fn container_section(
     ui: &mut egui::Ui,
     detail: &ContainerDetail,
     times: &std::collections::HashMap<String, String>,
-    evidence: Option<&str>,
     (archived, busy): (bool, bool),
     actions: &mut Vec<ContainerAction>,
 ) {
     let p = *theme::current(ui.ctx());
     let summary = &detail.summary;
-    ui.add_space(8.0);
+    ui.add_space(16.0);
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(&summary.name)
-                .family(theme::bold())
-                .size(16.0)
-                .color(p.text),
-        );
-        ui.label(small(if summary.open { "open" } else { "closed" }, p.muted));
+        let color = if summary.open { p.accent } else { p.muted };
+        ui.label(RichText::new(icons::CONTAINER).size(theme::ICON_SIZE).color(color));
+        ui.label(RichText::new(&summary.name).family(theme::bold()).color(p.text));
+        ui.label(small(
+            format!("{} · {}", detail.file_name, state_text(summary)),
+            p.muted,
+        ));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             IconButton::new(icons::MORE, "Container actions").menu(ui, |ui| menu(ui, summary, archived, busy, actions));
         });
     });
-    ui.add_space(4.0);
-    egui::Grid::new("container-facts")
+    ui.separator();
+    egui::Grid::new(("container-facts", summary.id))
         .num_columns(2)
         .spacing([12.0, 2.0])
         .show(ui, |ui| {
@@ -203,13 +232,13 @@ pub fn container_view(
                 }
             });
             ui.end_row();
-            if let Some(evidence) = evidence {
-                ui.label(small("Evidence", p.muted));
-                ui.label(small(evidence, p.secondary));
-                ui.end_row();
-            }
             ui.label(small("Base path", p.muted));
-            ui.add(egui::Label::new(small(&detail.base_path, p.secondary)).truncate());
+            let base = if detail.base_path.is_empty() {
+                "full paths"
+            } else {
+                detail.base_path.as_str()
+            };
+            ui.add(egui::Label::new(small(base, p.secondary)).truncate());
             ui.end_row();
         });
 
@@ -220,11 +249,14 @@ pub fn container_view(
         let bytes: u64 = add.files.iter().filter(|f| !f.metadata_only).map(|f| f.size).sum();
         let count = add.files.len();
         let files = format!("{count} file{}", if count == 1 { "" } else { "s" });
-        history.push((
-            add.entry_id,
-            add.utc.clone(),
-            format!("{files} added ({})", human_size(bytes)),
-        ));
+        let mut text = format!("{files} added ({})", human_size(bytes));
+        if !add.replaces.is_empty() {
+            text += &format!(" · {} added again", add.replaces.len());
+        }
+        for mount in &add.mounts {
+            text += &format!("\n{}", crate::container::mounts::mount_line(mount));
+        }
+        history.push((add.entry_id, add.utc.clone(), text));
     }
     for close in &detail.closes {
         let signed = if close.is_signed() { "signed" } else { "unsigned" };
@@ -232,6 +264,13 @@ pub fn container_view(
     }
     for (entry_id, utc) in &detail.closed_without_file {
         history.push((*entry_id, utc.clone(), "closed without its file (missing)".into()));
+    }
+    for (entry_id, utc, paths) in &detail.damaged_closes {
+        history.push((
+            *entry_id,
+            utc.clone(),
+            format!("closed as damaged · {} not matching", plural(paths.len(), "file")),
+        ));
     }
     for (entry_id, utc) in &detail.reopens {
         history.push((*entry_id, utc.clone(), "reopened".into()));
@@ -260,9 +299,11 @@ pub fn container_view(
         return;
     }
     let row_height = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+    // a long file list scrolls on its own, so the next container and the notes stay reachable
     egui::ScrollArea::vertical()
-        .id_salt("container-files")
-        .auto_shrink([false, false])
+        .id_salt(("container-files", summary.id))
+        .max_height(row_height * 12.0)
+        .auto_shrink([false, true])
         .show_rows(ui, row_height, files.len(), |ui, range| {
             let width = ui.available_width();
             for file in &files[range] {

@@ -209,6 +209,15 @@ impl Factum<'_> {
         };
         let not_empty =
             || FactumError::evidence_not_empty(format!("Evidence #{evidence_id} has notes and cannot be deleted."));
+        if self
+            .list_containers(evidence.case_id)?
+            .iter()
+            .any(|c| c.evidence_id == Some(evidence_id))
+        {
+            return Err(FactumError::evidence_not_empty(format!(
+                "Evidence #{evidence_id} has containers and cannot be deleted."
+            )));
+        }
         if self.has_entries(evidence_id)? {
             return Err(not_empty());
         }

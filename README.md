@@ -99,6 +99,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   behind its version chip (v2, v3, …). Tags, IOCs, labels and pins follow the newest version
 - `#tags` in the note text are covered by the signature; **labels** added by hand are not signed and look different.
   Typing a `#tag` and Add Label suggest the tags and labels in use, tolerating a typo
+- Notes are Markdown (toolbar in the note field; the log and the reports show it formatted, with a source toggle in the
+  log). Images can be pasted, dropped or inserted; they are signed with the note and shown inline and in the reports
 - Pin/unpin notes, filter by tag or label (substring match)
 - Entry IDs are never reused
 
@@ -138,14 +140,29 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   file (`.aff4l`, ZIP64 inside) holding the files with their original path, timestamps, size, Unix mode and MD5,
   SHA-1 and SHA-256, like an X-Ways evidence file container but in an open format. Files and folders come from a
   mounted image or an export folder; links are recorded, not followed; devices and FIFOs are skipped
-- **Case → New Container…** creates one (optionally from an evidence item); its ⋯ menu or right-click in the case list
-  has **Add Files…**, **Add Folder…**, **Close Container**, **Reopen Container**, **Verify Container…**, **Locate…**
-  and **Show in Folder**; **Close Without File…** closes an open container whose file is lost (the log records it;
-  nothing is signed), so its case can still be archived. Adding asks for the base path (removed from the stored paths), whether to keep the path,
-  metadata only (hashed, not stored), and an excerpt (a byte range) for a single file. Progress and Cancel show in the
-  status bar; a cancelled or failed addition adds nothing
+- A container is evidence: it belongs to an evidence item, which can hold several. In the case list such an item
+  shows a container symbol (blue while a container is open); selecting it shows its notes and, below them, each
+  container with its file, history and files
+- **New Container…** on a case (Case menu, or right-click) creates a new evidence item with a container; on an
+  evidence item (right-click) it adds a container to it. **Acquire** (optional) copies a folder in right away, e.g.
+  a disk image mounted read-only with xmount: one step from mount to container. Left empty, the container waits for
+  files
+- Each container's ⋯ menu has **Add Files…**, **Add Folder…**, **Close Container**, **Reopen Container**,
+  **Verify Container…**, **Locate…** and **Show in Folder**; **Close Without File…** closes an open container whose
+  file is lost (the log records it; nothing is signed), so its case can still be archived. Adding asks for the base
+  path (removed from the stored paths; empty keeps the full original path, with the drive on Windows, so files from
+  anywhere can go into one container), whether to keep the path, metadata only (hashed, not stored), and an excerpt
+  (a byte range) for a single file. Progress and Cancel show in the status bar; a cancelled or failed addition adds
+  nothing
+- Every addition records where its files were read from: the mount (device, file system, options and, for a loop or
+  xmount mount, the image behind it) on Linux, the volume (file system, serial, label, GUID) on Windows, and each
+  file's original absolute path
 - Every creation, addition (one entry per operation, listing every file with its hashes, and what could not be added
   and why), close, reopen and late signature is a **signed entry in the case log**. Archiving a case asks to close its open containers first
+- **Closing re-checks first**: everything added since the last close is read back from the container file and
+  compared with its hashes (on Linux past the page cache, from the disk). If something does not match, a dialog
+  offers **Add Again** (copy the files again from their sources; the damaged copies stay, marked as replaced),
+  **Close as Damaged** (logged with the failed files, not signed) or **Cancel**
 - **Closing signs the container**: a GPG signature over `information.turtle`, which lists every file's hashes, plus an
   X.509 (CMS) signature when **Settings → X.509 Certificate…** names a gpgsm certificate (the setup wizard offers it
   too). Without a key the container can be closed unsigned and signed later (**Sign All Unsigned**)
@@ -157,11 +174,19 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   tools get the AFF4-L v1.0 checks; older AFF4 formats are reported as unsupported
 - Recipients without factum run the script the container carries: extract `verify_container.py` and run
   `python3 verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
-  `gpg` and `openssl` for the signatures)
+  `gpg` and `openssl` for the signatures). The container's `factum/README.txt` names the script's SHA-256 and the
+  same script on GitHub for that version, to compare before running it
+- `samples/container/` holds a signed sample container with throwaway TEST ONLY keys, for checking other AFF4-L
+  tools against factum's GPG and X.509 signatures
 - Reports list each container with its files; the verification bundle carries the log entries, not the container
 - Limits: AFF4-L v1.0 is still a pre-release standard without signed reference images, so other tools may not yet
   accept factum's X.509 signature; pyaff4 (the reference implementation) does not read AFF4-L v1.0 yet; metadata-only
-  files may look like broken files to tools that expect content for every file
+  files may look like broken files to tools that expect content for every file. An evidence item with containers
+  cannot be deleted
+- **Known limitations on Windows**: the re-check at close reads through the Windows file cache, so it may not detect
+  a bad write to the disk (the close entry records `uncached: false`). factum does not prevent the last-access time
+  of sources on a writable volume from being updated; the Add dialog says so. Add from a read-only mounted image or
+  behind a write blocker
 
 ### Setup wizard
 - On the first start with a new database, a wizard walks through the signing key, the companion (optional, with its

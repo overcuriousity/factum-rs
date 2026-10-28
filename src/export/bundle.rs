@@ -1,5 +1,6 @@
 //! The verification bundle: a self-contained ZIP that anyone can verify without factum (verify.py).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,7 @@ hash to compare with the manifest.
   `late-seal-<id>.asc`
 - `public-keys.asc` — public keys of all signers
 - `report.html`, `report.pdf`, `report.md` — readable reports
+- `images/` — images of notes, named by their SHA-256 (also in `case.json`)
 - `MANIFEST.sha256` (+ `.asc`) — SHA-256 of every file above, detached-signed
 
 ## Format (version 1)
@@ -163,7 +165,14 @@ impl Factum<'_> {
         Ok((data, signatures))
     }
 
-    pub fn build_bundle(&self, model: &ReportModel, reports: &[(&str, Vec<u8>)], out_path: &Path) -> Result<PathBuf> {
+    /// `images` are `(file name, bytes)` as `markdown::image_files` returns them; they go under `images/`.
+    pub fn build_bundle(
+        &self,
+        model: &ReportModel,
+        reports: &[(&str, Vec<u8>)],
+        images: &[(String, &[u8])],
+        out_path: &Path,
+    ) -> Result<PathBuf> {
         let (data, signatures) = self.case_data(model)?;
         let mut fingerprints: Vec<String> = model
             .report
@@ -173,19 +182,23 @@ impl Factum<'_> {
             .collect();
         fingerprints.sort();
         fingerprints.dedup();
-        let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        files.insert("README.md".into(), BUNDLE_README.as_bytes().to_vec());
-        files.insert("verify.py".into(), VERIFY_PY.to_vec());
-        files.insert("case.json".into(), pretty_json(&data).into_bytes());
+        // borrowed where the content exists already: reports and images can be large
+        let mut files: BTreeMap<String, Cow<[u8]>> = BTreeMap::new();
+        files.insert("README.md".into(), Cow::Borrowed(BUNDLE_README.as_bytes()));
+        files.insert("verify.py".into(), Cow::Borrowed(VERIFY_PY));
+        files.insert("case.json".into(), Cow::Owned(pretty_json(&data).into_bytes()));
         files.insert(
             "public-keys.asc".into(),
-            self.signer.export_public_keys(&fingerprints).into_bytes(),
+            Cow::Owned(self.signer.export_public_keys(&fingerprints).into_bytes()),
         );
         for (name, content) in reports {
-            files.insert(name.to_string(), content.clone());
+            files.insert(name.to_string(), Cow::Borrowed(content));
+        }
+        for (name, content) in images {
+            files.insert(format!("images/{name}"), Cow::Borrowed(content));
         }
         for (name, text) in signatures {
-            files.insert(name, text.into_bytes());
+            files.insert(name, Cow::Owned(text.into_bytes()));
         }
         let manifest: String = files
             .iter()

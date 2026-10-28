@@ -52,6 +52,12 @@ jobs:
       - run: cargo test --locked
       - name: Test without the GUI
         run: cargo test --locked --no-default-features
+      - name: Sample container verifies with the bundled script
+        if: runner.os == 'Linux'
+        run: |
+          dir=$(mktemp -d)
+          unzip -q -j samples/container/sample.aff4l verify_container.py -d "$dir"
+          python3 -I "$dir/verify_container.py" samples/container/sample.aff4l --ca samples/container/root.pem --use-carried-key
 
   msrv:
     name: Minimum supported Rust version

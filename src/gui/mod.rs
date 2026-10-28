@@ -8,6 +8,8 @@ mod companion_windows;
 mod containers;
 mod dialogs;
 mod icons;
+mod markup_view;
+mod note_editor;
 mod tag_completion;
 mod theme;
 mod widgets;
@@ -29,6 +31,8 @@ use crate::companion::{CompanionDb, Settings, companion_db_path};
 use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
+use crate::images::{self, NoteImage};
+use crate::markup;
 use crate::notes::{Entry, EntryFilter};
 use crate::pystr::{strip, tail};
 use crate::seals::{REASON_CHECKPOINT, SEAL_DIR_SETTING};
@@ -154,10 +158,10 @@ struct View {
     case_status: Option<CaseStatus>,
     /// the Questions section: present while the companion is configured and a case is selected
     companion: Option<CompanionView>,
-    /// the selected container, shown in place of the log
-    container: Option<crate::containers::ContainerDetail>,
-    /// its files' last-written times, by ARN, from the container file
-    container_times: HashMap<String, String>,
+    /// the containers below the notes: the selected evidence's, or the one selected on its own (a row of its own)
+    containers: Vec<std::rc::Rc<crate::containers::ContainerDetail>>,
+    /// their files' last-written times, by container id, then by ARN, from the container files
+    container_times: HashMap<i64, HashMap<String, String>>,
 }
 
 /// A container file's times as last read: (file, its length then, last-written time by ARN).
@@ -170,6 +174,17 @@ struct AddJob {
     worker: workers::Worker<workers::AddResult>,
     progress: Arc<crate::container::volume::AddProgress>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A close re-checking what was added to its container, on a worker thread.
+struct CloseJob {
+    container_id: i64,
+    name: String,
+    worker: workers::Worker<workers::RecheckResult>,
+    progress: Arc<crate::container::volume::AddProgress>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Close and Archive: the case to archive once its containers are closed
+    then_archive: Option<i64>,
 }
 
 /// A container file being verified.
@@ -213,11 +228,15 @@ struct FactumApp {
     /// the scrolled height of the pinned notes in the last frame, for splitting the side panel
     pinned_height: f32,
     composer: String,
+    /// the images pasted, dropped or inserted into the composer; saved with the note that refers to them
+    composer_images: Vec<NoteImage>,
     tag_completion: tag_completion::TagCompletion,
     view: View,
     dirty: bool,
     focused_card: Option<i64>,
     history_open: HashSet<i64>,
+    /// the image shown full size: its entry and the image; one at a time
+    image_viewer: Option<(i64, NoteImage)>,
     scroll_to: Option<i64>,
     // signature checks of the entries shown, for this session: a card shows ✓ only after its check
     signature_checks: HashMap<i64, SignatureCheck>,
@@ -225,8 +244,19 @@ struct FactumApp {
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
     add_job: Option<AddJob>,
-    /// the selected container's file times: (file, its logged end (else its length) when read, times)
-    container_times_cache: std::cell::RefCell<Option<TimesCache>>,
+    /// a close re-checking its container, on a worker thread
+    close_job: Option<CloseJob>,
+    /// Add Again: the additions still to run, then the container to close (and the case to archive after it)
+    pending_adds: std::collections::VecDeque<(Vec<PathBuf>, crate::container::volume::AddOptions)>,
+    close_after_adds: Option<(i64, Option<i64>)>,
+    /// the shown containers' file times: (file, its logged end (else its length) when read, times), by container id
+    container_times_cache: std::cell::RefCell<HashMap<i64, TimesCache>>,
+    /// the shown containers as the log describes them, by id, with the id of the newest event they include: read
+    /// again only when there is a newer one (a container's file list can be long)
+    container_details: std::cell::RefCell<HashMap<i64, (i64, std::rc::Rc<crate::containers::ContainerDetail>)>>,
+    /// the decoded images of the note entries shown, by entry id: entries never change, so a rebuild (every
+    /// keystroke in the search, every action) does not parse and decode them again
+    note_images: std::cell::RefCell<HashMap<i64, Arc<[NoteImage]>>>,
     container_verify_job: Option<ContainerVerifyJob>,
     container_verify_windows: Vec<containers::ContainerVerifyWindow>,
     /// each case's last verification in this session: outcome, time and the tree size it covered
@@ -322,18 +352,25 @@ impl FactumApp {
             questions_open: true,
             pinned_height: 0.0,
             composer: String::new(),
+            composer_images: Vec::new(),
             tag_completion: Default::default(),
             view: View::default(),
             dirty: true,
             focused_card: None,
             history_open: HashSet::new(),
+            image_viewer: None,
             scroll_to: None,
             signature_checks: HashMap::new(),
             signature_worker: None,
             signature_check_pending: false,
             verify_job: None,
             add_job: None,
-            container_times_cache: std::cell::RefCell::new(None),
+            close_job: None,
+            pending_adds: std::collections::VecDeque::new(),
+            close_after_adds: None,
+            container_times_cache: std::cell::RefCell::new(HashMap::new()),
+            container_details: std::cell::RefCell::new(HashMap::new()),
+            note_images: Default::default(),
             container_verify_job: None,
             container_verify_windows: Vec::new(),
             verified: HashMap::new(),
@@ -571,6 +608,14 @@ impl FactumApp {
             Ok(view) => self.view = view,
             Err(e) => log::error!("Failed to populate the window: {e}"),
         }
+        let shown: HashSet<i64> = self
+            .view
+            .items
+            .iter()
+            .map(|item| item.entry().id)
+            .chain(self.view.pinned.iter().map(|card| card.entry.id))
+            .collect();
+        self.note_images.borrow_mut().retain(|id, _| shown.contains(id));
         self.reload_history();
         self.notify_companion();
         self.check_shown_signatures(ctx);
@@ -617,6 +662,19 @@ impl FactumApp {
         }
     }
 
+    /// The note's images, decoded once per entry: the view reads its entries without the payload.
+    fn card_images(&self, factum: &Factum, entry_id: i64) -> Result<Arc<[NoteImage]>> {
+        if let Some(images) = self.note_images.borrow().get(&entry_id) {
+            return Ok(images.clone());
+        }
+        let images: Arc<[NoteImage]> = match factum.get_entry(entry_id)? {
+            Some(entry) => entry.images().into(),
+            None => Arc::from([]),
+        };
+        self.note_images.borrow_mut().insert(entry_id, images.clone());
+        Ok(images)
+    }
+
     fn card(&self, factum: &Factum, entry: Entry, case: &Case) -> Result<Card> {
         let evidence = match entry.evidence_id {
             Some(id) => factum.get_evidence(id)?,
@@ -625,11 +683,14 @@ impl FactumApp {
         let mut history = Vec::new();
         let versions = factum.history(entry.id)?;
         for id in &versions[..versions.len() - 1] {
-            if let Some(old) = factum.get_entry(*id)? {
+            if let Some(old) = factum.get_entry_without_payload(*id)? {
                 history.push(old);
             }
         }
+        let blocks: Arc<[markup::Block]> = markup::parse(&entry.text).into();
         Ok(Card {
+            plain: markup::blocks_to_plain(&blocks),
+            blocks,
             tags: crate::tags::get_tags_for_entry(&self.db.conn, entry.id)?,
             history,
             // the card names its evidence only when the view does not already say it
@@ -637,6 +698,7 @@ impl FactumApp {
                 .filter(|e| Some(e.id) != self.evidence_id)
                 .map(|e| e.description),
             archived: case.is_archived(),
+            images: self.card_images(factum, entry.id)?,
             entry,
         })
     }
@@ -692,7 +754,7 @@ impl FactumApp {
                 pinned_only: false,
                 search: search.as_deref(),
             };
-            // a selected container is shown in place of the log
+            // a container selected on its own (no live evidence item) has no notes
             let entry_ids = if self.container_id.is_some() {
                 Vec::new()
             } else {
@@ -709,7 +771,7 @@ impl FactumApp {
             }
             for entry_id in entry_ids.iter().rev() {
                 // newest first
-                let Some(entry) = factum.get_entry(*entry_id)? else {
+                let Some(entry) = factum.get_entry_without_payload(*entry_id)? else {
                     continue;
                 };
                 view.items.push(if entry.is_note() {
@@ -749,7 +811,7 @@ impl FactumApp {
                 },
             )?;
             for entry_id in pinned_ids.iter().rev() {
-                if let Some(entry) = factum.get_entry(*entry_id)? {
+                if let Some(entry) = factum.get_entry_without_payload(*entry_id)? {
                     view.pinned.push(self.card(&factum, entry, &case)?);
                 }
             }
@@ -759,7 +821,9 @@ impl FactumApp {
             // the newest entry is never a superseded one; its tree size counts every entry, earlier versions too
             let newest = factum.list_entries(case.id, &EntryFilter::default())?.into_iter().max();
             let entries = match newest {
-                Some(id) => factum.get_entry(id)?.map_or(0, |entry| entry.tree_size as usize),
+                Some(id) => factum
+                    .get_entry_without_payload(id)?
+                    .map_or(0, |entry| entry.tree_size as usize),
                 None => 0,
             };
             view.case_status = Some(CaseStatus {
@@ -799,20 +863,58 @@ impl FactumApp {
                 None => case.case_name,
             };
         }
-        view.container = match self.container_id {
-            Some(id) => factum
-                .container(id)
-                .inspect_err(|e| log::error!("Container #{id} cannot be read: {e}"))
-                .ok(),
-            None => None,
+        let selected_case = view.case.as_ref().map(|c| c.id);
+        let summaries = match selected_case {
+            Some(case_id) => factum.list_containers(case_id)?,
+            None => Vec::new(),
         };
+        let shown: Vec<&crate::containers::ContainerSummary> = summaries
+            .iter()
+            .filter(|c| match (self.container_id, self.evidence_id) {
+                (Some(id), _) => c.id == id,
+                (None, Some(evidence_id)) => c.evidence_id == Some(evidence_id),
+                _ => false,
+            })
+            .collect();
+        let mut details = self.container_details.borrow_mut();
+        details.retain(|id, _| shown.iter().any(|c| c.id == *id));
+        view.containers = shown
+            .into_iter()
+            .filter_map(|summary| {
+                let detail = match details.get(&summary.id) {
+                    Some((key, detail)) if *key == summary.last_event => detail.clone(),
+                    _ => {
+                        let detail = std::rc::Rc::new(
+                            factum
+                                .container(summary.id)
+                                .inspect_err(|e| log::error!("Container #{} cannot be read: {e}", summary.id))
+                                .ok()?,
+                        );
+                        details.insert(summary.id, (summary.last_event, detail.clone()));
+                        detail
+                    }
+                };
+                // the file can go missing or come back without a log entry
+                Some(if detail.summary == *summary {
+                    detail
+                } else {
+                    let mut fresh = (*detail).clone();
+                    fresh.summary = summary.clone();
+                    std::rc::Rc::new(fresh)
+                })
+            })
+            .collect();
+        drop(details);
         view.container_times = view
-            .container
-            .as_ref()
+            .containers
+            .iter()
             .filter(|detail| !detail.summary.missing)
-            .and_then(|detail| Some((detail.summary.path.clone()?, detail)))
-            .map(|(path, detail)| self.container_times(&path, &detail.summary.uuid, detail.summary.id))
-            .unwrap_or_default();
+            .filter_map(|detail| Some((detail.summary.path.clone()?, detail)))
+            .map(|(path, detail)| {
+                let times = self.container_times(&path, &detail.summary.uuid, detail.summary.id);
+                (detail.summary.id, times)
+            })
+            .collect();
         view.companion = match (&self.companion_db, &view.case) {
             (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
                 CompanionView::read(&factum, cdb, case.id)
@@ -911,6 +1013,14 @@ impl FactumApp {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
         }
+        if let Some(job) = self.close_job.as_mut() {
+            if let Some(result) = job.worker.poll() {
+                let job = self.close_job.take().expect("polled");
+                self.finish_close(job.container_id, job.then_archive, result);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
         let mut finished = Vec::new();
         self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll() {
             Some(result) => {
@@ -944,6 +1054,8 @@ impl FactumApp {
             {
                 self.data_version = version;
                 self.dirty = true;
+                // another connection wrote: decode afresh what is shown, whatever it changed
+                self.note_images.borrow_mut().clear();
             }
         }
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -996,6 +1108,15 @@ impl FactumApp {
         let Ok(detail) = self.factum().container(id) else {
             return;
         };
+        // a container belongs to its evidence item: that is what gets selected, while it exists
+        let evidence = detail
+            .evidence_id
+            .and_then(|e| self.factum().get_evidence(e).ok().flatten())
+            .filter(|e| !e.is_deleted());
+        if let Some(evidence) = evidence {
+            self.select(Some(detail.summary.case_id), Some(evidence.id));
+            return;
+        }
         self.case_id = Some(detail.summary.case_id);
         self.evidence_id = None;
         self.container_id = Some(id);
@@ -1071,7 +1192,7 @@ impl FactumApp {
             .ok()
             .and_then(|end| end.parse().ok());
         let mut cache = self.container_times_cache.borrow_mut();
-        let cached = cache.as_ref().filter(|(cached, ..)| cached == path);
+        let cached = cache.get(&id).filter(|(cached, ..)| cached == path);
         let busy = self.add_job.as_ref().is_some_and(|job| job.container_id == id);
         // without a logged end (after Locate…), finding the state means searching the file: not while it grows
         let key = match end {
@@ -1088,7 +1209,7 @@ impl FactumApp {
             .map(|graph| crate::container::volume::modified_times(&graph))
             .inspect_err(|e| log::warn!("{e}"))
             .unwrap_or_default();
-        *cache = Some((path.to_path_buf(), key, times.clone()));
+        cache.insert(id, (path.to_path_buf(), key, times.clone()));
         times
     }
 
@@ -1097,29 +1218,44 @@ impl FactumApp {
         self.run(result);
     }
 
+    /// The case's New Container dialog: a new evidence item with a container.
     fn open_new_container(&mut self, case_id: i64) {
-        let evidence_choices: Vec<(i64, String)> = self
-            .view
-            .tree
+        self.push_new_container(case_id, None, String::new());
+    }
+
+    /// New Container for an evidence item; its name is the evidence's, numbered from the second container on.
+    fn open_new_container_for(&mut self, evidence_id: i64) {
+        let Ok(Some(evidence)) = self.factum().get_evidence(evidence_id) else {
+            return;
+        };
+        let held = self
+            .factum()
+            .list_containers(evidence.case_id)
+            .unwrap_or_default()
             .iter()
-            .filter(|node| node.case.id == case_id)
-            .flat_map(|node| node.evidence.iter().map(|(e, _)| (e.id, e.description.clone())))
-            .collect();
-        let evidence = self
-            .evidence_id
-            .filter(|id| evidence_choices.iter().any(|(e, _)| e == id));
+            .filter(|c| c.evidence_id == Some(evidence_id))
+            .count();
+        let name = match held {
+            0 => evidence.description.clone(),
+            n => format!("{} {}", evidence.description, n + 1),
+        };
+        self.push_new_container(evidence.case_id, Some((evidence_id, evidence.description)), name);
+    }
+
+    fn push_new_container(&mut self, case_id: i64, evidence: Option<(i64, String)>, name: String) {
         let folder = Some(self.db.get_setting(EXPORT_DIR_SETTING).unwrap_or_default())
             .filter(|f| !f.is_empty())
             .or_else(|| dirs::home_dir().map(|h| h.display().to_string()))
             .unwrap_or_default();
         self.dialogs.push(Dialog::NewContainer {
             case_id,
-            name: String::new(),
             evidence,
-            evidence_choices,
+            name,
+            hash: String::new(),
+            details: String::new(),
+            acquire: String::new(),
             folder,
             file_name: String::new(),
-            base: String::new(),
             error: None,
         });
     }
@@ -1128,6 +1264,11 @@ impl FactumApp {
         let Ok(detail) = self.factum().container(id) else {
             return;
         };
+        // a documented limitation: Windows may update the access times of sources on a writable volume
+        let writable_hint = cfg!(windows)
+            && crate::container::mounts::mounts_for(&sources, &[])
+                .iter()
+                .any(|m| m.read_only == Some(false));
         self.dialogs.push(Dialog::AddToContainer {
             container_id: id,
             sources,
@@ -1136,6 +1277,7 @@ impl FactumApp {
             metadata_only: false,
             excerpt_from: String::new(),
             excerpt_to: String::new(),
+            writable_hint,
             error: None,
         });
     }
@@ -1147,16 +1289,16 @@ impl FactumApp {
         sources: Vec<PathBuf>,
         options: crate::container::volume::AddOptions,
         cancel: Arc<std::sync::atomic::AtomicBool>,
-    ) {
+    ) -> bool {
         if self.add_job.is_some() {
             self.message(
                 "Factum",
                 "Files are being added already. Wait for it, or cancel it in the status bar.",
             );
-            return;
+            return false;
         }
         let result = self.factum().open_container_for_add(id);
-        let Some(volume) = self.run(result) else { return };
+        let Some(volume) = self.run(result) else { return false };
         let name = self.factum().container(id).map(|d| d.summary.name).unwrap_or_default();
         let ctx = self.egui_ctx.clone();
         let (worker, progress) = workers::add_to_container(&ctx, volume, sources, options, cancel.clone());
@@ -1167,15 +1309,28 @@ impl FactumApp {
             progress,
             cancel,
         });
+        true
     }
 
     /// Logs and lists what the worker staged, and says what happened.
     fn finish_add(&mut self, id: i64, result: workers::AddResult) {
         self.dirty = true;
+        // Add Again: a failed addition ends the run, the container stays open
+        let again = self.close_after_adds.filter(|(container, _)| *container == id);
+        let failed = |app: &mut Self| {
+            app.pending_adds.clear();
+            app.close_after_adds = None;
+        };
         let (mut volume, staged) = match result {
             Ok(done) => done,
-            Err(e) if e.contains("nothing was added") => return self.message("Factum", "Nothing was added."),
-            Err(e) => return self.message("Factum", e),
+            Err(e) if e.contains("nothing was added") => {
+                failed(self);
+                return self.message("Factum", "Nothing was added.");
+            }
+            Err(e) => {
+                failed(self);
+                return self.message("Factum", e);
+            }
         };
         let mut notes = Vec::new();
         if !staged.skipped.is_empty() {
@@ -1197,6 +1352,24 @@ impl FactumApp {
         let (count, bytes, folders) = (staged.records.len(), staged.bytes(), staged.folders.len());
         let result = self.factum().commit_container_add(id, &mut volume, staged);
         drop(volume);
+        if let Some((_, then_archive)) = again {
+            if result.is_ok() && notes.is_empty() {
+                match self.pending_adds.pop_front() {
+                    Some((sources, options)) => {
+                        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        if !self.start_add(id, sources, options, cancel) {
+                            failed(self);
+                        }
+                    }
+                    None => {
+                        self.close_after_adds = None;
+                        self.start_close(id, then_archive);
+                    }
+                }
+                return;
+            }
+            failed(self);
+        }
         let head = match result {
             Ok(_) if count == 0 => format!("{folders} folder{} added.", if folders == 1 { "" } else { "s" }),
             Ok(_) => format!(
@@ -1228,6 +1401,14 @@ impl FactumApp {
             self.message("Factum", message);
             return;
         }
+        if let Some(job) = self.close_job.as_ref().filter(|_| changes) {
+            let message = format!(
+                "\"{}\" is being re-checked. Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
         match action {
             ContainerAction::ShowEntry(entry_id) => self.jump_to_entry(entry_id),
             ContainerAction::Locate(id) => {
@@ -1245,17 +1426,7 @@ impl FactumApp {
                     self.message("Factum", format!("The folder cannot be opened: {e}"));
                 }
             }
-            ContainerAction::Close(id) => {
-                let result = self.factum().close_container(id);
-                if let Some(close) = self.run(result)
-                    && let Some(reason) = close.x509_refused
-                {
-                    self.message(
-                        "Container closed",
-                        format!("Container #{id} was closed and signed with GPG only. X.509: {reason}"),
-                    );
-                }
-            }
+            ContainerAction::Close(id) => self.start_close(id, None),
             ContainerAction::CloseWithoutFile(id) => {
                 self.dialogs.push(Dialog::Confirm {
                     message: format!(
@@ -1291,6 +1462,85 @@ impl FactumApp {
         self.dirty = true;
     }
 
+    /// Close: the re-check runs on a worker thread; `finish_close` closes, or asks what to do about damage.
+    fn start_close(&mut self, id: i64, then_archive: Option<i64>) {
+        if self.add_job.is_some() || self.close_job.is_some() {
+            self.message(
+                "Factum",
+                "A container is busy. Wait for it, or cancel it in the status bar.",
+            );
+            return;
+        }
+        let result = self.factum().recheck_input(id);
+        let Some(input) = self.run(result) else { return };
+        let name = self.factum().container(id).map(|d| d.summary.name).unwrap_or_default();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worker, progress) = workers::recheck(&self.egui_ctx.clone(), input, cancel.clone());
+        self.close_job = Some(CloseJob {
+            container_id: id,
+            name,
+            worker,
+            progress,
+            cancel,
+            then_archive,
+        });
+    }
+
+    fn finish_close(&mut self, id: i64, then_archive: Option<i64>, result: workers::RecheckResult) {
+        self.dirty = true;
+        let recheck = match result {
+            Ok(recheck) => recheck,
+            Err(e) => return self.message("Factum", e),
+        };
+        if !recheck.mismatches.is_empty() {
+            let add_again = self
+                .factum()
+                .add_again_plan(id, &recheck.mismatches)
+                .map_err(|e| e.to_string());
+            self.dialogs.push(Dialog::Damaged {
+                container_id: id,
+                mismatches: recheck.mismatches,
+                add_again,
+                then_archive,
+            });
+            return;
+        }
+        let result = self.factum().close_container_with(id, &self.factum().gpgsm(), &recheck);
+        let Some(close) = self.run(result) else { return };
+        if let Some(reason) = close.x509_refused {
+            self.message(
+                "Container closed",
+                format!("Container #{id} was closed and signed with GPG only. X.509: {reason}"),
+            );
+        }
+        if let Some(case_id) = then_archive {
+            self.close_next_and_archive(case_id);
+        }
+    }
+
+    /// Close and Archive: closes the case's next open container (one whose file is missing at once, without it,
+    /// the others through the re-check), and archives the case once none is open.
+    fn close_next_and_archive(&mut self, case_id: i64) {
+        loop {
+            let Some(next) = self
+                .factum()
+                .open_containers(case_id)
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+            else {
+                return self.carry_out(Pending::Archive(case_id));
+            };
+            if !next.missing {
+                return self.start_close(next.id, Some(case_id));
+            }
+            let result = self.factum().close_container_without_file(next.id);
+            if self.run(result).is_none() {
+                return;
+            }
+        }
+    }
+
     /// Before sealing without a key, ask once per GUI session whether to configure one.
     fn with_key_check(&mut self, then: Pending) {
         if self.signer.active_key().is_some() || self.no_gpg_key_prompted {
@@ -1308,21 +1558,7 @@ impl FactumApp {
                 self.run(result); // the case is archived even when sealing failed
                 self.select(None, None);
             }
-            Pending::CloseContainersAndArchive(case_id) => {
-                for container in self.factum().open_containers(case_id).unwrap_or_default() {
-                    let closed = if container.missing {
-                        let result = self.factum().close_container_without_file(container.id);
-                        self.run(result).is_some()
-                    } else {
-                        let result = self.factum().close_container(container.id);
-                        self.run(result).is_some()
-                    };
-                    if !closed {
-                        return;
-                    }
-                }
-                self.carry_out(Pending::Archive(case_id));
-            }
+            Pending::CloseContainersAndArchive(case_id) => self.close_next_and_archive(case_id),
             Pending::CloseContainerWithoutFile(id) => {
                 let result = self.factum().close_container_without_file(id);
                 self.run(result);
@@ -1588,9 +1824,13 @@ impl FactumApp {
         if text.is_empty() {
             return;
         }
-        let result = self.factum().create_note(&text, self.evidence_id, case.id);
+        let result = note_editor::check_shown(&text, &self.composer_images).and_then(|()| {
+            self.factum()
+                .create_note_with_images(&text, &self.composer_images, self.evidence_id, case.id)
+        });
         if self.run(result).is_some() {
             self.composer.clear();
+            self.composer_images.clear();
         }
     }
 
@@ -1615,6 +1855,39 @@ impl FactumApp {
         self.dirty = true;
         self.scroll_to = Some(entry.id);
         self.focused_card = Some(entry.id);
+    }
+
+    /// The picture of a note at the size it was decoded to (larger than the GPU takes: scaled down), scrolled.
+    fn image_viewer_window(&mut self, ctx: &egui::Context) {
+        let Some((entry_id, image)) = &self.image_viewer else {
+            return;
+        };
+        let texture = markup_view::texture(ctx, *entry_id, image);
+        let mut open = true;
+        dialogs::report_window(
+            ctx,
+            egui::Id::unique("image-viewer"),
+            &format!("Image {}", image.id),
+            &mut open,
+            [720.0, 540.0],
+            0.0,
+            |ui| match &texture {
+                Some(texture) => {
+                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.image((texture.id(), texture.size_vec2()));
+                    });
+                }
+                None => {
+                    ui.label(
+                        RichText::new(format!("[image {} could not be shown]", image.id))
+                            .color(theme::current(ctx).muted),
+                    );
+                }
+            },
+        );
+        if !open {
+            self.image_viewer = None;
+        }
     }
 
     fn handle_card_action(&mut self, action: CardAction, ctx: &egui::Context) {
@@ -1656,7 +1929,9 @@ impl FactumApp {
                     self.dialogs.push(Dialog::Correct {
                         entry_id: newest.id,
                         original: newest.text.clone(),
+                        images: newest.images(),
                         text: newest.text,
+                        error: None,
                     });
                 }
             }
@@ -1686,6 +1961,19 @@ impl FactumApp {
                 self.dirty = false; // verifying changes nothing
             }
             CardAction::Focus(entry_id) => self.focused_card = Some(entry_id),
+            CardAction::OpenImage(entry_id, image_id) => {
+                // the card's images are decoded already
+                let factum = self.factum();
+                let image = self
+                    .card_images(&factum, entry_id)
+                    .map(|images| images::find(&images, &image_id).cloned());
+                match self.run(image) {
+                    Some(Some(image)) => self.image_viewer = Some((entry_id, image)),
+                    Some(None) => log::warn!("Image {image_id} of entry #{entry_id} not found."),
+                    None => {}
+                }
+                self.dirty = false; // looking changes nothing
+            }
             CardAction::ToggleHistory(entry_id) => {
                 if !self.history_open.remove(&entry_id) {
                     self.history_open.insert(entry_id);
@@ -1742,14 +2030,34 @@ impl FactumApp {
             DialogResult::Confirmed(pending) => self.carry_out(pending),
             DialogResult::NewContainer {
                 case_id,
+                evidence_id,
                 name,
-                evidence,
+                hash,
+                details,
                 path,
-                base,
+                acquire,
             } => {
-                let result = self.factum().create_container(case_id, &name, evidence, &path, &base);
-                if let Some(id) = self.run(result) {
-                    self.select_container(id);
+                let base = acquire.as_ref().map(|a| a.display().to_string()).unwrap_or_default();
+                let result = match evidence_id {
+                    Some(evidence_id) => self
+                        .factum()
+                        .create_container(case_id, &name, evidence_id, &path, &base)
+                        .map(|id| (evidence_id, id)),
+                    None => self
+                        .factum()
+                        .create_evidence_with_container(case_id, &name, &hash, &details, &path, &base),
+                };
+                if let Some((evidence_id, id)) = self.run(result) {
+                    self.select(Some(case_id), Some(evidence_id));
+                    if let Some(acquire) = acquire {
+                        let options = crate::container::volume::AddOptions {
+                            base: acquire.clone(),
+                            keep_path: true,
+                            ..Default::default()
+                        };
+                        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        self.start_add(id, vec![acquire], options, cancel);
+                    }
                 }
             }
             DialogResult::X509 {
@@ -1763,6 +2071,34 @@ impl FactumApp {
             } => {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 self.start_add(container_id, sources, options, cancel);
+            }
+            DialogResult::AddAgain {
+                container_id,
+                plan,
+                then_archive,
+            } => {
+                let mut plan: std::collections::VecDeque<_> = plan.into();
+                if let Some((sources, options)) = plan.pop_front() {
+                    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    // the run continues only once its first addition is under way
+                    if self.start_add(container_id, sources, options, cancel) {
+                        self.pending_adds = plan;
+                        self.close_after_adds = Some((container_id, then_archive));
+                    }
+                }
+            }
+            DialogResult::CloseDamaged {
+                container_id,
+                mismatches,
+                then_archive,
+            } => {
+                let result = self.factum().close_container_damaged(container_id, &mismatches);
+                if self.run(result).is_some()
+                    && let Some(case_id) = then_archive
+                {
+                    self.close_next_and_archive(case_id);
+                }
+                self.dirty = true;
             }
             DialogResult::TypedConfirmed { case_id, typed } => {
                 let result = self.factum().delete_case_permanently(case_id, &typed);
@@ -1778,8 +2114,8 @@ impl FactumApp {
                 }
                 self.select(None, None);
             }
-            DialogResult::Correct { entry_id, text } => {
-                let result = self.factum().correct_note(entry_id, &text);
+            DialogResult::Correct { entry_id, text, images } => {
+                let result = self.factum().correct_note_with_images(entry_id, &text, &images);
                 self.run(result);
             }
             DialogResult::Export {
@@ -2433,6 +2769,7 @@ impl FactumApp {
                     4.0,
                     (!case.is_archived()).then_some(new_evidence.as_str()),
                     None,
+                    None,
                 );
                 let response = response.on_hover_text(format!(
                     "{} — {}{}",
@@ -2489,6 +2826,16 @@ impl FactumApp {
                 for (evidence, count) in &node.evidence {
                     let selected = self.evidence_id == Some(evidence.id);
                     let color = if case.is_archived() { p.muted } else { p.secondary };
+                    let held: Vec<&crate::containers::ContainerSummary> = node
+                        .containers
+                        .iter()
+                        .filter(|c| c.evidence_id == Some(evidence.id))
+                        .collect();
+                    let symbol_hover = (!held.is_empty()).then(|| containers::symbol_hover(&held));
+                    let symbol = symbol_hover.as_deref().map(|hover| {
+                        let color = if held.iter().any(|c| c.open) { p.accent } else { p.muted };
+                        (icons::CONTAINER, hover, color)
+                    });
                     let (response, _) = tree_row(
                         ui,
                         selected,
@@ -2496,7 +2843,10 @@ impl FactumApp {
                         (*count, "note"),
                         20.0,
                         None,
-                        None,
+                        held.iter()
+                            .any(|c| c.missing)
+                            .then_some(("⚠", "Container file missing")),
+                        symbol,
                     );
                     let response = response.on_hover_text(if evidence.details.is_empty() {
                         evidence.description.clone()
@@ -2514,11 +2864,16 @@ impl FactumApp {
                             if ui.button("Edit Description…").clicked() {
                                 menu_action = Some(TreeAction::EditEvidence(evidence.id));
                             }
+                            if ui.button("New Container…").clicked() {
+                                menu_action = Some(TreeAction::NewContainerFor(evidence.id));
+                            }
                             ui.separator();
-                            let empty = *count == 0 && !self.factum().has_entries(evidence.id).unwrap_or(true);
+                            let empty = *count == 0
+                                && held.is_empty()
+                                && !self.factum().has_entries(evidence.id).unwrap_or(true);
                             if ui
                                 .add_enabled(empty, egui::Button::new("Delete Evidence…"))
-                                .on_disabled_hover_text("Only evidence without notes")
+                                .on_disabled_hover_text("Only evidence without notes or containers")
                                 .clicked()
                             {
                                 menu_action = Some(TreeAction::DeleteEvidence(evidence.id));
@@ -2526,22 +2881,30 @@ impl FactumApp {
                         }
                     });
                 }
-                for summary in &node.containers {
+                // containers without a live evidence item (from before 2.7, or their evidence was deleted): rows
+                // of their own
+                let live: std::collections::HashSet<i64> = node.evidence.iter().map(|(e, _)| e.id).collect();
+                for summary in node
+                    .containers
+                    .iter()
+                    .filter(|c| c.evidence_id.is_none_or(|e| !live.contains(&e)))
+                {
                     let selected = self.container_id == Some(summary.id);
                     let color = if case.is_archived() { p.muted } else { p.secondary };
+                    let hover = containers::symbol_hover(&[summary]);
+                    let symbol_color = if summary.open { p.accent } else { p.muted };
                     let (response, _) = tree_row(
                         ui,
                         selected,
-                        RichText::new(containers::tree_label(summary)).color(color),
+                        RichText::new(&summary.name).color(color),
                         (summary.file_count as usize, "file"),
                         20.0,
                         None,
                         summary.missing.then_some(("⚠", "File missing")),
+                        Some((icons::CONTAINER, &hover, symbol_color)),
                     );
-                    let response = response.on_hover_text(match &summary.path {
-                        Some(path) if !summary.missing => path.display().to_string(),
-                        _ => "File missing — Locate…".to_string(),
-                    });
+                    let response =
+                        response.on_hover_text(containers::row_hover(summary, summary.evidence_id.is_some()));
                     if response.clicked() {
                         clicked_container = Some(summary.id);
                     }
@@ -2621,6 +2984,7 @@ impl FactumApp {
                 self.select(Some(case_id), None);
                 self.open_new_container(case_id);
             }
+            TreeAction::NewContainerFor(evidence_id) => self.open_new_container_for(evidence_id),
             TreeAction::Container(action) => self.container_action(action, ctx),
         }
     }
@@ -2650,7 +3014,7 @@ impl FactumApp {
                 if toggle.clicked() {
                     self.side_panel = !self.side_panel;
                 }
-                if self.view.case.is_some() && self.view.container.is_none() {
+                if self.view.case.is_some() && self.container_id.is_none() {
                     ui.add_space(8.0);
                     ui.label(RichText::new(&self.view.note_count).size(SMALL_SIZE).color(p.muted));
                 }
@@ -2660,35 +3024,12 @@ impl FactumApp {
         });
         ui.separator();
 
-        // a selected container is shown in place of the log and the note input
-        if let Some(detail) = self.view.container.clone() {
-            let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
-            let evidence = detail.evidence_id.and_then(|id| {
-                self.view
-                    .tree
-                    .iter()
-                    .flat_map(|node| &node.evidence)
-                    .find(|(e, _)| e.id == id)
-                    .map(|(e, _)| e.description.clone())
-            });
-            let mut container_actions = Vec::new();
-            let times = std::mem::take(&mut self.view.container_times);
-            let busy = self
-                .add_job
-                .as_ref()
-                .is_some_and(|job| job.container_id == detail.summary.id);
-            containers::container_view(
-                ui,
-                &detail,
-                &times,
-                evidence.as_deref(),
-                (archived, busy),
-                &mut container_actions,
-            );
-            self.view.container_times = times;
-            for action in container_actions {
-                self.container_action(action, ctx);
-            }
+        // a container selected on its own (a row of its own, no evidence item) is shown without notes and composer
+        if self.container_id.is_some() {
+            egui::ScrollArea::vertical()
+                .id_salt("container-alone")
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.container_sections(ui, ctx));
             return;
         }
 
@@ -2713,14 +3054,24 @@ impl FactumApp {
                     });
             }
             Some(_) => {
-                let max_composer = (ui.available_height() - 120.0).max(MIN_COMPOSER_HEIGHT);
-                let composer = egui::Panel::bottom("composer-panel")
-                    .resizable(true)
-                    .default_size(self.composer_height.clamp(MIN_COMPOSER_HEIGHT, max_composer))
-                    .size_range(MIN_COMPOSER_HEIGHT..=max_composer)
-                    .frame(egui::Frame::new().inner_margin(Margin { top: 6, ..Margin::ZERO }))
-                    .show(ui, |ui| self.composer(ui, ctx));
-                self.composer_height = composer.response.rect.height();
+                // with thumbnails the panel is taller; it keeps a size of its own, and the saved height is without
+                let strip = if self.composer_images.is_empty() {
+                    0.0
+                } else {
+                    note_editor::THUMBNAIL_STRIP
+                };
+                let max_composer = (ui.available_height() - 120.0).max(MIN_COMPOSER_HEIGHT + strip);
+                let composer = egui::Panel::bottom(if strip > 0.0 {
+                    "composer-panel-images"
+                } else {
+                    "composer-panel"
+                })
+                .resizable(true)
+                .default_size((self.composer_height + strip).clamp(MIN_COMPOSER_HEIGHT + strip, max_composer))
+                .size_range(MIN_COMPOSER_HEIGHT + strip..=max_composer)
+                .frame(egui::Frame::new().inner_margin(Margin { top: 6, ..Margin::ZERO }))
+                .show(ui, |ui| self.composer(ui, ctx));
+                self.composer_height = composer.response.rect.height() - strip;
             }
         }
         let now = chrono::Utc::now();
@@ -2754,10 +3105,29 @@ impl FactumApp {
                         self.scroll_to = None;
                     }
                 }
+                self.container_sections(ui, ctx);
                 ui.add_space(8.0);
             });
         for action in actions {
             self.handle_card_action(action, ctx);
+        }
+    }
+
+    /// The shown containers, one section each, below the notes.
+    fn container_sections(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
+        let mut container_actions = Vec::new();
+        let no_times = HashMap::new();
+        for detail in &self.view.containers {
+            let busy = self
+                .add_job
+                .as_ref()
+                .is_some_and(|job| job.container_id == detail.summary.id);
+            let times = self.view.container_times.get(&detail.summary.id).unwrap_or(&no_times);
+            containers::container_section(ui, detail, times, (archived, busy), &mut container_actions);
+        }
+        for action in container_actions {
+            self.container_action(action, ctx);
         }
     }
 
@@ -2882,8 +3252,27 @@ impl FactumApp {
                 });
                 ui.add_space(6.0);
             });
-        // a longer note scrolls inside the frame, which keeps its place
         let id = egui::Id::unique("composer");
+        if !self.composer_images.is_empty() {
+            egui::Panel::bottom("composer-thumbnails")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.inner_margin(Margin { top: 6, ..Margin::ZERO }))
+                .show(ui, |ui| {
+                    note_editor::thumbnails(ui, &mut self.composer, &mut self.composer_images)
+                });
+        }
+        // run() marks the view for a rebuild: only for an error to show
+        let toolbar = note_editor::toolbar(ui, id, &mut self.composer, &mut self.composer_images);
+        let input = if self.dialogs.is_empty() {
+            note_editor::handle_input(ctx, id, &mut self.composer, &mut self.composer_images)
+        } else {
+            Ok(())
+        };
+        if toolbar.is_err() || input.is_err() {
+            self.run(toolbar.and(input));
+        }
+        // a longer note scrolls inside the frame, which keeps its place
         let stroke = if ui.memory(|m| m.has_focus(id)) {
             ui.visuals().selection.stroke
         } else {
@@ -3081,9 +3470,17 @@ impl FactumApp {
         let small = |text: &str, color| RichText::new(text).size(SMALL_SIZE).color(color);
         let now = chrono::Utc::now();
         ui.horizontal(|ui| {
-            // files being added to a container take the place of the case's status
+            // files being added to a container, or re-checked, take the place of the case's status
             if let Some(job) = &self.add_job {
                 ui.label(small(&containers::add_status(&job.progress, &job.name), p.secondary));
+                if IconButton::new(icons::CLOSE, "Cancel").show(ui).clicked() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            } else if let Some(job) = &self.close_job {
+                ui.label(small(
+                    &containers::recheck_status(&job.progress, &job.name),
+                    p.secondary,
+                ));
                 if IconButton::new(icons::CLOSE, "Cancel").show(ui).clicked() {
                     job.cancel.store(true, Ordering::Relaxed);
                 }
@@ -3206,6 +3603,8 @@ enum TreeAction {
     DeleteEvidence(i64),
     EditEvidence(i64),
     NewContainer(i64),
+    /// New Container for an evidence item
+    NewContainerFor(i64),
     Container(ContainerAction),
 }
 
@@ -3252,6 +3651,7 @@ fn ioc_row(ui: &mut egui::Ui, ctx: &egui::Context, value: &str) {
 /// A row of the case tree: the name, and the number of notes (or files) on the right; `mark` is an icon with its
 /// tooltip. With `add` (the shortcut), a + for new evidence shows under the pointer; the second value is true when
 /// it was clicked.
+#[allow(clippy::too_many_arguments)]
 fn tree_row(
     ui: &mut egui::Ui,
     selected: bool,
@@ -3260,6 +3660,7 @@ fn tree_row(
     indent: f32,
     add: Option<&str>,
     mark: Option<(&str, &str)>,
+    symbol: Option<(&str, &str, egui::Color32)>,
 ) -> (egui::Response, bool) {
     let p = *theme::current(ui.ctx());
     let width = ui.available_width();
@@ -3302,6 +3703,12 @@ fn tree_row(
             };
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.add(egui::Label::new(text).truncate().selectable(false));
+                if let Some((icon, tip, color)) = symbol {
+                    let symbol = ui
+                        .label(RichText::new(icon).size(SMALL_SIZE).color(color))
+                        .on_hover_text(tip);
+                    symbol.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, tip));
+                }
             });
             added
         })
@@ -3382,6 +3789,8 @@ impl eframe::App for FactumApp {
                 self.jump_to_entry(entry_id);
             }
         }
+        self.image_viewer_window(&ctx);
+        markup_view::evict_unused(&ctx);
         let mut window_actions = Vec::new();
         for window in &mut self.companion_windows {
             window.show(&ctx, &mut window_actions);

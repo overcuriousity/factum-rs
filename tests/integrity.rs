@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use common::{Fixture, add_case_row};
 use factum::canonical::utc_now;
 use factum::error::ErrorKind;
+use factum::images::NoteImage;
 use factum::log_service::{Append, entry_signed_payload, leaf_data};
 use factum::notes::parse_payload;
 use factum::seals::{SEAL_DIR_SETTING, seal_payload};
@@ -700,4 +701,338 @@ fn case_database_verifies_unchanged_after_companion_use() {
         f.count("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%question%'"),
         0
     );
+}
+
+// --- notes with images
+
+fn test_image(shade: u8) -> NoteImage {
+    NoteImage::from_rgba(2, 2, &[shade; 16]).unwrap()
+}
+
+fn image_ids(images: &[NoteImage]) -> Vec<String> {
+    let mut ids: Vec<String> = images.iter().map(|i| i.id.clone()).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn note_images_are_stored_in_the_signed_payload() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let text = format!("Screenshot: {}", image.reference("login page"));
+    let id = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let entry = factum.get_entry(id).unwrap().unwrap();
+    assert_eq!(entry.images(), vec![image]);
+    assert_eq!(entry.text, text);
+    assert!(
+        factum::iocs::get_iocs_for_entry(&f.db.conn, id)
+            .unwrap()
+            .iter()
+            .all(|(kind, _)| kind != "hash")
+    );
+    factum.seal(case_id, "checkpoint").unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+}
+
+#[test]
+fn changing_one_base64_character_fails_verification() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let id = factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let json: String =
+        f.db.conn
+            .query_row("SELECT payload_json FROM entries WHERE id = ?", [id], |r| r.get(0))
+            .unwrap();
+    let start = json.find("\"data\":\"").unwrap() + 8;
+    let old = json.as_bytes()[start] as char;
+    let new = if old == 'A' { 'B' } else { 'A' };
+    let tampered = format!("{}{new}{}", &json[..start], &json[start + 1..]);
+    f.db.conn
+        .execute(
+            "UPDATE entries SET payload_json = ? WHERE id = ?",
+            rusqlite::params![tampered, id],
+        )
+        .unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Fail);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|x| x.level == Level::Fail && x.code == "leaf_hash" && x.entry_id == Some(id)),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn unreferenced_images_are_not_saved() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (kept, dropped) = (test_image(10), test_image(20));
+    let id = factum
+        .create_note_with_images(&kept.reference("a"), &[kept.clone(), dropped], None, case_id)
+        .unwrap();
+    let entry = factum.get_entry(id).unwrap().unwrap();
+    assert_eq!(entry.images(), vec![kept]);
+}
+
+#[test]
+fn a_reference_without_its_image_is_refused() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let err = factum
+        .create_note_with_images(&image.reference("a"), &[], None, case_id)
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        format!("The note refers to image {}, which is not attached.", image.id)
+    );
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries WHERE kind = 'note'"), 0);
+}
+
+#[test]
+fn a_correction_keeps_only_referenced_images() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (a, b, c) = (test_image(10), test_image(20), test_image(30));
+    let text = format!("{} {}", a.reference("a"), b.reference("b"));
+    let note = factum
+        .create_note_with_images(&text, &[a.clone(), b.clone()], None, case_id)
+        .unwrap();
+    // images are not carried over: the correction attaches exactly the ones it is given
+    let corrected = format!("{} {}", b.reference("b"), c.reference("c"));
+    let version = factum
+        .correct_note_with_images(note, &corrected, &[b.clone(), c.clone()])
+        .unwrap();
+    let entry = factum.get_entry(version).unwrap().unwrap();
+    assert_eq!(image_ids(&entry.images()), image_ids(&[b, c]));
+    factum.seal(case_id, "checkpoint").unwrap();
+    assert_eq!(factum.verify_case(case_id, None).unwrap().overall(), Level::Ok);
+    let err = factum
+        .correct_note_with_images(note, &a.reference("a"), &[])
+        .unwrap_err();
+    assert!(err.to_string().contains(&a.id), "{err}");
+}
+
+#[test]
+fn notes_without_images_keep_a_null_payload() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let id = factum.create_note("plain", None, case_id).unwrap();
+    let corrected = factum.correct_note(id, "plain, corrected").unwrap();
+    for id in [id, corrected] {
+        assert_eq!(
+            f.count(&format!("SELECT payload_json IS NULL FROM entries WHERE id = {id}")),
+            1
+        );
+        assert!(factum.get_entry(id).unwrap().unwrap().images().is_empty());
+    }
+}
+
+#[test]
+fn garbage_payload_still_lists_the_note() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let id = factum.create_note("plain", None, case_id).unwrap();
+    f.exec(&format!(
+        "UPDATE entries SET payload_json = '{{\"images\":5}}' WHERE id = {id}"
+    ));
+    assert!(factum.get_entry(id).unwrap().unwrap().images().is_empty());
+    assert!(factum.list_entries(case_id, &Default::default()).unwrap().contains(&id));
+}
+
+#[test]
+fn a_text_only_correction_keeps_the_images_it_still_refers_to() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (kept, dropped) = (test_image(10), test_image(20));
+    let text = format!("a {} b {}", kept.reference("one"), dropped.reference("two"));
+    let first = factum
+        .create_note_with_images(&text, &[kept.clone(), dropped], None, case_id)
+        .unwrap();
+    // the newest version's images are the source, also when the correction starts from an older id
+    let second = factum
+        .correct_note(first, &format!("a {} b, fixed", kept.reference("one")))
+        .unwrap();
+    assert_eq!(factum.get_entry(second).unwrap().unwrap().images(), vec![kept.clone()]);
+    let third = factum
+        .correct_note(first, &format!("a {} b, fixed again", kept.reference("one")))
+        .unwrap();
+    assert_eq!(factum.get_entry(third).unwrap().unwrap().images(), vec![kept]);
+    factum.seal(case_id, "checkpoint").unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+}
+
+#[test]
+fn every_way_markdown_shows_an_image_keeps_it() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let id = &image.id;
+    for text in [
+        format!("![a [b] c](factum-image:{id})"),
+        format!("![a](factum-image:{id} \"t\")"),
+        format!("![a](<factum-image:{id}>)"),
+        format!("![a][r]\n\n[r]: factum-image:{id}"),
+    ] {
+        let note = factum
+            .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+            .unwrap();
+        assert_eq!(
+            factum.get_entry(note).unwrap().unwrap().images(),
+            vec![image.clone()],
+            "{text}"
+        );
+        // without the image the same text is refused
+        let err = factum.create_note_with_images(&text, &[], None, case_id).unwrap_err();
+        assert!(err.to_string().contains(id.as_str()), "{text}: {err}");
+    }
+}
+
+#[test]
+fn a_reference_in_a_code_span_is_text() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let text = format!("the syntax is `{}`", image.reference("a"));
+    // not required...
+    factum.create_note_with_images(&text, &[], None, case_id).unwrap();
+    // ...and not kept
+    let note = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    assert!(factum.get_entry(note).unwrap().unwrap().images().is_empty());
+    assert_eq!(
+        f.count(&format!("SELECT payload_json IS NULL FROM entries WHERE id = {note}")),
+        1
+    );
+}
+
+/// Replaces the stored payload of `id` with these images, as a tampered database would hold them.
+fn tamper_images(f: &Fixture, id: i64, images: &[NoteImage]) {
+    let payload = factum::images::to_payload(images).unwrap().to_string();
+    f.db.conn
+        .execute(
+            "UPDATE entries SET payload_json = ? WHERE id = ?",
+            rusqlite::params![payload, id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_correction_does_not_sign_tampered_images_again() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (image, other) = (test_image(10), test_image(20));
+    let text = format!("see {}", image.reference("x"));
+    let note = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let notes = || f.count("SELECT COUNT(*) FROM entries WHERE kind = 'note'");
+    // other pixels under the image's id
+    let swapped = NoteImage {
+        bytes: other.bytes.clone(),
+        ..image.clone()
+    };
+    tamper_images(&f, note, std::slice::from_ref(&swapped));
+    let err = factum.correct_note(note, &format!("{text}, fixed")).unwrap_err();
+    assert!(err.to_string().contains(&image.id), "{err}");
+    assert_eq!(notes(), 1);
+    // the same from the correction dialog and the composer, which pass the images on
+    assert!(
+        factum
+            .correct_note_with_images(note, &text, std::slice::from_ref(&swapped))
+            .is_err()
+    );
+    assert!(
+        factum
+            .create_note_with_images(&text, &[swapped], None, case_id)
+            .is_err()
+    );
+    assert_eq!(notes(), 1);
+    // a forged type and hash are not signed: what is signed is computed from the bytes
+    let relabelled = NoteImage {
+        mime: "image/svg+xml".into(),
+        sha256: "../../x".into(),
+        ..image.clone()
+    };
+    tamper_images(&f, note, &[relabelled]);
+    let version = factum.correct_note(note, &format!("{text}, fixed")).unwrap();
+    assert_eq!(
+        factum.get_entry(version).unwrap().unwrap().images(),
+        vec![image.clone()]
+    );
+}
+
+#[test]
+fn a_correction_does_not_sign_an_image_over_the_limit() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let text = format!("see {}", image.reference("x"));
+    let note = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let mut bytes = image.bytes.clone();
+    bytes.resize(factum::images::MAX_IMAGE_BYTES + 1, 0);
+    let sha256 = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(&bytes))
+    };
+    let huge = NoteImage {
+        id: sha256[..12].to_string(),
+        mime: "image/png".into(),
+        sha256,
+        name: None,
+        bytes,
+    };
+    tamper_images(&f, note, std::slice::from_ref(&huge));
+    let err = factum.correct_note(note, &huge.reference("x")).unwrap_err();
+    assert!(err.to_string().contains("20 MB"), "{err}");
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries WHERE kind = 'note'"), 1);
+}
+
+#[test]
+fn an_entry_can_be_read_without_its_payload() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let id = factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let full = factum.get_entry(id).unwrap().unwrap();
+    assert!(full.payload_json.is_some());
+    let light = factum.get_entry_without_payload(id).unwrap().unwrap();
+    assert_eq!(light.payload_json, None);
+    assert_eq!(
+        light,
+        factum::notes::Entry {
+            payload_json: None,
+            ..full
+        }
+    );
+    assert!(factum.get_entry_without_payload(id + 100).unwrap().is_none());
 }

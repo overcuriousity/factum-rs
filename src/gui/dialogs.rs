@@ -6,12 +6,14 @@ use egui::{Align, Id, Layout, RichText, TextEdit};
 
 use super::companion_dialogs::CompanionSettingsDialog;
 use super::icons;
+use super::note_editor;
 use super::theme::{self, MONO_SIZE, SMALL_SIZE};
 use super::widgets::{IconButton, actions_shown, remember_shown, visible_ui};
 use super::wizard::{SEAL_EXPLAINED, SEAL_FOLDER_EXPLAINED, Wizard, WizardChoices};
 use crate::companion::Settings;
 use crate::container::volume::AddOptions;
 use crate::container::x509::X509Cert;
+use crate::images::NoteImage;
 use crate::pystr::{head, splitlines, strip};
 use crate::signer::GpgKey;
 use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, SignatureCheck};
@@ -96,6 +98,9 @@ pub enum Dialog {
         entry_id: i64,
         original: String,
         text: String,
+        /// the images the correction is saved with: those of the version, and those added since
+        images: Vec<NoteImage>,
+        error: Option<String>,
     },
     Export {
         case_id: i64,
@@ -132,14 +137,17 @@ pub enum Dialog {
     },
     NewContainer {
         case_id: i64,
+        /// (id, name) of the evidence item it is for; None: the case's dialog, which creates the evidence item
+        evidence: Option<(i64, String)>,
         name: String,
-        evidence: Option<i64>,
-        /// (id, name) of the case's evidence
-        evidence_choices: Vec<(i64, String)>,
+        /// the new evidence item's hash and description (the case's dialog only)
+        hash: String,
+        details: String,
+        /// a folder copied in right away (scenario 1); empty: none
+        acquire: String,
         folder: String,
         /// empty: the name, made safe, with .aff4l
         file_name: String,
-        base: String,
         error: Option<String>,
     },
     X509 {
@@ -149,6 +157,15 @@ pub enum Dialog {
         selected: Option<String>,
         chain_files: Vec<String>,
     },
+    /// a close's re-check found files that do not match their hashes
+    Damaged {
+        container_id: i64,
+        mismatches: Vec<crate::container::volume::FileRecord>,
+        /// how to add them again, or why that is not possible
+        add_again: std::result::Result<Vec<(Vec<PathBuf>, AddOptions)>, String>,
+        /// the case to archive once every container is closed (Close and Archive)
+        then_archive: Option<i64>,
+    },
     AddToContainer {
         container_id: i64,
         sources: Vec<PathBuf>,
@@ -157,6 +174,8 @@ pub enum Dialog {
         metadata_only: bool,
         excerpt_from: String,
         excerpt_to: String,
+        /// Windows, and a source on a writable volume: access times may change (a documented limitation)
+        writable_hint: bool,
         error: Option<String>,
     },
 }
@@ -191,15 +210,28 @@ pub enum DialogResult {
     Confirmed(Pending),
     NewContainer {
         case_id: i64,
+        /// None: create the evidence item too
+        evidence_id: Option<i64>,
         name: String,
-        evidence: Option<i64>,
+        hash: String,
+        details: String,
         path: PathBuf,
-        base: String,
+        acquire: Option<PathBuf>,
     },
     AddToContainer {
         container_id: i64,
         sources: Vec<PathBuf>,
         options: AddOptions,
+    },
+    AddAgain {
+        container_id: i64,
+        plan: Vec<(Vec<PathBuf>, AddOptions)>,
+        then_archive: Option<i64>,
+    },
+    CloseDamaged {
+        container_id: i64,
+        mismatches: Vec<crate::container::volume::FileRecord>,
+        then_archive: Option<i64>,
     },
     X509 {
         certificate: Option<String>,
@@ -212,6 +244,7 @@ pub enum DialogResult {
     Correct {
         entry_id: i64,
         text: String,
+        images: Vec<NoteImage>,
     },
     Export {
         case_id: i64,
@@ -734,43 +767,48 @@ impl Dialog {
             }
             Dialog::NewContainer {
                 case_id,
-                name,
                 evidence,
-                evidence_choices,
+                name,
+                hash,
+                details,
+                acquire,
                 folder,
                 file_name,
-                base,
                 error,
             } => {
-                title(ui, "New Container");
-                note(
-                    ui,
-                    "An AFF4-L evidence container for files preserved from this case; every addition, close and \
-                     reopen is a signed entry in the case log.",
-                );
+                match evidence {
+                    None => {
+                        title(ui, "New Container");
+                        note(
+                            ui,
+                            "Creates a new evidence item with an AFF4-L container. Every addition, close and reopen \
+                             is a signed entry in the case log.",
+                        );
+                    }
+                    Some((_, evidence_name)) => {
+                        title(ui, &format!("New Container for {evidence_name}"));
+                        note(
+                            ui,
+                            "Every addition, close and reopen is a signed entry in the case log.",
+                        );
+                    }
+                }
                 ui.add_space(4.0);
                 let first = field(ui, "Name", name, "e.g. FS01 preserved", true);
-                let chosen = evidence
-                    .and_then(|id| evidence_choices.iter().find(|(e, _)| *e == id))
-                    .map_or("None".to_string(), |(_, n)| n.clone());
-                egui::ComboBox::from_label("From evidence")
-                    .selected_text(chosen)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(evidence, None, "None");
-                        for (id, label) in evidence_choices.iter() {
-                            ui.selectable_value(evidence, Some(*id), label);
-                        }
-                    });
+                if evidence.is_none() {
+                    field(ui, "Evidence hash (optional)", hash, "e.g. the image's SHA-256", false);
+                    description_field(ui, details, "Description (optional)");
+                }
+                let acquire_label = ui.label("Acquire (optional)");
+                folder_field(ui, acquire, Some(acquire_label.id));
+                note(
+                    ui,
+                    "Copied in right away, e.g. the read-only mount point. Leave empty to add files later.",
+                );
                 let folder_label = ui.label("Folder");
                 folder_field(ui, folder, Some(folder_label.id));
                 let default_name = format!("{}.aff4l", crate::seals::safe_filename(strip(name)));
                 field(ui, "File name", file_name, &default_name, false);
-                let base_label = ui.label("Base path");
-                folder_field(ui, base, Some(base_label.id));
-                note(
-                    ui,
-                    "Removed from the sources' paths, e.g. the mount point of the image.",
-                );
                 error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Create", true);
                 if ok || (enter_pressed(ui) && first.lost_focus()) {
@@ -786,8 +824,8 @@ impl Dialog {
                         Some(format!("The folder {} does not exist.", strip(folder)))
                     } else if path.exists() {
                         Some(format!("{} exists already.", path.display()))
-                    } else if !Path::new(strip(base)).is_dir() {
-                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into())
+                    } else if !strip(acquire).is_empty() && !Path::new(strip(acquire)).is_dir() {
+                        Some(format!("The folder {} does not exist.", strip(acquire)))
                     } else {
                         None
                     };
@@ -796,10 +834,12 @@ impl Dialog {
                     }
                     return Some(DialogResult::NewContainer {
                         case_id: *case_id,
+                        evidence_id: evidence.as_ref().map(|(id, _)| *id),
                         name: strip(name).to_string(),
-                        evidence: *evidence,
+                        hash: strip(hash).to_string(),
+                        details: strip(details).to_string(),
                         path,
-                        base: strip(base).to_string(),
+                        acquire: Some(PathBuf::from(strip(acquire))).filter(|a| !a.as_os_str().is_empty()),
                     });
                 }
                 cancel.then_some(DialogResult::Cancel)
@@ -848,6 +888,58 @@ impl Dialog {
                 });
                 result
             }
+            Dialog::Damaged {
+                container_id,
+                mismatches,
+                add_again,
+                then_archive,
+            } => {
+                title(ui, "Container Damaged");
+                note(
+                    ui,
+                    &format!(
+                        "In the container, {}. The container file or its disk may be damaged.",
+                        crate::containers::mismatch_text(mismatches.len())
+                    ),
+                );
+                let shown: Vec<&str> = mismatches.iter().take(6).map(|r| r.path.as_str()).collect();
+                let mut listed = shown.join("\n");
+                if mismatches.len() > shown.len() {
+                    listed += &format!("\n… and {} more", mismatches.len() - shown.len());
+                }
+                ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE).monospace()).wrap());
+                note(
+                    ui,
+                    "Add Again copies them again from their sources and then closes. Close as Damaged closes \
+                     without signing; the log records which files failed.",
+                );
+                let mut result = None;
+                button_row(ui, |ui| {
+                    let add = ui
+                        .add_enabled(add_again.is_ok(), egui::Button::new("Add Again"))
+                        .on_disabled_hover_text(add_again.as_ref().err().cloned().unwrap_or_default());
+                    if add.clicked()
+                        && let Ok(plan) = add_again
+                    {
+                        result = Some(DialogResult::AddAgain {
+                            container_id: *container_id,
+                            plan: plan.clone(),
+                            then_archive: *then_archive,
+                        });
+                    }
+                    if ui.button("Close as Damaged").clicked() {
+                        result = Some(DialogResult::CloseDamaged {
+                            container_id: *container_id,
+                            mismatches: mismatches.clone(),
+                            then_archive: *then_archive,
+                        });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(DialogResult::Cancel);
+                    }
+                });
+                result
+            }
             Dialog::AddToContainer {
                 container_id,
                 sources,
@@ -856,6 +948,7 @@ impl Dialog {
                 metadata_only,
                 excerpt_from,
                 excerpt_to,
+                writable_hint,
                 error,
             } => {
                 title(ui, "Add to Container");
@@ -865,9 +958,20 @@ impl Dialog {
                     listed += &format!("\n… and {} more", sources.len() - shown.len());
                 }
                 ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE)).wrap());
+                if *writable_hint {
+                    ui.label(
+                        RichText::new("Windows may update access times on this writable volume.")
+                            .size(SMALL_SIZE)
+                            .color(p.warn),
+                    );
+                }
                 ui.add_space(4.0);
-                let base_label = ui.label("Base path");
+                let base_label = ui.label("Base path (optional)");
                 folder_field(ui, base, Some(base_label.id));
+                note(
+                    ui,
+                    "Removed from the sources' paths, e.g. the mount point. Empty: full paths are kept.",
+                );
                 ui.checkbox(keep_path, "Keep the path below the base path");
                 ui.checkbox(metadata_only, "Metadata only (hash the content, do not store it)");
                 let single_file = sources.len() == 1 && sources[0].is_file();
@@ -884,12 +988,11 @@ impl Dialog {
                 }
                 error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Add", !sources.is_empty());
-                if ok && strip(base).is_empty() {
-                    *error =
-                        Some("Choose the base path: a folder that contains the sources (e.g. the mount point).".into());
-                } else if ok {
+                if ok {
                     let base_path = PathBuf::from(strip(base));
-                    let outside = sources.iter().find(|s| !s.starts_with(&base_path));
+                    let outside = sources
+                        .iter()
+                        .find(|s| !base_path.as_os_str().is_empty() && !s.starts_with(&base_path));
                     let number = |text: &str| strip(text).parse::<u64>().ok();
                     // the excerpt fields count only while they are shown
                     let excerpt = match (strip(excerpt_from), strip(excerpt_to)) {
@@ -920,6 +1023,7 @@ impl Dialog {
                             keep_path: *keep_path,
                             metadata_only: *metadata_only,
                             excerpt: excerpt.ok().flatten(),
+                            replaces: Vec::new(),
                         },
                     });
                 }
@@ -1171,26 +1275,44 @@ impl Dialog {
                 entry_id,
                 original,
                 text,
+                images,
+                error,
             } => {
                 let heading = title(ui, &format!("Correct Note #{entry_id}"));
                 note(
                     ui,
                     "The original stays in the log; the corrected text is added as a new, signed version.",
                 );
+                let editor = Id::unique("correct-editor");
+                if let Err(e) = note_editor::toolbar(ui, editor, text, images) {
+                    *error = Some(e.to_string());
+                }
+                if let Err(e) = note_editor::handle_input(ui.ctx(), editor, text, images) {
+                    *error = Some(e.to_string());
+                }
                 ui.add(
                     TextEdit::multiline(text)
+                        .id(editor)
                         .font(egui::FontId::proportional(theme::NOTE_SIZE))
                         .desired_rows(8)
                         .desired_width(f32::INFINITY),
                 )
                 .labelled_by(heading.id);
+                note_editor::thumbnails(ui, text, images);
+                error_line(ui, error);
                 let changed = !strip(text).is_empty() && strip(text) != strip(original);
                 let (ok, cancel) = buttons(ui, "Add corrected version", changed);
                 if ok && changed {
-                    return Some(DialogResult::Correct {
-                        entry_id: *entry_id,
-                        text: strip(text).to_string(),
-                    });
+                    match note_editor::check_shown(strip(text), images) {
+                        Ok(()) => {
+                            return Some(DialogResult::Correct {
+                                entry_id: *entry_id,
+                                text: strip(text).to_string(),
+                                images: images.clone(),
+                            });
+                        }
+                        Err(e) => *error = Some(e.to_string()),
+                    }
                 }
                 cancel.then_some(DialogResult::Cancel)
             }

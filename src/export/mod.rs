@@ -50,27 +50,41 @@ impl Factum<'_> {
             compact_utc(&exported_utc)
         );
         let html = html::render_html(&model, false).into_bytes();
-        let markdown = markdown::render_markdown(&model).into_bytes();
+        // borrowed from the model: nothing is copied for formats that do not write image files
+        let images = markdown::image_files(&model);
+        let image_dir = format!("{stem}_images");
         let pdf = if unique.contains(&"pdf") || unique.contains(&"bundle") {
             pdf::render_pdf(&model)
         } else {
             Vec::new()
         };
         let mut written = Vec::new();
-        for (format, suffix, content) in [
-            ("html", ".html", &html),
-            ("pdf", ".pdf", &pdf),
-            ("md", ".md", &markdown),
-        ] {
+        for (format, suffix, content) in [("html", ".html", &html), ("pdf", ".pdf", &pdf)] {
             if unique.contains(&format) {
                 let path = out_dir.join(format!("{stem}{suffix}"));
                 std::fs::write(&path, content)?;
                 written.push(path);
             }
         }
+        if unique.contains(&"md") {
+            let path = out_dir.join(format!("{stem}.md"));
+            std::fs::write(&path, markdown::render_markdown(&model, &image_dir))?;
+            written.push(path);
+            if !images.is_empty() {
+                let folder = out_dir.join(&image_dir);
+                std::fs::create_dir_all(&folder)?;
+                for (name, bytes) in &images {
+                    let path = folder.join(name);
+                    std::fs::write(&path, bytes)?;
+                    written.push(path);
+                }
+            }
+        }
         if unique.contains(&"bundle") {
+            // not the .md report's text: the bundle links its images under images/
+            let markdown = markdown::render_markdown(&model, "images").into_bytes();
             let reports = [("report.html", html), ("report.pdf", pdf), ("report.md", markdown)];
-            written.push(self.build_bundle(&model, &reports, &out_dir.join(format!("{stem}.zip")))?);
+            written.push(self.build_bundle(&model, &reports, &images, &out_dir.join(format!("{stem}.zip")))?);
         }
         Ok(written)
     }

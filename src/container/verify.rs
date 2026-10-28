@@ -17,7 +17,7 @@ use super::volume::{
 };
 use super::x509::{Gpgsm, X509Check};
 use super::zip64::{Archive, find_last_end, member_bytes, read_archive};
-use super::{AFF4_NS, AFF4L_NS};
+use super::{AFF4_NS, AFF4L_NS, FACTUM_NS};
 use crate::error::{FactumError, Result};
 use crate::services::Factum;
 use crate::signer::Signer;
@@ -857,6 +857,7 @@ pub fn verify_file(
             } else {
                 record.path.clone()
             };
+            let findings_before = report.findings.len();
             // content longer than its listed size (a damaged or crafted container) never shows more than all of it
             let report_progress = |read: u64| progress((done + read).min(total), total);
             match hash_content(&mut file, &archive, graph, &record.arn, &report_progress, cancel) {
@@ -922,6 +923,51 @@ pub fn verify_file(
                             Level::Warn,
                             "not_checked",
                             format!("{name}: no MD5, SHA-1 or SHA-256 to check its content against."),
+                        );
+                    }
+                }
+            }
+            // a damaged copy that was added again (Add Again) is a known, logged fact: a warning, not a failure
+            let replacement = graph
+                .objects(&record.arn, &format!("{FACTUM_NS}replacedBy"))
+                .find_map(|t| match t {
+                    Term::Iri(arn) => Some(arn.clone()),
+                    Term::Literal { .. } => None,
+                });
+            if let Some(replacement) = replacement {
+                let failed = report.findings[findings_before..]
+                    .iter()
+                    .any(|f| f.code == "stream_hash");
+                if failed {
+                    let tail = report.findings.split_off(findings_before);
+                    report
+                        .findings
+                        .extend(tail.into_iter().filter(|f| f.code != "stream_hash"));
+                    let by = graph
+                        .first_value(&replacement, &format!("{AFF4L_NS}originalPathName"))
+                        .unwrap_or(&replacement)
+                        .to_string();
+                    // a replacement counts only when it is a file of this state with the same hashes and size
+                    let same = stored.iter().find(|r| r.arn == replacement).is_some_and(|new| {
+                        (&new.md5, &new.sha1, &new.sha256, new.size)
+                            == (&record.md5, &record.sha1, &record.sha256, record.size)
+                    });
+                    if same {
+                        report.finding(
+                            Level::Warn,
+                            "replaced_copy",
+                            format!(
+                                "{name}: the content does not match its hashes; replaced by a copy added again ({by})."
+                            ),
+                        );
+                    } else {
+                        report.finding(
+                            Level::Fail,
+                            "stream_hash",
+                            format!(
+                                "{name}: the content does not match its hashes; replaced by a copy with different \
+                                 content ({by})."
+                            ),
                         );
                     }
                 }

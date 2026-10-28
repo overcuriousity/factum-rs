@@ -1,6 +1,6 @@
 [package]
 name = "factum"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Forensic note-taking with GPG-signed, tamper-evident (RFC 9162 Merkle tree) case logs"
@@ -23,7 +23,7 @@ path = "src/main.rs"
 [features]
 default = ["gui"]
 # the GUI can be left out for headless servers: cargo build --no-default-features
-gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:image", "dep:ureq", "dep:serde"]
+gui = ["dep:arboard", "dep:eframe", "dep:egui", "dep:rfd", "dep:ureq", "dep:serde"]
 
 [dependencies]
 base64 = "0.23"
@@ -33,8 +33,10 @@ crc32fast = "1"
 dirs = "7"
 flate2 = "1"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 log = { version = "0.4", features = ["std"] }
 md-5 = "0.11"
+pulldown-cmark = { version = "0.13", default-features = false }
 regex = "1"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", optional = true, features = ["derive"] }
@@ -47,9 +49,10 @@ uuid = { version = "1", features = ["v4"] }
 which = "8"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
+# the image on the clipboard, which egui does not hand over unchanged (it premultiplies the alpha)
+arboard = { version = "3", optional = true }
 eframe = { version = "0.37", optional = true, default-features = false, features = ["clipboard", "default_fonts", "glow", "wayland", "x11"] }
 egui = { version = "0.37", optional = true }
-image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 rfd = { version = "0.17", optional = true }
 ureq = { version = "3", optional = true, default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
 

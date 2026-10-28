@@ -825,13 +825,8 @@ fn a_long_note_scrolls_inside_the_composer() {
     let height = harness.state().composer_height;
     assert!((height - DEFAULT_COMPOSER_HEIGHT).abs() < 1.0, "{height}");
     // dragging the panel's top edge up makes it taller
-    // the panel's top edge, just above the editor
-    let top = harness
-        .get_by_role(egui::accesskit::Role::MultilineTextInput)
-        .rect()
-        .min
-        .y
-        - 6.0;
+    // the panel's top edge, just above the toolbar
+    let top = harness.get_by_label("Bold").rect().min.y - 6.0;
     let pointer = |harness: &mut Harness<'_, FactumApp>, event: egui::Event| {
         harness.input_mut().events.push(event);
         harness.step();
@@ -1414,7 +1409,13 @@ impl Fixture {
         std::fs::write(source.join("notes.txt"), b"notes").unwrap();
         let path = fixture._dir.path().join("fs01.aff4l");
         let id = factum
-            .create_container(case_id, "FS01 preserved", None, &path, &source.display().to_string())
+            .create_container(
+                case_id,
+                "FS01 preserved",
+                factum.create_evidence(case_id, "usb", "", "").unwrap(),
+                &path,
+                &source.display().to_string(),
+            )
             .unwrap();
         let mut volume = factum.open_container_for_add(id).unwrap();
         let options = AddOptions {
@@ -1422,6 +1423,7 @@ impl Fixture {
             keep_path: true,
             metadata_only: false,
             excerpt: None,
+            replaces: Vec::new(),
         };
         let staged = volume
             .stage_add(
@@ -1442,53 +1444,169 @@ fn close_container(fixture: &Fixture, id: i64) {
     Factum::with_seal_dir(&db, &signer, None).close_container(id).unwrap();
 }
 
+/// The evidence item the fixture's container belongs to.
+fn container_evidence(fixture: &Fixture, id: i64) -> i64 {
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    Factum::with_seal_dir(&db, &signer, None)
+        .container(id)
+        .unwrap()
+        .evidence_id
+        .unwrap()
+}
+
 #[test]
-fn tree_lists_container_with_count_and_state() {
+fn evidence_row_shows_symbol_only_with_container() {
     let (fixture, id, _) = Fixture::with_container();
     let mut harness = fixture.harness();
     let node = &harness.state().view.tree[0];
     assert_eq!(node.containers.len(), 1);
     assert_eq!((node.containers[0].id, node.containers[0].file_count), (id, 2));
-    assert!(harness.query_by_label_contains("FS01 preserved · open").is_some());
+    // no row of its own: the symbol on its evidence row stands for it
+    assert!(harness.query_by_label_contains("FS01 preserved").is_none());
+    assert_eq!(harness.query_all_by_label("Container · open").count(), 1);
     close_container(&fixture, id);
     harness.state_mut().dirty = true;
     harness.run_ok();
-    assert!(harness.query_by_label_contains("FS01 preserved").is_some());
-    assert!(harness.query_by_label_contains("FS01 preserved · open").is_none());
+    assert_eq!(harness.query_all_by_label("Container · closed · unsigned").count(), 1);
 }
 
 #[test]
-fn selecting_container_shows_its_files() {
+fn selecting_evidence_shows_notes_then_containers() {
     let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let case_id = factum.list_cases(false).unwrap()[0];
+        factum
+            .create_note("seized at the desk", Some(evidence_id), case_id)
+            .unwrap();
+        factum
+            .create_container(
+                case_id,
+                "second",
+                evidence_id,
+                &fixture._dir.path().join("second.aff4l"),
+                "",
+            )
+            .unwrap();
+    }
     let mut harness = fixture.harness();
-    harness.state_mut().select_container(id);
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
     harness.run_ok();
     let app = harness.state();
-    assert_eq!(app.container_id, Some(id));
-    assert!(app.case_id.is_some(), "the case of the container is the current case");
-    assert!(app.view.items.is_empty());
-    assert_eq!(app.view.container.as_ref().map(|c| c.summary.id), Some(id));
+    assert_eq!(app.view.containers.len(), 2);
+    assert!(harness.query_by_label_contains("seized at the desk").is_some());
+    assert!(harness.query_by_label("FS01 preserved").is_some());
+    assert!(harness.query_by_label("second").is_some());
     assert!(harness.query_by_label("evil.exe").is_some());
-    assert!(harness.query_by_label("notes.txt").is_some());
-    screenshot(&mut harness, "container_view");
-    // selecting the case again leaves the container
-    let case_id = harness.state().case_id;
-    harness.state_mut().select(case_id, None);
-    harness.run_ok();
-    assert!(harness.state().container_id.is_none());
-    assert!(harness.state().view.container.is_none());
+    screenshot(&mut harness, "evidence_with_containers");
 }
 
 #[test]
-fn jump_to_entry_leaves_the_container_view() {
+fn search_keeps_container_sections() {
     let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
     let mut harness = fixture.harness();
-    harness.state_mut().select_container(id);
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
+    harness.state_mut().filter = "nothing matches this".into();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(harness.query_by_label("evil.exe").is_some());
+}
+
+#[test]
+fn jump_to_entry_shows_it_in_the_case_log() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    let mut harness = fixture.harness();
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
     harness.run_ok();
     harness.state_mut().jump_to_entry(id);
     harness.run_ok();
-    assert!(harness.state().container_id.is_none());
     assert!(harness.state().view.items.iter().any(|i| i.entry().id == id));
+}
+
+#[test]
+fn old_container_without_evidence_gets_its_own_row() {
+    let fixture = Fixture::new();
+    let uuid = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let case_id = factum.list_cases(false).unwrap()[0];
+        let id = factum
+            .create_container(
+                case_id,
+                "old",
+                factum.create_evidence(case_id, "tmp", "", "").unwrap(),
+                &fixture._dir.path().join("old.aff4l"),
+                "",
+            )
+            .unwrap();
+        let detail = factum.container(id).unwrap();
+        // a 2.6 container: the same event without an evidence item
+        factum
+            .append(
+                case_id,
+                crate::log_service::KIND_SYSTEM,
+                "Container \"orphan\" created",
+                crate::log_service::Append {
+                    payload: Some(serde_json::json!({"event": "container_created", "case_id": case_id,
+                        "container_id": "9b2b1f4e-0000-4000-8000-000000000001", "name": "orphan",
+                        "evidence_id": null, "file_name": "orphan.aff4l", "base_path": "",
+                        "created_utc": detail.created_utc})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        "9b2b1f4e-0000-4000-8000-000000000001"
+    };
+    let mut harness = fixture.harness();
+    let row = harness.query_by_label("orphan").expect("a row of its own");
+    row.click();
+    harness.run_ok();
+    let app = harness.state();
+    assert_eq!(app.view.containers.len(), 1);
+    assert_eq!(app.view.containers[0].summary.uuid, uuid);
+}
+
+#[test]
+fn container_of_deleted_evidence_gets_its_own_row() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE evidence SET deleted_utc = '2026-10-28T00:00:00Z' WHERE id = ?",
+            [evidence_id],
+        )
+        .unwrap();
+    let harness = fixture.harness();
+    let row = harness.query_by_label("FS01 preserved").expect("a row of its own");
+    let _ = row;
+    let summary = &harness.state().view.tree[0].containers[0];
+    assert!(containers::row_hover(summary, true).contains("(deleted)"));
+}
+
+#[test]
+fn symbol_hover_texts() {
+    let (fixture, _, _) = Fixture::with_container();
+    let harness = fixture.harness();
+    let open = harness.state().view.tree[0].containers[0].clone();
+    assert_eq!(containers::symbol_hover(&[&open]), "Container · open");
+    let mut closed = open.clone();
+    closed.open = false;
+    assert_eq!(
+        containers::symbol_hover(&[&open, &closed, &closed]),
+        "3 containers · 1 open"
+    );
 }
 
 #[test]
@@ -1499,7 +1617,7 @@ fn missing_file_is_marked_and_locate_enabled() {
     harness.run_ok();
     let summary = harness.state().view.tree[0].containers[0].clone();
     assert!(summary.missing);
-    assert!(harness.query_by_label("File missing").is_some());
+    assert!(harness.query_by_label("Container file missing").is_some());
     let items = containers::menu_items(&summary, false, false);
     let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
     assert!(enabled("Locate…"));
@@ -1549,7 +1667,7 @@ fn locate_accepts_the_moved_file() {
 }
 
 #[test]
-fn new_container_dialog_creates_file_and_selects_it() {
+fn case_new_container_creates_evidence_and_container() {
     let fixture = Fixture::new();
     let mut harness = fixture.harness();
     select_case(&mut harness);
@@ -1558,25 +1676,108 @@ fn new_container_dialog_creates_file_and_selects_it() {
     harness.run_ok();
     let folder = fixture._dir.path().to_path_buf();
     if let Some(Dialog::NewContainer {
-        folder: field, base, ..
+        folder: field,
+        evidence,
+        ..
     }) = harness.state_mut().dialogs.last_mut()
     {
+        assert!(evidence.is_none(), "the case dialog creates the evidence item");
         *field = folder.display().to_string();
-        *base = folder.display().to_string();
     } else {
         panic!("the New Container dialog is not open");
     }
-    type_into(&mut harness, "Name", "FS01 preserved");
-    screenshot(&mut harness, "new_container_dialog");
+    assert!(harness.query_by_label("Evidence hash (optional)").is_some());
+    type_into(&mut harness, "Name", "USB 2");
+    screenshot(&mut harness, "new_container_case");
     click_label(&mut harness, "Create");
-    let path = folder.join("FS01-preserved.aff4l");
+    let path = folder.join("USB-2.aff4l");
     assert!(path.is_file());
     let app = harness.state();
-    let id = app.container_id.expect("the new container is selected");
-    assert_eq!(
-        app.factum().container(id).unwrap().summary.path.as_deref(),
-        Some(path.as_path())
+    let evidence = app.view.evidence.as_ref().expect("the new evidence item is selected");
+    assert_eq!(evidence.description, "USB 2");
+    assert_eq!(app.view.containers.len(), 1);
+    assert_eq!(app.view.containers[0].summary.path.as_deref(), Some(path.as_path()));
+}
+
+#[test]
+fn evidence_new_container_prefills_name() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    let mut harness = fixture.harness();
+    harness.state_mut().open_new_container_for(evidence_id);
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::NewContainer {
+            evidence: Some((e, _)),
+            name,
+            ..
+        }) => assert_eq!((*e, name.as_str()), (evidence_id, "usb 2")),
+        _ => panic!("the evidence's New Container dialog is not open"),
+    }
+    assert!(harness.query_by_label("New Container for usb").is_some());
+    assert!(harness.query_by_label("Evidence hash (optional)").is_none());
+}
+
+#[test]
+fn acquire_adds_the_folder_in_one_step() {
+    let fixture = Fixture::new();
+    let acquire = fixture._dir.path().join("mounted");
+    std::fs::create_dir_all(acquire.join("Users")).unwrap();
+    std::fs::write(acquire.join("Users/a.txt"), b"a").unwrap();
+    std::fs::write(acquire.join("b.txt"), b"bb").unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().open_new_container(case_id);
+    harness.run_ok();
+    if let Some(Dialog::NewContainer {
+        folder, acquire: field, ..
+    }) = harness.state_mut().dialogs.last_mut()
+    {
+        *folder = fixture._dir.path().display().to_string();
+        *field = acquire.display().to_string();
+    }
+    type_into(&mut harness, "Name", "Mounted");
+    click_label(&mut harness, "Create");
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    let detail = harness.state().view.containers[0].clone();
+    assert_eq!(detail.summary.file_count, 2);
+    assert_eq!(detail.base_path, acquire.display().to_string());
+}
+
+#[test]
+fn add_dialog_accepts_empty_base() {
+    let (fixture, id, _) = Fixture::with_container();
+    let elsewhere = fixture._dir.path().join("elsewhere.txt");
+    std::fs::write(&elsewhere, b"elsewhere").unwrap();
+    let mut harness = fixture.harness();
+    harness.state_mut().select(None, None);
+    harness.state_mut().open_add_to_container(id, vec![elsewhere.clone()]);
+    if let Some(Dialog::AddToContainer { base, .. }) = harness.state_mut().dialogs.last_mut() {
+        base.clear();
+    }
+    harness.run_ok();
+    click_label(&mut harness, "Add");
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    let detail = harness.state().factum().container(id).unwrap();
+    let stored = &detail.adds[1].files[0].path;
+    assert!(
+        elsewhere.display().to_string().ends_with(stored.as_str()) && stored.contains("elsewhere.txt"),
+        "{stored}"
     );
+    assert!(stored.len() > "elsewhere.txt".len());
+}
+
+#[test]
+fn evidence_menu_has_new_container_and_delete_disabled() {
+    let (fixture, _, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness.get_all_by_label("usb").next().unwrap().click_secondary();
+    harness.run_ok();
+    assert!(harness.query_by_label("New Container…").is_some());
+    use egui_kittest::kittest::NodeT as _;
+    let delete = harness.get_by_label("Delete Evidence…");
+    assert!(delete.accesskit_node().is_disabled());
 }
 
 #[test]
@@ -1594,14 +1795,12 @@ fn new_container_dialog_validates() {
         name,
         folder,
         file_name,
-        base,
         ..
     }) = harness.state_mut().dialogs.last_mut()
     {
         *name = "Again".into();
         *folder = path.parent().unwrap().display().to_string();
         *file_name = "fs01.aff4l".into();
-        *base = "/".into();
     }
     harness.run_ok();
     click_label(&mut harness, "Create");
@@ -1617,7 +1816,8 @@ fn add_runs_in_background_and_commits() {
         std::fs::write(more.join(name), name.repeat(10)).unwrap();
     }
     let mut harness = fixture.harness();
-    harness.state_mut().select_container(id);
+    // nothing selected: no composer, whose Add button would be a second "Add"
+    harness.state_mut().select(None, None);
     harness.state_mut().open_add_to_container(id, vec![more.clone()]);
     harness.run_ok();
     screenshot(&mut harness, "add_to_container_dialog");
@@ -1641,6 +1841,7 @@ fn cancel_adds_nothing() {
         keep_path: true,
         metadata_only: false,
         excerpt: None,
+        replaces: Vec::new(),
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     harness.state_mut().start_add(id, vec![source], options, cancel);
@@ -1692,6 +1893,7 @@ fn archive_with_open_container_asks_to_close() {
     ));
     assert!(harness.state().factum().container(id).unwrap().summary.open);
     click_label(&mut harness, "Continue unsigned");
+    run_until(&mut harness, |h| h.state().close_job.is_none());
     let factum = harness.state().factum();
     assert!(!factum.container(id).unwrap().summary.open);
     assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
@@ -1902,7 +2104,7 @@ fn container_view_shows_modified_times() {
     let mut harness = fixture.harness();
     harness.state_mut().select_container(id);
     harness.run_ok();
-    assert_eq!(harness.state().view.container_times.len(), 2);
+    assert_eq!(harness.state().view.container_times[&id].len(), 2);
     let shown = containers::short_time(&modified);
     assert!(shown.ends_with(" UTC") && shown.as_bytes()[10] == b' ', "{shown}");
     assert!(harness.query_all_by_label(&shown).next().is_some(), "{shown}");
@@ -1964,21 +2166,6 @@ fn verify_container_can_be_cancelled() {
 }
 
 #[test]
-fn add_dialog_needs_a_base_path() {
-    let (fixture, id, _) = Fixture::with_container();
-    let mut harness = fixture.harness();
-    let source = fixture._dir.path().join("mnt/evil.exe");
-    harness.state_mut().open_add_to_container(id, vec![source]);
-    if let Some(Dialog::AddToContainer { base, .. }) = harness.state_mut().dialogs.last_mut() {
-        base.clear();
-    }
-    harness.run_ok();
-    click_label(&mut harness, "Add");
-    assert!(harness.state().add_job.is_none());
-    assert!(harness.query_by_label_contains("Choose the base path").is_some());
-}
-
-#[test]
 fn hidden_excerpt_fields_do_not_block_a_metadata_only_add() {
     let (fixture, id, _) = Fixture::with_container();
     let mut harness = fixture.harness();
@@ -2001,4 +2188,838 @@ fn hidden_excerpt_fields_do_not_block_a_metadata_only_add() {
         harness.state().dialogs.last(),
         Some(Dialog::AddToContainer { .. })
     ));
+}
+
+/// The fixture plus one more note with `text` and `images`; returns the new entry's id.
+fn add_note(fixture: &Fixture, text: &str, images: &[crate::images::NoteImage]) -> i64 {
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let factum = Factum::with_seal_dir(&db, &signer, None);
+    let case_id = factum.list_cases(false).unwrap()[0];
+    factum.create_note_with_images(text, images, None, case_id).unwrap()
+}
+
+/// [`add_note`] for images no save accepts (bytes that do not match their id): written to the row afterwards, as a
+/// tampered database holds them.
+fn add_tampered_note(fixture: &Fixture, text: &str, images: &[crate::images::NoteImage]) -> i64 {
+    let note = add_note(fixture, "placeholder", &[]);
+    let payload = crate::images::to_payload(images).map(|p| p.to_string());
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE entries SET text = ?, payload_json = ? WHERE id = ?",
+            rusqlite::params![text, payload, note],
+        )
+        .unwrap();
+    note
+}
+
+fn test_image(width: u32, height: u32) -> crate::images::NoteImage {
+    let rgba = vec![180u8; (width * height * 4) as usize];
+    crate::images::NoteImage::from_rgba(width, height, &rgba).unwrap()
+}
+
+/// A harness showing the case log with the new note's actions visible.
+fn harness_on_note(fixture: &Fixture, note: i64) -> Harness<'static, FactumApp> {
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.state_mut().focused_card = Some(note);
+    harness.run_ok();
+    harness
+}
+
+#[test]
+fn note_card_renders_markdown() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "**bold** text", &[]);
+    let harness = harness_on_note(&fixture, note);
+    assert!(harness.query_by_label("bold text").is_some());
+    assert!(harness.query_by_label_contains("**").is_none());
+}
+
+#[test]
+fn source_toggle_shows_the_literal_text() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "**bold** text", &[]);
+    let mut harness = harness_on_note(&fixture, note);
+    harness.get_by_label("Show source").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("**bold** text").is_some());
+    assert!(harness.query_by_label("bold text").is_none());
+    harness.get_by_label("Show formatted").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("bold text").is_some());
+    assert!(harness.query_by_label("**bold** text").is_none());
+}
+
+#[test]
+fn note_card_shows_its_image() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(&fixture, &format!("see {}", image.reference("shot")), &[image]);
+    let harness = harness_on_note(&fixture, note);
+    let shown = harness.get_by_role(egui::accesskit::Role::Image).rect();
+    assert!(
+        shown.width() <= theme::MAX_CARD_WIDTH && shown.height() <= 400.0,
+        "{shown:?}"
+    );
+    assert!(shown.width() > 0.0 && shown.height() > 0.0);
+}
+
+#[test]
+fn a_tall_image_is_shown_at_most_400_high() {
+    let fixture = Fixture::new();
+    let image = test_image(600, 1800);
+    let note = add_note(&fixture, &image.reference("tall"), &[image]);
+    let harness = harness_on_note(&fixture, note);
+    let shown = harness.get_by_role(egui::accesskit::Role::Image).rect();
+    assert!(shown.height() <= 400.0 + 0.5, "{shown:?}");
+    assert!((shown.width() / shown.height() - 1.0 / 3.0).abs() < 0.01, "{shown:?}");
+}
+
+#[test]
+fn clicking_an_image_opens_the_viewer() {
+    let fixture = Fixture::new();
+    let image = test_image(40, 30);
+    let note = add_note(&fixture, &image.reference("shot"), std::slice::from_ref(&image));
+    let mut harness = harness_on_note(&fixture, note);
+    harness.get_by_role(egui::accesskit::Role::Image).click();
+    harness.run_ok();
+    let title = format!("Image {}", image.id);
+    assert!(harness.query_all_by_label(&title).count() >= 1);
+    assert_eq!(
+        harness.state().image_viewer.as_ref().map(|(entry, _)| *entry),
+        Some(note)
+    );
+    // closable
+    harness.get_by_label("Close").click();
+    harness.run_ok();
+    assert!(harness.query_all_by_label(&title).count() == 0);
+    assert!(harness.state().image_viewer.is_none());
+}
+
+#[test]
+fn link_shows_its_address_and_is_not_clickable() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "[l](https://x.test)", &[]);
+    let harness = harness_on_note(&fixture, note);
+    assert!(harness.query_by_label("l (https://x.test)").is_some());
+    assert!(harness.query_by_role(egui::accesskit::Role::Link).is_none());
+}
+
+#[test]
+fn images_that_cannot_be_shown_say_so() {
+    let fixture = Fixture::new();
+    let mut broken = test_image(4, 4);
+    broken.bytes = b"not a picture".to_vec();
+    let gone = test_image(5, 5);
+    let text = format!(
+        "![a](https://x.test/p.png) {} {}",
+        gone.reference("b"),
+        broken.reference("c")
+    );
+    let note = add_tampered_note(&fixture, &text, &[broken.clone(), gone.clone()]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // the stored payload is untrusted: an image that is not there, and one of a type nobody embeds
+    for item in &mut harness.state_mut().view.items {
+        if let Item::Note(card) = item
+            && card.entry.id == note
+        {
+            card.images = card
+                .images
+                .iter()
+                .filter(|image| image.id != gone.id)
+                .cloned()
+                .collect();
+        }
+    }
+    harness.run_ok();
+    assert!(
+        harness
+            .query_by_label_contains("[external image https://x.test/p.png not loaded]")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} missing]", gone.id))
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} could not be shown]", broken.id))
+            .is_some()
+    );
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_none());
+}
+
+#[test]
+fn an_image_of_another_type_counts_as_missing() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(&fixture, &image.reference("x"), std::slice::from_ref(&image));
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    for item in &mut harness.state_mut().view.items {
+        if let Item::Note(card) = item
+            && card.entry.id == note
+        {
+            let mut images = card.images.to_vec();
+            images[0].mime = "image/svg+xml".into();
+            card.images = images.into();
+        }
+    }
+    harness.run_ok();
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} missing]", image.id))
+            .is_some()
+    );
+}
+
+#[test]
+fn the_pinned_panel_shows_a_note_as_plain_text() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "**bold** [l](https://x.test)", &[]);
+    fixture
+        .db()
+        .conn
+        .execute("UPDATE entries SET is_pinned = 1 WHERE id = ?", [note])
+        .unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let card = harness.state().view.pinned.iter().find(|c| c.entry.id == note).unwrap();
+    assert_eq!(card.entry.text, "**bold** [l](https://x.test)");
+    // the log shows it formatted, the compact card as one plain line
+    assert_eq!(harness.query_all_by_label("bold l (https://x.test)").count(), 2);
+    assert!(harness.query_by_label_contains("**").is_none());
+}
+
+#[test]
+fn an_image_is_decoded_only_while_it_is_on_screen() {
+    let fixture = Fixture::new();
+    let image = test_image(40, 30);
+    let filler = "line\n\n".repeat(120);
+    // the log lists the newest first: the image note comes after the long one
+    let note = add_note(&fixture, &image.reference("far below"), &[image]);
+    add_note(&fixture, &filler, &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // below the visible part of the log: the room is kept, nothing is decoded
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_none());
+    assert_eq!(markup_view::cached_count(&harness.ctx), 1); // its header size only
+    let ctx = harness.ctx.clone();
+    let decoded = |ctx: &egui::Context| markup_view::texture_cached(ctx, note);
+    assert!(!decoded(&ctx));
+    harness.state_mut().scroll_to = Some(note);
+    harness.run_ok();
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_some());
+    assert!(decoded(&ctx));
+}
+
+#[test]
+fn a_texture_scrolled_away_for_30_seconds_is_released() {
+    let fixture = Fixture::new();
+    let image = test_image(40, 30);
+    let note = add_note(&fixture, &image.reference("far below"), &[image]);
+    let filler = add_note(&fixture, &"line\n\n".repeat(120), &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.state_mut().scroll_to = Some(note);
+    harness.run_ok();
+    let ctx = harness.ctx.clone();
+    assert!(markup_view::texture_cached(&ctx, note));
+    // back to the top: the image is laid out below the visible part every frame, but not drawn
+    harness.state_mut().scroll_to = Some(filler);
+    harness.run_ok();
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_none());
+    let now = ctx.input(|i| i.time);
+    harness.input_mut().time = Some(now + 31.0);
+    harness.run_ok();
+    assert!(!markup_view::texture_cached(&ctx, note));
+}
+
+#[test]
+fn a_rebuild_does_not_decode_the_images_again() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let text = format!("see {}", image.reference("x"));
+    let first = add_note(&fixture, &text, std::slice::from_ref(&image));
+    let note = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let note = factum.correct_note(first, &format!("{text}, corrected")).unwrap();
+        factum.pin_note(note).unwrap();
+        note
+    };
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let cards = |harness: &Harness<'_, FactumApp>| -> Vec<Arc<[crate::images::NoteImage]>> {
+        let view = &harness.state().view;
+        let listed = view.items.iter().filter_map(|item| match item {
+            Item::Note(card) => Some(card),
+            Item::System(_) => None,
+        });
+        listed
+            .chain(&view.pinned)
+            .filter(|card| card.entry.id == note)
+            .map(|card| {
+                // the card keeps the decoded images only, not the base64 of its own or its earlier versions
+                assert!(card.entry.payload_json.is_none());
+                assert!(card.history.iter().all(|old| old.payload_json.is_none()));
+                card.images.clone()
+            })
+            .collect()
+    };
+    let before = cards(&harness);
+    assert_eq!(before.len(), 2); // in the log and pinned
+    assert_eq!(&*before[0], std::slice::from_ref(&image));
+    let ctx = harness.ctx.clone();
+    harness.state_mut().rebuild(&ctx);
+    // the same decoded images: nothing was decoded again
+    for (old, new) in before.iter().zip(cards(&harness)) {
+        assert!(Arc::ptr_eq(old, &new));
+    }
+    assert!(Arc::ptr_eq(&before[0], &before[1]));
+}
+
+#[test]
+fn an_image_that_does_not_decode_says_so_where_it_stands() {
+    let fixture = Fixture::new();
+    let mut image = test_image(8, 8);
+    image.bytes.truncate(40); // the header reads, the pixels are gone
+    let note = add_tampered_note(&fixture, &image.reference("cut"), std::slice::from_ref(&image));
+    let harness = harness_on_note(&fixture, note);
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} could not be shown]", image.id))
+            .is_some()
+    );
+}
+
+// ---- composer and correction dialog: Markdown toolbar, images
+
+fn composer_id() -> egui::Id {
+    egui::Id::unique("composer")
+}
+
+fn png(width: u32, height: u32) -> Vec<u8> {
+    test_image(width, height).bytes
+}
+
+/// A file dropped on the window, in memory.
+#[derive(Debug)]
+struct DroppedBytes {
+    path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+impl egui::DroppedFile for DroppedBytes {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn bytes(&self) -> std::result::Result<Vec<u8>, String> {
+        Ok(self.bytes.clone())
+    }
+}
+
+fn drop_file(harness: &mut Harness<'_, FactumApp>, name: &str, bytes: Vec<u8>) {
+    let file = DroppedBytes {
+        path: PathBuf::from("/nonexistent").join(name),
+        bytes,
+    };
+    harness.input_mut().dropped_files.push(Arc::new(file));
+    harness.run_ok();
+}
+
+fn paste_image(harness: &mut Harness<'_, FactumApp>) {
+    let pixels = egui::ColorImage::new([2, 2], vec![egui::Color32::from_rgb(10, 20, 30); 4]);
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::PasteImage(Arc::new(pixels)));
+    harness.run_ok();
+}
+
+#[test]
+fn composer_saves_a_pasted_image() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let image = test_image(4, 4);
+    harness.state_mut().composer = format!("look: {}", image.reference("screenshot"));
+    harness.state_mut().composer_images = vec![image.clone()];
+    harness.state_mut().submit_note();
+    harness.run_ok();
+    assert!(harness.state().composer.is_empty());
+    assert!(harness.state().composer_images.is_empty());
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    let newest = *factum
+        .list_entries(case_id, &EntryFilter::notes())
+        .unwrap()
+        .last()
+        .unwrap();
+    let entry = factum.get_entry(newest).unwrap().unwrap();
+    assert_eq!(entry.images(), vec![image]);
+}
+
+#[test]
+fn a_note_that_fails_to_save_keeps_its_images() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let (image, gone) = (test_image(4, 4), test_image(5, 5));
+    // one reference is to an image that is not attached
+    let text = format!("{} {}", image.reference("kept"), gone.reference("gone"));
+    harness.state_mut().composer = text.clone();
+    harness.state_mut().composer_images = vec![image.clone()];
+    harness.state_mut().submit_note();
+    harness.run_ok();
+    assert_eq!(harness.state().composer, text);
+    assert_eq!(harness.state().composer_images, vec![image]);
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+}
+
+#[test]
+fn correction_dialog_keeps_the_images() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(
+        &fixture,
+        &format!("see {}", image.reference("x")),
+        std::slice::from_ref(&image),
+    );
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+    match harness.state_mut().dialogs.last_mut() {
+        Some(Dialog::Correct { text, images, .. }) => {
+            assert_eq!(*images, vec![image.clone()]);
+            text.push_str(" and more");
+        }
+        _ => panic!("no correction dialog"),
+    }
+    harness.run_ok();
+    harness.get_by_label("Add corrected version").click();
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+    let factum = harness.state().factum();
+    let newest = factum
+        .get_entry(factum.latest_version_id(note).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_ne!(newest.id, note);
+    assert!(newest.text.ends_with(" and more"));
+    assert_eq!(newest.images(), vec![image]);
+}
+
+#[test]
+fn clicking_an_image_opens_it_from_the_cards_images() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(
+        &fixture,
+        &format!("see {}", image.reference("x")),
+        std::slice::from_ref(&image),
+    );
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // the log decoded the note's images for its card
+    assert!(harness.state().note_images.borrow().contains_key(&note));
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::OpenImage(note, image.id.clone()), &ctx);
+    harness.run_ok();
+    assert_eq!(harness.state().image_viewer, Some((note, image)));
+}
+
+#[test]
+fn an_image_the_text_does_not_show_is_not_lost() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let image = test_image(4, 4);
+    // pasted inside a code fence, the reference is code, not an image
+    let text = format!("```\n{}\n```", image.reference("screenshot"));
+    harness.state_mut().composer = text.clone();
+    harness.state_mut().composer_images = vec![image.clone()];
+    harness.run_ok();
+    assert_eq!(note_editor::unshown(&text, std::slice::from_ref(&image)), vec![&image]);
+    harness.state_mut().submit_note();
+    harness.run_ok();
+    assert_eq!(harness.state().composer, text);
+    assert_eq!(harness.state().composer_images, vec![image.clone()]);
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    for id in factum.list_entries(case_id, &EntryFilter::notes()).unwrap() {
+        assert!(!factum.get_entry(id).unwrap().unwrap().text.contains(&image.id));
+    }
+}
+
+#[test]
+fn a_correction_that_hides_an_image_is_refused() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(
+        &fixture,
+        &format!("see {}", image.reference("x")),
+        std::slice::from_ref(&image),
+    );
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+    match harness.state_mut().dialogs.last_mut() {
+        Some(Dialog::Correct { text, .. }) => *text = format!("see `{}`", image.reference("x")),
+        _ => panic!("no correction dialog"),
+    }
+    harness.run_ok();
+    harness.get_by_label("Add corrected version").click();
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::Correct { error, .. }) => {
+            assert!(
+                error.as_deref().is_some_and(|e| e.contains("not shown in the note")),
+                "{error:?}"
+            )
+        }
+        _ => panic!("the correction dialog closed"),
+    }
+    let factum = harness.state().factum();
+    assert_eq!(factum.latest_version_id(note).unwrap(), note);
+}
+
+#[test]
+fn the_toolbar_formats_the_selection() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    type_into_composer(&mut harness, "hello world");
+    // "world" selected
+    let mut state = egui::TextEdit::load_state(&harness.ctx, composer_id()).unwrap_or_default();
+    state.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+        egui::text::CCursor::new(egui::text::CharIndex(6)),
+        egui::text::CCursor::new(egui::text::CharIndex(11)),
+    )));
+    state.store(&harness.ctx, composer_id());
+    harness.run_ok();
+    harness.get_by_label("Bold").click();
+    harness.run_ok();
+    assert_eq!(harness.state().composer, "hello **world**");
+    // the editor keeps the focus and the inside is selected: typing replaces it
+    assert!(
+        harness
+            .get_by_role(egui::accesskit::Role::MultilineTextInput)
+            .is_focused()
+    );
+    harness.input_mut().events.push(egui::Event::Text("there".into()));
+    harness.run_ok();
+    assert_eq!(harness.state().composer, "hello **there**");
+    for name in ["Italic", "Code", "Link", "Heading", "List", "Quote", "Image…"] {
+        assert!(harness.query_by_label(name).is_some(), "{name}");
+    }
+}
+
+#[test]
+fn a_pasted_image_goes_into_the_focused_composer() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    type_into_composer(&mut harness, "see ");
+    paste_image(&mut harness);
+    let app = harness.state();
+    assert_eq!(app.composer_images.len(), 1);
+    assert_eq!(
+        app.composer,
+        format!("see {}", app.composer_images[0].reference("screenshot"))
+    );
+    // a second paste of the same pixels adds the reference, not the image
+    paste_image(&mut harness);
+    assert_eq!(harness.state().composer_images.len(), 1);
+    assert_eq!(images::referenced_ids(&harness.state().composer).len(), 1);
+    assert_eq!(harness.state().composer.matches("](factum-image:").count(), 2);
+    harness.get_by_label("Add").click();
+    harness.run_ok();
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    let newest = *factum
+        .list_entries(case_id, &EntryFilter::notes())
+        .unwrap()
+        .last()
+        .unwrap();
+    assert_eq!(factum.get_entry(newest).unwrap().unwrap().images().len(), 1);
+}
+
+#[test]
+fn an_image_is_not_pasted_while_the_composer_is_not_focused() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    paste_image(&mut harness);
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+}
+
+#[test]
+fn a_dropped_image_goes_into_the_composer() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    drop_file(&mut harness, "login page.png", png(3, 3));
+    screenshot(&mut harness, "composer-image");
+    let app = harness.state();
+    assert_eq!(app.composer_images.len(), 1);
+    assert_eq!(app.composer_images[0].name.as_deref(), Some("login page.png"));
+    assert_eq!(app.composer, app.composer_images[0].reference("login page"));
+    // its thumbnail has a button that takes it out again, with its reference
+    harness.get_by_label("Remove image").click();
+    harness.run_ok();
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+    assert!(harness.query_by_label("Remove image").is_none());
+}
+
+#[test]
+fn a_dropped_file_that_is_no_image_is_reported() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    drop_file(&mut harness, "notes.png", b"not a picture".to_vec());
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+}
+
+#[test]
+fn images_are_added_to_a_correction_not_to_the_composer_behind_it() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "plain", &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+    drop_file(&mut harness, "a.png", png(3, 3));
+    screenshot(&mut harness, "correct-image");
+    assert!(harness.state().composer_images.is_empty());
+    assert!(harness.state().composer.is_empty());
+    let Some(Dialog::Correct { text, images, .. }) = harness.state().dialogs.last() else {
+        panic!()
+    };
+    assert_eq!(images.len(), 1);
+    assert!(text.starts_with("plain") || text.contains("factum-image:"), "{text}");
+    // pasted into the correction's editor
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::MultilineTextInput,
+            &format!("Correct Note #{note}"),
+        )
+        .focus();
+    harness.run_ok();
+    paste_image(&mut harness);
+    let Some(Dialog::Correct { images, .. }) = harness.state().dialogs.last() else {
+        panic!()
+    };
+    assert_eq!(images.len(), 2);
+    harness.get_by_label("Add corrected version").click();
+    harness.run_ok();
+    let factum = harness.state().factum();
+    let newest = factum
+        .get_entry(factum.latest_version_id(note).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(newest.images().len(), 2);
+}
+
+#[test]
+fn thumbnails_sit_between_the_editor_and_the_buttons() {
+    let fixture = Fixture::new();
+    let height = format!("{MIN_COMPOSER_HEIGHT}");
+    fixture.db().set_setting(COMPOSER_HEIGHT_SETTING, &height).unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    drop_file(&mut harness, "a.png", png(120, 30));
+    harness.run_ok();
+    let editor = harness.get_by_role(egui::accesskit::Role::MultilineTextInput).rect();
+    let remove = harness.get_by_label("Remove image").rect();
+    let add = harness.get_by_label("Add").rect();
+    let bold = harness.get_by_label("Bold").rect();
+    assert!(bold.max.y <= editor.min.y, "{bold:?} {editor:?}");
+    assert!(editor.max.y <= remove.min.y + 4.0, "{editor:?} {remove:?}");
+    assert!(remove.max.y <= add.min.y, "{remove:?} {add:?}");
+    assert!(editor.height() >= 60.0, "{editor:?}");
+    // the panel with images has a size of its own; the saved height is without the strip
+    assert!((harness.state().composer_height - MIN_COMPOSER_HEIGHT).abs() < 1.0);
+    harness.get_by_label("Remove image").click();
+    harness.run_ok();
+    assert!((harness.state().composer_height - MIN_COMPOSER_HEIGHT).abs() < 1.0);
+}
+
+// --- closing: the re-check in the background, and what follows a mismatch
+
+/// Flips one byte inside the stored content of the container's first file, in place.
+fn damage_first_file(fixture: &Fixture, id: i64, path: &std::path::Path) {
+    use crate::container::zip64::read_archive;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let arn = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        Factum::with_seal_dir(&db, &signer, None).container(id).unwrap().adds[0].files[0]
+            .arn
+            .clone()
+    };
+    let uuid = crate::container::volume::Volume::uuid_of(path).unwrap();
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let entry = archive
+        .get(&crate::container::member_name(&arn, &format!("aff4://{uuid}")))
+        .unwrap()
+        .clone();
+    let mut header = [0u8; 30];
+    file.seek(SeekFrom::Start(entry.header_offset)).unwrap();
+    file.read_exact(&mut header).unwrap();
+    let skip =
+        30 + u16::from_le_bytes([header[26], header[27]]) as u64 + u16::from_le_bytes([header[28], header[29]]) as u64;
+    let at = entry.header_offset + skip + entry.compressed_size / 2;
+    let mut byte = [0u8; 1];
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.read_exact(&mut byte).unwrap();
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+}
+
+fn close_from_menu(harness: &mut Harness<'_, FactumApp>, id: i64) {
+    harness
+        .state_mut()
+        .container_action(ContainerAction::Close(id), &egui::Context::default());
+    run_until(harness, |h| h.state().close_job.is_none());
+}
+
+#[test]
+fn close_runs_in_background_and_logs_recheck() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness
+        .state_mut()
+        .container_action(ContainerAction::Close(id), &egui::Context::default());
+    assert!(harness.state().close_job.is_some());
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(!detail.summary.open);
+    let text = harness
+        .state()
+        .factum()
+        .get_entry(detail.closes[0].entry_id)
+        .unwrap()
+        .unwrap()
+        .text;
+    assert!(text.contains("re-checked"), "{text}");
+}
+
+#[test]
+fn damaged_container_opens_the_dialog() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    match harness.state().dialogs.last() {
+        Some(Dialog::Damaged { mismatches, .. }) => assert_eq!(mismatches.len(), 1),
+        _ => panic!("no damaged dialog"),
+    }
+    screenshot(&mut harness, "damaged_dialog");
+    click_label(&mut harness, "Cancel");
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.open && detail.closes.is_empty() && detail.damaged_closes.is_empty());
+}
+
+#[test]
+fn close_as_damaged_from_the_dialog() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    click_label(&mut harness, "Close as Damaged");
+    let summary = harness.state().factum().container(id).unwrap().summary;
+    assert!(summary.damaged && !summary.open);
+    assert_eq!(containers::state_text(&summary), "closed · damaged");
+}
+
+#[test]
+fn add_again_then_closes() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    click_label(&mut harness, "Add Again");
+    run_until(&mut harness, |h| {
+        h.state().add_job.is_none() && h.state().close_job.is_none() && h.state().close_after_adds.is_none()
+    });
+    let detail = harness.state().factum().container(id).unwrap();
+    assert_eq!(detail.adds.len(), 2);
+    assert_eq!(detail.adds[1].replaces.len(), 1);
+    assert!(!detail.summary.open && detail.closes.len() == 1);
+}
+
+#[test]
+fn add_again_with_source_gone_shows_error() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    std::fs::remove_file(fixture._dir.path().join("mnt/evil.exe")).unwrap();
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    click_label(&mut harness, "Add Again");
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+    assert!(harness.state().close_after_adds.is_none());
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.open && detail.adds.len() == 1);
+    harness.state_mut().dialogs.clear();
+    close_from_menu(&mut harness, id);
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Damaged { .. })));
+}
+
+#[test]
+fn add_again_that_cannot_start_leaves_no_state() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    std::fs::remove_file(&path).unwrap();
+    click_label(&mut harness, "Add Again");
+    assert!(harness.state().add_job.is_none());
+    assert!(harness.state().close_after_adds.is_none());
+    assert!(harness.state().pending_adds.is_empty());
+}
+
+#[test]
+fn container_details_are_reused_between_rebuilds() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    let mut harness = fixture.harness();
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
+    harness.run_ok();
+    let cached = |h: &Harness<'_, FactumApp>| h.state().container_details.borrow().get(&id).map(|(key, _)| *key);
+    let first = cached(&harness).expect("the shown container is cached");
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert_eq!(cached(&harness), Some(first));
+    close_container(&fixture, id);
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(
+        cached(&harness).unwrap() > first,
+        "a new event replaces the cached detail"
+    );
+    assert!(!harness.state().view.containers[0].summary.open);
 }

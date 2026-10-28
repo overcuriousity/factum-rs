@@ -170,6 +170,23 @@ pub fn add_to_container(
     (worker, progress)
 }
 
+pub type RecheckResult = Result<crate::container::volume::Recheck, String>;
+
+/// Re-reads what a close checks, on a thread of its own (spec 5.2).
+pub fn recheck(
+    ctx: &egui::Context,
+    input: crate::containers::RecheckInput,
+    cancel: Arc<AtomicBool>,
+) -> (Worker<RecheckResult>, Arc<AddProgress>) {
+    let progress = Arc::new(AddProgress::default());
+    let shared = progress.clone();
+    let worker = Worker::spawn(ctx, move || {
+        crate::container::volume::recheck(&input.path, input.end, &input.records, &shared, &cancel)
+            .map_err(|e| e.to_string())
+    });
+    (worker, progress)
+}
+
 pub type ContainerVerifyResult = Result<crate::container::verify::ContainerReport, String>;
 
 /// Verifies a container file on a thread of its own; progress in bytes.

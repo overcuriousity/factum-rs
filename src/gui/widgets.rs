@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, UiBuilder};
 
 use super::icons;
+use super::markup_view;
 use super::theme::{self, ICON_SIZE, MAX_CARD_WIDTH, NOTE_SIZE, Palette, SMALL_SIZE};
+use crate::images::NoteImage;
+use crate::markup;
 use crate::notes::Entry;
 use crate::verifier::SignatureCheck;
 
@@ -196,6 +199,12 @@ pub struct Card {
     /// the evidence, when the view does not already show it
     pub evidence: Option<String>,
     pub archived: bool,
+    /// the images in the note's payload, decoded from base64 once per entry (shared by its cards and rebuilds)
+    pub images: std::sync::Arc<[NoteImage]>,
+    /// the note's Markdown, parsed once when the card is built, not on every frame
+    pub blocks: std::sync::Arc<[markup::Block]>,
+    /// the note on one line, for the compact view
+    pub plain: String,
 }
 
 impl Card {
@@ -220,6 +229,8 @@ pub enum CardAction {
     Verify(i64),
     Focus(i64),
     ToggleHistory(i64),
+    /// the entry and the id of one of its images, to show full size
+    OpenImage(i64, String),
 }
 
 fn mono(text: impl Into<String>, size: f32, color: Color32) -> RichText {
@@ -383,6 +394,8 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
     let entry = &card.entry;
     let id = ui.scope_id().with(("card", entry.id, view.compact));
     let shown = actions_shown(ui, id) || view.focused;
+    let source_id = egui::Id::unique(("source", entry.id));
+    let source_on = !view.compact && ui.data(|d| d.get_temp::<bool>(source_id)).unwrap_or(false);
     let mut menu_open = false;
     let width = ui.available_width().min(MAX_CARD_WIDTH);
     let response = ui
@@ -401,6 +414,20 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                                 menu_open =
                                     IconButton::new(icons::MORE, "More").menu(ui, |ui| card_menu(ui, card, actions));
                             });
+                            // the narrow pinned panel shows plain text only
+                            if !view.compact {
+                                // on while the source shows, so that the way back is in sight
+                                visible_ui(ui, shown || source_on, |ui| {
+                                    let name = if source_on { "Show formatted" } else { "Show source" };
+                                    if IconButton::new(icons::SOURCE, name)
+                                        .selected(source_on)
+                                        .show(ui)
+                                        .clicked()
+                                    {
+                                        ui.data_mut(|d| d.insert_temp(source_id, !source_on));
+                                    }
+                                });
+                            }
                             if card.archived {
                                 return;
                             }
@@ -449,15 +476,34 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                     if toggle_history {
                         actions.push(CardAction::ToggleHistory(entry.id));
                     }
-                    // notes are evidence: shown as plain text, never interpreted
-                    let text = ui.add(
-                        egui::Label::new(RichText::new(&entry.text).size(NOTE_SIZE).color(p.text))
-                            .selectable(true)
-                            .wrap(),
-                    );
-                    text.context_menu(|ui| card_menu(ui, card, actions));
-                    if text.clicked() {
-                        actions.push(CardAction::Focus(entry.id));
+                    // the signed text stays the evidence: the formatted view is drawn from it, and one click shows
+                    // it as it is
+                    let on_body = |response: &egui::Response, actions: &mut Vec<CardAction>| {
+                        response.context_menu(|ui| card_menu(ui, card, actions));
+                        if response.clicked() {
+                            actions.push(CardAction::Focus(entry.id));
+                        }
+                    };
+                    if view.compact {
+                        let text = ui.add(
+                            egui::Label::new(RichText::new(&card.plain).size(NOTE_SIZE).color(p.text))
+                                .selectable(true)
+                                .wrap(),
+                        );
+                        on_body(&text, actions);
+                    } else if source_on {
+                        let text = markup_view::source(ui, &entry.text, NOTE_SIZE - 1.5, p.text);
+                        on_body(&text, actions);
+                    } else if let Some(image) = markup_view::note_body_with(
+                        ui,
+                        entry.id,
+                        &card.blocks,
+                        &card.images,
+                        NOTE_SIZE,
+                        p.text,
+                        &mut |response| on_body(response, actions),
+                    ) {
+                        actions.push(CardAction::OpenImage(entry.id, image));
                     }
                     // tags are signed with the note; labels look different because they are not
                     if !card.tags.is_empty() {

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use serde_json::{Value, json};
 use sha2::Digest;
 
+use super::mounts::Mount;
 use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_bytes, read_meta, stored_path};
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
@@ -25,10 +26,22 @@ pub const KEY_GPG: &str = "information.turtle.pubkey.asc";
 pub const SIG_X509: &str = "information.turtle.factum.sig";
 pub const CER_X509: &str = "information.turtle.factum.cer";
 pub const SIGNATURE_MEMBERS: [&str; 4] = [SIG_GPG, KEY_GPG, SIG_X509, CER_X509];
-const README: &[u8] = include_bytes!("README.txt");
+const README: &str = include_str!("README.txt");
 pub const VERIFY_CONTAINER_PY: &[u8] = include_bytes!("verify_container.py");
 
 /// The name of a closed state's copy of a member.
+/// The README a container carries: what it is, how to verify it, and which verifier it carries (spec 5.3).
+pub fn readme_text() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let hash = hex::encode(sha2::Sha256::digest(VERIFY_CONTAINER_PY));
+    format!(
+        "{README}\nWritten by factum {version}. verify_container.py in this container:\n  SHA-256 {hash}\n\
+         The same script is published at\n  \
+         https://github.com/overcuriousity/factum-rs/blob/v{version}/src/container/verify_container.py\n\
+         Compare the hash with that copy (sha256sum verify_container.py) before running it.\n"
+    )
+}
+
 pub fn history_member(n: u32, name: &str) -> String {
     format!("factum/history/{n}/{name}")
 }
@@ -45,13 +58,16 @@ pub struct VolumeInfo {
 }
 
 /// The choices of one Add operation (spec 4.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AddOptions {
+    /// removed from the sources' paths; empty: the full paths are kept
     pub base: PathBuf,
     pub keep_path: bool,
     pub metadata_only: bool,
     /// from (inclusive) and to (exclusive) byte offset, for a single file
     pub excerpt: Option<(u64, u64)>,
+    /// (source path, ARN): copies this operation adds again, replacing the ARN's damaged copy
+    pub replaces: Vec<(PathBuf, String)>,
 }
 
 /// One file as the log records it (`container_files_added`).
@@ -66,6 +82,8 @@ pub struct FileRecord {
     pub metadata_only: bool,
     pub excerpt: Option<(u64, u64)>,
     pub link: Option<String>,
+    /// the absolute path it was read from (not recorded before 2.7)
+    pub source: Option<String>,
 }
 
 impl FileRecord {
@@ -74,6 +92,7 @@ impl FileRecord {
             "arn": self.arn, "path": self.path, "size": self.size, "md5": self.md5, "sha1": self.sha1,
             "sha256": self.sha256, "metadata_only": self.metadata_only,
             "excerpt": self.excerpt.map(|(from, to)| json!([from, to])), "link": self.link,
+            "source": self.source,
         })
     }
 
@@ -94,6 +113,7 @@ impl FileRecord {
             metadata_only: value.get("metadata_only")?.as_bool()?,
             excerpt,
             link: text("link"),
+            source: text("source"),
         })
     }
 }
@@ -152,9 +172,14 @@ pub struct Staged {
     pub skipped: Vec<(String, String)>,
     /// (path, reason): files that could not be read or changed while they were read
     pub errors: Vec<(String, String)>,
+    /// the mounts the sources lie on
+    pub mounts: Vec<Mount>,
+    /// (ARN, ARN of its copy added again by this operation)
+    pub replaced: Vec<(String, String)>,
     graph: Graph,
     task_arn: String,
     base: PathBuf,
+    pub keep_path: bool,
     mark: Mark,
 }
 
@@ -166,6 +191,11 @@ impl Staged {
 
     pub fn bytes(&self) -> u64 {
         self.records.iter().filter(|r| !r.metadata_only).map(|r| r.size).sum()
+    }
+
+    /// The base path the sources' paths were stored below; empty: full paths.
+    pub fn base(&self) -> &Path {
+        &self.base
     }
 }
 
@@ -234,6 +264,110 @@ fn io_error(path: &Path, e: io::Error) -> FactumError {
     FactumError::general(format!("The container {} could not be written: {e}", path.display()))
 }
 
+/// What a re-check read back from the container file (spec 5.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recheck {
+    pub files: u64,
+    pub bytes: u64,
+    /// the operating system's cache was bypassed, so the bytes came from the disk
+    pub uncached: bool,
+    /// files whose stored content cannot be read or does not match their hashes
+    pub mismatches: Vec<FileRecord>,
+}
+
+/// Drops the file's cached pages, so the next reads come from the disk; true when that was possible.
+fn drop_cache(file: &File) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid descriptor for the call; the advice changes no data
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        false
+    }
+}
+
+/// Whether a read error during a re-check means the stored content is damaged (missing, corrupt, cut short), rather
+/// than that the container could not be read right now (a pulled drive, a lock, permissions).
+fn is_damage(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::InvalidData
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::NotFound
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Reads the stored content of `records` back from the state that ends at `end` (the newest when None) and
+/// compares it with their hashes.
+pub fn recheck(
+    path: &Path,
+    end: Option<u64>,
+    records: &[FileRecord],
+    progress: &AddProgress,
+    cancel: &AtomicBool,
+) -> Result<Recheck> {
+    let unreadable = |e: String| FactumError::general(format!("The container {} cannot be read: {e}", path.display()));
+    let mut file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
+    let uncached = drop_cache(&file);
+    let end = find_last_end(&mut file, end)
+        .map_err(|e| unreadable(e.to_string()))?
+        .ok_or_else(|| unreadable("no complete ZIP directory".into()))?;
+    let archive = read_archive(&mut file, end).map_err(|e| unreadable(e.to_string()))?;
+    let entry = archive
+        .get(TURTLE)
+        .ok_or_else(|| unreadable("information.turtle is missing".into()))?;
+    let text = member_text(&mut file, entry).map_err(|e| unreadable(e.to_string()))?;
+    let graph = turtle::parse(&text).map_err(unreadable)?;
+    progress.total_files.store(records.len() as u64, Ordering::Relaxed);
+    progress
+        .total_bytes
+        .store(records.iter().map(|r| r.size).sum(), Ordering::Relaxed);
+    progress.files.store(0, Ordering::Relaxed);
+    progress.bytes.store(0, Ordering::Relaxed);
+    let cancelled = || FactumError::general("Re-check cancelled — the container was not closed.");
+    let mut result = Recheck {
+        uncached,
+        ..Default::default()
+    };
+    for record in records {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        let done = result.bytes;
+        let report = |read: u64| progress.bytes.store(done + read, Ordering::Relaxed);
+        let hashed = match content_reader(&mut file, &archive, &graph, &record.arn) {
+            Ok(Some(mut reader)) => stream::hash_only(&mut reader, &report, cancel).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let matches = match hashed {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(cancelled()),
+            // not damage: the check stops, the container stays open and nothing is logged
+            Err(e) if !is_damage(e.kind()) => return Err(unreadable(e.to_string())),
+            Ok(Some((size, digests))) => {
+                size == record.size
+                    && digests.md5 == record.md5
+                    && digests.sha1 == record.sha1
+                    && digests.sha256 == record.sha256
+            }
+            Ok(None) | Err(_) => false,
+        };
+        if !matches {
+            result.mismatches.push(record.clone());
+        }
+        result.files += 1;
+        result.bytes += record.size;
+        progress.files.store(result.files, Ordering::Relaxed);
+        progress.bytes.store(result.bytes, Ordering::Relaxed);
+    }
+    Ok(result)
+}
+
 /// The metadata of a container file's newest complete state, read without changing the file. `end`, where the
 /// logged state ends, spares the search for it while an addition is being written after it.
 pub fn read_graph(path: &Path, end: Option<u64>) -> Result<Graph> {
@@ -289,6 +423,7 @@ pub fn file_records(graph: &Graph) -> Vec<FileRecord> {
                 metadata_only: value(factum("metadataOnly")).as_deref() == Some("true"),
                 excerpt,
                 link: value(factum("symlinkTarget")),
+                source: value(factum("sourcePath")),
             }
         })
         .collect()
@@ -372,6 +507,38 @@ fn name_and_meta(graph: &mut Graph, arn: &str, name: &[u8], stored: &[u8], meta:
     }
     if let Some(mode) = meta.mode {
         graph.add(arn, &aff4l("fileMode"), typed(mode, "long"));
+    }
+}
+
+/// A mount as its own subject `arn`, and the FUSE mount behind it as another.
+fn mount_triples(graph: &mut Graph, arn: &str, mount: &Mount) {
+    graph.add(arn, &rdf_type(), Term::Iri(factum("Mount")));
+    if mount.is_unknown() {
+        graph.add(arn, &factum("unknown"), typed("true", "boolean"));
+    }
+    if !mount.mount_point.is_empty() {
+        graph.add(arn, &factum("mountPoint"), plain(&mount.mount_point));
+    }
+    for (property, value) in [
+        ("device", &mount.device),
+        ("fileSystem", &mount.fs_type),
+        ("mountOptions", &mount.options),
+        ("image", &mount.image),
+        ("volumeSerial", &mount.volume_serial),
+        ("volumeLabel", &mount.volume_label),
+        ("volumeGuid", &mount.volume_guid),
+    ] {
+        if let Some(value) = value {
+            graph.add(arn, &factum(property), plain(value));
+        }
+    }
+    if let Some(read_only) = mount.read_only {
+        graph.add(arn, &factum("readOnly"), typed(read_only, "boolean"));
+    }
+    if let Some(backing) = &mount.backing {
+        let backing_arn = new_arn();
+        graph.add(arn, &factum("backingMount"), Term::Iri(backing_arn.clone()));
+        mount_triples(graph, &backing_arn, backing);
     }
 }
 
@@ -529,7 +696,7 @@ impl Volume {
             app.add_bytes("version.txt", 0, version.as_bytes())?;
             app.add_bytes("container.description", 0, arn.as_bytes())?;
             app.add_bytes("verify_container.py", 8, VERIFY_CONTAINER_PY)?;
-            app.add_bytes("factum/README.txt", 8, README)?;
+            app.add_bytes("factum/README.txt", 8, readme_text().as_bytes())?;
             Ok(())
         };
         write(&mut app).map_err(|e| io_error(path, e))?;
@@ -764,8 +931,11 @@ impl Volume {
         }
         let mut errors = Vec::new();
         let mut items = Vec::new();
+        // a container inside the folder being added never adds itself
+        let own = std::fs::canonicalize(&self.path).ok();
         for walked in source::walk(sources) {
             match walked {
+                Ok(item) if own.is_some() && std::fs::canonicalize(&item.0).ok() == own => {}
                 Ok(item) => items.push(item),
                 Err((path, e)) => errors.push((path.display().to_string(), e.to_string())),
             }
@@ -804,6 +974,8 @@ impl Volume {
         progress.files.store(0, Ordering::Relaxed);
         progress.bytes.store(0, Ordering::Relaxed);
 
+        let walked: Vec<PathBuf> = items.iter().map(|(path, _)| path.clone()).collect();
+        let mounts = crate::container::mounts::mounts_for(sources, &walked);
         let mark = self.mark();
         let start = mark.write_pos;
         let volume_arn = self.arn();
@@ -849,6 +1021,7 @@ impl Volume {
                     name_and_meta(&mut graph, &arn, &name, stored, meta);
                     graph.add(&arn, &aff4("size"), typed(0, "long"));
                     graph.add(&arn, &factum("symlinkTarget"), plain(&target));
+                    graph.add(&arn, &factum("sourcePath"), plain(&display));
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     records.push(FileRecord {
                         arn,
@@ -860,6 +1033,7 @@ impl Volume {
                         metadata_only: false,
                         excerpt: None,
                         link: Some(target),
+                        source: Some(display.clone()),
                     });
                     progress.files.fetch_add(1, Ordering::Relaxed);
                 }
@@ -936,6 +1110,7 @@ impl Volume {
                         graph.add(&arn, &factum("excerptEnd"), typed(to, "long"));
                         graph.add(&arn, &factum("originalSize"), typed(meta.size, "long"));
                     }
+                    graph.add(&arn, &factum("sourcePath"), plain(&display));
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     done_bytes += read_size;
                     progress.bytes.store(done_bytes, Ordering::Relaxed);
@@ -950,19 +1125,37 @@ impl Volume {
                         metadata_only: options.metadata_only,
                         excerpt: options.excerpt,
                         link: None,
+                        source: Some(display.clone()),
                     });
                 }
             }
         }
+        // a copy replaces a damaged one only when it is the same content: a source that changed since is new evidence
+        let earlier = file_records(&self.graph);
+        let replaced = options
+            .replaces
+            .iter()
+            .filter_map(|(source, old)| {
+                let source = source.display().to_string();
+                let new = records.iter().find(|r| r.source.as_deref() == Some(source.as_str()))?;
+                let old_record = earlier.iter().find(|r| r.arn == *old)?;
+                let same = (&new.md5, &new.sha1, &new.sha256, new.size)
+                    == (&old_record.md5, &old_record.sha1, &old_record.sha256, old_record.size);
+                same.then(|| (old.clone(), new.arn.clone()))
+            })
+            .collect();
         Ok(Staged {
             start,
             records,
             folders,
+            replaced,
             skipped,
             errors,
             graph,
+            mounts,
             task_arn,
             base: options.base.clone(),
+            keep_path: options.keep_path,
             mark,
         })
     }
@@ -977,10 +1170,26 @@ impl Volume {
         graph.extend(staged.graph.clone());
         let task = &staged.task_arn;
         graph.add(task, &rdf_type(), Term::Iri(aff4l("LogicalAcquisitionTask")));
-        let root = encode_name(&os_bytes(staged.base.as_os_str()));
-        graph.add(task, &aff4l("filesystemRoot"), plain(root.text));
+        // without a base path the full paths are stored: below / on Unix, with the drive on Windows
+        let root = if staged.base.as_os_str().is_empty() {
+            if cfg!(windows) { String::new() } else { "/".to_string() }
+        } else {
+            encode_name(&os_bytes(staged.base.as_os_str())).text
+        };
+        graph.add(task, &aff4l("filesystemRoot"), plain(root));
         graph.add(task, &aff4l("pathSeparator"), plain(std::path::MAIN_SEPARATOR_STR));
         graph.add(task, &factum("logEntry"), typed(entry_id, "long"));
+        for (old, new) in &staged.replaced {
+            graph.add(old, &factum("replacedBy"), Term::Iri(new.clone()));
+        }
+        let mount_arns: Vec<String> = staged.mounts.iter().map(|_| new_arn()).collect();
+        // the task's triples first: the file lists them by subject, in the order subjects first appear
+        for arn in &mount_arns {
+            graph.add(task, &factum("mount"), Term::Iri(arn.clone()));
+        }
+        for (arn, mount) in mount_arns.iter().zip(&staged.mounts) {
+            mount_triples(&mut graph, arn, mount);
+        }
         self.commit(graph, &[], &SIGNATURE_MEMBERS)
     }
 
@@ -1148,6 +1357,7 @@ mod tests {
                 keep_path: true,
                 metadata_only: false,
                 excerpt: None,
+                replaces: Vec::new(),
             }
         }
     }
@@ -1760,6 +1970,32 @@ mod tests {
     }
 
     #[test]
+    fn recheck_tells_damage_from_read_errors() {
+        use io::ErrorKind::*;
+        for kind in [InvalidData, InvalidInput, NotFound, UnexpectedEof] {
+            assert!(is_damage(kind), "{kind:?}");
+        }
+        for kind in [PermissionDenied, Other, TimedOut, WouldBlock] {
+            assert!(!is_damage(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn readme_names_the_script_hash() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let readme = String::from_utf8(volume.member("factum/README.txt").unwrap()).unwrap();
+        let script = volume.member("verify_container.py").unwrap();
+        let hash = hex::encode(sha2::Sha256::digest(&script));
+        assert_eq!(script, VERIFY_CONTAINER_PY);
+        assert!(readme.contains(&hash), "{readme}");
+        assert!(readme.contains(&format!(
+            "blob/v{}/src/container/verify_container.py",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+
+    #[test]
     fn records_survive_json() {
         let record = FileRecord {
             arn: "aff4://a".into(),
@@ -1771,6 +2007,7 @@ mod tests {
             metadata_only: false,
             excerpt: Some((1, 3)),
             link: None,
+            source: Some("/mnt/x".into()),
         };
         let json = record.to_json();
         assert_eq!(json["excerpt"], serde_json::json!([1, 3]));

@@ -11,7 +11,7 @@ use sha2::Digest;
 
 use crate::canonical::utc_now;
 use crate::container::volume::{
-    FileRecord, FolderRecord, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, history_member,
+    FileRecord, FolderRecord, Recheck, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, history_member,
     task_entries,
 };
 use crate::container::x509::{Gpgsm, X509_CERT_SETTING, X509_CHAIN_SETTING};
@@ -58,6 +58,14 @@ pub struct ContainerSummary {
     pub path: Option<PathBuf>,
     /// no file at the remembered path
     pub missing: bool,
+    /// the evidence item it belongs to (containers from before 2.7 may have none)
+    pub evidence_id: Option<i64>,
+    /// the newest close is signed, when it was made or later
+    pub signed: bool,
+    /// the newest close was a close as damaged
+    pub damaged: bool,
+    /// the entry id of its newest event: what it shows changes only with a new one
+    pub last_event: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +74,13 @@ pub struct AddEvent {
     pub utc: String,
     pub files: Vec<FileRecord>,
     pub folders: Vec<FolderRecord>,
+    /// the mounts the sources were read from (not recorded before 2.7)
+    pub mounts: Vec<crate::container::mounts::Mount>,
+    /// the base path and path option the files were added with (not recorded before 2.7)
+    pub base_path: Option<String>,
+    pub keep_path: Option<bool>,
+    /// (ARN, ARN of the copy added again in its place)
+    pub replaces: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +119,8 @@ pub struct ContainerDetail {
     /// closes logged while the file was missing (entry id, time): no state was signed or written, so they are not
     /// in `closes`, whose order matches the closed states kept in the file
     pub closed_without_file: Vec<(i64, String)>,
+    /// closes as damaged (entry id, time, the paths that did not match): nothing signed or written either
+    pub damaged_closes: Vec<(i64, String, Vec<String>)>,
     /// `container_signed` entries: (entry id, turtle_sha256, gpg fingerprint, x509 fingerprint)
     pub late_signatures: Vec<(i64, String, Option<String>, Option<String>)>,
 }
@@ -120,6 +137,15 @@ impl ContainerDetail {
             .iter()
             .flat_map(|add| add.files.iter().map(move |file| (add, file)))
     }
+}
+
+/// What a close re-checks, read from the log on the GUI thread and checked on a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecheckInput {
+    pub path: PathBuf,
+    /// the logged end of the container's state
+    pub end: Option<u64>,
+    pub records: Vec<FileRecord>,
 }
 
 /// The signatures of one state and who made them.
@@ -163,6 +189,14 @@ impl Event {
 
 fn signatures_json(gpg: &Option<String>, x509: &Option<String>) -> Value {
     json!({"gpg": gpg, "x509": x509})
+}
+
+/// "1 file doesn't match its hashes", "3 files don't match their hashes".
+pub fn mismatch_text(count: usize) -> String {
+    match count {
+        1 => "1 file doesn't match its hashes".to_string(),
+        n => format!("{n} files don't match their hashes"),
+    }
 }
 
 fn plural(count: usize, word: &str) -> String {
@@ -309,15 +343,7 @@ impl Factum<'_> {
         (!stored.is_empty()).then(|| PathBuf::from(stored))
     }
 
-    fn summary(
-        &self,
-        id: i64,
-        case_id: i64,
-        uuid: String,
-        name: String,
-        open: bool,
-        file_count: u64,
-    ) -> ContainerSummary {
+    fn summary(&self, id: i64, case_id: i64, uuid: String, name: String, evidence_id: Option<i64>) -> ContainerSummary {
         let path = self.container_path(&uuid);
         let missing = path.as_ref().is_none_or(|p| !p.is_file());
         ContainerSummary {
@@ -325,18 +351,28 @@ impl Factum<'_> {
             case_id,
             uuid,
             name,
-            open,
-            file_count,
+            open: true,
+            file_count: 0,
             path,
             missing,
+            evidence_id,
+            signed: false,
+            damaged: false,
+            last_event: id,
         }
     }
 
     /// The containers of a case, read from the log without its file lists.
     pub fn list_containers(&self, case_id: i64) -> Result<Vec<ContainerSummary>> {
         let mut statement = self.db.conn.prepare_cached(
-            "SELECT id, (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END), (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.container_id') END), \
-             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END), (CASE WHEN json_valid(payload_json) THEN json_array_length(payload_json, '$.files') END) \
+            "SELECT id, (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.container_id') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_array_length(payload_json, '$.files') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.evidence_id') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.signatures.gpg') IS NOT NULL \
+                OR json_extract(payload_json, '$.signatures.x509') IS NOT NULL ELSE 0 END), \
+             (CASE WHEN json_valid(payload_json) THEN json_type(payload_json, '$.damaged') IS NOT NULL ELSE 0 END) \
              FROM entries WHERE case_id = ? AND kind = 'system' \
              AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END) LIKE 'container\\_%' ESCAPE '\\' ORDER BY leaf_index",
         )?;
@@ -347,30 +383,36 @@ impl Factum<'_> {
                 row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, bool>(6)?,
+                row.get::<_, bool>(7)?,
             ))
         })?;
-        // (id, uuid, name, open, files) in creation order
-        let mut containers: Vec<(i64, String, String, bool, u64)> = Vec::new();
+        // in creation order
+        let mut containers: Vec<ContainerSummary> = Vec::new();
         for row in rows {
-            let (entry_id, event, uuid, name, files) = row?;
+            let (entry_id, event, uuid, name, files, evidence_id, signed, damaged) = row?;
             if event == "container_created" {
-                containers.push((entry_id, uuid, name.unwrap_or_default(), true, 0));
+                containers.push(self.summary(entry_id, case_id, uuid, name.unwrap_or_default(), evidence_id));
                 continue;
             }
-            let Some(container) = containers.iter_mut().find(|c| c.1 == uuid) else {
+            let Some(container) = containers.iter_mut().find(|c| c.uuid == uuid) else {
                 continue;
             };
+            container.last_event = entry_id;
             match event.as_str() {
-                "container_files_added" => container.4 += files.unwrap_or(0).max(0) as u64,
-                "container_closed" => container.3 = false,
-                "container_reopened" => container.3 = true,
+                "container_files_added" => container.file_count += files.unwrap_or(0).max(0) as u64,
+                "container_closed" => {
+                    container.open = false;
+                    container.signed = signed;
+                    container.damaged = damaged;
+                }
+                "container_signed" => container.signed = true,
+                "container_reopened" => container.open = true,
                 _ => {}
             }
         }
-        Ok(containers
-            .into_iter()
-            .map(|(id, uuid, name, open, files)| self.summary(id, case_id, uuid, name, open, files))
-            .collect())
+        Ok(containers)
     }
 
     pub fn open_containers(&self, case_id: i64) -> Result<Vec<ContainerSummary>> {
@@ -407,7 +449,13 @@ impl Factum<'_> {
         };
         let uuid = created.text("container_id");
         let mut detail = ContainerDetail {
-            summary: self.summary(id, entry.case_id, uuid.clone(), created.text("name"), true, 0),
+            summary: self.summary(
+                id,
+                entry.case_id,
+                uuid.clone(),
+                created.text("name"),
+                created.payload.get("evidence_id").and_then(Value::as_i64),
+            ),
             evidence_id: created.payload.get("evidence_id").and_then(Value::as_i64),
             file_name: created.text("file_name"),
             base_path: created.text("base_path"),
@@ -416,9 +464,11 @@ impl Factum<'_> {
             closes: Vec::new(),
             reopens: Vec::new(),
             closed_without_file: Vec::new(),
+            damaged_closes: Vec::new(),
             late_signatures: Vec::new(),
         };
         for event in self.container_events(entry.case_id, Some(&uuid))? {
+            detail.summary.last_event = detail.summary.last_event.max(event.entry_id);
             match event.text("event").as_str() {
                 "container_files_added" => {
                     let files = event
@@ -433,16 +483,52 @@ impl Factum<'_> {
                         .and_then(Value::as_array)
                         .map(|folders| folders.iter().filter_map(FolderRecord::from_json).collect())
                         .unwrap_or_default();
+                    let mounts = event
+                        .payload
+                        .get("sources")
+                        .and_then(Value::as_array)
+                        .map(|mounts| {
+                            mounts
+                                .iter()
+                                .filter_map(crate::container::mounts::Mount::from_json)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let replaces = event
+                        .payload
+                        .get("replaces")
+                        .and_then(Value::as_array)
+                        .map(|pairs| {
+                            pairs
+                                .iter()
+                                .filter_map(|p| Some((p["arn"].as_str()?.to_string(), p["by"].as_str()?.to_string())))
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     detail.adds.push(AddEvent {
                         entry_id: event.entry_id,
+                        base_path: event.optional("base_path"),
+                        keep_path: event.payload.get("keep_path").and_then(Value::as_bool),
                         utc: event.utc,
                         files,
                         folders,
+                        mounts,
+                        replaces,
                     });
                 }
                 "container_closed" if event.payload.get("file_missing") == Some(&Value::Bool(true)) => {
                     detail.summary.open = false;
                     detail.closed_without_file.push((event.entry_id, event.utc));
+                }
+                "container_closed" if event.payload.contains_key("damaged") => {
+                    let paths = event
+                        .payload
+                        .get("damaged")
+                        .and_then(Value::as_array)
+                        .map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                        .unwrap_or_default();
+                    detail.summary.open = false;
+                    detail.damaged_closes.push((event.entry_id, event.utc, paths));
                 }
                 "container_closed" => {
                     let (gpg, x509) = event.signatures();
@@ -489,6 +575,19 @@ impl Factum<'_> {
             }
         }
         detail.summary.file_count = detail.adds.iter().map(|a| a.files.len() as u64).sum();
+        // the newest close decides: a regular one is signed or not, one without file or as damaged never is
+        let newest_regular = detail.closes.last().map(|c| c.entry_id);
+        let newest_damaged = detail.damaged_closes.last().map(|(id, ..)| *id);
+        let newest_other = detail
+            .closed_without_file
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(newest_damaged)
+            .max();
+        detail.summary.damaged =
+            newest_damaged.is_some() && newest_damaged == newest_other && newest_damaged > newest_regular;
+        detail.summary.signed =
+            newest_regular > newest_other && detail.closes.last().is_some_and(CloseEvent::is_signed);
         Ok(detail)
     }
 
@@ -497,7 +596,7 @@ impl Factum<'_> {
         &self,
         case_id: i64,
         name: &str,
-        evidence_id: Option<i64>,
+        evidence_id: i64,
         path: &Path,
         base_path: &str,
     ) -> Result<i64> {
@@ -507,16 +606,13 @@ impl Factum<'_> {
         }
         let case = self.require_case(case_id)?;
         ensure_case_open(&self.db.conn, case_id)?;
-        let evidence = match evidence_id {
-            Some(evidence_id) => match self.get_evidence(evidence_id)? {
-                Some(e) if !e.is_deleted() && e.case_id == case_id => Some((e.id, e.description, e.details)),
-                _ => {
-                    return Err(FactumError::general(format!(
-                        "Evidence #{evidence_id} does not exist in this case."
-                    )));
-                }
-            },
-            None => None,
+        let evidence = match self.get_evidence(evidence_id)? {
+            Some(e) if !e.is_deleted() && e.case_id == case_id => Some((e.id, e.description, e.details)),
+            _ => {
+                return Err(FactumError::general(format!(
+                    "Evidence #{evidence_id} does not exist in this case."
+                )));
+            }
         };
         let path = std::path::absolute(path)?;
         let file_name = path
@@ -568,6 +664,28 @@ impl Factum<'_> {
         };
         log::info!("Container #{id} created: {}", path.display());
         Ok(id)
+    }
+
+    /// A new evidence item and a container for it, named alike: two log entries, as if made one after the other.
+    /// Returns (evidence id, container id); the evidence stays when the container cannot be created.
+    pub fn create_evidence_with_container(
+        &self,
+        case_id: i64,
+        name: &str,
+        hash: &str,
+        details: &str,
+        path: &Path,
+        base_path: &str,
+    ) -> Result<(i64, i64)> {
+        let evidence_id = self.create_evidence(case_id, name, hash, details)?;
+        let container_id = self
+            .create_container(case_id, name, evidence_id, path, base_path)
+            .map_err(|e| {
+                FactumError::general(format!(
+                    "Evidence #{evidence_id} was created, but its container was not: {e}"
+                ))
+            })?;
+        Ok((evidence_id, container_id))
     }
 
     /// Opens the container file of a container the log knows, checking that it is that container.
@@ -683,7 +801,17 @@ impl Factum<'_> {
         };
         let payload = json!({"event": "container_files_added", "case_id": detail.summary.case_id,
                              "container_id": detail.summary.uuid, "files": files, "folders": folders,
-                             "not_added": not_added, "added_utc": utc_now()});
+                             "not_added": not_added, "added_utc": utc_now(),
+                             "base_path": staged.base().display().to_string(), "keep_path": staged.keep_path,
+                             "sources": staged.mounts.iter().map(crate::container::mounts::Mount::to_json).collect::<Vec<_>>()});
+        let mut payload = payload;
+        if !staged.replaced.is_empty() {
+            payload["replaces"] = staged
+                .replaced
+                .iter()
+                .map(|(arn, by)| json!({"arn": arn, "by": by}))
+                .collect();
+        }
         let mark = staged.mark();
         let result = {
             let cell = RefCell::new(&mut *volume);
@@ -777,17 +905,70 @@ impl Factum<'_> {
         })
     }
 
+    /// Re-checks what was added since the last close, then closes and signs the container.
     pub fn close_container(&self, id: i64) -> Result<CloseEvent> {
-        self.close_container_with(id, &self.gpgsm())
+        let recheck = self.recheck_container(id)?;
+        self.close_container_with(id, &self.gpgsm(), &recheck)
+    }
+
+    /// What a close re-checks: the stored files added since the newest signed-state close (all, if none), without
+    /// metadata-only files and links (spec 5.2).
+    pub fn recheck_input(&self, id: i64) -> Result<RecheckInput> {
+        let detail = self.container(id)?;
+        let path = detail
+            .summary
+            .path
+            .clone()
+            .filter(|_| !detail.summary.missing)
+            .ok_or_else(|| FactumError::general(format!("The file of container #{id} is missing.")))?;
+        let end = self
+            .db
+            .get_setting(&end_setting(&detail.summary.uuid))
+            .ok()
+            .and_then(|end| end.parse().ok());
+        let since = detail.closes.last().map_or(0, |close| close.entry_id);
+        let replaced: std::collections::HashSet<&str> = detail
+            .adds
+            .iter()
+            .flat_map(|add| add.replaces.iter().map(|(arn, _)| arn.as_str()))
+            .collect();
+        let records = detail
+            .adds
+            .iter()
+            .filter(|add| add.entry_id > since)
+            .flat_map(|add| add.files.iter())
+            .filter(|r| !r.metadata_only && r.link.is_none() && !replaced.contains(r.arn.as_str()))
+            .cloned()
+            .collect();
+        Ok(RecheckInput { path, end, records })
+    }
+
+    /// The re-check of `recheck_input`, here and now (no progress, not cancellable).
+    pub fn recheck_container(&self, id: i64) -> Result<Recheck> {
+        let input = self.recheck_input(id)?;
+        crate::container::volume::recheck(
+            &input.path,
+            input.end,
+            &input.records,
+            &crate::container::volume::AddProgress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
     }
 
     /// Closes a container: signs its state and logs `container_closed`; the signatures and a copy of the state
     /// under factum/history/<n>/ are written inside the append.
-    pub fn close_container_with(&self, id: i64, gpgsm: &Gpgsm) -> Result<CloseEvent> {
+    /// Closes and signs the container after `recheck` (of `recheck_input`) found every file intact.
+    pub fn close_container_with(&self, id: i64, gpgsm: &Gpgsm, recheck: &Recheck) -> Result<CloseEvent> {
         let detail = self.container(id)?;
         ensure_case_open(&self.db.conn, detail.summary.case_id)?;
         if !detail.summary.open {
             return Err(FactumError::general(format!("Container #{id} is already closed.")));
+        }
+        if !recheck.mismatches.is_empty() {
+            return Err(FactumError::general(format!(
+                "Container #{id} was not closed: {}.",
+                mismatch_text(recheck.mismatches.len())
+            )));
         }
         let mut volume = self.open_volume(&detail)?;
         self.ensure_matches_log(id, &volume)?;
@@ -804,7 +985,9 @@ impl Factum<'_> {
         let mut payload = json!({"event": "container_closed", "case_id": detail.summary.case_id,
                                  "container_id": detail.summary.uuid, "turtle_sha256": turtle_sha256,
                                  "file_count": file_count, "signatures": signatures_json(&gpg, &x509),
-                                 "closed_utc": closed_utc});
+                                 "closed_utc": closed_utc,
+                                 "recheck": {"files": recheck.files, "bytes": recheck.bytes,
+                                             "uncached": recheck.uncached}});
         if let Some(reason) = &x509_refused {
             payload["x509_refused"] = json!(reason);
         }
@@ -813,7 +996,7 @@ impl Factum<'_> {
         } else {
             "unsigned"
         };
-        let text = format!("Container #{id} closed · {file_count} files · {signed}");
+        let text = format!("Container #{id} closed · {file_count} files · re-checked · {signed}");
         let mark = volume.mark();
         let uuid = detail.summary.uuid.clone();
         let result = {
@@ -857,6 +1040,84 @@ impl Factum<'_> {
 
     /// Closes an open container whose file is missing, so that its case can be archived: `container_closed` with
     /// `file_missing`, and nothing signed or written, as there is no file. Refused while the file is there.
+    /// Closes a container whose re-check found damaged files, without signing or writing anything (spec 5.2).
+    pub fn close_container_damaged(&self, id: i64, damaged: &[FileRecord]) -> Result<i64> {
+        let detail = self.container(id)?;
+        ensure_case_open(&self.db.conn, detail.summary.case_id)?;
+        if !detail.summary.open {
+            return Err(FactumError::general(format!("Container #{id} is already closed.")));
+        }
+        let file_count = detail.summary.file_count;
+        let paths: Vec<&str> = damaged.iter().map(|r| r.path.as_str()).collect();
+        self.append(
+            detail.summary.case_id,
+            KIND_SYSTEM,
+            &format!(
+                "Container #{id} closed as damaged · {} · not signed",
+                mismatch_text(damaged.len())
+            ),
+            Append {
+                payload: Some(json!({"event": "container_closed", "case_id": detail.summary.case_id,
+                                     "container_id": detail.summary.uuid, "damaged": paths,
+                                     "file_count": file_count, "closed_utc": utc_now()})),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// How to add damaged files again: one Add operation per original one, with its base path and options, each
+    /// replacing the damaged copies. Fails when a file's source was not recorded (added before 2.7).
+    pub fn add_again_plan(
+        &self,
+        id: i64,
+        mismatches: &[FileRecord],
+    ) -> Result<Vec<(Vec<PathBuf>, crate::container::volume::AddOptions)>> {
+        let detail = self.container(id)?;
+        let mut plan: Vec<(i64, Vec<PathBuf>, crate::container::volume::AddOptions)> = Vec::new();
+        for record in mismatches {
+            let not_recorded = || {
+                FactumError::general(format!(
+                    "{}: its source is not recorded, so it cannot be added again.",
+                    record.path
+                ))
+            };
+            let add = detail
+                .adds
+                .iter()
+                .find(|add| add.files.iter().any(|f| f.arn == record.arn))
+                .ok_or_else(not_recorded)?;
+            let (Some(source), Some(base), Some(keep_path)) = (&record.source, &add.base_path, add.keep_path) else {
+                return Err(not_recorded());
+            };
+            let source = PathBuf::from(source);
+            let position = match plan
+                .iter()
+                .position(|(entry, _, o)| *entry == add.entry_id && o.excerpt == record.excerpt)
+            {
+                Some(position) => position,
+                None => {
+                    plan.push((
+                        add.entry_id,
+                        Vec::new(),
+                        crate::container::volume::AddOptions {
+                            base: PathBuf::from(base),
+                            keep_path,
+                            excerpt: record.excerpt,
+                            ..Default::default()
+                        },
+                    ));
+                    plan.len() - 1
+                }
+            };
+            plan[position].1.push(source.clone());
+            plan[position].2.replaces.push((source, record.arn.clone()));
+        }
+        Ok(plan
+            .into_iter()
+            .map(|(_, sources, options)| (sources, options))
+            .collect())
+    }
+
     pub fn close_container_without_file(&self, id: i64) -> Result<i64> {
         let detail = self.container(id)?;
         ensure_case_open(&self.db.conn, detail.summary.case_id)?;
@@ -1102,6 +1363,9 @@ impl Factum<'_> {
         for (entry_id, _) in detail.closed_without_file.iter().filter(|(e, _)| *e > upto) {
             after.push((*entry_id, "closed while its file was missing".into()));
         }
+        for (entry_id, ..) in detail.damaged_closes.iter().filter(|(e, ..)| *e > upto) {
+            after.push((*entry_id, "closed as damaged".into()));
+        }
         for (entry_id, ..) in detail.late_signatures.iter().filter(|(e, ..)| *e > upto) {
             after.push((*entry_id, "signed".into()));
         }
@@ -1121,6 +1385,20 @@ impl Factum<'_> {
                          file is in an open state that was never closed or signed."
                     ),
                     Some(entry_id),
+                ));
+            } else if lacking && matches_close.is_none() && detail.summary.damaged {
+                let (entry_id, ..) = detail.damaged_closes.last().cloned().unwrap_or_default();
+                findings.push(Finding::new(
+                    Level::Warn,
+                    "log_mismatch",
+                    format!(
+                        "The case log closed this container as damaged (entry #{entry_id}); the file is in its \
+                         unsigned open state."
+                    ),
+                    Ref {
+                        entry_id: Some(entry_id),
+                        tree_head_id: None,
+                    },
                 ));
             } else if lacking {
                 findings.push(fail(

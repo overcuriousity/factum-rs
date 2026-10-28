@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use crate::cases::Case;
 use crate::error::Result;
+use crate::images::NoteImage;
 use crate::pystr::{head, tail};
 use crate::seals::TreeHead;
 use crate::services::Factum;
@@ -44,6 +45,8 @@ pub struct ReportEntry {
     pub origin_created_utc: String,
     pub evidence: Option<String>,
     pub text: String,
+    /// the images the note carries in its payload (notes only)
+    pub images: Vec<NoteImage>,
     pub labels: Vec<String>,
     /// 1 = never corrected
     pub version: usize,
@@ -121,6 +124,10 @@ pub struct ContainerRow {
     pub state: String,
     /// who signed the newest close, or "unsigned" / "not closed"
     pub signatures: String,
+    /// the base path, or "full paths"
+    pub base_path: String,
+    /// one line per add and mount: "2026-10-28 19:21:49 UTC · /mnt/disk · /dev/loop0 · ntfs3 · ro"
+    pub sources: Vec<String>,
     /// (path, size, SHA-256)
     pub files: Vec<(String, u64, String)>,
 }
@@ -134,6 +141,8 @@ impl ContainerRow {
         }
         rows.push(("State", self.state.clone()));
         rows.push(("Signatures", self.signatures.clone()));
+        rows.push(("Base path", self.base_path.clone()));
+        rows.extend(self.sources.iter().map(|line| ("Source", line.clone())));
         rows
     }
 
@@ -270,6 +279,7 @@ impl Factum<'_> {
         for summary in self.list_containers(case_id)? {
             let detail = self.container(summary.id)?;
             let signatures = match detail.closes.last() {
+                _ if detail.summary.damaged => "none: closed as damaged".to_string(),
                 _ if detail.last_closed_without_file() => "none: closed while its file was missing".to_string(),
                 None => "not closed".to_string(),
                 Some(close) => {
@@ -305,13 +315,29 @@ impl Factum<'_> {
                 file_name: detail.file_name.clone(),
                 uuid: summary.uuid.clone(),
                 evidence: detail.evidence_id.and_then(|id| evidence_names.get(&id).cloned()),
-                state: match (summary.open, detail.last_closed_without_file()) {
-                    (true, _) => "open",
-                    (false, true) => "closed (file missing)",
-                    (false, false) => "closed",
+                state: match (summary.open, detail.summary.damaged, detail.last_closed_without_file()) {
+                    (true, ..) => "open",
+                    (false, true, _) => "closed as damaged",
+                    (false, false, true) => "closed (file missing)",
+                    (false, false, false) => "closed",
                 }
                 .to_string(),
                 signatures,
+                base_path: if detail.base_path.is_empty() {
+                    "full paths".to_string()
+                } else {
+                    detail.base_path.clone()
+                },
+                sources: detail
+                    .adds
+                    .iter()
+                    .flat_map(|add| {
+                        let time = readable_utc(Some(&add.utc));
+                        add.mounts
+                            .iter()
+                            .map(move |m| format!("{time} · {}", crate::container::mounts::mount_line(m)))
+                    })
+                    .collect(),
                 files: detail
                     .files()
                     .map(|(_, f)| (report_path(f), f.size, f.sha256.clone()))
@@ -368,6 +394,7 @@ impl Factum<'_> {
                     .unwrap_or_else(|| entry.created_utc.clone()),
                 evidence: entry.evidence_id.and_then(|id| names.get(&id).cloned()),
                 text: entry.text.clone(),
+                images: if entry.is_note() { entry.images() } else { Vec::new() },
                 labels,
                 version: line_version,
                 status: result.status(),
