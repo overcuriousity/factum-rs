@@ -140,11 +140,12 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   mounted image or an export folder; links are recorded, not followed; devices and FIFOs are skipped
 - **Case → New Container…** creates one (optionally from an evidence item); its ⋯ menu or right-click in the case list
   has **Add Files…**, **Add Folder…**, **Close Container**, **Reopen Container**, **Verify Container…**, **Locate…**
-  and **Show in Folder**. Adding asks for the base path (removed from the stored paths), whether to keep the path,
+  and **Show in Folder**; **Close Without File…** closes an open container whose file is lost (the log records it;
+  nothing is signed), so its case can still be archived. Adding asks for the base path (removed from the stored paths), whether to keep the path,
   metadata only (hashed, not stored), and an excerpt (a byte range) for a single file. Progress and Cancel show in the
   status bar; a cancelled or failed addition adds nothing
-- Every creation, addition (one entry per operation, listing every file with its hashes), close, reopen and late
-  signature is a **signed entry in the case log**. Archiving a case asks to close its open containers first
+- Every creation, addition (one entry per operation, listing every file with its hashes, and what could not be added
+  and why), close, reopen and late signature is a **signed entry in the case log**. Archiving a case asks to close its open containers first
 - **Closing signs the container**: a GPG signature over `information.turtle`, which lists every file's hashes, plus an
   X.509 (CMS) signature when **Settings → X.509 Certificate…** names a gpgsm certificate (the setup wizard offers it
   too). Without a key the container can be closed unsigned and signed later (**Sign All Unsigned**)
