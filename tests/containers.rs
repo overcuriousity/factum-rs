@@ -376,7 +376,7 @@ fn close_signs_and_logs_turtle_hash() {
     assert!(member(&s.container_path(), &history_member(1, HASHES)).is_some());
     assert_eq!(
         s.entry_text(close.entry_id),
-        format!("Container #{id} closed · 2 files · signed")
+        format!("Container #{id} closed · 2 files · re-checked · signed")
     );
     let detail = s.f.factum().container(id).unwrap();
     assert!(!detail.summary.open);
@@ -394,7 +394,7 @@ fn close_without_key_then_sign_later() {
     assert!(close.gpg.is_none());
     assert_eq!(
         s.entry_text(close.entry_id),
-        format!("Container #{id} closed · 1 files · unsigned")
+        format!("Container #{id} closed · 1 files · re-checked · unsigned")
     );
     assert!(member(&s.container_path(), SIG_GPG).is_none());
     // without a key there is nothing to sign with
@@ -1193,7 +1193,8 @@ mod verify {
         home.trusted();
         s.f.db.set_setting(X509_CERT_SETTING, &home.leaf_fingerprint).unwrap();
         let gpgsm = Gpgsm::new(Some(home.path()));
-        let close = s.f.factum().close_container_with(id, &gpgsm).unwrap();
+        let recheck = s.f.factum().recheck_container(id).unwrap();
+        let close = s.f.factum().close_container_with(id, &gpgsm, &recheck).unwrap();
         assert_eq!(
             close.x509.as_deref(),
             Some(home.leaf_fingerprint.as_str()),
@@ -1581,7 +1582,11 @@ mod script {
         s.f.db.set_setting(X509_CERT_SETTING, &home.leaf_fingerprint).unwrap();
         let close =
             s.f.factum()
-                .close_container_with(id, &Gpgsm::new(Some(home.path())))
+                .close_container_with(
+                    id,
+                    &Gpgsm::new(Some(home.path())),
+                    &s.f.factum().recheck_container(id).unwrap(),
+                )
                 .unwrap();
         assert!(close.x509.is_some(), "{:?}", close.x509_refused);
         let root = home.file("root.pem");
@@ -1802,4 +1807,107 @@ fn add_logs_sources() {
         .filter_map(factum::container::mounts::Mount::from_json)
         .collect();
     assert_eq!(detail.adds[0].mounts, logged);
+}
+
+/// Flips one byte inside the stored content of `arn`, in place: the container's structure stays intact.
+fn damage_content(path: &Path, arn: &str) {
+    use factum::container::zip64::read_archive;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let uuid = String::from_utf8(member(path, "container.description").unwrap()).unwrap();
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let entry = archive
+        .get(&factum::container::member_name(arn, &uuid))
+        .unwrap()
+        .clone();
+    let mut header = [0u8; 30];
+    file.seek(SeekFrom::Start(entry.header_offset)).unwrap();
+    file.read_exact(&mut header).unwrap();
+    let name_len = u16::from_le_bytes([header[26], header[27]]) as u64;
+    let extra_len = u16::from_le_bytes([header[28], header[29]]) as u64;
+    let at = entry.header_offset + 30 + name_len + extra_len + entry.compressed_size / 2;
+    let mut byte = [0u8; 1];
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.read_exact(&mut byte).unwrap();
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+}
+
+fn first_arn(s: &Setup, id: i64) -> String {
+    s.f.factum().container(id).unwrap().adds[0].files[0].arn.clone()
+}
+
+#[test]
+fn close_rechecks_and_logs_it() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt"), s.file("b.txt")]);
+    let close = s.f.factum().close_container(id).unwrap();
+    let event = &s.events("container_closed")[0];
+    assert_eq!(event["recheck"]["files"], 2);
+    assert_eq!(event["recheck"]["bytes"], 3);
+    #[cfg(target_os = "linux")]
+    assert_eq!(event["recheck"]["uncached"], true);
+    assert!(
+        s.entry_text(close.entry_id).contains("re-checked"),
+        "{}",
+        s.entry_text(close.entry_id)
+    );
+}
+
+#[test]
+fn close_after_reopen_rechecks_only_new_files() {
+    let s = Setup::new();
+    let id = s.create();
+    let factum = s.f.factum();
+    s.add(id, &[s.file("a.txt"), s.file("b.txt")]);
+    factum.close_container(id).unwrap();
+    factum.reopen_container(id).unwrap();
+    s.add(id, &[s.file("c.txt")]);
+    factum.close_container(id).unwrap();
+    assert_eq!(s.events("container_closed")[1]["recheck"]["files"], 1);
+}
+
+#[test]
+fn damaged_bytes_refuse_the_close() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt"), s.file("d.txt")]);
+    damage_content(&s.container_path(), &first_arn(&s, id));
+    let error = s.f.factum().close_container(id).unwrap_err();
+    assert!(error.to_string().contains("don't match their hashes"), "{error}");
+    assert!(s.events("container_closed").is_empty());
+    assert!(s.f.factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn recheck_reports_the_damaged_file() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt"), s.file("d.txt")]);
+    damage_content(&s.container_path(), &first_arn(&s, id));
+    let input = s.f.factum().recheck_input(id).unwrap();
+    assert_eq!(input.records.len(), 2);
+    let result = factum::container::volume::recheck(
+        &input.path,
+        input.end,
+        &input.records,
+        &AddProgress::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(result.mismatches.len(), 1);
+    assert_eq!(result.mismatches[0].arn, first_arn(&s, id));
+}
+
+#[test]
+fn close_with_missing_file_fails_cleanly() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    std::fs::remove_file(s.container_path()).unwrap();
+    assert!(s.f.factum().close_container(id).is_err());
+    assert!(s.events("container_closed").is_empty());
+    assert!(s.f.factum().container(id).unwrap().summary.open);
 }

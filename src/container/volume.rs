@@ -262,6 +262,96 @@ fn io_error(path: &Path, e: io::Error) -> FactumError {
     FactumError::general(format!("The container {} could not be written: {e}", path.display()))
 }
 
+/// What a re-check read back from the container file (spec 5.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Recheck {
+    pub files: u64,
+    pub bytes: u64,
+    /// the operating system's cache was bypassed, so the bytes came from the disk
+    pub uncached: bool,
+    /// files whose stored content cannot be read or does not match their hashes
+    pub mismatches: Vec<FileRecord>,
+}
+
+/// Drops the file's cached pages, so the next reads come from the disk; true when that was possible.
+fn drop_cache(file: &File) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: a valid descriptor for the call; the advice changes no data
+        unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        false
+    }
+}
+
+/// Reads the stored content of `records` back from the state that ends at `end` (the newest when None) and
+/// compares it with their hashes.
+pub fn recheck(
+    path: &Path,
+    end: Option<u64>,
+    records: &[FileRecord],
+    progress: &AddProgress,
+    cancel: &AtomicBool,
+) -> Result<Recheck> {
+    let unreadable = |e: String| FactumError::general(format!("The container {} cannot be read: {e}", path.display()));
+    let mut file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
+    let uncached = drop_cache(&file);
+    let end = find_last_end(&mut file, end)
+        .map_err(|e| unreadable(e.to_string()))?
+        .ok_or_else(|| unreadable("no complete ZIP directory".into()))?;
+    let archive = read_archive(&mut file, end).map_err(|e| unreadable(e.to_string()))?;
+    let entry = archive
+        .get(TURTLE)
+        .ok_or_else(|| unreadable("information.turtle is missing".into()))?;
+    let text = member_text(&mut file, entry).map_err(|e| unreadable(e.to_string()))?;
+    let graph = turtle::parse(&text).map_err(unreadable)?;
+    progress.total_files.store(records.len() as u64, Ordering::Relaxed);
+    progress
+        .total_bytes
+        .store(records.iter().map(|r| r.size).sum(), Ordering::Relaxed);
+    progress.files.store(0, Ordering::Relaxed);
+    progress.bytes.store(0, Ordering::Relaxed);
+    let cancelled = || FactumError::general("Re-check cancelled — the container was not closed.");
+    let mut result = Recheck {
+        uncached,
+        ..Default::default()
+    };
+    for record in records {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
+        let done = result.bytes;
+        let report = |read: u64| progress.bytes.store(done + read, Ordering::Relaxed);
+        let hashed = match content_reader(&mut file, &archive, &graph, &record.arn) {
+            Ok(Some(mut reader)) => stream::hash_only(&mut reader, &report, cancel).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        };
+        let matches = match hashed {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(cancelled()),
+            Ok(Some((size, digests))) => {
+                size == record.size
+                    && digests.md5 == record.md5
+                    && digests.sha1 == record.sha1
+                    && digests.sha256 == record.sha256
+            }
+            Ok(None) | Err(_) => false,
+        };
+        if !matches {
+            result.mismatches.push(record.clone());
+        }
+        result.files += 1;
+        result.bytes += record.size;
+        progress.files.store(result.files, Ordering::Relaxed);
+        progress.bytes.store(result.bytes, Ordering::Relaxed);
+    }
+    Ok(result)
+}
+
 /// The metadata of a container file's newest complete state, read without changing the file. `end`, where the
 /// logged state ends, spares the search for it while an addition is being written after it.
 pub fn read_graph(path: &Path, end: Option<u64>) -> Result<Graph> {

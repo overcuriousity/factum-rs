@@ -11,7 +11,7 @@ use sha2::Digest;
 
 use crate::canonical::utc_now;
 use crate::container::volume::{
-    FileRecord, FolderRecord, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, history_member,
+    FileRecord, FolderRecord, Recheck, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, history_member,
     task_entries,
 };
 use crate::container::x509::{Gpgsm, X509_CERT_SETTING, X509_CHAIN_SETTING};
@@ -128,6 +128,15 @@ impl ContainerDetail {
             .iter()
             .flat_map(|add| add.files.iter().map(move |file| (add, file)))
     }
+}
+
+/// What a close re-checks, read from the log on the GUI thread and checked on a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecheckInput {
+    pub path: PathBuf,
+    /// the logged end of the container's state
+    pub end: Option<u64>,
+    pub records: Vec<FileRecord>,
 }
 
 /// The signatures of one state and who made them.
@@ -832,17 +841,65 @@ impl Factum<'_> {
         })
     }
 
+    /// Re-checks what was added since the last close, then closes and signs the container.
     pub fn close_container(&self, id: i64) -> Result<CloseEvent> {
-        self.close_container_with(id, &self.gpgsm())
+        let recheck = self.recheck_container(id)?;
+        self.close_container_with(id, &self.gpgsm(), &recheck)
+    }
+
+    /// What a close re-checks: the stored files added since the newest signed-state close (all, if none), without
+    /// metadata-only files and links (spec 5.2).
+    pub fn recheck_input(&self, id: i64) -> Result<RecheckInput> {
+        let detail = self.container(id)?;
+        let path = detail
+            .summary
+            .path
+            .clone()
+            .filter(|_| !detail.summary.missing)
+            .ok_or_else(|| FactumError::general(format!("The file of container #{id} is missing.")))?;
+        let end = self
+            .db
+            .get_setting(&end_setting(&detail.summary.uuid))
+            .ok()
+            .and_then(|end| end.parse().ok());
+        let since = detail.closes.last().map_or(0, |close| close.entry_id);
+        let records = detail
+            .adds
+            .iter()
+            .filter(|add| add.entry_id > since)
+            .flat_map(|add| add.files.iter())
+            .filter(|r| !r.metadata_only && r.link.is_none())
+            .cloned()
+            .collect();
+        Ok(RecheckInput { path, end, records })
+    }
+
+    /// The re-check of `recheck_input`, here and now (no progress, not cancellable).
+    pub fn recheck_container(&self, id: i64) -> Result<Recheck> {
+        let input = self.recheck_input(id)?;
+        crate::container::volume::recheck(
+            &input.path,
+            input.end,
+            &input.records,
+            &crate::container::volume::AddProgress::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
     }
 
     /// Closes a container: signs its state and logs `container_closed`; the signatures and a copy of the state
     /// under factum/history/<n>/ are written inside the append.
-    pub fn close_container_with(&self, id: i64, gpgsm: &Gpgsm) -> Result<CloseEvent> {
+    /// Closes and signs the container after `recheck` (of `recheck_input`) found every file intact.
+    pub fn close_container_with(&self, id: i64, gpgsm: &Gpgsm, recheck: &Recheck) -> Result<CloseEvent> {
         let detail = self.container(id)?;
         ensure_case_open(&self.db.conn, detail.summary.case_id)?;
         if !detail.summary.open {
             return Err(FactumError::general(format!("Container #{id} is already closed.")));
+        }
+        if !recheck.mismatches.is_empty() {
+            return Err(FactumError::general(format!(
+                "{} in the container don't match their hashes.",
+                plural(recheck.mismatches.len(), "file")
+            )));
         }
         let mut volume = self.open_volume(&detail)?;
         self.ensure_matches_log(id, &volume)?;
@@ -859,7 +916,9 @@ impl Factum<'_> {
         let mut payload = json!({"event": "container_closed", "case_id": detail.summary.case_id,
                                  "container_id": detail.summary.uuid, "turtle_sha256": turtle_sha256,
                                  "file_count": file_count, "signatures": signatures_json(&gpg, &x509),
-                                 "closed_utc": closed_utc});
+                                 "closed_utc": closed_utc,
+                                 "recheck": {"files": recheck.files, "bytes": recheck.bytes,
+                                             "uncached": recheck.uncached}});
         if let Some(reason) = &x509_refused {
             payload["x509_refused"] = json!(reason);
         }
@@ -868,7 +927,7 @@ impl Factum<'_> {
         } else {
             "unsigned"
         };
-        let text = format!("Container #{id} closed · {file_count} files · {signed}");
+        let text = format!("Container #{id} closed · {file_count} files · re-checked · {signed}");
         let mark = volume.mark();
         let uuid = detail.summary.uuid.clone();
         let result = {
