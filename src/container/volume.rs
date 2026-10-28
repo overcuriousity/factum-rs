@@ -26,10 +26,22 @@ pub const KEY_GPG: &str = "information.turtle.pubkey.asc";
 pub const SIG_X509: &str = "information.turtle.factum.sig";
 pub const CER_X509: &str = "information.turtle.factum.cer";
 pub const SIGNATURE_MEMBERS: [&str; 4] = [SIG_GPG, KEY_GPG, SIG_X509, CER_X509];
-const README: &[u8] = include_bytes!("README.txt");
+const README: &str = include_str!("README.txt");
 pub const VERIFY_CONTAINER_PY: &[u8] = include_bytes!("verify_container.py");
 
 /// The name of a closed state's copy of a member.
+/// The README a container carries: what it is, how to verify it, and which verifier it carries (spec 5.3).
+pub fn readme_text() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let hash = hex::encode(sha2::Sha256::digest(VERIFY_CONTAINER_PY));
+    format!(
+        "{README}\nWritten by factum {version}. verify_container.py in this container:\n  SHA-256 {hash}\n\
+         The same script is published at\n  \
+         https://github.com/overcuriousity/factum-rs/blob/v{version}/src/container/verify_container.py\n\
+         Compare the hash with that copy (sha256sum verify_container.py) before running it.\n"
+    )
+}
+
 pub fn history_member(n: u32, name: &str) -> String {
     format!("factum/history/{n}/{name}")
 }
@@ -578,7 +590,7 @@ impl Volume {
             app.add_bytes("version.txt", 0, version.as_bytes())?;
             app.add_bytes("container.description", 0, arn.as_bytes())?;
             app.add_bytes("verify_container.py", 8, VERIFY_CONTAINER_PY)?;
-            app.add_bytes("factum/README.txt", 8, README)?;
+            app.add_bytes("factum/README.txt", 8, readme_text().as_bytes())?;
             Ok(())
         };
         write(&mut app).map_err(|e| io_error(path, e))?;
@@ -1830,6 +1842,21 @@ mod tests {
         let mut back = Vec::new();
         volume.read_file(&arn).unwrap().read_to_end(&mut back).unwrap();
         assert_eq!(back, data);
+    }
+
+    #[test]
+    fn readme_names_the_script_hash() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let readme = String::from_utf8(volume.member("factum/README.txt").unwrap()).unwrap();
+        let script = volume.member("verify_container.py").unwrap();
+        let hash = hex::encode(sha2::Sha256::digest(&script));
+        assert_eq!(script, VERIFY_CONTAINER_PY);
+        assert!(readme.contains(&hash), "{readme}");
+        assert!(readme.contains(&format!(
+            "blob/v{}/src/container/verify_container.py",
+            env!("CARGO_PKG_VERSION")
+        )));
     }
 
     #[test]
