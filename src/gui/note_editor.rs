@@ -121,16 +121,12 @@ pub fn insert(text: &mut String, at: usize, snippet: &str) -> usize {
     at + snippet.chars().count()
 }
 
-/// Drops the image and every reference to it from the text.
+/// Drops the image and every reference to it from the text: each place the Markdown shows it.
 pub fn remove_image(text: &mut String, images: &mut Vec<NoteImage>, id: &str) {
     images.retain(|image| image.id != id);
-    let pattern = format!(
-        r"!\[[^\]]*\]\({}{}\)",
-        regex::escape(crate::images::SCHEME),
-        regex::escape(id)
-    );
-    if let Ok(reference) = regex::Regex::new(&pattern) {
-        *text = reference.replace_all(text, "").into_owned();
+    let url = format!("{}{id}", crate::images::SCHEME);
+    for range in crate::markup::image_ranges(text, &url).into_iter().rev() {
+        text.replace_range(range, "");
     }
 }
 
@@ -492,6 +488,42 @@ mod tests {
         // an id that is not there changes nothing
         remove_image(&mut text, &mut images, "000000000000");
         assert_eq!(images, vec![two]);
+    }
+
+    #[test]
+    fn remove_image_cuts_what_the_markdown_shows_as_that_image() {
+        let (one, two) = (image(1), image(2));
+        let id = &one.id;
+        let cases = [
+            (format!("x ![a [b] c](factum-image:{id}) y"), "x  y".to_string()),
+            (format!("x ![a](factum-image:{id} \"t\") y"), "x  y".to_string()),
+            (format!("x ![a](<factum-image:{id}>) y"), "x  y".to_string()),
+            (
+                format!("x ![a][r] y\n\n[r]: factum-image:{id}"),
+                format!("x  y\n\n[r]: factum-image:{id}"),
+            ),
+            // the image in a link's text goes, the link stays
+            (
+                format!("[![a](factum-image:{id})](https://x)"),
+                "[](https://x)".to_string(),
+            ),
+            // in a code span it is text, not the image: left alone
+            (
+                format!("`![a](factum-image:{id})`"),
+                format!("`![a](factum-image:{id})`"),
+            ),
+            (
+                format!("{} {}", one.reference("a"), two.reference("b")),
+                format!(" {}", two.reference("b")),
+            ),
+        ];
+        for (before, after) in cases {
+            let mut text = before.clone();
+            let mut images = vec![one.clone(), two.clone()];
+            remove_image(&mut text, &mut images, id);
+            assert_eq!(text, after, "{before}");
+            assert_eq!(images, vec![two.clone()]);
+        }
     }
 
     #[test]

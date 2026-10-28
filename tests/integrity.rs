@@ -880,3 +880,50 @@ fn a_text_only_correction_keeps_the_images_it_still_refers_to() {
     let report = factum.verify_case(case_id, None).unwrap();
     assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
 }
+
+#[test]
+fn every_way_markdown_shows_an_image_keeps_it() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let id = &image.id;
+    for text in [
+        format!("![a [b] c](factum-image:{id})"),
+        format!("![a](factum-image:{id} \"t\")"),
+        format!("![a](<factum-image:{id}>)"),
+        format!("![a][r]\n\n[r]: factum-image:{id}"),
+    ] {
+        let note = factum
+            .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+            .unwrap();
+        assert_eq!(
+            factum.get_entry(note).unwrap().unwrap().images(),
+            vec![image.clone()],
+            "{text}"
+        );
+        // without the image the same text is refused
+        let err = factum.create_note_with_images(&text, &[], None, case_id).unwrap_err();
+        assert!(err.to_string().contains(id.as_str()), "{text}: {err}");
+    }
+}
+
+#[test]
+fn a_reference_in_a_code_span_is_text() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let text = format!("the syntax is `{}`", image.reference("a"));
+    // not required...
+    factum.create_note_with_images(&text, &[], None, case_id).unwrap();
+    // ...and not kept
+    let note = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    assert!(factum.get_entry(note).unwrap().unwrap().images().is_empty());
+    assert_eq!(
+        f.count(&format!("SELECT payload_json IS NULL FROM entries WHERE id = {note}")),
+        1
+    );
+}

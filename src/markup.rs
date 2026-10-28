@@ -2,6 +2,8 @@
 //! what a note says. Only plain CommonMark is read; raw HTML and anything unsupported stay literal source text,
 //! so a rendered note never shows less than, or something other than, what was signed.
 
+use std::ops::Range;
+
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 use crate::images::SCHEME;
@@ -299,6 +301,21 @@ fn text_lines(s: &str) -> Vec<Inline> {
         }
     }
     out
+}
+
+/// Where `text` has an image of the address `url`, as byte ranges of its source (`![alt](url)`, `![alt][ref]`, ...),
+/// outermost only, in order.
+pub fn image_ranges(text: &str, url: &str) -> Vec<Range<usize>> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (event, range) in Parser::new_ext(text, Options::empty()).into_offset_iter() {
+        if let Event::Start(Tag::Image { dest_url, .. }) = event
+            && dest_url.as_ref() == url
+            && ranges.last().is_none_or(|last| range.start >= last.end)
+        {
+            ranges.push(range);
+        }
+    }
+    ranges
 }
 
 /// Text content only; images count as their alt text.

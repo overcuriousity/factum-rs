@@ -1,18 +1,16 @@
 //! Images embedded in a note. They live in the entry's signed payload, so the hash and signature cover the pixels too.
 //! Notes refer to them as `![alt](factum-image:<id>)`.
 
-use std::collections::HashSet;
 use std::io::Cursor;
-use std::sync::OnceLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use image::{ImageFormat, RgbaImage};
-use regex::Regex;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::error::{FactumError, Result};
+use crate::markup::{self, Block, ImageTarget, Inline};
 
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 /// URL scheme of an image reference inside note text
@@ -93,17 +91,35 @@ impl NoteImage {
     }
 }
 
-/// Ids of the images a note text refers to, each once, in order of first appearance.
+/// Ids of the images a note text refers to, each once, in order of first appearance: exactly the
+/// `factum-image:` images the rendered note shows ([`markup::parse`]), so nothing is saved that is not shown, and
+/// nothing shown is left out.
 pub fn referenced_ids(text: &str) -> Vec<String> {
-    static REFERENCE: OnceLock<Regex> = OnceLock::new();
-    let reference = REFERENCE
-        .get_or_init(|| Regex::new(&format!(r"!\[[^\]]*\]\({SCHEME}([0-9a-f]{{12}})\)")).expect("valid pattern"));
-    let mut seen = HashSet::new();
-    reference
-        .captures_iter(text)
-        .map(|c| c[1].to_string())
-        .filter(|id| seen.insert(id.clone()))
-        .collect()
+    fn blocks(list: &[Block], ids: &mut Vec<String>) {
+        for block in list {
+            match block {
+                Block::Paragraph(v) | Block::Heading(_, v) => inlines(v, ids),
+                Block::List { items, .. } => items.iter().for_each(|item| blocks(item, ids)),
+                Block::Quote(inner) => blocks(inner, ids),
+                Block::Code(_) => {}
+            }
+        }
+    }
+    fn inlines(list: &[Inline], ids: &mut Vec<String>) {
+        for inline in list {
+            match inline {
+                Inline::Emphasis(v) | Inline::Strong(v) | Inline::Link { text: v, .. } => inlines(v, ids),
+                Inline::Image {
+                    target: ImageTarget::Note(id),
+                    ..
+                } if !ids.contains(id) => ids.push(id.clone()),
+                _ => {}
+            }
+        }
+    }
+    let mut ids = Vec::new();
+    blocks(&markup::parse(text), &mut ids);
+    ids
 }
 
 /// The `payload` of a note entry: `{"images": {<id>: {data, mime, name?, sha256}}}`, `None` without images.
@@ -222,6 +238,39 @@ mod tests {
         let text = "![a](factum-image:aaaaaaaaaaaa) ![b](factum-image:bbbbbbbbbbbb) ![](factum-image:aaaaaaaaaaaa)";
         assert_eq!(referenced_ids(text), vec!["aaaaaaaaaaaa", "bbbbbbbbbbbb"]);
         assert!(referenced_ids("![x](https://example.org/a.png)").is_empty());
+    }
+
+    /// The cases where a pattern match and the Markdown parse disagree.
+    fn reference_variants(id: &str) -> Vec<String> {
+        vec![
+            format!("![a [b] c](factum-image:{id})"),
+            format!("![a](factum-image:{id} \"t\")"),
+            format!("![a](<factum-image:{id}>)"),
+            format!("![a][r]\n\n[r]: factum-image:{id}"),
+            format!("![r]\n\n[r]: factum-image:{id}"),
+        ]
+    }
+
+    #[test]
+    fn referenced_ids_are_the_images_the_markdown_shows() {
+        let id = "aaaaaaaaaaaa";
+        for text in reference_variants(id) {
+            assert_eq!(referenced_ids(&text), vec![id], "{text}");
+        }
+        // shown as text, not as an image: not referenced
+        for text in [
+            format!("`![a](factum-image:{id})`"),
+            format!("```\n![a](factum-image:{id})\n```"),
+            format!("\\![a](factum-image:{id})"),
+            format!("[a](factum-image:{id})"),
+        ] {
+            assert!(referenced_ids(&text).is_empty(), "{text}");
+        }
+        // inside a link it is still an image
+        assert_eq!(
+            referenced_ids(&format!("[![a](factum-image:{id})](https://x)")),
+            vec![id]
+        );
     }
 
     #[test]
