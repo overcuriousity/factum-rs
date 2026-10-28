@@ -158,10 +158,10 @@ struct View {
     case_status: Option<CaseStatus>,
     /// the Questions section: present while the companion is configured and a case is selected
     companion: Option<CompanionView>,
-    /// the selected container, shown in place of the log
-    container: Option<crate::containers::ContainerDetail>,
-    /// its files' last-written times, by ARN, from the container file
-    container_times: HashMap<String, String>,
+    /// the containers below the notes: the selected evidence's, or the one selected on its own (a row of its own)
+    containers: Vec<crate::containers::ContainerDetail>,
+    /// their files' last-written times, by container id, then by ARN, from the container files
+    container_times: HashMap<i64, HashMap<String, String>>,
 }
 
 /// A container file's times as last read: (file, its length then, last-written time by ARN).
@@ -233,8 +233,8 @@ struct FactumApp {
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
     add_job: Option<AddJob>,
-    /// the selected container's file times: (file, its logged end (else its length) when read, times)
-    container_times_cache: std::cell::RefCell<Option<TimesCache>>,
+    /// the shown containers' file times: (file, its logged end (else its length) when read, times), by container id
+    container_times_cache: std::cell::RefCell<HashMap<i64, TimesCache>>,
     /// the decoded images of the note entries shown, by entry id: entries never change, so a rebuild (every
     /// keystroke in the search, every action) does not parse and decode them again
     note_images: std::cell::RefCell<HashMap<i64, Arc<[NoteImage]>>>,
@@ -346,7 +346,7 @@ impl FactumApp {
             signature_check_pending: false,
             verify_job: None,
             add_job: None,
-            container_times_cache: std::cell::RefCell::new(None),
+            container_times_cache: std::cell::RefCell::new(HashMap::new()),
             note_images: Default::default(),
             container_verify_job: None,
             container_verify_windows: Vec::new(),
@@ -731,7 +731,7 @@ impl FactumApp {
                 pinned_only: false,
                 search: search.as_deref(),
             };
-            // a selected container is shown in place of the log
+            // a container selected on its own (no live evidence item) has no notes
             let entry_ids = if self.container_id.is_some() {
                 Vec::new()
             } else {
@@ -840,20 +840,36 @@ impl FactumApp {
                 None => case.case_name,
             };
         }
-        view.container = match self.container_id {
-            Some(id) => factum
-                .container(id)
-                .inspect_err(|e| log::error!("Container #{id} cannot be read: {e}"))
-                .ok(),
-            None => None,
+        let selected_case = view.case.as_ref().map(|c| c.id);
+        let container_ids: Vec<i64> = match (self.container_id, self.evidence_id, selected_case) {
+            (Some(id), ..) => vec![id],
+            (None, Some(evidence_id), Some(case_id)) => factum
+                .list_containers(case_id)?
+                .into_iter()
+                .filter(|c| c.evidence_id == Some(evidence_id))
+                .map(|c| c.id)
+                .collect(),
+            _ => Vec::new(),
         };
+        view.containers = container_ids
+            .into_iter()
+            .filter_map(|id| {
+                factum
+                    .container(id)
+                    .inspect_err(|e| log::error!("Container #{id} cannot be read: {e}"))
+                    .ok()
+            })
+            .collect();
         view.container_times = view
-            .container
-            .as_ref()
+            .containers
+            .iter()
             .filter(|detail| !detail.summary.missing)
-            .and_then(|detail| Some((detail.summary.path.clone()?, detail)))
-            .map(|(path, detail)| self.container_times(&path, &detail.summary.uuid, detail.summary.id))
-            .unwrap_or_default();
+            .filter_map(|detail| Some((detail.summary.path.clone()?, detail)))
+            .map(|(path, detail)| {
+                let times = self.container_times(&path, &detail.summary.uuid, detail.summary.id);
+                (detail.summary.id, times)
+            })
+            .collect();
         view.companion = match (&self.companion_db, &view.case) {
             (Some(cdb), Some(case)) if self.companion_settings.is_configured() => {
                 CompanionView::read(&factum, cdb, case.id)
@@ -1039,6 +1055,15 @@ impl FactumApp {
         let Ok(detail) = self.factum().container(id) else {
             return;
         };
+        // a container belongs to its evidence item: that is what gets selected, while it exists
+        let evidence = detail
+            .evidence_id
+            .and_then(|e| self.factum().get_evidence(e).ok().flatten())
+            .filter(|e| !e.is_deleted());
+        if let Some(evidence) = evidence {
+            self.select(Some(detail.summary.case_id), Some(evidence.id));
+            return;
+        }
         self.case_id = Some(detail.summary.case_id);
         self.evidence_id = None;
         self.container_id = Some(id);
@@ -1114,7 +1139,7 @@ impl FactumApp {
             .ok()
             .and_then(|end| end.parse().ok());
         let mut cache = self.container_times_cache.borrow_mut();
-        let cached = cache.as_ref().filter(|(cached, ..)| cached == path);
+        let cached = cache.get(&id).filter(|(cached, ..)| cached == path);
         let busy = self.add_job.as_ref().is_some_and(|job| job.container_id == id);
         // without a logged end (after Locate…), finding the state means searching the file: not while it grows
         let key = match end {
@@ -1131,7 +1156,7 @@ impl FactumApp {
             .map(|graph| crate::container::volume::modified_times(&graph))
             .inspect_err(|e| log::warn!("{e}"))
             .unwrap_or_default();
-        *cache = Some((path.to_path_buf(), key, times.clone()));
+        cache.insert(id, (path.to_path_buf(), key, times.clone()));
         times
     }
 
@@ -2535,6 +2560,7 @@ impl FactumApp {
                     4.0,
                     (!case.is_archived()).then_some(new_evidence.as_str()),
                     None,
+                    None,
                 );
                 let response = response.on_hover_text(format!(
                     "{} — {}{}",
@@ -2591,6 +2617,16 @@ impl FactumApp {
                 for (evidence, count) in &node.evidence {
                     let selected = self.evidence_id == Some(evidence.id);
                     let color = if case.is_archived() { p.muted } else { p.secondary };
+                    let held: Vec<&crate::containers::ContainerSummary> = node
+                        .containers
+                        .iter()
+                        .filter(|c| c.evidence_id == Some(evidence.id))
+                        .collect();
+                    let symbol_hover = (!held.is_empty()).then(|| containers::symbol_hover(&held));
+                    let symbol = symbol_hover.as_deref().map(|hover| {
+                        let color = if held.iter().any(|c| c.open) { p.accent } else { p.muted };
+                        (icons::CONTAINER, hover, color)
+                    });
                     let (response, _) = tree_row(
                         ui,
                         selected,
@@ -2598,7 +2634,10 @@ impl FactumApp {
                         (*count, "note"),
                         20.0,
                         None,
-                        None,
+                        held.iter()
+                            .any(|c| c.missing)
+                            .then_some(("⚠", "Container file missing")),
+                        symbol,
                     );
                     let response = response.on_hover_text(if evidence.details.is_empty() {
                         evidence.description.clone()
@@ -2628,22 +2667,30 @@ impl FactumApp {
                         }
                     });
                 }
-                for summary in &node.containers {
+                // containers without a live evidence item (from before 2.8, or their evidence was deleted): rows
+                // of their own
+                let live: std::collections::HashSet<i64> = node.evidence.iter().map(|(e, _)| e.id).collect();
+                for summary in node
+                    .containers
+                    .iter()
+                    .filter(|c| c.evidence_id.is_none_or(|e| !live.contains(&e)))
+                {
                     let selected = self.container_id == Some(summary.id);
                     let color = if case.is_archived() { p.muted } else { p.secondary };
+                    let hover = containers::symbol_hover(&[summary]);
+                    let symbol_color = if summary.open { p.accent } else { p.muted };
                     let (response, _) = tree_row(
                         ui,
                         selected,
-                        RichText::new(containers::tree_label(summary)).color(color),
+                        RichText::new(&summary.name).color(color),
                         (summary.file_count as usize, "file"),
                         20.0,
                         None,
                         summary.missing.then_some(("⚠", "File missing")),
+                        Some((icons::CONTAINER, &hover, symbol_color)),
                     );
-                    let response = response.on_hover_text(match &summary.path {
-                        Some(path) if !summary.missing => path.display().to_string(),
-                        _ => "File missing — Locate…".to_string(),
-                    });
+                    let response =
+                        response.on_hover_text(containers::row_hover(summary, summary.evidence_id.is_some()));
                     if response.clicked() {
                         clicked_container = Some(summary.id);
                     }
@@ -2752,7 +2799,7 @@ impl FactumApp {
                 if toggle.clicked() {
                     self.side_panel = !self.side_panel;
                 }
-                if self.view.case.is_some() && self.view.container.is_none() {
+                if self.view.case.is_some() && self.container_id.is_none() {
                     ui.add_space(8.0);
                     ui.label(RichText::new(&self.view.note_count).size(SMALL_SIZE).color(p.muted));
                 }
@@ -2762,35 +2809,12 @@ impl FactumApp {
         });
         ui.separator();
 
-        // a selected container is shown in place of the log and the note input
-        if let Some(detail) = self.view.container.clone() {
-            let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
-            let evidence = detail.evidence_id.and_then(|id| {
-                self.view
-                    .tree
-                    .iter()
-                    .flat_map(|node| &node.evidence)
-                    .find(|(e, _)| e.id == id)
-                    .map(|(e, _)| e.description.clone())
-            });
-            let mut container_actions = Vec::new();
-            let times = std::mem::take(&mut self.view.container_times);
-            let busy = self
-                .add_job
-                .as_ref()
-                .is_some_and(|job| job.container_id == detail.summary.id);
-            containers::container_view(
-                ui,
-                &detail,
-                &times,
-                evidence.as_deref(),
-                (archived, busy),
-                &mut container_actions,
-            );
-            self.view.container_times = times;
-            for action in container_actions {
-                self.container_action(action, ctx);
-            }
+        // a container selected on its own (a row of its own, no evidence item) is shown without notes and composer
+        if self.container_id.is_some() {
+            egui::ScrollArea::vertical()
+                .id_salt("container-alone")
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.container_sections(ui, ctx));
             return;
         }
 
@@ -2866,10 +2890,33 @@ impl FactumApp {
                         self.scroll_to = None;
                     }
                 }
+                self.container_sections(ui, ctx);
                 ui.add_space(8.0);
             });
         for action in actions {
             self.handle_card_action(action, ctx);
+        }
+    }
+
+    /// The shown containers, one section each, below the notes.
+    fn container_sections(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let archived = self.view.case.as_ref().is_some_and(|c| c.is_archived());
+        let mut container_actions = Vec::new();
+        for detail in &self.view.containers {
+            let busy = self
+                .add_job
+                .as_ref()
+                .is_some_and(|job| job.container_id == detail.summary.id);
+            let times = self
+                .view
+                .container_times
+                .get(&detail.summary.id)
+                .cloned()
+                .unwrap_or_default();
+            containers::container_section(ui, detail, &times, (archived, busy), &mut container_actions);
+        }
+        for action in container_actions {
+            self.container_action(action, ctx);
         }
     }
 
@@ -3391,6 +3438,7 @@ fn tree_row(
     indent: f32,
     add: Option<&str>,
     mark: Option<(&str, &str)>,
+    symbol: Option<(&str, &str, egui::Color32)>,
 ) -> (egui::Response, bool) {
     let p = *theme::current(ui.ctx());
     let width = ui.available_width();
@@ -3433,6 +3481,12 @@ fn tree_row(
             };
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.add(egui::Label::new(text).truncate().selectable(false));
+                if let Some((icon, tip, color)) = symbol {
+                    let symbol = ui
+                        .label(RichText::new(icon).size(SMALL_SIZE).color(color))
+                        .on_hover_text(tip);
+                    symbol.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, tip));
+                }
             });
             added
         })

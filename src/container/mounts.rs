@@ -86,7 +86,8 @@ pub fn mount_line(m: &Mount) -> String {
     }
     let mut parts: Vec<String> = Vec::new();
     for part in [&Some(m.mount_point.clone()), &m.device, &m.fs_type] {
-        if let Some(part) = part.as_ref().filter(|p| !p.is_empty()) {
+        // a pseudo file system names its source like its type (tmpfs, proc): once is enough
+        if let Some(part) = part.as_ref().filter(|p| !p.is_empty() && !parts.contains(p)) {
             parts.push(part.clone());
         }
     }
@@ -378,6 +379,13 @@ mod tests {
             "/mnt/disk · /dev/loop0 · ntfs3 · ro,noatime · image /mnt/xmount/disk.dd · on /mnt/xmount fuse.xmount xmount"
         );
         assert_eq!(mount_line(&Mount::default()), "mount unknown");
+        let tmpfs = Mount {
+            mount_point: "/tmp".into(),
+            device: Some("tmpfs".into()),
+            fs_type: Some("tmpfs".into()),
+            ..Default::default()
+        };
+        assert_eq!(mount_line(&tmpfs), "/tmp · tmpfs");
         assert_eq!(Mount::from_json(&mount.to_json()), Some(mount));
     }
 

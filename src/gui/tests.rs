@@ -1444,53 +1444,169 @@ fn close_container(fixture: &Fixture, id: i64) {
     Factum::with_seal_dir(&db, &signer, None).close_container(id).unwrap();
 }
 
+/// The evidence item the fixture's container belongs to.
+fn container_evidence(fixture: &Fixture, id: i64) -> i64 {
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    Factum::with_seal_dir(&db, &signer, None)
+        .container(id)
+        .unwrap()
+        .evidence_id
+        .unwrap()
+}
+
 #[test]
-fn tree_lists_container_with_count_and_state() {
+fn evidence_row_shows_symbol_only_with_container() {
     let (fixture, id, _) = Fixture::with_container();
     let mut harness = fixture.harness();
     let node = &harness.state().view.tree[0];
     assert_eq!(node.containers.len(), 1);
     assert_eq!((node.containers[0].id, node.containers[0].file_count), (id, 2));
-    assert!(harness.query_by_label_contains("FS01 preserved · open").is_some());
+    // no row of its own: the symbol on its evidence row stands for it
+    assert!(harness.query_by_label_contains("FS01 preserved").is_none());
+    assert_eq!(harness.query_all_by_label("Container · open").count(), 1);
     close_container(&fixture, id);
     harness.state_mut().dirty = true;
     harness.run_ok();
-    assert!(harness.query_by_label_contains("FS01 preserved").is_some());
-    assert!(harness.query_by_label_contains("FS01 preserved · open").is_none());
+    assert_eq!(harness.query_all_by_label("Container · closed · unsigned").count(), 1);
 }
 
 #[test]
-fn selecting_container_shows_its_files() {
+fn selecting_evidence_shows_notes_then_containers() {
     let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let case_id = factum.list_cases(false).unwrap()[0];
+        factum
+            .create_note("seized at the desk", Some(evidence_id), case_id)
+            .unwrap();
+        factum
+            .create_container(
+                case_id,
+                "second",
+                evidence_id,
+                &fixture._dir.path().join("second.aff4l"),
+                "",
+            )
+            .unwrap();
+    }
     let mut harness = fixture.harness();
-    harness.state_mut().select_container(id);
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
     harness.run_ok();
     let app = harness.state();
-    assert_eq!(app.container_id, Some(id));
-    assert!(app.case_id.is_some(), "the case of the container is the current case");
-    assert!(app.view.items.is_empty());
-    assert_eq!(app.view.container.as_ref().map(|c| c.summary.id), Some(id));
+    assert_eq!(app.view.containers.len(), 2);
+    assert!(harness.query_by_label_contains("seized at the desk").is_some());
+    assert!(harness.query_by_label("FS01 preserved").is_some());
+    assert!(harness.query_by_label("second").is_some());
     assert!(harness.query_by_label("evil.exe").is_some());
-    assert!(harness.query_by_label("notes.txt").is_some());
-    screenshot(&mut harness, "container_view");
-    // selecting the case again leaves the container
-    let case_id = harness.state().case_id;
-    harness.state_mut().select(case_id, None);
-    harness.run_ok();
-    assert!(harness.state().container_id.is_none());
-    assert!(harness.state().view.container.is_none());
+    screenshot(&mut harness, "evidence_with_containers");
 }
 
 #[test]
-fn jump_to_entry_leaves_the_container_view() {
+fn search_keeps_container_sections() {
     let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
     let mut harness = fixture.harness();
-    harness.state_mut().select_container(id);
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
+    harness.state_mut().filter = "nothing matches this".into();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(harness.query_by_label("evil.exe").is_some());
+}
+
+#[test]
+fn jump_to_entry_shows_it_in_the_case_log() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    let mut harness = fixture.harness();
+    let case_id = harness.state().view.tree[0].case.id;
+    harness.state_mut().select(Some(case_id), Some(evidence_id));
     harness.run_ok();
     harness.state_mut().jump_to_entry(id);
     harness.run_ok();
-    assert!(harness.state().container_id.is_none());
     assert!(harness.state().view.items.iter().any(|i| i.entry().id == id));
+}
+
+#[test]
+fn old_container_without_evidence_gets_its_own_row() {
+    let fixture = Fixture::new();
+    let uuid = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let factum = Factum::with_seal_dir(&db, &signer, None);
+        let case_id = factum.list_cases(false).unwrap()[0];
+        let id = factum
+            .create_container(
+                case_id,
+                "old",
+                factum.create_evidence(case_id, "tmp", "", "").unwrap(),
+                &fixture._dir.path().join("old.aff4l"),
+                "",
+            )
+            .unwrap();
+        let detail = factum.container(id).unwrap();
+        // a 2.6 container: the same event without an evidence item
+        factum
+            .append(
+                case_id,
+                crate::log_service::KIND_SYSTEM,
+                "Container \"orphan\" created",
+                crate::log_service::Append {
+                    payload: Some(serde_json::json!({"event": "container_created", "case_id": case_id,
+                        "container_id": "9b2b1f4e-0000-4000-8000-000000000001", "name": "orphan",
+                        "evidence_id": null, "file_name": "orphan.aff4l", "base_path": "",
+                        "created_utc": detail.created_utc})),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        "9b2b1f4e-0000-4000-8000-000000000001"
+    };
+    let mut harness = fixture.harness();
+    let row = harness.query_by_label("orphan").expect("a row of its own");
+    row.click();
+    harness.run_ok();
+    let app = harness.state();
+    assert_eq!(app.view.containers.len(), 1);
+    assert_eq!(app.view.containers[0].summary.uuid, uuid);
+}
+
+#[test]
+fn container_of_deleted_evidence_gets_its_own_row() {
+    let (fixture, id, _) = Fixture::with_container();
+    let evidence_id = container_evidence(&fixture, id);
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE evidence SET deleted_utc = '2026-10-28T00:00:00Z' WHERE id = ?",
+            [evidence_id],
+        )
+        .unwrap();
+    let harness = fixture.harness();
+    let row = harness.query_by_label("FS01 preserved").expect("a row of its own");
+    let _ = row;
+    let summary = &harness.state().view.tree[0].containers[0];
+    assert!(containers::row_hover(summary, true).contains("(deleted)"));
+}
+
+#[test]
+fn symbol_hover_texts() {
+    let (fixture, _, _) = Fixture::with_container();
+    let harness = fixture.harness();
+    let open = harness.state().view.tree[0].containers[0].clone();
+    assert_eq!(containers::symbol_hover(&[&open]), "Container · open");
+    let mut closed = open.clone();
+    closed.open = false;
+    assert_eq!(
+        containers::symbol_hover(&[&open, &closed, &closed]),
+        "3 containers · 1 open"
+    );
 }
 
 #[test]
@@ -1501,7 +1617,7 @@ fn missing_file_is_marked_and_locate_enabled() {
     harness.run_ok();
     let summary = harness.state().view.tree[0].containers[0].clone();
     assert!(summary.missing);
-    assert!(harness.query_by_label("File missing").is_some());
+    assert!(harness.query_by_label("Container file missing").is_some());
     let items = containers::menu_items(&summary, false, false);
     let enabled = |label: &str| items.iter().find(|(l, _, _)| *l == label).unwrap().2;
     assert!(enabled("Locate…"));
@@ -1574,11 +1690,12 @@ fn new_container_dialog_creates_file_and_selects_it() {
     let path = folder.join("FS01-preserved.aff4l");
     assert!(path.is_file());
     let app = harness.state();
-    let id = app.container_id.expect("the new container is selected");
-    assert_eq!(
-        app.factum().container(id).unwrap().summary.path.as_deref(),
-        Some(path.as_path())
-    );
+    let shown = app
+        .view
+        .containers
+        .first()
+        .expect("the new container's evidence is selected");
+    assert_eq!(shown.summary.path.as_deref(), Some(path.as_path()));
 }
 
 #[test]
@@ -1619,7 +1736,8 @@ fn add_runs_in_background_and_commits() {
         std::fs::write(more.join(name), name.repeat(10)).unwrap();
     }
     let mut harness = fixture.harness();
-    harness.state_mut().select_container(id);
+    // nothing selected: no composer, whose Add button would be a second "Add"
+    harness.state_mut().select(None, None);
     harness.state_mut().open_add_to_container(id, vec![more.clone()]);
     harness.run_ok();
     screenshot(&mut harness, "add_to_container_dialog");
@@ -1905,7 +2023,7 @@ fn container_view_shows_modified_times() {
     let mut harness = fixture.harness();
     harness.state_mut().select_container(id);
     harness.run_ok();
-    assert_eq!(harness.state().view.container_times.len(), 2);
+    assert_eq!(harness.state().view.container_times[&id].len(), 2);
     let shown = containers::short_time(&modified);
     assert!(shown.ends_with(" UTC") && shown.as_bytes()[10] == b' ', "{shown}");
     assert!(harness.query_all_by_label(&shown).next().is_some(), "{shown}");

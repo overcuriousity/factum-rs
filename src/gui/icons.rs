@@ -30,3 +30,5 @@ pub const HEADING: &str = "\u{e6ba}";
 pub const LIST: &str = "\u{e2f2}";
 pub const QUOTE: &str = "\u{e660}";
 pub const IMAGE: &str = "\u{e2ca}";
+/// package: an evidence item that has containers
+pub const CONTAINER: &str = "\u{e390}";
