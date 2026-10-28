@@ -2185,3 +2185,39 @@ fn the_pinned_panel_shows_a_note_as_plain_text() {
     assert_eq!(harness.query_all_by_label("bold l (https://x.test)").count(), 2);
     assert!(harness.query_by_label_contains("**").is_none());
 }
+
+#[test]
+fn an_image_is_decoded_only_while_it_is_on_screen() {
+    let fixture = Fixture::new();
+    let image = test_image(40, 30);
+    let filler = "line\n\n".repeat(120);
+    // the log lists the newest first: the image note comes after the long one
+    let note = add_note(&fixture, &image.reference("far below"), &[image]);
+    add_note(&fixture, &filler, &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // below the visible part of the log: the room is kept, nothing is decoded
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_none());
+    assert_eq!(markup_view::cached_count(&harness.ctx), 1); // its header size only
+    let ctx = harness.ctx.clone();
+    let decoded = |ctx: &egui::Context| markup_view::texture_cached(ctx, note);
+    assert!(!decoded(&ctx));
+    harness.state_mut().scroll_to = Some(note);
+    harness.run_ok();
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_some());
+    assert!(decoded(&ctx));
+}
+
+#[test]
+fn an_image_that_does_not_decode_says_so_where_it_stands() {
+    let fixture = Fixture::new();
+    let mut image = test_image(8, 8);
+    image.bytes.truncate(40); // the header reads, the pixels are gone
+    let note = add_note(&fixture, &image.reference("cut"), std::slice::from_ref(&image));
+    let harness = harness_on_note(&fixture, note);
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} could not be shown]", image.id))
+            .is_some()
+    );
+}

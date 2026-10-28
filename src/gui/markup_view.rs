@@ -24,16 +24,96 @@ pub fn fit(size: [usize; 2], max_side: usize) -> [usize; 2] {
     [scale(size[0]), scale(size[1])]
 }
 
-/// The picture as a texture, decoded once per `(entry, image)` and kept for the session; `None` (also kept) when the
-/// type is not one reports embed or the bytes do not decode. Larger than the GPU takes: shown scaled down.
+/// Textures are dropped when no frame drew them for this many seconds of input time.
+const KEEP_SECONDS: f64 = 30.0;
+
+/// What is known about one picture of one entry, and when a frame last needed it.
+struct Slot {
+    /// the size it is shown at before scaling to the card: `Some(None)` when its header does not read
+    size: Option<Option<[usize; 2]>>,
+    /// the decoded picture: `Some(None)` when it does not decode
+    texture: Option<Option<TextureHandle>>,
+    last_used: f64,
+}
+
+type Cache = std::collections::HashMap<(i64, String), Slot>;
+
+/// The session's pictures, in the context's temporary data.
+fn cache(ctx: &egui::Context) -> std::sync::Arc<std::sync::Mutex<Cache>> {
+    let key = egui::Id::unique("note-image-cache");
+    type Shared = std::sync::Arc<std::sync::Mutex<Cache>>;
+    ctx.data_mut(|d| d.get_temp_mut_or_insert_with(key, Shared::default).clone())
+}
+
+/// The picture as a texture, decoded when first asked for per `(entry, image)`; `None` (also kept) when the type is
+/// not one reports embed or the bytes do not decode. Larger than the GPU takes: scaled down. It stays while frames
+/// ask for it; see [`evict_unused`].
 pub fn texture(ctx: &egui::Context, entry_id: i64, image: &NoteImage) -> Option<TextureHandle> {
-    let key = egui::Id::unique(("note-image", entry_id, &image.id));
-    if let Some(cached) = ctx.data(|d| d.get_temp::<Option<TextureHandle>>(key)) {
-        return cached;
+    texture_at(ctx, entry_id, image, ctx.input(|i| i.time))
+}
+
+fn texture_at(ctx: &egui::Context, entry_id: i64, image: &NoteImage, now: f64) -> Option<TextureHandle> {
+    let cache = cache(ctx);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = slot(&mut cache, entry_id, image, now);
+    slot.texture.get_or_insert_with(|| decode(ctx, entry_id, image)).clone()
+}
+
+/// The size the picture is shown at in a texture, from its header alone: no pixels are decoded.
+fn display_size(ctx: &egui::Context, entry_id: i64, image: &NoteImage, now: f64) -> Option<[usize; 2]> {
+    let cache = cache(ctx);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let max_side = ctx.input(|i| i.max_texture_side).max(1);
+    *slot(&mut cache, entry_id, image, now).size.get_or_insert_with(|| {
+        let reader = image::ImageReader::new(std::io::Cursor::new(&image.bytes))
+            .with_guessed_format()
+            .ok()?;
+        let (width, height) = reader.into_dimensions().ok()?;
+        (width > 0 && height > 0).then(|| fit([width as usize, height as usize], max_side))
+    })
+}
+
+fn slot<'a>(cache: &'a mut Cache, entry_id: i64, image: &NoteImage, now: f64) -> &'a mut Slot {
+    let slot = cache.entry((entry_id, image.id.clone())).or_insert(Slot {
+        size: None,
+        texture: None,
+        last_used: now,
+    });
+    slot.last_used = now;
+    slot
+}
+
+/// How many pictures are kept, for tests.
+#[cfg(test)]
+pub(super) fn cached_count(ctx: &egui::Context) -> usize {
+    cache(ctx).lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Whether a picture of the entry was decoded, for tests.
+#[cfg(test)]
+pub(super) fn texture_cached(ctx: &egui::Context, entry_id: i64) -> bool {
+    let cache = cache(ctx);
+    let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .iter()
+        .any(|((entry, _), slot)| *entry == entry_id && slot.texture.is_some())
+}
+
+/// Once per frame: drops the pictures no frame has drawn for [`KEEP_SECONDS`] (a case that was left, a note that was
+/// scrolled away or corrected), which frees their textures. Asks for a frame to come back to it while any are kept.
+pub fn evict_unused(ctx: &egui::Context) {
+    let keeping = evict_older_than(ctx, ctx.input(|i| i.time) - KEEP_SECONDS);
+    if keeping {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(KEEP_SECONDS));
     }
-    let handle = decode(ctx, entry_id, image);
-    ctx.data_mut(|d| d.insert_temp(key, handle.clone()));
-    handle
+}
+
+/// Drops what was last used before `limit`; true while something is left.
+fn evict_older_than(ctx: &egui::Context, limit: f64) -> bool {
+    let cache = cache(ctx);
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|_, slot| slot.last_used >= limit);
+    !cache.is_empty()
 }
 
 fn decode(ctx: &egui::Context, entry_id: i64, image: &NoteImage) -> Option<TextureHandle> {
@@ -286,20 +366,32 @@ impl Body<'_> {
             job.append(&format!("[image {id} missing]"), 0.0, self.muted(look));
             return;
         };
-        let Some(texture) = texture(ui.ctx(), self.entry_id, image) else {
+        let now = ui.input(|i| i.time);
+        let Some(size) = display_size(ui.ctx(), self.entry_id, image, now) else {
             job.append(&format!("[image {id} could not be shown]"), 0.0, self.muted(look));
             return;
         };
         self.flush(ui, job);
-        let natural = texture.size_vec2();
+        // the room is reserved from the header; the picture is decoded only once it is on screen
+        let natural = egui::vec2(size[0] as f32, size[1] as f32);
         let scale = (ui.available_width() / natural.x)
             .min(MAX_IMAGE_HEIGHT / natural.y)
             .min(1.0);
+        let (rect, _) = ui.allocate_exact_size(natural * scale, Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+        let Some(texture) = texture_at(ui.ctx(), self.entry_id, image, now) else {
+            let text = egui::RichText::new(format!("[image {id} could not be shown]")).color(self.palette.muted);
+            ui.put(rect, egui::Label::new(text).wrap());
+            return;
+        };
         let alt = if alt.is_empty() { "Image" } else { alt };
         let response = ui
-            .add(
+            .put(
+                rect,
                 egui::Image::new(egui::load::SizedTexture::new(texture.id(), natural))
-                    .fit_to_exact_size(natural * scale)
+                    .fit_to_exact_size(rect.size())
                     .alt_text(alt)
                     .sense(Sense::click()),
             )
@@ -369,6 +461,33 @@ mod tests {
         svg.mime = "image/svg+xml".into();
         assert!(texture(&ctx, 1, &svg).is_none());
         assert!(texture(&ctx, 2, &png(2, 2)).is_some());
+    }
+
+    #[test]
+    fn the_size_comes_from_the_header_without_decoding() {
+        let ctx = egui::Context::default();
+        let image = png(30, 20);
+        assert_eq!(display_size(&ctx, 1, &image, 0.0), Some([30, 20]));
+        assert!(cache(&ctx).lock().unwrap()[&(1, image.id.clone())].texture.is_none());
+        let mut broken = png(2, 2);
+        broken.bytes = b"not a picture".to_vec();
+        assert_eq!(display_size(&ctx, 2, &broken, 0.0), None);
+    }
+
+    #[test]
+    fn pictures_not_drawn_for_30_seconds_are_dropped() {
+        let ctx = egui::Context::default();
+        let (old, fresh) = (png(2, 2), png(3, 3));
+        let _ = texture_at(&ctx, 1, &old, 0.0).unwrap();
+        let _ = texture_at(&ctx, 2, &fresh, 20.0).unwrap();
+        assert_eq!(cached_count(&ctx), 2);
+        // 35 s: the first is 35 s old, the second 15 s; drawing the first again would keep it
+        assert!(evict_older_than(&ctx, 35.0 - KEEP_SECONDS));
+        assert_eq!(cached_count(&ctx), 1);
+        assert!(cache(&ctx).lock().unwrap().contains_key(&(2, fresh.id.clone())));
+        let _ = texture_at(&ctx, 2, &fresh, 40.0).unwrap();
+        assert!(!evict_older_than(&ctx, 71.0 - KEEP_SECONDS));
+        assert_eq!(cached_count(&ctx), 0);
     }
 
     #[test]

@@ -3434,6 +3434,7 @@ impl eframe::App for FactumApp {
             }
         }
         self.image_viewer_window(&ctx);
+        markup_view::evict_unused(&ctx);
         let mut window_actions = Vec::new();
         for window in &mut self.companion_windows {
             window.show(&ctx, &mut window_actions);
