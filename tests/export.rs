@@ -752,13 +752,19 @@ fn report_lists_container_sources_and_damaged_state() {
         rows.iter().any(|(k, v)| *k == "Source" && v.contains(&mount)),
         "{rows:?}"
     );
-    for text in [render_html(&model, false), render_markdown(&model, "images")] {
-        assert!(text.contains("closed as damaged"), "{text}");
-        assert!(
-            text.contains(&mount) || text.contains(&mount.replace('·', "&middot;")),
-            "{text}"
-        );
-    }
+    let html = render_html(&model, false);
+    assert!(html.contains("closed as damaged"), "{html}");
+    assert!(
+        html.contains(&mount) || html.contains(&mount.replace('·', "&middot;")),
+        "{html}"
+    );
+    // Markdown escapes what it would otherwise read as markup (a Windows "C:\", an "_" in mount options)
+    let markdown = render_markdown(&model, "images");
+    assert!(markdown.contains("closed as damaged"), "{markdown}");
+    assert!(
+        markdown.contains(&factum::export::markdown::inline(&mount)),
+        "{markdown}"
+    );
 }
 
 #[test]

@@ -128,7 +128,8 @@ pub fn mount_line(m: &Mount) -> String {
 /// point. The mount table is read once.
 pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
     let canonical = |p: &Path| plain(std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
-    let sources: Vec<PathBuf> = sources.iter().map(|s| canonical(s)).collect();
+    // a source is looked up by its real path (macOS' /var is /private/var) and listed as it was added
+    let sources: Vec<(PathBuf, PathBuf)> = sources.iter().map(|s| (s.clone(), canonical(s))).collect();
     // a walked item's folder is resolved once; the item itself is not followed (a link is read where it lies)
     let mut folders: HashMap<PathBuf, PathBuf> = HashMap::new();
     let walked: Vec<PathBuf> = walked
@@ -144,13 +145,18 @@ pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
     platform::mounts_for(&sources, &walked)
 }
 
-/// Groups paths by the mount `resolve` finds for them (unknown when it finds none).
-fn group(sources: &[PathBuf], walked: &[PathBuf], resolve: &mut dyn FnMut(&Path) -> Option<Mount>) -> Vec<Mount> {
+/// Groups paths by the mount `resolve` finds for them (unknown when it finds none). Sources are (as added, real
+/// path) pairs.
+fn group(
+    sources: &[(PathBuf, PathBuf)],
+    walked: &[PathBuf],
+    resolve: &mut dyn FnMut(&Path) -> Option<Mount>,
+) -> Vec<Mount> {
     let mut mounts: Vec<Mount> = Vec::new();
-    for (path, is_source) in sources
+    for (given, path, is_source) in sources
         .iter()
-        .map(|p| (p, true))
-        .chain(walked.iter().map(|p| (p, false)))
+        .map(|(given, real)| (given, real, true))
+        .chain(walked.iter().map(|p| (p, p, false)))
     {
         let mount = resolve(path).unwrap_or_default();
         let index = match mounts
@@ -165,7 +171,7 @@ fn group(sources: &[PathBuf], walked: &[PathBuf], resolve: &mut dyn FnMut(&Path)
         };
         let known = &mut mounts[index];
         let label = if is_source || known.mount_point.is_empty() {
-            path.display().to_string()
+            given.display().to_string()
         } else {
             known.mount_point.clone()
         };
@@ -180,7 +186,7 @@ fn group(sources: &[PathBuf], walked: &[PathBuf], resolve: &mut dyn FnMut(&Path)
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn assign(
     entries: &[MountEntry],
-    sources: &[PathBuf],
+    sources: &[(PathBuf, PathBuf)],
     walked: &[PathBuf],
     to_mount: &dyn Fn(&MountEntry) -> Mount,
 ) -> Vec<Mount> {
@@ -301,7 +307,7 @@ mod platform {
         }
     }
 
-    pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
+    pub fn mounts_for(sources: &[(PathBuf, PathBuf)], walked: &[PathBuf]) -> Vec<Mount> {
         let entries = entries().unwrap_or_default();
         // a loop device: the image file behind it, and the FUSE mount that file lies on (xmount and similar)
         let with_backing = |entry: &MountEntry| {
@@ -342,7 +348,7 @@ mod platform {
             .into_owned()
     }
 
-    pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
+    pub fn mounts_for(sources: &[(PathBuf, PathBuf)], walked: &[PathBuf]) -> Vec<Mount> {
         // one volume lookup per folder, not per file
         let mut by_folder: HashMap<PathBuf, Option<Mount>> = HashMap::new();
         group(sources, walked, &mut |path| {
@@ -396,7 +402,7 @@ mod platform {
     use super::*;
 
     /// macOS and others: not recorded (optional, spec 5.1)
-    pub fn mounts_for(sources: &[PathBuf], walked: &[PathBuf]) -> Vec<Mount> {
+    pub fn mounts_for(sources: &[(PathBuf, PathBuf)], walked: &[PathBuf]) -> Vec<Mount> {
         group(sources, walked, &mut |_| None)
     }
 }
@@ -431,7 +437,7 @@ mod tests {
         let entries = parse_mountinfo(MOUNTINFO);
         let mounts = assign(
             &entries,
-            &[PathBuf::from("/mnt")],
+            &[(PathBuf::from("/mnt"), PathBuf::from("/mnt"))],
             &[PathBuf::from("/mnt/x.txt"), PathBuf::from("/mnt/my disk/Users/a")],
             &|e| Mount {
                 mount_point: e.mount_point.clone(),
@@ -503,6 +509,20 @@ mod tests {
         assert!(!mounts[0].mount_point.is_empty());
         assert!(mounts[0].fs_type.is_some());
         assert_eq!(mounts[0].paths.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sources_are_listed_as_given() {
+        // a link in the path (as /var is on macOS): the mount is found through the real path, the source is named
+        // the way it was added
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let source = dir.path().join("link/a.txt");
+        std::fs::write(&source, "a").unwrap();
+        let mounts = mounts_for(std::slice::from_ref(&source), &[]);
+        assert_eq!(mounts[0].paths, vec![source.display().to_string()]);
     }
 
     #[cfg(windows)]

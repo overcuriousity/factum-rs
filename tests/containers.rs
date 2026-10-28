@@ -1789,9 +1789,14 @@ fn add_without_base_from_two_folders() {
         assert_eq!(event["keep_path"], true);
         let record = &event["files"][0];
         assert_eq!(record["source"], source.display().to_string());
-        let full = source.display().to_string();
-        let path = record["path"].as_str().unwrap();
-        assert!(full.ends_with(path) && path.len() + 1 >= full.len(), "{path} vs {full}");
+        // compared by components: the stored path uses the platform's separator throughout
+        let path = Path::new(record["path"].as_str().unwrap());
+        assert!(source.ends_with(path), "{} vs {}", path.display(), source.display());
+        assert!(
+            path.components().count() + 1 >= source.components().count(),
+            "{}",
+            path.display()
+        );
     }
     let volume = factum.open_container_for_add(id).unwrap();
     assert!(factum.compare_with_log(id, &volume).unwrap().is_empty());
