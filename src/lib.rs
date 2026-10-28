@@ -16,6 +16,7 @@ pub mod error;
 pub mod evidence;
 pub mod export;
 
+pub mod images;
 pub mod iocs;
 pub mod late_signing;
 pub mod log_service;
