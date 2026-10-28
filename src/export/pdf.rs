@@ -29,6 +29,8 @@ const MARGIN_X: f32 = 56.0;
 const MARGIN_TOP: f32 = 56.0;
 const MARGIN_BOTTOM: f32 = 60.0;
 const CONTENT_WIDTH: f32 = PAGE_WIDTH - 2.0 * MARGIN_X;
+/// Nested lists and quotes stop moving right here, so deeply nested note text keeps a usable width.
+const MAX_INDENT: f32 = CONTENT_WIDTH * 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FontId {
@@ -173,9 +175,15 @@ fn decode(image: &NoteImage) -> Option<PdfImage> {
     let decoded = reader.decode().ok()?;
     let (width, height) = (decoded.width(), decoded.height());
     if decoded.color().has_alpha() {
-        let rgba = decoded.to_rgba8();
-        let alpha: Vec<u8> = rgba.pixels().map(|pixel| pixel[3]).collect();
-        let rgb: Vec<u8> = rgba.pixels().flat_map(|pixel| [pixel[0], pixel[1], pixel[2]]).collect();
+        // no copy of the pixels when the decoder already produced RGBA; rgb and alpha are split in one pass
+        let rgba = decoded.into_rgba8().into_raw();
+        let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+        let mut alpha = Vec::with_capacity(rgba.len() / 4);
+        for pixel in rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&pixel[..3]);
+            alpha.push(pixel[3]);
+        }
+        drop(rgba);
         let opaque = alpha.iter().all(|a| *a == 255);
         return Some(PdfImage {
             width,
@@ -187,7 +195,7 @@ fn decode(image: &NoteImage) -> Option<PdfImage> {
     Some(PdfImage {
         width,
         height,
-        rgb: decoded.to_rgb8().into_raw(),
+        rgb: decoded.into_rgb8().into_raw(),
         alpha: None,
     })
 }
@@ -633,7 +641,7 @@ impl Writer {
                         self.ensure(body.line_height() * 1.5);
                         let baseline = self.y - body.size * 1.05;
                         self.draw_text(&body, marker, MARGIN_X + indent + 2.0, baseline);
-                        self.blocks(item, images, body, indent + step);
+                        self.blocks(item, images, body, (indent + step).min(MAX_INDENT));
                     }
                 }
                 Block::Quote(inner) => {
@@ -642,7 +650,7 @@ impl Writer {
                         ..body
                     };
                     let (first_page, top) = (self.current, self.y);
-                    self.blocks(inner, images, quoted, indent + 12.0);
+                    self.blocks(inner, images, quoted, (indent + 12.0).min(MAX_INDENT));
                     self.quote_bar(indent, first_page, top);
                 }
                 Block::Code(code) => {
@@ -1449,5 +1457,95 @@ mod tests {
             page.contains(&format!(" 0 0 {:.2} ", PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM)),
             "{page}"
         );
+    }
+
+    #[test]
+    fn deep_nesting_keeps_text_and_images_on_the_page() {
+        let mut writer = Writer::new();
+        let body = Style::new(FontId::Sans, 11.0, TEXT);
+        let image = rgba_image(30, 20, 255);
+        let mut text = String::new();
+        for level in 0..60 {
+            text += &format!("{}- level {level}\n", "  ".repeat(level));
+        }
+        text += &format!("{}- {}\n", "  ".repeat(60), image.reference("deep"));
+        let quotes = format!("{} deep quote {}", ">".repeat(60), image.reference("q"));
+        writer.markup(&text, std::slice::from_ref(&image), body);
+        writer.markup(&quotes, std::slice::from_ref(&image), body);
+        let mut drawn = 0;
+        for page in &writer.pages {
+            for line in page.lines().filter(|line| line.ends_with(" Do Q")) {
+                let numbers: Vec<f32> = line[2..].split(' ').filter_map(|n| n.parse().ok()).collect();
+                let (width, height, x) = (numbers[0], numbers[3], numbers[4]);
+                assert!(width > 0.0 && height > 0.0, "{line}");
+                assert!(x >= MARGIN_X && x + width <= PAGE_WIDTH - MARGIN_X + 0.01, "{line}");
+                drawn += 1;
+            }
+            // text starts inside the page too
+            for line in page.lines().filter(|line| line.starts_with("BT ")) {
+                let x: f32 = line
+                    .split(" Td")
+                    .next()
+                    .unwrap()
+                    .rsplit(' ')
+                    .nth(1)
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!((MARGIN_X..PAGE_WIDTH - MARGIN_X).contains(&x), "{line}");
+            }
+        }
+        assert_eq!(drawn, 2);
+        let lines = writer.rich_lines(
+            &[Span {
+                style: body,
+                text: "word ".repeat(10),
+                image: None,
+            }],
+            CONTENT_WIDTH - MAX_INDENT,
+        );
+        assert!(lines.len() < 10, "the clamped width still holds several words per line");
+    }
+
+    /// A PNG whose header declares width x height with a tiny (invalid) body, the size of a decompression bomb.
+    fn png_declaring(width: u32, height: u32) -> NoteImage {
+        fn crc(data: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in data {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend((data.len() as u32).to_be_bytes());
+            let body: Vec<u8> = kind.iter().chain(data).copied().collect();
+            out.extend(&body);
+            out.extend(crc(&body).to_be_bytes());
+        }
+        let mut header = Vec::new();
+        header.extend(width.to_be_bytes());
+        header.extend(height.to_be_bytes());
+        header.extend([8, 6, 0, 0, 0]); // 8 bit RGBA
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut bytes, b"IHDR", &header);
+        chunk(&mut bytes, b"IDAT", &compress(&[0; 16]));
+        chunk(&mut bytes, b"IEND", &[]);
+        NoteImage::from_bytes(bytes, None).unwrap()
+    }
+
+    #[test]
+    fn images_declaring_huge_dimensions_do_not_decode() {
+        let started = std::time::Instant::now();
+        assert!(decode(&png_declaring(100_000, 100_000)).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // the helper itself builds readable files: a small declaration with too little data fails, but not by size
+        assert!(decode(&png_declaring(4, 4)).is_none());
     }
 }
