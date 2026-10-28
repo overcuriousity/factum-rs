@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use crate::db::ensure_entry_case_open;
 use crate::error::{FactumError, Result};
+use crate::images::{self, NoteImage};
 use crate::log_service::{Append, KIND_NOTE};
 use crate::pystr::strip;
 use crate::services::Factum;
@@ -64,6 +65,11 @@ impl Entry {
     /// hashes it as it is and reports it.
     pub fn payload(&self) -> Value {
         parse_payload(self.payload_json.as_deref())
+    }
+
+    /// The images in the payload; none when the payload has none or is not the expected shape.
+    pub fn images(&self) -> Vec<NoteImage> {
+        images::from_payload(&self.payload())
     }
 
     pub fn is_note(&self) -> bool {
@@ -132,8 +138,30 @@ impl EntryFilter<'_> {
     }
 }
 
+/// The images the text refers to, in order of reference; unreferenced ones are dropped.
+fn referenced_images(text: &str, images: &[NoteImage]) -> Result<Vec<NoteImage>> {
+    images::referenced_ids(text)
+        .iter()
+        .map(|id| {
+            images::find(images, id)
+                .cloned()
+                .ok_or_else(|| FactumError::general(format!("The note refers to image {id}, which is not attached.")))
+        })
+        .collect()
+}
+
 impl Factum<'_> {
     pub fn create_note(&self, note_text: &str, evidence_id: Option<i64>, case_id: i64) -> Result<i64> {
+        self.create_note_with_images(note_text, &[], evidence_id, case_id)
+    }
+
+    pub fn create_note_with_images(
+        &self,
+        note_text: &str,
+        images: &[NoteImage],
+        evidence_id: Option<i64>,
+        case_id: i64,
+    ) -> Result<i64> {
         if strip(note_text).is_empty() {
             return Err(FactumError::general("The note is empty."));
         }
@@ -164,18 +192,25 @@ impl Factum<'_> {
                 Some((_, None)) => {}
             }
         }
+        let kept = referenced_images(note_text, images)?;
         self.append(
             case_id,
             KIND_NOTE,
             note_text,
             Append {
                 evidence_id,
+                payload: images::to_payload(&kept),
                 ..Default::default()
             },
         )
     }
 
     pub fn correct_note(&self, note_id: i64, new_text: &str) -> Result<i64> {
+        self.correct_note_with_images(note_id, new_text, &[])
+    }
+
+    /// Images are not carried over from the corrected version: the correction holds the ones passed here.
+    pub fn correct_note_with_images(&self, note_id: i64, new_text: &str, images: &[NoteImage]) -> Result<i64> {
         if strip(new_text).is_empty() {
             return Err(FactumError::general("The corrected note is empty."));
         }
@@ -187,6 +222,7 @@ impl Factum<'_> {
                 )));
             }
         };
+        let kept = referenced_images(new_text, images)?;
         // versions never branch: a correction always attaches to the newest version of the line
         let newest = self.latest_version_id(note_id)?;
         // the pin and the labels follow the newest version
@@ -205,6 +241,7 @@ impl Factum<'_> {
             new_text,
             Append {
                 evidence_id: entry.evidence_id,
+                payload: images::to_payload(&kept),
                 corrects_id: Some(newest),
                 on_commit: Some(&move_pin_and_labels),
                 ..Default::default()
