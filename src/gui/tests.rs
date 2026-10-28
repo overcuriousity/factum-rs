@@ -2007,6 +2007,22 @@ fn add_note(fixture: &Fixture, text: &str, images: &[crate::images::NoteImage]) 
     factum.create_note_with_images(text, images, None, case_id).unwrap()
 }
 
+/// [`add_note`] for images no save accepts (bytes that do not match their id): written to the row afterwards, as a
+/// tampered database holds them.
+fn add_tampered_note(fixture: &Fixture, text: &str, images: &[crate::images::NoteImage]) -> i64 {
+    let note = add_note(fixture, "placeholder", &[]);
+    let payload = crate::images::to_payload(images).map(|p| p.to_string());
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE entries SET text = ?, payload_json = ? WHERE id = ?",
+            rusqlite::params![text, payload, note],
+        )
+        .unwrap();
+    note
+}
+
 fn test_image(width: u32, height: u32) -> crate::images::NoteImage {
     let rgba = vec![180u8; (width * height * 4) as usize];
     crate::images::NoteImage::from_rgba(width, height, &rgba).unwrap()
@@ -2111,7 +2127,7 @@ fn images_that_cannot_be_shown_say_so() {
         gone.reference("b"),
         broken.reference("c")
     );
-    let note = add_note(&fixture, &text, &[broken.clone(), gone.clone()]);
+    let note = add_tampered_note(&fixture, &text, &[broken.clone(), gone.clone()]);
     let mut harness = fixture.harness();
     select_case(&mut harness);
     // the stored payload is untrusted: an image that is not there, and one of a type nobody embeds
@@ -2208,7 +2224,7 @@ fn an_image_that_does_not_decode_says_so_where_it_stands() {
     let fixture = Fixture::new();
     let mut image = test_image(8, 8);
     image.bytes.truncate(40); // the header reads, the pixels are gone
-    let note = add_note(&fixture, &image.reference("cut"), std::slice::from_ref(&image));
+    let note = add_tampered_note(&fixture, &image.reference("cut"), std::slice::from_ref(&image));
     let harness = harness_on_note(&fixture, note);
     assert!(
         harness

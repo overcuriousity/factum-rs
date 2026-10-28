@@ -927,3 +927,89 @@ fn a_reference_in_a_code_span_is_text() {
         1
     );
 }
+
+/// Replaces the stored payload of `id` with these images, as a tampered database would hold them.
+fn tamper_images(f: &Fixture, id: i64, images: &[NoteImage]) {
+    let payload = factum::images::to_payload(images).unwrap().to_string();
+    f.db.conn
+        .execute(
+            "UPDATE entries SET payload_json = ? WHERE id = ?",
+            rusqlite::params![payload, id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_correction_does_not_sign_tampered_images_again() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (image, other) = (test_image(10), test_image(20));
+    let text = format!("see {}", image.reference("x"));
+    let note = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let notes = || f.count("SELECT COUNT(*) FROM entries WHERE kind = 'note'");
+    // other pixels under the image's id
+    let swapped = NoteImage {
+        bytes: other.bytes.clone(),
+        ..image.clone()
+    };
+    tamper_images(&f, note, std::slice::from_ref(&swapped));
+    let err = factum.correct_note(note, &format!("{text}, fixed")).unwrap_err();
+    assert!(err.to_string().contains(&image.id), "{err}");
+    assert_eq!(notes(), 1);
+    // the same from the correction dialog and the composer, which pass the images on
+    assert!(
+        factum
+            .correct_note_with_images(note, &text, &[swapped.clone()])
+            .is_err()
+    );
+    assert!(
+        factum
+            .create_note_with_images(&text, &[swapped], None, case_id)
+            .is_err()
+    );
+    assert_eq!(notes(), 1);
+    // a forged type and hash are not signed: what is signed is computed from the bytes
+    let relabelled = NoteImage {
+        mime: "image/svg+xml".into(),
+        sha256: "../../x".into(),
+        ..image.clone()
+    };
+    tamper_images(&f, note, &[relabelled]);
+    let version = factum.correct_note(note, &format!("{text}, fixed")).unwrap();
+    assert_eq!(
+        factum.get_entry(version).unwrap().unwrap().images(),
+        vec![image.clone()]
+    );
+}
+
+#[test]
+fn a_correction_does_not_sign_an_image_over_the_limit() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let text = format!("see {}", image.reference("x"));
+    let note = factum
+        .create_note_with_images(&text, std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let mut bytes = image.bytes.clone();
+    bytes.resize(factum::images::MAX_IMAGE_BYTES + 1, 0);
+    let sha256 = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(&bytes))
+    };
+    let huge = NoteImage {
+        id: sha256[..12].to_string(),
+        mime: "image/png".into(),
+        sha256,
+        name: None,
+        bytes,
+    };
+    tamper_images(&f, note, std::slice::from_ref(&huge));
+    let err = factum.correct_note(note, &huge.reference("x")).unwrap_err();
+    assert!(err.to_string().contains("20 MB"), "{err}");
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries WHERE kind = 'note'"), 1);
+}

@@ -138,14 +138,24 @@ impl EntryFilter<'_> {
     }
 }
 
-/// The images the text refers to, in order of reference; unreferenced ones are dropped.
+/// The images the text refers to, in order of reference; unreferenced ones are dropped. Each is rebuilt from its
+/// bytes, so what is signed is checked like a new image: a stored payload (a correction carries one on) is
+/// untrusted, and its type, hash or size must not be signed again unchecked.
 fn referenced_images(text: &str, images: &[NoteImage]) -> Result<Vec<NoteImage>> {
     images::referenced_ids(text)
         .iter()
         .map(|id| {
-            images::find(images, id)
-                .cloned()
-                .ok_or_else(|| FactumError::general(format!("The note refers to image {id}, which is not attached.")))
+            let image = images::find(images, id).ok_or_else(|| {
+                FactumError::general(format!("The note refers to image {id}, which is not attached."))
+            })?;
+            let checked = NoteImage::from_bytes(image.bytes.clone(), image.name.clone())?;
+            if checked.id != *id {
+                return Err(FactumError::general(format!(
+                    "Image {id} does not match its contents (they hash to {}); it cannot be saved.",
+                    checked.id
+                )));
+            }
+            Ok(checked)
         })
         .collect()
 }
