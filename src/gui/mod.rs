@@ -176,6 +176,17 @@ struct AddJob {
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// A close re-checking what was added to its container, on a worker thread.
+struct CloseJob {
+    container_id: i64,
+    name: String,
+    worker: workers::Worker<workers::RecheckResult>,
+    progress: Arc<crate::container::volume::AddProgress>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Close and Archive: the case to archive once its containers are closed
+    then_archive: Option<i64>,
+}
+
 /// A container file being verified.
 struct ContainerVerifyJob {
     worker: workers::Worker<workers::ContainerVerifyResult>,
@@ -233,6 +244,11 @@ struct FactumApp {
     signature_check_pending: bool,
     verify_job: Option<VerifyJob>,
     add_job: Option<AddJob>,
+    /// a close re-checking its container, on a worker thread
+    close_job: Option<CloseJob>,
+    /// Add Again: the additions still to run, then the container to close (and the case to archive after it)
+    pending_adds: std::collections::VecDeque<(Vec<PathBuf>, crate::container::volume::AddOptions)>,
+    close_after_adds: Option<(i64, Option<i64>)>,
     /// the shown containers' file times: (file, its logged end (else its length) when read, times), by container id
     container_times_cache: std::cell::RefCell<HashMap<i64, TimesCache>>,
     /// the decoded images of the note entries shown, by entry id: entries never change, so a rebuild (every
@@ -346,6 +362,9 @@ impl FactumApp {
             signature_check_pending: false,
             verify_job: None,
             add_job: None,
+            close_job: None,
+            pending_adds: std::collections::VecDeque::new(),
+            close_after_adds: None,
             container_times_cache: std::cell::RefCell::new(HashMap::new()),
             note_images: Default::default(),
             container_verify_job: None,
@@ -968,6 +987,14 @@ impl FactumApp {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
         }
+        if let Some(job) = self.close_job.as_mut() {
+            if let Some(result) = job.worker.poll() {
+                let job = self.close_job.take().expect("polled");
+                self.finish_close(job.container_id, job.then_archive, result);
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+        }
         let mut finished = Vec::new();
         self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll() {
             Some(result) => {
@@ -1261,10 +1288,22 @@ impl FactumApp {
     /// Logs and lists what the worker staged, and says what happened.
     fn finish_add(&mut self, id: i64, result: workers::AddResult) {
         self.dirty = true;
+        // Add Again: a failed addition ends the run, the container stays open
+        let again = self.close_after_adds.filter(|(container, _)| *container == id);
+        let failed = |app: &mut Self| {
+            app.pending_adds.clear();
+            app.close_after_adds = None;
+        };
         let (mut volume, staged) = match result {
             Ok(done) => done,
-            Err(e) if e.contains("nothing was added") => return self.message("Factum", "Nothing was added."),
-            Err(e) => return self.message("Factum", e),
+            Err(e) if e.contains("nothing was added") => {
+                failed(self);
+                return self.message("Factum", "Nothing was added.");
+            }
+            Err(e) => {
+                failed(self);
+                return self.message("Factum", e);
+            }
         };
         let mut notes = Vec::new();
         if !staged.skipped.is_empty() {
@@ -1286,6 +1325,22 @@ impl FactumApp {
         let (count, bytes, folders) = (staged.records.len(), staged.bytes(), staged.folders.len());
         let result = self.factum().commit_container_add(id, &mut volume, staged);
         drop(volume);
+        if let Some((_, then_archive)) = again {
+            if result.is_ok() && notes.is_empty() {
+                match self.pending_adds.pop_front() {
+                    Some((sources, options)) => {
+                        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        self.start_add(id, sources, options, cancel);
+                    }
+                    None => {
+                        self.close_after_adds = None;
+                        self.start_close(id, then_archive);
+                    }
+                }
+                return;
+            }
+            failed(self);
+        }
         let head = match result {
             Ok(_) if count == 0 => format!("{folders} folder{} added.", if folders == 1 { "" } else { "s" }),
             Ok(_) => format!(
@@ -1317,6 +1372,14 @@ impl FactumApp {
             self.message("Factum", message);
             return;
         }
+        if let Some(job) = self.close_job.as_ref().filter(|_| changes) {
+            let message = format!(
+                "\"{}\" is being re-checked. Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
         match action {
             ContainerAction::ShowEntry(entry_id) => self.jump_to_entry(entry_id),
             ContainerAction::Locate(id) => {
@@ -1334,17 +1397,7 @@ impl FactumApp {
                     self.message("Factum", format!("The folder cannot be opened: {e}"));
                 }
             }
-            ContainerAction::Close(id) => {
-                let result = self.factum().close_container(id);
-                if let Some(close) = self.run(result)
-                    && let Some(reason) = close.x509_refused
-                {
-                    self.message(
-                        "Container closed",
-                        format!("Container #{id} was closed and signed with GPG only. X.509: {reason}"),
-                    );
-                }
-            }
+            ContainerAction::Close(id) => self.start_close(id, None),
             ContainerAction::CloseWithoutFile(id) => {
                 self.dialogs.push(Dialog::Confirm {
                     message: format!(
@@ -1380,6 +1433,85 @@ impl FactumApp {
         self.dirty = true;
     }
 
+    /// Close: the re-check runs on a worker thread; `finish_close` closes, or asks what to do about damage.
+    fn start_close(&mut self, id: i64, then_archive: Option<i64>) {
+        if self.add_job.is_some() || self.close_job.is_some() {
+            self.message(
+                "Factum",
+                "A container is busy. Wait for it, or cancel it in the status bar.",
+            );
+            return;
+        }
+        let result = self.factum().recheck_input(id);
+        let Some(input) = self.run(result) else { return };
+        let name = self.factum().container(id).map(|d| d.summary.name).unwrap_or_default();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (worker, progress) = workers::recheck(&self.egui_ctx.clone(), input, cancel.clone());
+        self.close_job = Some(CloseJob {
+            container_id: id,
+            name,
+            worker,
+            progress,
+            cancel,
+            then_archive,
+        });
+    }
+
+    fn finish_close(&mut self, id: i64, then_archive: Option<i64>, result: workers::RecheckResult) {
+        self.dirty = true;
+        let recheck = match result {
+            Ok(recheck) => recheck,
+            Err(e) => return self.message("Factum", e),
+        };
+        if !recheck.mismatches.is_empty() {
+            let add_again = self
+                .factum()
+                .add_again_plan(id, &recheck.mismatches)
+                .map_err(|e| e.to_string());
+            self.dialogs.push(Dialog::Damaged {
+                container_id: id,
+                mismatches: recheck.mismatches,
+                add_again,
+                then_archive,
+            });
+            return;
+        }
+        let result = self.factum().close_container_with(id, &self.factum().gpgsm(), &recheck);
+        let Some(close) = self.run(result) else { return };
+        if let Some(reason) = close.x509_refused {
+            self.message(
+                "Container closed",
+                format!("Container #{id} was closed and signed with GPG only. X.509: {reason}"),
+            );
+        }
+        if let Some(case_id) = then_archive {
+            self.close_next_and_archive(case_id);
+        }
+    }
+
+    /// Close and Archive: closes the case's next open container (one whose file is missing at once, without it,
+    /// the others through the re-check), and archives the case once none is open.
+    fn close_next_and_archive(&mut self, case_id: i64) {
+        loop {
+            let Some(next) = self
+                .factum()
+                .open_containers(case_id)
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+            else {
+                return self.carry_out(Pending::Archive(case_id));
+            };
+            if !next.missing {
+                return self.start_close(next.id, Some(case_id));
+            }
+            let result = self.factum().close_container_without_file(next.id);
+            if self.run(result).is_none() {
+                return;
+            }
+        }
+    }
+
     /// Before sealing without a key, ask once per GUI session whether to configure one.
     fn with_key_check(&mut self, then: Pending) {
         if self.signer.active_key().is_some() || self.no_gpg_key_prompted {
@@ -1397,21 +1529,7 @@ impl FactumApp {
                 self.run(result); // the case is archived even when sealing failed
                 self.select(None, None);
             }
-            Pending::CloseContainersAndArchive(case_id) => {
-                for container in self.factum().open_containers(case_id).unwrap_or_default() {
-                    let closed = if container.missing {
-                        let result = self.factum().close_container_without_file(container.id);
-                        self.run(result).is_some()
-                    } else {
-                        let result = self.factum().close_container(container.id);
-                        self.run(result).is_some()
-                    };
-                    if !closed {
-                        return;
-                    }
-                }
-                self.carry_out(Pending::Archive(case_id));
-            }
+            Pending::CloseContainersAndArchive(case_id) => self.close_next_and_archive(case_id),
             Pending::CloseContainerWithoutFile(id) => {
                 let result = self.factum().close_container_without_file(id);
                 self.run(result);
@@ -1924,6 +2042,31 @@ impl FactumApp {
             } => {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 self.start_add(container_id, sources, options, cancel);
+            }
+            DialogResult::AddAgain {
+                container_id,
+                plan,
+                then_archive,
+            } => {
+                self.pending_adds = plan.into();
+                self.close_after_adds = Some((container_id, then_archive));
+                if let Some((sources, options)) = self.pending_adds.pop_front() {
+                    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    self.start_add(container_id, sources, options, cancel);
+                }
+            }
+            DialogResult::CloseDamaged {
+                container_id,
+                mismatches,
+                then_archive,
+            } => {
+                let result = self.factum().close_container_damaged(container_id, &mismatches);
+                if self.run(result).is_some()
+                    && let Some(case_id) = then_archive
+                {
+                    self.close_next_and_archive(case_id);
+                }
+                self.dirty = true;
             }
             DialogResult::TypedConfirmed { case_id, typed } => {
                 let result = self.factum().delete_case_permanently(case_id, &typed);
@@ -3299,9 +3442,17 @@ impl FactumApp {
         let small = |text: &str, color| RichText::new(text).size(SMALL_SIZE).color(color);
         let now = chrono::Utc::now();
         ui.horizontal(|ui| {
-            // files being added to a container take the place of the case's status
+            // files being added to a container, or re-checked, take the place of the case's status
             if let Some(job) = &self.add_job {
                 ui.label(small(&containers::add_status(&job.progress, &job.name), p.secondary));
+                if IconButton::new(icons::CLOSE, "Cancel").show(ui).clicked() {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            } else if let Some(job) = &self.close_job {
+                ui.label(small(
+                    &containers::recheck_status(&job.progress, &job.name),
+                    p.secondary,
+                ));
                 if IconButton::new(icons::CLOSE, "Cancel").show(ui).clicked() {
                     job.cancel.store(true, Ordering::Relaxed);
                 }

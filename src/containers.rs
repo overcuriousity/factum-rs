@@ -189,6 +189,14 @@ fn signatures_json(gpg: &Option<String>, x509: &Option<String>) -> Value {
     json!({"gpg": gpg, "x509": x509})
 }
 
+/// "1 file doesn't match its hashes", "3 files don't match their hashes".
+pub fn mismatch_text(count: usize) -> String {
+    match count {
+        1 => "1 file doesn't match its hashes".to_string(),
+        n => format!("{n} files don't match their hashes"),
+    }
+}
+
 fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
@@ -562,8 +570,19 @@ impl Factum<'_> {
             }
         }
         detail.summary.file_count = detail.adds.iter().map(|a| a.files.len() as u64).sum();
+        // the newest close decides: a regular one is signed or not, one without file or as damaged never is
+        let newest_regular = detail.closes.last().map(|c| c.entry_id);
+        let newest_damaged = detail.damaged_closes.last().map(|(id, ..)| *id);
+        let newest_other = detail
+            .closed_without_file
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(newest_damaged)
+            .max();
+        detail.summary.damaged =
+            newest_damaged.is_some() && newest_damaged == newest_other && newest_damaged > newest_regular;
         detail.summary.signed =
-            !detail.last_closed_without_file() && detail.closes.last().is_some_and(CloseEvent::is_signed);
+            newest_regular > newest_other && detail.closes.last().is_some_and(CloseEvent::is_signed);
         Ok(detail)
     }
 
@@ -942,8 +961,8 @@ impl Factum<'_> {
         }
         if !recheck.mismatches.is_empty() {
             return Err(FactumError::general(format!(
-                "{} in the container don't match their hashes.",
-                plural(recheck.mismatches.len(), "file")
+                "Container #{id} was not closed: {}.",
+                mismatch_text(recheck.mismatches.len())
             )));
         }
         let mut volume = self.open_volume(&detail)?;
@@ -1029,8 +1048,8 @@ impl Factum<'_> {
             detail.summary.case_id,
             KIND_SYSTEM,
             &format!(
-                "Container #{id} closed as damaged · {} don't match their hashes · not signed",
-                plural(damaged.len(), "file")
+                "Container #{id} closed as damaged · {} · not signed",
+                mismatch_text(damaged.len())
             ),
             Append {
                 payload: Some(json!({"event": "container_closed", "case_id": detail.summary.case_id,

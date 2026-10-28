@@ -157,6 +157,15 @@ pub enum Dialog {
         selected: Option<String>,
         chain_files: Vec<String>,
     },
+    /// a close's re-check found files that do not match their hashes
+    Damaged {
+        container_id: i64,
+        mismatches: Vec<crate::container::volume::FileRecord>,
+        /// how to add them again, or why that is not possible
+        add_again: std::result::Result<Vec<(Vec<PathBuf>, AddOptions)>, String>,
+        /// the case to archive once every container is closed (Close and Archive)
+        then_archive: Option<i64>,
+    },
     AddToContainer {
         container_id: i64,
         sources: Vec<PathBuf>,
@@ -213,6 +222,16 @@ pub enum DialogResult {
         container_id: i64,
         sources: Vec<PathBuf>,
         options: AddOptions,
+    },
+    AddAgain {
+        container_id: i64,
+        plan: Vec<(Vec<PathBuf>, AddOptions)>,
+        then_archive: Option<i64>,
+    },
+    CloseDamaged {
+        container_id: i64,
+        mismatches: Vec<crate::container::volume::FileRecord>,
+        then_archive: Option<i64>,
     },
     X509 {
         certificate: Option<String>,
@@ -865,6 +884,58 @@ impl Dialog {
                             certificate: None,
                             chain_files: Vec::new(),
                         });
+                    }
+                });
+                result
+            }
+            Dialog::Damaged {
+                container_id,
+                mismatches,
+                add_again,
+                then_archive,
+            } => {
+                title(ui, "Container Damaged");
+                note(
+                    ui,
+                    &format!(
+                        "In the container, {}. The container file or its disk may be damaged.",
+                        crate::containers::mismatch_text(mismatches.len())
+                    ),
+                );
+                let shown: Vec<&str> = mismatches.iter().take(6).map(|r| r.path.as_str()).collect();
+                let mut listed = shown.join("\n");
+                if mismatches.len() > shown.len() {
+                    listed += &format!("\n… and {} more", mismatches.len() - shown.len());
+                }
+                ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE).monospace()).wrap());
+                note(
+                    ui,
+                    "Add Again copies them again from their sources and then closes. Close as Damaged closes \
+                     without signing; the log records which files failed.",
+                );
+                let mut result = None;
+                button_row(ui, |ui| {
+                    let add = ui
+                        .add_enabled(add_again.is_ok(), egui::Button::new("Add Again"))
+                        .on_disabled_hover_text(add_again.as_ref().err().cloned().unwrap_or_default());
+                    if add.clicked()
+                        && let Ok(plan) = add_again
+                    {
+                        result = Some(DialogResult::AddAgain {
+                            container_id: *container_id,
+                            plan: plan.clone(),
+                            then_archive: *then_archive,
+                        });
+                    }
+                    if ui.button("Close as Damaged").clicked() {
+                        result = Some(DialogResult::CloseDamaged {
+                            container_id: *container_id,
+                            mismatches: mismatches.clone(),
+                            then_archive: *then_archive,
+                        });
+                    }
+                    if ui.button("Cancel").clicked() {
+                        result = Some(DialogResult::Cancel);
                     }
                 });
                 result

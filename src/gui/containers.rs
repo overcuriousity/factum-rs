@@ -87,6 +87,11 @@ pub fn add_status(progress: &AddProgress, name: &str) -> String {
     )
 }
 
+/// The status bar while a close re-checks the container.
+pub fn recheck_status(progress: &AddProgress, name: &str) -> String {
+    add_status(progress, name).replacen("Adding to", "Re-checking", 1)
+}
+
 /// An xsd:dateTime as the view shows it: 2026-10-27 21:10:04 UTC.
 pub fn short_time(xsd: &str) -> String {
     let seconds = xsd.trim_end_matches('Z').split('.').next().unwrap_or(xsd);

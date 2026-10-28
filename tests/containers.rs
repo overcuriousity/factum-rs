@@ -1900,7 +1900,7 @@ fn damaged_bytes_refuse_the_close() {
     s.add(id, &[s.file("a.txt"), s.file("d.txt")]);
     damage_content(&s.container_path(), &first_arn(&s, id));
     let error = s.f.factum().close_container(id).unwrap_err();
-    assert!(error.to_string().contains("don't match their hashes"), "{error}");
+    assert!(error.to_string().contains("doesn't match its hashes"), "{error}");
     assert!(s.events("container_closed").is_empty());
     assert!(s.f.factum().container(id).unwrap().summary.open);
 }

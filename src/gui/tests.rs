@@ -1893,6 +1893,7 @@ fn archive_with_open_container_asks_to_close() {
     ));
     assert!(harness.state().factum().container(id).unwrap().summary.open);
     click_label(&mut harness, "Continue unsigned");
+    run_until(&mut harness, |h| h.state().close_job.is_none());
     let factum = harness.state().factum();
     assert!(!factum.container(id).unwrap().summary.open);
     assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
@@ -2861,4 +2862,128 @@ fn thumbnails_sit_between_the_editor_and_the_buttons() {
     harness.get_by_label("Remove image").click();
     harness.run_ok();
     assert!((harness.state().composer_height - MIN_COMPOSER_HEIGHT).abs() < 1.0);
+}
+
+// --- closing: the re-check in the background, and what follows a mismatch
+
+/// Flips one byte inside the stored content of the container's first file, in place.
+fn damage_first_file(fixture: &Fixture, id: i64, path: &std::path::Path) {
+    use crate::container::zip64::read_archive;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let arn = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        Factum::with_seal_dir(&db, &signer, None).container(id).unwrap().adds[0].files[0]
+            .arn
+            .clone()
+    };
+    let uuid = crate::container::volume::Volume::uuid_of(path).unwrap();
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let entry = archive
+        .get(&crate::container::member_name(&arn, &format!("aff4://{uuid}")))
+        .unwrap()
+        .clone();
+    let mut header = [0u8; 30];
+    file.seek(SeekFrom::Start(entry.header_offset)).unwrap();
+    file.read_exact(&mut header).unwrap();
+    let skip =
+        30 + u16::from_le_bytes([header[26], header[27]]) as u64 + u16::from_le_bytes([header[28], header[29]]) as u64;
+    let at = entry.header_offset + skip + entry.compressed_size / 2;
+    let mut byte = [0u8; 1];
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.read_exact(&mut byte).unwrap();
+    file.seek(SeekFrom::Start(at)).unwrap();
+    file.write_all(&[byte[0] ^ 0xFF]).unwrap();
+}
+
+fn close_from_menu(harness: &mut Harness<'_, FactumApp>, id: i64) {
+    harness
+        .state_mut()
+        .container_action(ContainerAction::Close(id), &egui::Context::default());
+    run_until(harness, |h| h.state().close_job.is_none());
+}
+
+#[test]
+fn close_runs_in_background_and_logs_recheck() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness
+        .state_mut()
+        .container_action(ContainerAction::Close(id), &egui::Context::default());
+    assert!(harness.state().close_job.is_some());
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(!detail.summary.open);
+    let text = harness
+        .state()
+        .factum()
+        .get_entry(detail.closes[0].entry_id)
+        .unwrap()
+        .unwrap()
+        .text;
+    assert!(text.contains("re-checked"), "{text}");
+}
+
+#[test]
+fn damaged_container_opens_the_dialog() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    match harness.state().dialogs.last() {
+        Some(Dialog::Damaged { mismatches, .. }) => assert_eq!(mismatches.len(), 1),
+        _ => panic!("no damaged dialog"),
+    }
+    screenshot(&mut harness, "damaged_dialog");
+    click_label(&mut harness, "Cancel");
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.open && detail.closes.is_empty() && detail.damaged_closes.is_empty());
+}
+
+#[test]
+fn close_as_damaged_from_the_dialog() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    click_label(&mut harness, "Close as Damaged");
+    let summary = harness.state().factum().container(id).unwrap().summary;
+    assert!(summary.damaged && !summary.open);
+    assert_eq!(containers::state_text(&summary), "closed · damaged");
+}
+
+#[test]
+fn add_again_then_closes() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    click_label(&mut harness, "Add Again");
+    run_until(&mut harness, |h| {
+        h.state().add_job.is_none() && h.state().close_job.is_none() && h.state().close_after_adds.is_none()
+    });
+    let detail = harness.state().factum().container(id).unwrap();
+    assert_eq!(detail.adds.len(), 2);
+    assert_eq!(detail.adds[1].replaces.len(), 1);
+    assert!(!detail.summary.open && detail.closes.len() == 1);
+}
+
+#[test]
+fn add_again_with_source_gone_shows_error() {
+    let (fixture, id, path) = Fixture::with_container();
+    damage_first_file(&fixture, id, &path);
+    std::fs::remove_file(fixture._dir.path().join("mnt/evil.exe")).unwrap();
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    click_label(&mut harness, "Add Again");
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+    assert!(harness.state().close_after_adds.is_none());
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.open && detail.adds.len() == 1);
+    harness.state_mut().dialogs.clear();
+    close_from_menu(&mut harness, id);
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Damaged { .. })));
 }
