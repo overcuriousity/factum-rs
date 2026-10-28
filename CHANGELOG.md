@@ -11,8 +11,14 @@ All notable changes to this project are documented here. The format follows
   each note in the log
 - Images in notes: paste a screenshot (when the clipboard has no text), drop image files on the window or insert them
   with Image…; thumbnails show what the note will be saved with. The images are part of the note's signed payload,
-  shown inline in the log and exported with the reports. Correcting a note keeps its images; `--correct` on the
-  command line keeps the ones the new text still refers to
+  shown inline in the log and exported with the reports. Correcting a note, in the GUI or with `--correct`, keeps the
+  images the corrected text still refers to. On Wayland, pasting an image depends on the compositor offering
+  clipboard data control (not verified; GNOME likely does not); inserting from a file always works
+
+### Changed
+- Existing notes are shown as Markdown too, so some read differently than before: `__init__` turns bold, lines
+  starting with `* x` or `1.` become lists. The source toggle in the log (and the source block in HTML reports) shows
+  the note exactly as signed
 
 ## [2.6.0] - 2026-10-28
 
