@@ -265,10 +265,20 @@ impl Factum<'_> {
     }
 
     pub fn get_entry(&self, entry_id: i64) -> Result<Option<Entry>> {
+        self.read_entry(entry_id, Entry::COLUMNS)
+    }
+
+    /// [`Self::get_entry`] with `payload_json` left out (`None`), for views that show the text: a note's payload
+    /// may hold megabytes of images.
+    pub fn get_entry_without_payload(&self, entry_id: i64) -> Result<Option<Entry>> {
+        self.read_entry(entry_id, &Entry::COLUMNS.replace("payload_json", "NULL"))
+    }
+
+    fn read_entry(&self, entry_id: i64, columns: &str) -> Result<Option<Entry>> {
         let conn = &self.db.conn;
         let entry = conn
             .query_row(
-                &format!("SELECT {} FROM entries WHERE id = ?", Entry::COLUMNS),
+                &format!("SELECT {columns} FROM entries WHERE id = ?"),
                 [entry_id],
                 Entry::from_row,
             )

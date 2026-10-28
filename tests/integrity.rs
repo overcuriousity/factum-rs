@@ -1013,3 +1013,26 @@ fn a_correction_does_not_sign_an_image_over_the_limit() {
     assert!(err.to_string().contains("20 MB"), "{err}");
     assert_eq!(f.count("SELECT COUNT(*) FROM entries WHERE kind = 'note'"), 1);
 }
+
+#[test]
+fn an_entry_can_be_read_without_its_payload() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let image = test_image(10);
+    let id = factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let full = factum.get_entry(id).unwrap().unwrap();
+    assert!(full.payload_json.is_some());
+    let light = factum.get_entry_without_payload(id).unwrap().unwrap();
+    assert_eq!(light.payload_json, None);
+    assert_eq!(
+        light,
+        factum::notes::Entry {
+            payload_json: None,
+            ..full
+        }
+    );
+    assert!(factum.get_entry_without_payload(id + 100).unwrap().is_none());
+}

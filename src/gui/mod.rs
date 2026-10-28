@@ -638,22 +638,20 @@ impl FactumApp {
         }
     }
 
-    /// The entry's images, decoded once; the card keeps them and not the base64.
-    fn card_images(&self, entry: &mut Entry) -> Arc<[NoteImage]> {
-        let images = match entry.payload_json {
+    /// The note's images, decoded once per entry: the view reads its entries without the payload.
+    fn card_images(&self, factum: &Factum, entry_id: i64) -> Result<Arc<[NoteImage]>> {
+        if let Some(images) = self.note_images.borrow().get(&entry_id) {
+            return Ok(images.clone());
+        }
+        let images: Arc<[NoteImage]> = match factum.get_entry(entry_id)? {
+            Some(entry) => entry.images().into(),
             None => Arc::from([]),
-            Some(_) => self
-                .note_images
-                .borrow_mut()
-                .entry(entry.id)
-                .or_insert_with(|| entry.images().into())
-                .clone(),
         };
-        entry.payload_json = None;
-        images
+        self.note_images.borrow_mut().insert(entry_id, images.clone());
+        Ok(images)
     }
 
-    fn card(&self, factum: &Factum, mut entry: Entry, case: &Case) -> Result<Card> {
+    fn card(&self, factum: &Factum, entry: Entry, case: &Case) -> Result<Card> {
         let evidence = match entry.evidence_id {
             Some(id) => factum.get_evidence(id)?,
             None => None,
@@ -661,8 +659,7 @@ impl FactumApp {
         let mut history = Vec::new();
         let versions = factum.history(entry.id)?;
         for id in &versions[..versions.len() - 1] {
-            if let Some(mut old) = factum.get_entry(*id)? {
-                old.payload_json = None; // only its text is shown
+            if let Some(old) = factum.get_entry_without_payload(*id)? {
                 history.push(old);
             }
         }
@@ -674,7 +671,7 @@ impl FactumApp {
                 .filter(|e| Some(e.id) != self.evidence_id)
                 .map(|e| e.description),
             archived: case.is_archived(),
-            images: self.card_images(&mut entry),
+            images: self.card_images(factum, entry.id)?,
             entry,
         })
     }
@@ -747,7 +744,7 @@ impl FactumApp {
             }
             for entry_id in entry_ids.iter().rev() {
                 // newest first
-                let Some(entry) = factum.get_entry(*entry_id)? else {
+                let Some(entry) = factum.get_entry_without_payload(*entry_id)? else {
                     continue;
                 };
                 view.items.push(if entry.is_note() {
@@ -787,7 +784,7 @@ impl FactumApp {
                 },
             )?;
             for entry_id in pinned_ids.iter().rev() {
-                if let Some(entry) = factum.get_entry(*entry_id)? {
+                if let Some(entry) = factum.get_entry_without_payload(*entry_id)? {
                     view.pinned.push(self.card(&factum, entry, &case)?);
                 }
             }
@@ -797,7 +794,9 @@ impl FactumApp {
             // the newest entry is never a superseded one; its tree size counts every entry, earlier versions too
             let newest = factum.list_entries(case.id, &EntryFilter::default())?.into_iter().max();
             let entries = match newest {
-                Some(id) => factum.get_entry(id)?.map_or(0, |entry| entry.tree_size as usize),
+                Some(id) => factum
+                    .get_entry_without_payload(id)?
+                    .map_or(0, |entry| entry.tree_size as usize),
                 None => 0,
             };
             view.case_status = Some(CaseStatus {
