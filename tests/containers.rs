@@ -957,6 +957,45 @@ mod verify {
     }
 
     #[test]
+    fn progress_never_passes_the_total() {
+        let s = Setup::new();
+        let id = s.create();
+        let factum = s.f.factum();
+        let mut volume = factum.open_container_for_add(id).unwrap();
+        let options = AddOptions {
+            metadata_only: true,
+            ..s.options()
+        };
+        let staged = volume
+            .stage_add(
+                &[s.file("d.txt")],
+                &options,
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        factum.commit_container_add(id, &mut volume, staged).unwrap();
+        drop(volume);
+        s.add(id, &[s.file("a.txt")]);
+        let seen = std::cell::RefCell::new(Vec::new());
+        factum
+            .verify_container_file(
+                &s.container_path(),
+                &Gpgsm::unavailable(),
+                &|done, total| seen.borrow_mut().push((done, total)),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let seen = seen.into_inner();
+        assert!(!seen.is_empty());
+        // one stored byte; the metadata-only file's four bytes are not read
+        assert!(
+            seen.iter().all(|&(done, total)| total == 1 && done <= total),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
     fn duplicate_member_names_fail() {
         let s = Setup::new();
         let id = closed_with_files(&s);

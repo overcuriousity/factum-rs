@@ -843,11 +843,9 @@ pub fn verify_file(
     // every stored stream, once, against the hashes its newest state gives
     if let Some(&(_, graph)) = states.last() {
         let stored: Vec<FileRecord> = file_records(graph);
-        let total: u64 = stored
-            .iter()
-            .filter(|r| !r.metadata_only && r.link.is_none())
-            .map(|r| r.size)
-            .sum();
+        // metadata-only files and links have no content to read: they count for neither total nor progress
+        let counted = |r: &FileRecord| !r.metadata_only && r.link.is_none();
+        let total: u64 = stored.iter().filter(|r| counted(r)).map(|r| r.size).sum();
         let mut done = 0u64;
         progress(0, total);
         for record in &stored {
@@ -859,7 +857,8 @@ pub fn verify_file(
             } else {
                 record.path.clone()
             };
-            let report_progress = |read: u64| progress(done + read, total);
+            // content longer than its listed size (a damaged or crafted container) never shows more than all of it
+            let report_progress = |read: u64| progress((done + read).min(total), total);
             match hash_content(&mut file, &archive, graph, &record.arn, &report_progress, cancel) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                     return Err(FactumError::general("Verification cancelled."));
@@ -927,7 +926,9 @@ pub fn verify_file(
                     }
                 }
             }
-            done += record.size;
+            if counted(record) {
+                done += record.size;
+            }
         }
         progress(total, total);
         if newest_readable {
