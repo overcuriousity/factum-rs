@@ -669,9 +669,21 @@ impl Factum<'_> {
                 human_size(staged.bytes())
             )
         };
+        // what was chosen but not added (unreadable, changed while read, special files) is recorded too, so the
+        // entry never claims a folder was acquired whole when it was not
+        let not_added: Vec<Value> = staged
+            .errors
+            .iter()
+            .chain(&staged.skipped)
+            .map(|(path, reason)| json!({"path": path, "reason": reason}))
+            .collect();
+        let text = match not_added.len() {
+            0 => text,
+            count => format!("{text} · {count} not added"),
+        };
         let payload = json!({"event": "container_files_added", "case_id": detail.summary.case_id,
                              "container_id": detail.summary.uuid, "files": files, "folders": folders,
-                             "added_utc": utc_now()});
+                             "not_added": not_added, "added_utc": utc_now()});
         let mark = staged.mark();
         let result = {
             let cell = RefCell::new(&mut *volume);

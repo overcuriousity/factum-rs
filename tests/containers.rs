@@ -279,6 +279,34 @@ fn add_logs_one_entry_per_operation() {
 }
 
 #[test]
+fn what_was_not_added_is_logged() {
+    let s = Setup::new();
+    let id = s.create();
+    let factum = s.f.factum();
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    let staged = volume
+        .stage_add(
+            &[s.file("a.txt"), s.file("gone.txt")],
+            &s.options(),
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let entry = factum.commit_container_add(id, &mut volume, staged).unwrap();
+    assert_eq!(
+        s.entry_text(entry),
+        format!("1 file added to container #{id} (1 B) · 1 not added")
+    );
+    let not_added = s.events("container_files_added")[0]["not_added"].clone();
+    assert_eq!(not_added.as_array().unwrap().len(), 1);
+    assert!(
+        not_added[0]["path"].as_str().unwrap().ends_with("gone.txt"),
+        "{not_added}"
+    );
+    assert!(not_added[0]["reason"].is_string());
+}
+
+#[test]
 fn failed_finalize_rolls_back_entry_and_file() {
     let s = Setup::new();
     let id = s.create();

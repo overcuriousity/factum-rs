@@ -200,8 +200,8 @@ fn walk_one(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Walked>) {
     if !folder {
         return;
     }
-    let mut children: Vec<PathBuf> = match std::fs::read_dir(path) {
-        Ok(entries) => entries.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+    let mut children = match std::fs::read_dir(path) {
+        Ok(entries) => readable_entries(path, entries.map(|e| e.map(|e| e.path())), out),
         Err(e) => {
             out.push(Err((path.to_path_buf(), e)));
             return;
@@ -213,11 +213,50 @@ fn walk_one(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Walked>) {
     }
 }
 
+/// The entries of `folder` that could be listed; one that could not is an error of the folder, never dropped.
+fn readable_entries(
+    folder: &Path,
+    entries: impl Iterator<Item = io::Result<PathBuf>>,
+    out: &mut Vec<Walked>,
+) -> Vec<PathBuf> {
+    let mut children = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(child) => children.push(child),
+            Err(e) => out.push(Err((
+                folder.to_path_buf(),
+                io::Error::new(
+                    e.kind(),
+                    format!("an entry of this folder cannot be read ({e}); it was not added"),
+                ),
+            ))),
+        }
+    }
+    children
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine;
     use std::io::Read;
+
+    #[test]
+    fn an_unreadable_folder_entry_is_an_error() {
+        let folder = Path::new("/mnt/share");
+        let mut out = Vec::new();
+        let entries = vec![
+            Ok(folder.join("a")),
+            Err(io::Error::other("stale handle")),
+            Ok(folder.join("b")),
+        ];
+        let children = readable_entries(folder, entries.into_iter(), &mut out);
+        assert_eq!(children, vec![folder.join("a"), folder.join("b")]);
+        assert_eq!(out.len(), 1);
+        let (path, error) = out[0].as_ref().unwrap_err();
+        assert_eq!(path, folder);
+        assert!(error.to_string().contains("stale handle"), "{error}");
+    }
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
