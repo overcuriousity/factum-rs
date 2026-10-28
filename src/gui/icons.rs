@@ -21,3 +21,4 @@ pub const RESTORE: &str = "\u{e038}";
 pub const SHOW: &str = "\u{e220}";
 pub const SIGN: &str = "\u{ebac}";
 pub const SEND: &str = "\u{e396}";
+pub const SOURCE: &str = "\u{e1bc}";

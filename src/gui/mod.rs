@@ -8,6 +8,7 @@ mod companion_windows;
 mod containers;
 mod dialogs;
 mod icons;
+mod markup_view;
 mod tag_completion;
 mod theme;
 mod widgets;
@@ -29,6 +30,7 @@ use crate::companion::{CompanionDb, Settings, companion_db_path};
 use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
+use crate::images::{self, NoteImage};
 use crate::notes::{Entry, EntryFilter};
 use crate::pystr::{strip, tail};
 use crate::seals::{REASON_CHECKPOINT, SEAL_DIR_SETTING};
@@ -218,6 +220,8 @@ struct FactumApp {
     dirty: bool,
     focused_card: Option<i64>,
     history_open: HashSet<i64>,
+    /// the image shown full size: its entry and the image; one at a time
+    image_viewer: Option<(i64, NoteImage)>,
     scroll_to: Option<i64>,
     // signature checks of the entries shown, for this session: a card shows ✓ only after its check
     signature_checks: HashMap<i64, SignatureCheck>,
@@ -327,6 +331,7 @@ impl FactumApp {
             dirty: true,
             focused_card: None,
             history_open: HashSet::new(),
+            image_viewer: None,
             scroll_to: None,
             signature_checks: HashMap::new(),
             signature_worker: None,
@@ -637,6 +642,7 @@ impl FactumApp {
                 .filter(|e| Some(e.id) != self.evidence_id)
                 .map(|e| e.description),
             archived: case.is_archived(),
+            images: entry.images(),
             entry,
         })
     }
@@ -1617,6 +1623,39 @@ impl FactumApp {
         self.focused_card = Some(entry.id);
     }
 
+    /// The picture of a note at the size it was decoded to (larger than the GPU takes: scaled down), scrolled.
+    fn image_viewer_window(&mut self, ctx: &egui::Context) {
+        let Some((entry_id, image)) = &self.image_viewer else {
+            return;
+        };
+        let texture = markup_view::texture(ctx, *entry_id, image);
+        let mut open = true;
+        dialogs::report_window(
+            ctx,
+            egui::Id::unique("image-viewer"),
+            &format!("Image {}", image.id),
+            &mut open,
+            [720.0, 540.0],
+            0.0,
+            |ui| match &texture {
+                Some(texture) => {
+                    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                        ui.image((texture.id(), texture.size_vec2()));
+                    });
+                }
+                None => {
+                    ui.label(
+                        RichText::new(format!("[image {} could not be shown]", image.id))
+                            .color(theme::current(ctx).muted),
+                    );
+                }
+            },
+        );
+        if !open {
+            self.image_viewer = None;
+        }
+    }
+
     fn handle_card_action(&mut self, action: CardAction, ctx: &egui::Context) {
         match action {
             CardAction::TogglePin(entry_id) => {
@@ -1686,6 +1725,18 @@ impl FactumApp {
                 self.dirty = false; // verifying changes nothing
             }
             CardAction::Focus(entry_id) => self.focused_card = Some(entry_id),
+            CardAction::OpenImage(entry_id, image_id) => {
+                let image = self
+                    .factum()
+                    .get_entry(entry_id)
+                    .map(|entry| entry.and_then(|entry| images::find(&entry.images(), &image_id).cloned()));
+                match self.run(image) {
+                    Some(Some(image)) => self.image_viewer = Some((entry_id, image)),
+                    Some(None) => log::warn!("Image {image_id} of entry #{entry_id} not found."),
+                    None => {}
+                }
+                self.dirty = false; // looking changes nothing
+            }
             CardAction::ToggleHistory(entry_id) => {
                 if !self.history_open.remove(&entry_id) {
                     self.history_open.insert(entry_id);
@@ -3382,6 +3433,7 @@ impl eframe::App for FactumApp {
                 self.jump_to_entry(entry_id);
             }
         }
+        self.image_viewer_window(&ctx);
         let mut window_actions = Vec::new();
         for window in &mut self.companion_windows {
             window.show(&ctx, &mut window_actions);

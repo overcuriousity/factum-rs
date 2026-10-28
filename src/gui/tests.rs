@@ -2002,3 +2002,186 @@ fn hidden_excerpt_fields_do_not_block_a_metadata_only_add() {
         Some(Dialog::AddToContainer { .. })
     ));
 }
+
+/// The fixture plus one more note with `text` and `images`; returns the new entry's id.
+fn add_note(fixture: &Fixture, text: &str, images: &[crate::images::NoteImage]) -> i64 {
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let factum = Factum::with_seal_dir(&db, &signer, None);
+    let case_id = factum.list_cases(false).unwrap()[0];
+    factum.create_note_with_images(text, images, None, case_id).unwrap()
+}
+
+fn test_image(width: u32, height: u32) -> crate::images::NoteImage {
+    let rgba = vec![180u8; (width * height * 4) as usize];
+    crate::images::NoteImage::from_rgba(width, height, &rgba).unwrap()
+}
+
+/// A harness showing the case log with the new note's actions visible.
+fn harness_on_note(fixture: &Fixture, note: i64) -> Harness<'static, FactumApp> {
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.state_mut().focused_card = Some(note);
+    harness.run_ok();
+    harness
+}
+
+#[test]
+fn note_card_renders_markdown() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "**bold** text", &[]);
+    let harness = harness_on_note(&fixture, note);
+    assert!(harness.query_by_label("bold text").is_some());
+    assert!(harness.query_by_label_contains("**").is_none());
+}
+
+#[test]
+fn source_toggle_shows_the_literal_text() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "**bold** text", &[]);
+    let mut harness = harness_on_note(&fixture, note);
+    harness.get_by_label("Show source").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("**bold** text").is_some());
+    assert!(harness.query_by_label("bold text").is_none());
+    harness.get_by_label("Show formatted").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("bold text").is_some());
+    assert!(harness.query_by_label("**bold** text").is_none());
+}
+
+#[test]
+fn note_card_shows_its_image() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(&fixture, &format!("see {}", image.reference("shot")), &[image]);
+    let harness = harness_on_note(&fixture, note);
+    let shown = harness.get_by_role(egui::accesskit::Role::Image).rect();
+    assert!(
+        shown.width() <= theme::MAX_CARD_WIDTH && shown.height() <= 400.0,
+        "{shown:?}"
+    );
+    assert!(shown.width() > 0.0 && shown.height() > 0.0);
+}
+
+#[test]
+fn a_tall_image_is_shown_at_most_400_high() {
+    let fixture = Fixture::new();
+    let image = test_image(600, 1800);
+    let note = add_note(&fixture, &image.reference("tall"), &[image]);
+    let harness = harness_on_note(&fixture, note);
+    let shown = harness.get_by_role(egui::accesskit::Role::Image).rect();
+    assert!(shown.height() <= 400.0 + 0.5, "{shown:?}");
+    assert!((shown.width() / shown.height() - 1.0 / 3.0).abs() < 0.01, "{shown:?}");
+}
+
+#[test]
+fn clicking_an_image_opens_the_viewer() {
+    let fixture = Fixture::new();
+    let image = test_image(40, 30);
+    let note = add_note(&fixture, &image.reference("shot"), std::slice::from_ref(&image));
+    let mut harness = harness_on_note(&fixture, note);
+    harness.get_by_role(egui::accesskit::Role::Image).click();
+    harness.run_ok();
+    let title = format!("Image {}", image.id);
+    assert!(harness.query_all_by_label(&title).count() >= 1);
+    assert_eq!(
+        harness.state().image_viewer.as_ref().map(|(entry, _)| *entry),
+        Some(note)
+    );
+    // closable
+    harness.get_by_label("Close").click();
+    harness.run_ok();
+    assert!(harness.query_all_by_label(&title).count() == 0);
+    assert!(harness.state().image_viewer.is_none());
+}
+
+#[test]
+fn link_shows_its_address_and_is_not_clickable() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "[l](https://x.test)", &[]);
+    let harness = harness_on_note(&fixture, note);
+    assert!(harness.query_by_label("l (https://x.test)").is_some());
+    assert!(harness.query_by_role(egui::accesskit::Role::Link).is_none());
+}
+
+#[test]
+fn images_that_cannot_be_shown_say_so() {
+    let fixture = Fixture::new();
+    let mut broken = test_image(4, 4);
+    broken.bytes = b"not a picture".to_vec();
+    let gone = test_image(5, 5);
+    let text = format!(
+        "![a](https://x.test/p.png) {} {}",
+        gone.reference("b"),
+        broken.reference("c")
+    );
+    let note = add_note(&fixture, &text, &[broken.clone(), gone.clone()]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // the stored payload is untrusted: an image that is not there, and one of a type nobody embeds
+    for item in &mut harness.state_mut().view.items {
+        if let Item::Note(card) = item
+            && card.entry.id == note
+        {
+            card.images.retain(|image| image.id != gone.id);
+        }
+    }
+    harness.run_ok();
+    assert!(
+        harness
+            .query_by_label_contains("[external image https://x.test/p.png not loaded]")
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} missing]", gone.id))
+            .is_some()
+    );
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} could not be shown]", broken.id))
+            .is_some()
+    );
+    assert!(harness.query_by_role(egui::accesskit::Role::Image).is_none());
+}
+
+#[test]
+fn an_image_of_another_type_counts_as_missing() {
+    let fixture = Fixture::new();
+    let image = test_image(4, 4);
+    let note = add_note(&fixture, &image.reference("x"), std::slice::from_ref(&image));
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    for item in &mut harness.state_mut().view.items {
+        if let Item::Note(card) = item
+            && card.entry.id == note
+        {
+            card.images[0].mime = "image/svg+xml".into();
+        }
+    }
+    harness.run_ok();
+    assert!(
+        harness
+            .query_by_label_contains(&format!("[image {} missing]", image.id))
+            .is_some()
+    );
+}
+
+#[test]
+fn the_pinned_panel_shows_a_note_as_plain_text() {
+    let fixture = Fixture::new();
+    let note = add_note(&fixture, "**bold** [l](https://x.test)", &[]);
+    fixture
+        .db()
+        .conn
+        .execute("UPDATE entries SET is_pinned = 1 WHERE id = ?", [note])
+        .unwrap();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let card = harness.state().view.pinned.iter().find(|c| c.entry.id == note).unwrap();
+    assert_eq!(card.entry.text, "**bold** [l](https://x.test)");
+    // the log shows it formatted, the compact card as one plain line
+    assert_eq!(harness.query_all_by_label("bold l (https://x.test)").count(), 2);
+    assert!(harness.query_by_label_contains("**").is_none());
+}
