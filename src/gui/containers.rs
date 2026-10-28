@@ -92,6 +92,44 @@ pub fn recheck_status(progress: &AddProgress, name: &str) -> String {
     add_status(progress, name).replacen("Adding to", "Re-checking", 1)
 }
 
+/// `text` shortened in the middle until `fits` accepts it: as much of the start as fits, "…", and the file name
+/// whole, or when not even that fits, its end. Names that differ only at the end (photo.png, photo.jpg,
+/// photo-1.png) stay apart, which cutting off the end would hide.
+pub fn elide_middle(text: &str, fits: &dyn Fn(&str) -> bool) -> String {
+    if fits(text) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let name_start = chars.iter().rposition(|c| matches!(c, '/' | '\\')).map_or(0, |i| i + 1);
+    let build = |head: usize, tail: usize| -> String {
+        chars[..head].iter().chain(['…'].iter()).chain(&chars[tail..]).collect()
+    };
+    if fits(&build(0, name_start)) {
+        // the largest start that fits before the whole name
+        let (mut low, mut high) = (0, name_start);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if fits(&build(mid, name_start)) {
+                low = mid
+            } else {
+                high = mid - 1
+            }
+        }
+        return build(low, name_start);
+    }
+    // the longest end of the name that fits
+    let (mut low, mut high) = (name_start, chars.len());
+    while low < high {
+        let mid = (low + high) / 2;
+        if fits(&build(0, mid)) {
+            high = mid
+        } else {
+            low = mid + 1
+        }
+    }
+    build(0, low)
+}
+
 /// An xsd:dateTime as the view shows it: 2026-10-27 21:10:04 UTC.
 pub fn short_time(xsd: &str) -> String {
     let seconds = xsd.trim_end_matches('Z').split('.').next().unwrap_or(xsd);
@@ -318,8 +356,20 @@ pub fn container_section(
                         path += &format!("  → {target}");
                     }
                     ui.allocate_ui(egui::vec2(width * 0.42, row_height), |ui| {
-                        ui.add(egui::Label::new(RichText::new(&path).color(p.text)).truncate())
-                            .on_hover_text(&path);
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let room = ui.available_width();
+                        let fits = |text: &str| {
+                            let galley = ui
+                                .ctx()
+                                .fonts_mut(|f| f.layout_no_wrap(text.to_string(), font.clone(), p.text));
+                            galley.size().x <= room
+                        };
+                        let shown = elide_middle(&path, &fits);
+                        // one tooltip, with the whole path, and only when part of it is hidden
+                        let label = ui.add(egui::Label::new(RichText::new(&shown).color(p.text)).selectable(false));
+                        if shown != path {
+                            label.on_hover_text(&path);
+                        }
                     });
                     ui.allocate_ui(egui::vec2(width * 0.15, row_height), |ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

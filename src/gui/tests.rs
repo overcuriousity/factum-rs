@@ -3023,3 +3023,19 @@ fn container_details_are_reused_between_rebuilds() {
     );
     assert!(!harness.state().view.containers[0].summary.open);
 }
+
+#[test]
+fn file_paths_are_shortened_in_the_middle() {
+    let fits = |n: usize| move |s: &str| s.chars().count() <= n;
+    let path = "pictures/holiday/photo_0001_copy-1.png";
+    assert_eq!(containers::elide_middle(path, &fits(100)), path);
+    // the file name stays whole, the folder gives way
+    assert_eq!(
+        containers::elide_middle(path, &fits(28)),
+        "pictur…photo_0001_copy-1.png"
+    );
+    assert_eq!(containers::elide_middle(path, &fits(22)), "…photo_0001_copy-1.png");
+    // not even the name fits: its end does, so names that differ at the end stay apart
+    assert_eq!(containers::elide_middle(path, &fits(11)), "…copy-1.png");
+    assert_eq!(containers::elide_middle("a-very-long-name.png", &fits(9)), "…name.png");
+}
