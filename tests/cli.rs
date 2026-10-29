@@ -241,6 +241,20 @@ fn run_binary(home: &std::path::Path, cwd: &std::path::Path, argv: &[&str]) -> s
 
 #[cfg(target_os = "linux")]
 #[test]
+fn a_dotenv_in_the_current_directory_is_not_read() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path().join("work");
+    std::fs::create_dir(&work).unwrap();
+    let planted = home.path().join("planted.db");
+    std::fs::write(work.join(".env"), format!("FACTUM_DB={}\n", planted.display())).unwrap();
+    let output = run_binary(home.path(), &work, &["--list-cases"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!planted.exists());
+    assert!(home.path().join("data/factum/factum.db").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn starting_factum_moves_the_seal_folder_setting_to_the_user_config() {
     let home = tempfile::tempdir().unwrap();
     let db = factum::Db::open(&home.path().join("data/factum/factum.db")).unwrap();

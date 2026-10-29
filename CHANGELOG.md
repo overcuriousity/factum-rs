@@ -10,6 +10,7 @@ All notable changes to this project are documented here. The format follows
   verifier no longer takes the folder it checks from the database it verifies, which a tamperer could point at an
   empty folder. A folder set in the GUI of an earlier version is moved there once, when the database is opened. Verify
   reports name the seal folder they checked; a change of the seal folder is written to the application log
+- A `.env` in the current directory is no longer read, only the one in the user config directory
 
 ### Fixed
 - A seal file that cannot be read or parsed is reported as a warning naming the file instead of being skipped

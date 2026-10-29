@@ -177,9 +177,9 @@ pub fn seal_dir() -> Option<PathBuf> {
 
 impl Config {
     pub fn load() -> Self {
-        // later sources override earlier ones: user config dir, current working directory, process environment
+        // the process environment overrides the user config; a .env in the current directory is not read, so
+        // the folder factum happens to be started from cannot change its database
         let mut env = dotenv_values(&user_env_path());
-        env.extend(dotenv_values(Path::new(".env")));
         for key in ENV_KEYS {
             if let Ok(value) = std::env::var(key) {
                 env.insert(key.to_string(), value);

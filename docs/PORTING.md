@@ -12,7 +12,7 @@ The port keeps the behaviour, data formats and messages of factum-notes. Where i
 - Exports: HTML and Markdown reports, `case.json` (like `json.dumps(indent=2, sort_keys=True)`), signature file names,
   manifest, the unchanged `verify.py`
 - CLI options, output and exit codes; log messages on stderr in Python's `LEVEL:root:message` format
-- Configuration: `.env` files, `FACTUM_DB`, `FACTUM_SEAL_DIR`, `LOG_LEVEL`, the same per-user folders
+- Configuration: `FACTUM_DB`, `FACTUM_SEAL_DIR`, `LOG_LEVEL`, the same per-user folders and user config `.env`
 - GPG: the system `gpg` with `--status-fd`, as python-gnupg used it (keyring, trust model and pinentry unchanged)
 
 Cross-checked: a database written by factum verifies with factum-notes and the other way round, including signed
@@ -31,6 +31,7 @@ notes and corrections from both; bundles from factum pass `verify.py`.
 | PyInstaller workaround for `LD_LIBRARY_PATH` | not needed | Rust binaries do not bundle shared libraries |
 | ⚙ before system entries | ◇ | the embedded fonts have no ⚙ |
 | database schema 3 | schema 4 since factum 2.2 (adds `evidence.details`; schema 3 is upgraded on open) | evidence descriptions |
+| `.env` read from the user config and the current directory | only from the user config | the start folder must not change the database |
 | GUI seal folder stored in the database (`settings.seal_dir`) | stored as `FACTUM_SEAL_DIR` in the user config `.env`; a database value is moved there once | the verifier must not learn from the database it checks where the external seal copies are |
 | seal file names as long as the case file number | the case file number's part is cut at 100 bytes, with a short hash | names over 255 bytes cannot be written |
 

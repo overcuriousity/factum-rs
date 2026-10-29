@@ -264,8 +264,9 @@ never modified — set `FACTUM_DB` to a new file.
 ## Configuration
 
 Optional settings are read from a `.env` file in the user config directory (Linux: `~/.config/factum/.env`, macOS:
-`~/Library/Application Support/factum/.env`, Windows: `%LOCALAPPDATA%\factum\.env`), then from `.env` in the current
-directory; real environment variables override both. See [.env.example](.env.example).
+`~/Library/Application Support/factum/.env`, Windows: `%LOCALAPPDATA%\factum\.env`); real environment variables
+override it. A `.env` in the current directory is not read, so the folder factum is started from cannot change which
+database or seal folder it uses. See [.env.example](.env.example).
 
 | Variable                   | Meaning                                                                                       |
 |----------------------------|-----------------------------------------------------------------------------------------------|
@@ -273,9 +274,6 @@ directory; real environment variables override both. See [.env.example](.env.exa
 | `FACTUM_DB`                | Path of the database file                                                                     |
 | `FACTUM_SEAL_DIR`          | Folder for external seal copies; must already exist (default: `seals/` next to the database). **Settings → Seal Folder…** writes it to the user config `.env` |
 | `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                                 |
-
-A launcher (application menu, Start menu) does not read `.env` from a working directory: put settings in the user
-config directory.
 
 The seal folder is never taken from the database: someone who can edit the database could otherwise point the check
 at an empty folder. A seal folder chosen in the GUI of factum up to 2.7.1 (stored in the database) is moved to the
