@@ -555,13 +555,22 @@ impl Factum<'_> {
             }
         }
 
-        for seal_file in self.read_seal_files(case_id)? {
-            let name = seal_file
-                .path
-                .file_name()
+        let file_name = |path: &Path| {
+            path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let what = format!("Seal file {name}");
+                .unwrap_or_default()
+        };
+        let seal_files = self.read_seal_files(case_id)?;
+        for (path, problem) in &seal_files.unreadable {
+            findings.push(Finding::new(
+                Level::Warn,
+                "seal_file_unreadable",
+                format!("Seal file {} {problem} — it was not checked.", file_name(path)),
+                Ref::default(),
+            ));
+        }
+        for seal_file in seal_files.found {
+            let what = format!("Seal file {}", file_name(&seal_file.path));
             let mut head_findings = Self::head_findings(
                 seal_file.tree_size(),
                 seal_file.root_hash(),
@@ -620,14 +629,15 @@ impl Factum<'_> {
                 findings.push(finding);
             }
         }
+        let seal_dir = self.seal_dir();
         let seal_dir_is_default = self.seal_dir_is_default();
-        if !self.seal_dir().is_dir() && !seal_dir_is_default {
+        if !seal_dir.is_dir() && !seal_dir_is_default {
             findings.push(Finding::new(
                 Level::Warn,
                 "seal_dir_unreachable",
                 format!(
                     "The seal folder {} is not reachable — external seal copies were not checked.",
-                    self.seal_dir().display()
+                    seal_dir.display()
                 ),
                 Ref::default(),
             ));

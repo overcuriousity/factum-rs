@@ -1,11 +1,13 @@
 //! Signed tree heads: stored in tree_heads and, as the copy that matters, written to the seal folder.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
 use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::canonical::{canonical_json, compact_utc, extract_clearsigned_text, utc_now};
 use crate::config::expand_user;
@@ -15,6 +17,9 @@ use crate::notes::parse_payload;
 use crate::services::Factum;
 
 pub const SEAL_DIR_SETTING: &str = "seal_dir";
+/// the case file number's share of a seal file name; the rest (`_<id>_size<n>_<time>.asc`) stays under 70 bytes,
+/// together well below the 255 bytes most file systems allow
+const SEAL_NAME_MAX_BYTES: usize = 100;
 pub const REASON_CHECKPOINT: &str = "checkpoint";
 pub const REASON_ARCHIVE: &str = "archive";
 pub const REASON_EXPORT: &str = "export";
@@ -102,6 +107,46 @@ pub fn safe_filename(text: &str) -> String {
     } else {
         trimmed.into()
     }
+}
+
+/// safe_filename, at most `max_bytes` long (UTF-8; at least 16): a longer name is cut at a character boundary
+/// and ends in 8 hex digits of the SHA-256 of `text`, so names cut to the same start stay distinct. Names that
+/// fit are returned unchanged.
+pub fn safe_filename_capped(text: &str, max_bytes: usize) -> String {
+    let name = safe_filename(text);
+    if name.len() <= max_bytes {
+        return name;
+    }
+    let suffix = format!("-{}", &hex::encode(Sha256::digest(text.as_bytes()))[..8]);
+    let mut end = max_bytes.saturating_sub(suffix.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", name[..end].trim_end_matches(['.', '-']))
+}
+
+/// Writes a file that is afterwards complete or not there: a temporary file in the same folder, synced, renamed
+/// over `path`, then the folder synced (not possible on Windows). An existing file keeps its permissions.
+pub fn write_atomically(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let folder = parent_of(path);
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".factum-").suffix(".tmp");
+    #[cfg(unix)]
+    let permissions = std::fs::metadata(path).map(|m| m.permissions()).unwrap_or_else(|_| {
+        // like fs::write: what the umask leaves of rw-rw-rw-
+        std::os::unix::fs::PermissionsExt::from_mode(0o666)
+    });
+    #[cfg(unix)]
+    builder.permissions(permissions);
+    let mut file = builder.tempfile_in(&folder)?;
+    file.write_all(content)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
+    #[cfg(unix)]
+    if let Ok(folder) = std::fs::File::open(&folder) {
+        let _ = folder.sync_all();
+    }
+    Ok(())
 }
 
 /// Python's Path.resolve(): absolute, with the symlinks of the existing part resolved.
@@ -216,7 +261,7 @@ impl Factum<'_> {
         let signature = self.sign_or_fail(&payload, "GPG signing failed — the seal was not created.")?;
         let name = format!(
             "{}_{case_id}_size{tree_size}_{}",
-            safe_filename(&case_file),
+            safe_filename_capped(&case_file, SEAL_NAME_MAX_BYTES),
             compact_utc(&created_utc)
         );
         let folder = self.seal_dir();
@@ -232,7 +277,7 @@ impl Factum<'_> {
         // written byte for byte: gpg on Windows already writes CRLF
         let content = signature.clone().unwrap_or_else(|| format!("{payload}\n"));
         std::fs::create_dir_all(&parent)
-            .and_then(|_| std::fs::write(&path, content.as_bytes()))
+            .and_then(|_| write_atomically(&path, content.as_bytes()))
             .map_err(|e| FactumError::general(format!("The seal could not be written to {}: {e}", parent.display())))?;
         let id = self.db.transaction(|conn| {
             conn.execute(
@@ -270,12 +315,14 @@ impl Factum<'_> {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Seal files of this case in the seal folder, matched on case id and any case file number the case has had.
-    pub fn read_seal_files(&self, case_id: i64) -> Result<Vec<SealFile>> {
+    /// Seal files of this case in the seal folder, matched on case id and any case file number the case has had,
+    /// and the files that could not be read as a seal.
+    pub fn read_seal_files(&self, case_id: i64) -> Result<SealFiles> {
         let folder = self.seal_dir();
         let case_files = self.known_case_files(case_id)?;
+        let mut result = SealFiles::default();
         if !folder.is_dir() {
-            return Ok(Vec::new());
+            return Ok(result);
         }
         let mut signed = Vec::new();
         let mut unsigned = Vec::new();
@@ -292,45 +339,66 @@ impl Factum<'_> {
         }
         signed.sort();
         unsigned.sort();
-        // an unsigned seal that was signed later has a .asc with the same name; the .json is then superseded
-        let stems: Vec<_> = signed.iter().map(|p| p.file_stem().map(|s| s.to_os_string())).collect();
-        unsigned.retain(|path| !stems.contains(&path.file_stem().map(|s| s.to_os_string())));
-        let mut found = Vec::new();
-        for path in signed.into_iter().chain(unsigned) {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let is_signed = path.extension().and_then(|e| e.to_str()) == Some("asc");
-            let payload_text = if is_signed {
-                match extract_clearsigned_text(&text) {
-                    Some(payload_text) => payload_text,
-                    None => continue,
-                }
-            } else {
-                crate::pystr::strip(&text).to_string()
-            };
-            if payload_text.is_empty() {
+        // an unsigned seal that was signed later has a .asc with the same name; the .json is then superseded,
+        // but only by a .asc that could be read
+        let mut superseding = Vec::new();
+        let unsigned: Vec<_> = unsigned.into_iter().map(|path| (path, false)).collect();
+        for (path, is_signed) in signed.into_iter().map(|path| (path, true)).chain(unsigned) {
+            let stem = path.file_stem().map(|s| s.to_os_string());
+            if !is_signed && superseding.contains(&stem) {
                 continue;
             }
-            let Ok(Value::Object(payload)) = serde_json::from_str::<Value>(&payload_text) else {
-                continue;
+            let (text, payload_text, payload) = match parse_seal_file(&path, is_signed) {
+                Ok(parsed) => parsed,
+                Err(problem) => {
+                    result.unreadable.push((path, problem));
+                    continue;
+                }
             };
+            if is_signed {
+                superseding.push(stem);
+            }
             if payload.get("case_id").and_then(Value::as_i64) != Some(case_id)
                 || !case_files.contains(payload.get("case_file").unwrap_or(&Value::Null))
             {
                 continue;
             }
             if !is_int(payload.get("tree_size")) || !payload.get("root_hash").is_some_and(Value::is_string) {
+                result
+                    .unreadable
+                    .push((path, "has no valid tree size or root hash".into()));
                 continue;
             }
-            found.push(SealFile {
+            result.found.push(SealFile {
                 path,
                 payload,
                 payload_text,
                 signature: is_signed.then_some(text),
             });
         }
-        Ok(found)
+        Ok(result)
+    }
+}
+
+/// What read_seal_files found in the seal folder.
+#[derive(Debug, Default)]
+pub struct SealFiles {
+    pub found: Vec<SealFile>,
+    /// seal files that could not be read or parsed, with what is wrong ("cannot be read (…)")
+    pub unreadable: Vec<(PathBuf, String)>,
+}
+
+/// (file text, signed payload text, payload) of a seal file, or what keeps it from being read as one.
+fn parse_seal_file(path: &Path, is_signed: bool) -> std::result::Result<(String, String, Map<String, Value>), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot be read ({e})"))?;
+    let payload_text = if is_signed {
+        extract_clearsigned_text(&text).ok_or("is not a clearsigned text")?
+    } else {
+        crate::pystr::strip(&text).to_string()
+    };
+    match serde_json::from_str::<Value>(&payload_text) {
+        Ok(Value::Object(payload)) => Ok((text, payload_text, payload)),
+        _ => Err("does not contain a seal".into()),
     }
 }
 
@@ -360,5 +428,43 @@ mod tests {
         assert_eq!(safe_filename("2026/04 Müller"), "2026-04-Müller");
         assert_eq!(safe_filename("../x"), "x");
         assert_eq!(safe_filename("///"), "case");
+    }
+
+    #[test]
+    fn capped_filenames_cut_at_a_character_boundary_and_stay_distinct() {
+        assert_eq!(safe_filename_capped("2026/04 Müller", 100), "2026-04-Müller");
+        let long = "案".repeat(80);
+        let capped = safe_filename_capped(&long, 100);
+        assert!(capped.len() <= 100, "{}", capped.len());
+        // 91 bytes for the text: 30 three-byte characters, then "-" and 8 hex digits
+        assert_eq!(capped, format!("{}-{}", "案".repeat(30), &capped[capped.len() - 8..]));
+        let other = safe_filename_capped(&format!("{long}2"), 100);
+        assert_eq!(other.len(), capped.len());
+        assert_ne!(other, capped);
+        // the cut does not leave a separator before the hash
+        assert!(!safe_filename_capped(&format!("{}/{}", "a".repeat(90), "b".repeat(20)), 100).contains("--"));
+    }
+
+    #[test]
+    fn atomic_writes_replace_and_leave_no_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seal.asc");
+        write_atomically(&path, b"one").unwrap();
+        write_atomically(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(write_atomically(&dir.path().join("missing").join("x"), b"x").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_keep_the_permissions_of_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, "x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_atomically(&path, b"y").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

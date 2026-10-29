@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::canonical::utc_now;
 use crate::error::{FactumError, Result};
 use crate::log_service::entry_signed_payload;
-use crate::seals::{TreeHead, seal_payload};
+use crate::seals::{TreeHead, seal_payload, write_atomically};
 use crate::services::Factum;
 use crate::verifier::{CaseReport, EntryResult, Level, SealSource};
 
@@ -125,7 +125,7 @@ impl Factum<'_> {
         if let Some(file_path) = head.file_path.as_deref().filter(|p| !p.is_empty()) {
             let signed_copy = PathBuf::from(file_path).with_extension("asc");
             // written as gpg wrote it, see seal()
-            std::fs::write(&signed_copy, signature.as_bytes()).map_err(|e| {
+            write_atomically(&signed_copy, signature.as_bytes()).map_err(|e| {
                 FactumError::general(format!(
                     "Seal #{} was signed, but the signed copy could not be written to {}: {e}",
                     head.id,

@@ -141,7 +141,8 @@ fn read_seal_files_ignores_other_cases() {
     let other = seal_payload(case_id, "OTHER", 99, "00", "2026-01-01T00:00:00.000Z", "checkpoint");
     std::fs::write(f.seal_dir.join("OTHER_1_size99_x.json"), other).unwrap();
     std::fs::write(f.seal_dir.join("garbage.asc"), "not a seal").unwrap();
-    let found = factum.read_seal_files(case_id).unwrap();
+    let seal_files = factum.read_seal_files(case_id).unwrap();
+    let found = seal_files.found;
     assert_eq!(
         found
             .iter()
@@ -153,6 +154,105 @@ fn read_seal_files_ignores_other_cases() {
         found[0].payload_text,
         factum::canonical::canonical_json(&serde_json::Value::Object(found[0].payload.clone()))
     );
+    // a seal of another case is skipped silently, a file that is no seal at all is reported
+    assert_eq!(
+        seal_files.unreadable,
+        vec![(f.seal_dir.join("garbage.asc"), "is not a clearsigned text".to_string())]
+    );
+}
+
+#[test]
+fn unreadable_seal_files_warn_and_a_broken_asc_does_not_hide_its_json() {
+    let f = Fixture::with_signer(FakeSigner::new(false));
+    let factum = f.factum();
+    let (case_id, _, notes) = verifier_case(&factum);
+    let head = factum
+        .get_tree_head(factum.seal(case_id, "checkpoint").unwrap())
+        .unwrap()
+        .unwrap();
+    // a signed copy that got corrupted, and a file that is not text
+    let json = PathBuf::from(head.file_path.unwrap());
+    let asc = json.with_extension("asc");
+    std::fs::write(
+        &asc,
+        "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA512\n\n{\"case_id\":",
+    )
+    .unwrap();
+    std::fs::write(f.seal_dir.join("binary.json"), [0xff, 0xfe, 0x00]).unwrap();
+    f.exec(&format!(
+        "DELETE FROM entries WHERE id = {}; DELETE FROM tree_heads;",
+        notes[2]
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert!(
+        codes(&report, Some(Level::Fail)).contains("seal_truncated"),
+        "{:?}",
+        report.findings
+    );
+    let warnings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.code == "seal_file_unreadable")
+        .map(|f| (f.level, f.message.as_str()))
+        .collect();
+    let asc_name = asc.file_name().unwrap().to_str().unwrap();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings.iter().all(|(level, _)| *level == Level::Warn));
+    assert!(warnings.contains(&(
+        Level::Warn,
+        format!("Seal file {asc_name} is not a clearsigned text — it was not checked.").as_str()
+    )));
+    assert!(
+        warnings
+            .iter()
+            .any(|(_, w)| w.starts_with("Seal file binary.json cannot be read (")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn a_line_separator_in_the_case_file_number_keeps_the_seal_file_readable() {
+    // canonical JSON leaves U+2028 unescaped; splitting the clearsigned text there lost the whole seal
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C\u{2028}1\u{85}", "Case", "").unwrap();
+    let note = factum.create_note("note", None, case_id).unwrap();
+    factum.seal(case_id, "checkpoint").unwrap();
+    assert_eq!(factum.read_seal_files(case_id).unwrap().found.len(), 1);
+    f.exec(&format!(
+        "DELETE FROM entries WHERE id = {note}; DELETE FROM tree_heads;"
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert!(
+        codes(&report, Some(Level::Fail)).contains("seal_truncated"),
+        "{:?}",
+        report.findings
+    );
+    assert!(!codes(&report, None).contains("seal_file_unreadable"));
+}
+
+#[test]
+fn long_case_file_numbers_get_short_seal_file_names() {
+    // 80 CJK characters are 240 bytes: with the rest of the name more than a file system allows
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_file = "案".repeat(80);
+    let case_id = factum.create_case(&case_file, "Case", "").unwrap();
+    let head = factum
+        .get_tree_head(factum.seal(case_id, "checkpoint").unwrap())
+        .unwrap()
+        .unwrap();
+    let path = PathBuf::from(head.file_path.unwrap());
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(name.len() <= 255 && name.starts_with(&"案".repeat(30)), "{name}");
+    assert!(name.ends_with(&format!(
+        "_{case_id}_size1_{}.asc",
+        factum::canonical::compact_utc(&head.created_utc)
+    )));
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+    // the seal folder holds the seal and nothing left over from writing it
+    assert_eq!(std::fs::read_dir(&f.seal_dir).unwrap().count(), 1);
 }
 
 #[test]
@@ -200,6 +300,7 @@ fn seal_file_keeps_gpg_line_endings() {
         factum
             .read_seal_files(case_id)
             .unwrap()
+            .found
             .iter()
             .map(|s| s.tree_size())
             .collect::<Vec<_>>(),

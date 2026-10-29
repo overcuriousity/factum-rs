@@ -5,6 +5,14 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A seal file that cannot be read or parsed is reported as a warning naming the file instead of being skipped
+  silently, and a corrupt signed copy (`.asc`) no longer hides the unsigned seal file (`.json`) it replaces
+- Seal files of a case whose file number contains U+2028, U+2029 or U+0085 are no longer ignored by the verifier
+- Seal files are written to a temporary file and renamed, so a crash leaves no half-written seal
+- Very long case file numbers (e.g. 80 CJK characters) no longer fail to seal with "File name too long": the file
+  name is shortened, with a short hash keeping it unique
+
 ## [2.7.1] - 2026-10-29
 
 ### Fixed
