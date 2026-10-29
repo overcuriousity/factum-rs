@@ -7,8 +7,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 - A container's file list shortens long paths in the middle, so the file name stays visible: files whose names
-  differ only at the end (`photo.png`, `photo.jpg`, `photo-1.png`) no longer look alike. A shortened path shows one
-  tooltip with the whole path, not two
+  differ only at the end (`photo.png`, `photo.jpg`, `photo-1.png`) no longer look alike. A link keeps its own name,
+  not its target's, and `(metadata only)` or `(excerpt …)` follows the name instead of pushing it out. A shortened
+  path shows one tooltip with the whole path, not two; its context menu copies the whole path. The container's file
+  and base path are shortened the same way
+- The evidence on a note card and the target above the composer show one tooltip when they are cut off, not two
 
 ## [2.7.0] - 2026-10-28
 

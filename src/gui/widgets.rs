@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Stroke, UiBuilder};
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::icons;
 use super::markup_view;
@@ -247,6 +248,127 @@ fn chip(ui: &mut egui::Ui, text: &str, fg: Color32, fill: Color32, stroke: Strok
         .inner
 }
 
+/// `path` and its `suffix` ("  (metadata only)", "  → target") shortened until `width` puts them within `room`. The
+/// path is cut in the middle: as much of its start as fits, "…", and the file name whole, or when not even that fits,
+/// its end, so names that differ only at the end (photo.png, photo.jpg, photo-1.png) stay apart. The suffix is never
+/// taken for part of the name: it follows whole while the path keeps half the room, and is cut at its end after that.
+/// The name starts after the last `separator`; the cuts fall between graphemes, so an accent stays on its letter.
+pub fn elide_middle(
+    path: &str,
+    suffix: &str,
+    separator: fn(char) -> bool,
+    room: f32,
+    width: &dyn Fn(&str) -> f32,
+) -> String {
+    let whole = format!("{path}{suffix}");
+    if width(&whole) <= room {
+        return whole;
+    }
+    if width(suffix) <= room / 2.0 {
+        return elide_path(path, separator, &|text| width(&format!("{text}{suffix}")) <= room) + suffix;
+    }
+    let shown = elide_path(path, separator, &|text| width(text) <= room / 2.0);
+    let parts: Vec<&str> = suffix.graphemes(true).collect();
+    let cut = |n: usize| format!("{shown}{}…", parts[..n].concat());
+    cut(last_fitting(parts.len(), &|n| width(&cut(n)) <= room))
+}
+
+/// `path` shortened in the middle until `fits` accepts it, as [`elide_middle`] describes.
+fn elide_path(path: &str, separator: fn(char) -> bool, fits: &dyn Fn(&str) -> bool) -> String {
+    if fits(path) {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.graphemes(true).collect();
+    let name_start = parts
+        .iter()
+        .rposition(|g| g.chars().all(separator))
+        .map_or(0, |i| i + 1);
+    let build = |head: usize, tail: usize| format!("{}…{}", parts[..head].concat(), parts[tail..].concat());
+    if fits(&build(0, name_start)) {
+        // the longest start that fits before the whole name
+        return build(
+            last_fitting(name_start, &|head| fits(&build(head, name_start))),
+            name_start,
+        );
+    }
+    // the longest end of the name that fits
+    let kept = last_fitting(parts.len() - name_start, &|kept| fits(&build(0, parts.len() - kept)));
+    build(0, parts.len() - kept)
+}
+
+/// The largest n up to `most` that `fits`, or 0: what fits stops fitting past some n.
+fn last_fitting(most: usize, fits: &dyn Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, most);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(mid) { low = mid } else { high = mid - 1 }
+    }
+    low
+}
+
+/// A path on one line, shortened in the middle to fit (see [`elide_middle`]); what it shows is kept until the path,
+/// the room or the font changes. One tooltip shows the path whole, and only when part of it is hidden. The text is
+/// not selectable, since a selection would copy the shortened text: its menu copies the whole path.
+pub fn path_label(
+    ui: &mut egui::Ui,
+    path: &str,
+    suffix: &str,
+    separator: fn(char) -> bool,
+    rich: impl Fn(String) -> RichText,
+) -> egui::Response {
+    let room = ui.available_width();
+    // measured as the label lays it out, in the font the style gives it
+    let (style, valign) = (ui.style().clone(), ui.text_valign());
+    let width = |text: &str| {
+        let job = egui::WidgetText::from(rich(text.to_string())).into_layout_job(
+            &style,
+            egui::FontSelection::Default,
+            valign,
+        );
+        ui.ctx()
+            .fonts_mut(|f| f.layout_job(std::sync::Arc::unwrap_or_clone(job)))
+            .size()
+            .x
+    };
+    let whole = format!("{path}{suffix}");
+    let full = width(&whole);
+    let shown = if full <= room {
+        whole.clone()
+    } else {
+        let id = egui::Id::unique(("path-label", path, suffix));
+        let key = (room.to_bits(), full.to_bits());
+        match ui.data(|d| d.get_temp::<((u32, u32), String)>(id)) {
+            Some((cached, shown)) if cached == key => shown,
+            _ => {
+                let shown = elide_middle(path, suffix, separator, room, &width);
+                ui.data_mut(|d| d.insert_temp(id, (key, shown.clone())));
+                shown
+            }
+        }
+    };
+    let shortened = shown != whole;
+    let response = ui.add(
+        egui::Label::new(rich(shown))
+            // should the measure be off after all, the end is cut rather than run into the next column, and then
+            // egui's tooltip is the one
+            .truncate()
+            .show_tooltip_when_elided(!shortened)
+            .selectable(false)
+            .sense(Sense::click() - Sense::FOCUSABLE),
+    );
+    let response = if shortened {
+        response.on_hover_text(&whole)
+    } else {
+        response
+    };
+    response.context_menu(|ui| {
+        if ui.button("Copy Path").clicked() {
+            ui.ctx().copy_text(path.to_string());
+        }
+    });
+    response
+}
+
 /// The signature mark, always on screen; the tooltip names the state.
 fn signature_mark(ui: &mut egui::Ui, entry: &Entry, check: CheckView) {
     let p = theme::current(ui.ctx());
@@ -466,7 +588,8 @@ pub fn note_card(ui: &mut egui::Ui, card: &Card, view: &CardView, actions: &mut 
                             if let Some(evidence) = &card.evidence {
                                 ui.add(
                                     egui::Label::new(RichText::new(evidence).size(SMALL_SIZE).color(p.secondary))
-                                        .truncate(),
+                                        .truncate()
+                                        .show_tooltip_when_elided(false),
                                 )
                                 .on_hover_text(format!("Evidence: {evidence}"));
                             }

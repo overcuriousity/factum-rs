@@ -92,44 +92,6 @@ pub fn recheck_status(progress: &AddProgress, name: &str) -> String {
     add_status(progress, name).replacen("Adding to", "Re-checking", 1)
 }
 
-/// `text` shortened in the middle until `fits` accepts it: as much of the start as fits, "…", and the file name
-/// whole, or when not even that fits, its end. Names that differ only at the end (photo.png, photo.jpg,
-/// photo-1.png) stay apart, which cutting off the end would hide.
-pub fn elide_middle(text: &str, fits: &dyn Fn(&str) -> bool) -> String {
-    if fits(text) {
-        return text.to_string();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let name_start = chars.iter().rposition(|c| matches!(c, '/' | '\\')).map_or(0, |i| i + 1);
-    let build = |head: usize, tail: usize| -> String {
-        chars[..head].iter().chain(['…'].iter()).chain(&chars[tail..]).collect()
-    };
-    if fits(&build(0, name_start)) {
-        // the largest start that fits before the whole name
-        let (mut low, mut high) = (0, name_start);
-        while low < high {
-            let mid = (low + high).div_ceil(2);
-            if fits(&build(mid, name_start)) {
-                low = mid
-            } else {
-                high = mid - 1
-            }
-        }
-        return build(low, name_start);
-    }
-    // the longest end of the name that fits
-    let (mut low, mut high) = (name_start, chars.len());
-    while low < high {
-        let mid = (low + high) / 2;
-        if fits(&build(0, mid)) {
-            high = mid
-        } else {
-            low = mid + 1
-        }
-    }
-    build(0, low)
-}
-
 /// An xsd:dateTime as the view shows it: 2026-10-27 21:10:04 UTC.
 pub fn short_time(xsd: &str) -> String {
     let seconds = xsd.trim_end_matches('Z').split('.').next().unwrap_or(xsd);
@@ -245,7 +207,8 @@ pub fn container_section(
             ui.label(small("File", p.muted));
             match (&summary.path, summary.missing) {
                 (Some(path), false) => {
-                    ui.add(egui::Label::new(small(path.display().to_string(), p.secondary)).truncate());
+                    let path = path.display().to_string();
+                    widgets::path_label(ui, &path, "", std::path::is_separator, |text| small(text, p.secondary));
                 }
                 _ => {
                     ui.horizontal(|ui| {
@@ -271,12 +234,13 @@ pub fn container_section(
             });
             ui.end_row();
             ui.label(small("Base path", p.muted));
-            let base = if detail.base_path.is_empty() {
-                "full paths"
+            if detail.base_path.is_empty() {
+                ui.label(small("full paths", p.secondary));
             } else {
-                detail.base_path.as_str()
-            };
-            ui.add(egui::Label::new(small(base, p.secondary)).truncate());
+                widgets::path_label(ui, &detail.base_path, "", std::path::is_separator, |text| {
+                    small(text, p.secondary)
+                });
+            }
             ui.end_row();
         });
 
@@ -347,29 +311,24 @@ pub fn container_section(
             for file in &files[range] {
                 ui.horizontal(|ui| {
                     ui.set_height(row_height);
-                    let mut path = file.path.clone();
-                    if file.metadata_only {
-                        path += "  (metadata only)";
+                    let suffix = if file.metadata_only {
+                        "  (metadata only)".to_string()
                     } else if let Some((from, to)) = file.excerpt {
-                        path += &format!("  (excerpt {from}–{to})");
+                        format!("  (excerpt {from}–{to})")
                     } else if let Some(target) = &file.link {
-                        path += &format!("  → {target}");
-                    }
+                        format!("  → {target}")
+                    } else {
+                        String::new()
+                    };
                     ui.allocate_ui(egui::vec2(width * 0.42, row_height), |ui| {
-                        let font = egui::TextStyle::Body.resolve(ui.style());
-                        let room = ui.available_width();
-                        let fits = |text: &str| {
-                            let galley = ui
-                                .ctx()
-                                .fonts_mut(|f| f.layout_no_wrap(text.to_string(), font.clone(), p.text));
-                            galley.size().x <= room
-                        };
-                        let shown = elide_middle(&path, &fits);
-                        // one tooltip, with the whole path, and only when part of it is hidden
-                        let label = ui.add(egui::Label::new(RichText::new(&shown).color(p.text)).selectable(false));
-                        if shown != path {
-                            label.on_hover_text(&path);
-                        }
+                        // paths in a container are always written with "/"
+                        widgets::path_label(
+                            ui,
+                            &file.path,
+                            &suffix,
+                            |c| c == '/',
+                            |text| RichText::new(text).color(p.text),
+                        );
                     });
                     ui.allocate_ui(egui::vec2(width * 0.15, row_height), |ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

@@ -2110,6 +2110,28 @@ fn container_view_shows_modified_times() {
     assert!(harness.query_all_by_label(&shown).next().is_some(), "{shown}");
 }
 
+#[test]
+fn a_container_file_path_can_be_copied() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness.state_mut().select_container(id);
+    harness.run_ok();
+    let detail = harness.state().container_details.borrow()[&id].1.clone();
+    let path = detail.files().next().unwrap().1.path.clone();
+    harness.get_by_label(&path).click_secondary();
+    harness.run_ok();
+    harness.get_by_label("Copy Path").click();
+    // the frame that takes the click copies
+    harness.step();
+    let copied = harness
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .any(|c| *c == egui::OutputCommand::CopyText(path.clone()));
+    assert!(copied, "{path}");
+}
+
 /// An addition to container `id` that is still running (its worker waits).
 fn running_add_job(harness: &mut Harness<'_, FactumApp>, id: i64) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3026,16 +3048,62 @@ fn container_details_are_reused_between_rebuilds() {
 
 #[test]
 fn file_paths_are_shortened_in_the_middle() {
-    let fits = |n: usize| move |s: &str| s.chars().count() <= n;
+    // one unit per grapheme
+    let width = |s: &str| unicode_segmentation::UnicodeSegmentation::graphemes(s, true).count() as f32;
+    let slash = |c| c == '/';
+    let elide = |path: &str, suffix: &str, room: f32| widgets::elide_middle(path, suffix, slash, room, &width);
     let path = "pictures/holiday/photo_0001_copy-1.png";
-    assert_eq!(containers::elide_middle(path, &fits(100)), path);
+    assert_eq!(elide(path, "", 100.0), path);
     // the file name stays whole, the folder gives way
-    assert_eq!(
-        containers::elide_middle(path, &fits(28)),
-        "pictur…photo_0001_copy-1.png"
-    );
-    assert_eq!(containers::elide_middle(path, &fits(22)), "…photo_0001_copy-1.png");
+    assert_eq!(elide(path, "", 28.0), "pictur…photo_0001_copy-1.png");
+    assert_eq!(elide(path, "", 22.0), "…photo_0001_copy-1.png");
     // not even the name fits: its end does, so names that differ at the end stay apart
-    assert_eq!(containers::elide_middle(path, &fits(11)), "…copy-1.png");
-    assert_eq!(containers::elide_middle("a-very-long-name.png", &fits(9)), "…name.png");
+    assert_eq!(elide(path, "", 11.0), "…copy-1.png");
+    assert_eq!(elide("a-very-long-name.png", "", 9.0), "…name.png");
+}
+
+#[test]
+fn a_suffix_is_not_taken_for_the_file_name() {
+    let width = |s: &str| unicode_segmentation::UnicodeSegmentation::graphemes(s, true).count() as f32;
+    let elide = |path: &str, suffix: &str, room: f32| widgets::elide_middle(path, suffix, |c| c == '/', room, &width);
+    // a link keeps its own name, not its target's
+    let target = "  → /mnt/src/real.png";
+    assert_eq!(
+        elide("evidence/photos/IMG_0001.png", target, 44.0),
+        "evidence/p…IMG_0001.png  → /mnt/src/real.png"
+    );
+    assert_ne!(
+        elide("evidence/photos/IMG_0001.png", target, 34.0),
+        elide("evidence/photos/IMG_0002.png", target, 34.0)
+    );
+    // the suffix follows whole after the end of the name, which tells the files apart
+    let only = "  (metadata only)";
+    assert_eq!(
+        elide("dir/holiday_photo_0001.png", only, 34.0),
+        "…y_photo_0001.png  (metadata only)"
+    );
+    assert_eq!(
+        elide("dir/holiday_photo_0001.jpg", only, 34.0),
+        "…y_photo_0001.jpg  (metadata only)"
+    );
+    // past half the room the suffix gives way, cut at its end
+    assert_eq!(elide("dir/holiday_photo_0001.png", only, 18.0), "…0001.png  (metad…");
+}
+
+#[test]
+fn a_backslash_in_a_container_path_is_part_of_the_name() {
+    let width = |s: &str| s.chars().count() as f32;
+    assert_eq!(
+        widgets::elide_middle("exports/report\\2026-final.pdf", "", |c| c == '/', 24.0, &width),
+        "ex…report\\2026-final.pdf"
+    );
+}
+
+#[test]
+fn a_path_is_cut_between_graphemes() {
+    // "a" and its combining accent count as one: the cut never leaves the accent on its own
+    let width = |s: &str| s.chars().count() as f32;
+    let shown = widgets::elide_middle("Fotos/Ba\u{301}dfoto-Urlaub.png", "", |c| c == '/', 18.0, &width);
+    assert!(!shown.contains("…\u{301}"), "{shown}");
+    assert_eq!(shown, "…dfoto-Urlaub.png");
 }

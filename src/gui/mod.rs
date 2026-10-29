@@ -3244,9 +3244,11 @@ impl FactumApp {
                                 target += &format!(" › {}", evidence.description);
                             }
                             ui.add(
-                                egui::Label::new(RichText::new(target).size(SMALL_SIZE).color(p.secondary)).truncate(),
+                                egui::Label::new(RichText::new(&target).size(SMALL_SIZE).color(p.secondary))
+                                    .truncate()
+                                    .show_tooltip_when_elided(false),
                             )
-                            .on_hover_text("New notes go here");
+                            .on_hover_text(format!("New notes go here: {target}"));
                         });
                     });
                 });
