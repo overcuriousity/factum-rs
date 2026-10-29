@@ -5,6 +5,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-10-29
+
 ### Fixed
 - A container's file list shortens long paths in the middle, so the file name stays visible: files whose names
   differ only at the end (`photo.png`, `photo.jpg`, `photo-1.png`) no longer look alike. A link keeps its own name,
