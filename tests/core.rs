@@ -2,10 +2,14 @@
 
 mod common;
 
+use std::path::PathBuf;
+
 use common::{Fixture, add_case_row, add_raw_entry, system_events};
+use factum::config::{SEAL_DIR_KEY, file_seal_dir, set_dotenv_value};
 use factum::error::ErrorKind;
 use factum::log_service::{Append, entry_signed_payload};
 use factum::notes::EntryFilter;
+use factum::seals::{SEAL_DIR_MIGRATED_SETTING, SEAL_DIR_SETTING, migrate_seal_dir_setting};
 use factum::signer::FakeSigner;
 use factum::{Db, Factum, iocs, merkle, tags};
 use serde_json::json;
@@ -817,4 +821,38 @@ fn case_iocs_only_count_newest_versions() {
         iocs::get_iocs_for_entry(&f.db.conn, original).unwrap(),
         vec![("ip".into(), "10.0.0.1".into())]
     );
+}
+
+// --- the seal folder setting of factum up to 2.7.1
+
+#[test]
+fn seal_folder_setting_moves_to_the_user_config_once() {
+    let f = Fixture::new();
+    let env = f.path().join("config").join(".env");
+    f.db.set_setting(SEAL_DIR_SETTING, "/media/usb/seals").unwrap();
+    migrate_seal_dir_setting(&f.db, &env).unwrap();
+    assert_eq!(file_seal_dir(&env), Some(PathBuf::from("/media/usb/seals")));
+    // reset to the default afterwards: opening the database again does not bring the old folder back
+    set_dotenv_value(&env, SEAL_DIR_KEY, None).unwrap();
+    migrate_seal_dir_setting(&f.db, &env).unwrap();
+    assert_eq!(file_seal_dir(&env), None);
+}
+
+#[test]
+fn seal_folder_in_the_user_config_wins_over_the_database_setting() {
+    let f = Fixture::new();
+    let env = f.path().join(".env");
+    std::fs::write(&env, "FACTUM_SEAL_DIR=/mine\n").unwrap();
+    f.db.set_setting(SEAL_DIR_SETTING, "/theirs").unwrap();
+    migrate_seal_dir_setting(&f.db, &env).unwrap();
+    assert_eq!(file_seal_dir(&env), Some(PathBuf::from("/mine")));
+    assert_eq!(f.db.get_setting(SEAL_DIR_MIGRATED_SETTING).unwrap(), "1");
+}
+
+#[test]
+fn without_a_seal_folder_setting_nothing_is_written() {
+    let f = Fixture::new();
+    let env = f.path().join("config").join(".env");
+    migrate_seal_dir_setting(&f.db, &env).unwrap();
+    assert!(!env.exists() && !env.parent().unwrap().exists());
 }

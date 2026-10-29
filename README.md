@@ -271,11 +271,16 @@ directory; real environment variables override both. See [.env.example](.env.exa
 |----------------------------|-----------------------------------------------------------------------------------------------|
 | `LOG_LEVEL`                | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`; `--log-level` overrides it         |
 | `FACTUM_DB`                | Path of the database file                                                                     |
-| `FACTUM_SEAL_DIR`          | Folder for external seal copies; must already exist (default: GUI setting, else `seals/` next to the database) |
+| `FACTUM_SEAL_DIR`          | Folder for external seal copies; must already exist (default: `seals/` next to the database). **Settings → Seal Folder…** writes it to the user config `.env` |
 | `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                                 |
 
 A launcher (application menu, Start menu) does not read `.env` from a working directory: put settings in the user
 config directory.
+
+The seal folder is never taken from the database: someone who can edit the database could otherwise point the check
+at an empty folder. A seal folder chosen in the GUI of factum up to 2.7.1 (stored in the database) is moved to the
+user config `.env` once, the first time that database is opened, unless the `.env` already sets one. Every verify
+report names the seal folder it checked.
 
 ## What the integrity checks protect against
 

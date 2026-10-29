@@ -31,6 +31,7 @@ notes and corrections from both; bundles from factum pass `verify.py`.
 | PyInstaller workaround for `LD_LIBRARY_PATH` | not needed | Rust binaries do not bundle shared libraries |
 | ⚙ before system entries | ◇ | the embedded fonts have no ⚙ |
 | database schema 3 | schema 4 since factum 2.2 (adds `evidence.details`; schema 3 is upgraded on open) | evidence descriptions |
+| GUI seal folder stored in the database (`settings.seal_dir`) | stored as `FACTUM_SEAL_DIR` in the user config `.env`; a database value is moved there once | the verifier must not learn from the database it checks where the external seal copies are |
 | seal file names as long as the case file number | the case file number's part is cut at 100 bytes, with a short hash | names over 255 bytes cannot be written |
 
 Unicode details follow Python where it matters: `str.strip()`/`splitlines()` semantics (`pystr.rs`), `\w` in tags and

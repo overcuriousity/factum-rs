@@ -1750,6 +1750,7 @@ impl VerifyWindow {
                     .newest_seal_size
                     .map(|s| format!("size {s}"))
                     .unwrap_or_else(|| "none".into());
+                let seal_dir = report.seal_dir.display().to_string();
                 egui::Grid::new("verify-facts")
                     .num_columns(2)
                     .spacing([16.0, 2.0])
@@ -1757,6 +1758,7 @@ impl VerifyWindow {
                         for (name, value) in [
                             ("Signers", if signers.is_empty() { "none" } else { signers.as_str() }),
                             ("Newest valid seal", newest.as_str()),
+                            ("Seal folder checked", seal_dir.as_str()),
                         ] {
                             ui.label(RichText::new(name).size(SMALL_SIZE).color(p.muted));
                             ui.label(RichText::new(value).size(SMALL_SIZE).color(p.secondary));

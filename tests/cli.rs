@@ -128,6 +128,10 @@ fn verify_exit_codes() {
     let (code, out) = run(&f, &f.signer, &["--verify", "-v"]);
     assert_eq!(code, 0);
     assert!(out.contains("Case C-1: OK") && out.contains("[OK  ] #"), "{out}");
+    assert!(
+        out.contains(&format!("  seal folder checked: {}\n", f.seal_dir.display())),
+        "{out}"
+    );
     f.exec("UPDATE entries SET text = 'tampered'");
     let (code, out) = run(&f, &f.signer, &["--verify", "C-1"]);
     assert_eq!(code, 1);
@@ -216,6 +220,38 @@ fn unsupported_database_exits_cleanly() {
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("ERROR:root:This database was created by an older factum version")
+    );
+}
+
+/// The factum binary with its user folders under `home` (XDG) and no FACTUM_* variables, started in `cwd`.
+#[cfg(target_os = "linux")]
+fn run_binary(home: &std::path::Path, cwd: &std::path::Path, argv: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_factum"))
+        .args(argv)
+        .current_dir(cwd)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env_remove("FACTUM_DB")
+        .env_remove("FACTUM_SEAL_DIR")
+        .env_remove("LOG_LEVEL")
+        .output()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn starting_factum_moves_the_seal_folder_setting_to_the_user_config() {
+    let home = tempfile::tempdir().unwrap();
+    let db = factum::Db::open(&home.path().join("data/factum/factum.db")).unwrap();
+    db.set_setting(factum::seals::SEAL_DIR_SETTING, "/media/usb/seals")
+        .unwrap();
+    drop(db);
+    let output = run_binary(home.path(), home.path(), &["--list-cases"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        factum::config::file_seal_dir(&home.path().join("config/factum/.env")),
+        Some(std::path::PathBuf::from("/media/usb/seals"))
     );
 }
 

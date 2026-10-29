@@ -19,6 +19,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // up to 2.7.1 the GUI kept the seal folder in the database
+    if let Err(e) = factum::seals::migrate_seal_dir_setting(&db, &config::user_env_path()) {
+        log::warn!("{e}");
+    }
     if args.gui {
         run_gui(db);
     } else {

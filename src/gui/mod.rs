@@ -28,6 +28,7 @@ use crate::cases::Case;
 use crate::companion::ask::Answer;
 use crate::companion::thread::{Command, CompanionHandle, Status};
 use crate::companion::{CompanionDb, Settings, companion_db_path};
+use crate::config::{self, SEAL_DIR_KEY};
 use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
@@ -35,7 +36,7 @@ use crate::images::{self, NoteImage};
 use crate::markup;
 use crate::notes::{Entry, EntryFilter};
 use crate::pystr::{strip, tail};
-use crate::seals::{REASON_CHECKPOINT, SEAL_DIR_SETTING};
+use crate::seals::REASON_CHECKPOINT;
 use crate::services::Factum;
 use crate::signer::{ACTIVE_KEY_SETTING, GnupgSigner, Signer};
 use crate::verifier::{CaseReport, Level, SignatureCheck};
@@ -207,7 +208,12 @@ struct FactumApp {
     egui_ctx: egui::Context,
     // one signing service for everything, so the active key and the pinentry state are shared
     signer: GnupgSigner,
+    /// FACTUM_SEAL_DIR of the process environment: it overrides the seal folder setting
     env_seal_dir: Option<PathBuf>,
+    /// the seal folder setting, FACTUM_SEAL_DIR in user_env; None: next to the database
+    seal_dir: Option<PathBuf>,
+    /// the user config .env (a temporary one in tests)
+    user_env: PathBuf,
     // what is selected in the tree; when evidence is selected, case_id is None (like the case tree items)
     case_id: Option<i64>,
     evidence_id: Option<i64>,
@@ -291,11 +297,12 @@ struct FactumApp {
 
 impl FactumApp {
     fn new(db: Db, ctx: &egui::Context) -> Self {
-        Self::build(db, ctx, true)
+        Self::build(db, ctx, true, config::user_env_path())
     }
 
     /// `start_companion`: start the companion thread when it is configured (tests have no endpoint).
-    fn build(db: Db, ctx: &egui::Context, start_companion: bool) -> Self {
+    /// `user_env`: the .env the seal folder setting is read from and written to.
+    fn build(db: Db, ctx: &egui::Context, start_companion: bool, user_env: PathBuf) -> Self {
         let signer = GnupgSigner::new(&db, None);
         let setting = |key: &str| db.get_setting(key).unwrap_or_default();
         let mut theme = setting(THEME_SETTING);
@@ -335,7 +342,9 @@ impl FactumApp {
             db,
             egui_ctx: ctx.clone(),
             signer,
-            env_seal_dir: crate::config::settings().seal_dir.clone(),
+            env_seal_dir: config::env_seal_dir(),
+            seal_dir: config::file_seal_dir(&user_env),
+            user_env,
             case_id: None,
             evidence_id: None,
             container_id: None,
@@ -424,7 +433,11 @@ impl FactumApp {
             current_key: self.signer.active_key(),
             companion: self.companion_settings.clone(),
             db_path: self.db.path.clone(),
-            seal_folder: self.db.get_setting(SEAL_DIR_SETTING).unwrap_or_default(),
+            seal_folder: self
+                .seal_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
             default_seal_folder: self.factum().default_seal_dir().display().to_string(),
             seal_env: self.env_seal_dir.clone(),
             theme: self.theme.clone(),
@@ -458,12 +471,8 @@ impl FactumApp {
             self.save_x509(certificate, chain_files);
         }
         match choices.seal_folder.as_deref() {
-            Some("") => {
-                let _ = self.db.delete_setting(SEAL_DIR_SETTING);
-            }
-            Some(folder) => {
-                let _ = self.db.set_setting(SEAL_DIR_SETTING, folder);
-            }
+            Some("") => self.set_seal_folder(None),
+            Some(folder) => self.set_seal_folder(Some(folder)),
             None => {}
         }
         match choices.theme {
@@ -564,7 +573,7 @@ impl FactumApp {
             db: &self.db,
             signer: &self.signer,
             seal_dir_override: None,
-            env_seal_dir: self.env_seal_dir.clone(),
+            env_seal_dir: self.env_seal_dir.clone().or_else(|| self.seal_dir.clone()),
         }
     }
 
@@ -2145,11 +2154,9 @@ impl FactumApp {
             },
             // the default folder is stored as no setting, so it follows the database
             DialogResult::SealFolder(folder) if folder == self.factum().default_seal_dir().display().to_string() => {
-                let _ = self.db.delete_setting(SEAL_DIR_SETTING);
+                self.set_seal_folder(None);
             }
-            DialogResult::SealFolder(folder) => {
-                let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
-            }
+            DialogResult::SealFolder(folder) => self.set_seal_folder(Some(&folder)),
             DialogResult::WizardFinished(choices) => self.finish_wizard(ctx, *choices),
             DialogResult::WizardCancelled { theme } => {
                 theme::apply(ctx, &theme);
@@ -2302,6 +2309,24 @@ impl FactumApp {
     fn open_companion_settings(&mut self) {
         let dialog = CompanionSettingsDialog::new(&self.companion_settings, self.db.path.clone());
         self.dialogs.push(Dialog::CompanionSettings(Box::new(dialog)));
+    }
+
+    /// Stores the seal folder in the user config (None: next to the database), never in the database that the
+    /// verifier checks. The change goes to the application log.
+    fn set_seal_folder(&mut self, folder: Option<&str>) {
+        let before = self.factum().seal_dir();
+        if let Err(e) = config::set_dotenv_value(&self.user_env, SEAL_DIR_KEY, folder) {
+            let text = format!("The seal folder could not be saved to {}: {e}", self.user_env.display());
+            log::error!("{text}");
+            self.message("Seal folder", text);
+            return;
+        }
+        self.seal_dir = config::file_seal_dir(&self.user_env);
+        log::info!(
+            "Seal folder changed from {} to {}.",
+            before.display(),
+            self.factum().seal_dir().display()
+        );
     }
 
     fn choose_seal_folder(&mut self) {

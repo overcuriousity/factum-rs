@@ -10,13 +10,17 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::canonical::{canonical_json, compact_utc, extract_clearsigned_text, utc_now};
-use crate::config::expand_user;
+use crate::config::{SEAL_DIR_KEY, file_seal_dir, set_dotenv_value};
+use crate::db::Db;
 use crate::error::{FactumError, Result};
 use crate::merkle;
 use crate::notes::parse_payload;
 use crate::services::Factum;
 
+/// where the GUI kept the seal folder up to 2.7.1; only read once, to move it to the user config
 pub const SEAL_DIR_SETTING: &str = "seal_dir";
+/// set once SEAL_DIR_SETTING was moved, so a folder reset to the default later does not come back
+pub const SEAL_DIR_MIGRATED_SETTING: &str = "seal_dir_migrated";
 /// the case file number's share of a seal file name; the rest (`_<id>_size<n>_<time>.asc`) stays under 70 bytes,
 /// together well below the 255 bytes most file systems allow
 const SEAL_NAME_MAX_BYTES: usize = 100;
@@ -149,6 +153,31 @@ pub fn write_atomically(path: &Path, content: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Moves the seal folder of a database written by factum up to 2.7.1 to the user config `.env`, once, unless the
+/// config already names one. Afterwards the database setting is never used: the verifier must not learn from
+/// the database it checks where the external copies are.
+pub fn migrate_seal_dir_setting(db: &Db, env_file: &Path) -> Result<()> {
+    let stored = db.get_setting(SEAL_DIR_SETTING)?;
+    if stored.is_empty() || !db.get_setting(SEAL_DIR_MIGRATED_SETTING)?.is_empty() {
+        return Ok(());
+    }
+    if file_seal_dir(env_file).is_none() {
+        set_dotenv_value(env_file, SEAL_DIR_KEY, Some(&stored)).map_err(|e| {
+            FactumError::general(format!(
+                "The seal folder setting could not be moved to {}: {e}",
+                env_file.display()
+            ))
+        })?;
+        log::info!("The seal folder {stored} is now set in {}.", env_file.display());
+    } else {
+        log::info!(
+            "The seal folder {stored} of this database is ignored: {} sets one already.",
+            env_file.display()
+        );
+    }
+    db.set_setting(SEAL_DIR_MIGRATED_SETTING, "1")
+}
+
 /// Python's Path.resolve(): absolute, with the symlinks of the existing part resolved.
 pub fn resolve(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
@@ -192,18 +221,13 @@ impl Factum<'_> {
         parent_of(&self.db.path).join("seals")
     }
 
-    /// precedence: explicit setting of this Factum, FACTUM_SEAL_DIR, GUI setting, next to the database
+    /// precedence: explicit setting of this Factum, FACTUM_SEAL_DIR (environment, then user config), next to the
+    /// database; never a setting stored in the database, which could point the check at an empty folder
     pub fn seal_dir(&self) -> PathBuf {
-        if let Some(dir) = &self.seal_dir_override {
-            return dir.clone();
-        }
-        if let Some(dir) = &self.env_seal_dir {
-            return dir.clone();
-        }
-        match self.db.get_setting(SEAL_DIR_SETTING) {
-            Ok(stored) if !stored.is_empty() => expand_user(&stored),
-            _ => self.default_seal_dir(),
-        }
+        self.seal_dir_override
+            .clone()
+            .or_else(|| self.env_seal_dir.clone())
+            .unwrap_or_else(|| self.default_seal_dir())
     }
 
     pub fn seal_dir_is_default(&self) -> bool {

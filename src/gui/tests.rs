@@ -6,6 +6,7 @@ use egui_kittest::kittest::Queryable;
 
 use super::*;
 use crate::companion::{Preset, Rating};
+use crate::seals::SEAL_DIR_SETTING;
 use crate::signer::FakeSigner;
 use companion_dialogs::BUILTIN_GUIDELINE;
 
@@ -46,8 +47,18 @@ impl Fixture {
         Db::open(&self.path).unwrap()
     }
 
+    /// stands in for the user config .env
+    fn user_env(&self) -> PathBuf {
+        self.path.with_file_name("config.env")
+    }
+
+    fn seal_folder_setting(&self) -> Option<PathBuf> {
+        config::file_seal_dir(&self.user_env())
+    }
+
     fn harness(&self) -> Harness<'static, FactumApp> {
         let db = self.db();
+        let user_env = self.user_env();
         let builder = Harness::builder().with_size(egui::vec2(1280.0, 820.0));
         // rendering needs a GPU adapter (CI runners have none): only for screenshots
         let builder = if std::env::var_os("FACTUM_SCREENSHOTS").is_some() {
@@ -58,7 +69,7 @@ impl Fixture {
         let mut harness = builder.build_eframe(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
             // no companion thread: tests have no endpoint; a stub handle is installed where commands matter
-            FactumApp::build(db, &cc.egui_ctx, false)
+            FactumApp::build(db, &cc.egui_ctx, false, user_env)
         });
         harness.run_ok();
         harness
@@ -915,7 +926,7 @@ fn skipping_everything_writes_only_the_flag() {
     let db = fixture.db();
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
     assert_eq!(db.get_setting(ACTIVE_KEY_SETTING).unwrap(), "");
-    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(fixture.seal_folder_setting(), None);
     assert_eq!(db.get_setting(THEME_SETTING).unwrap(), "");
     assert!(!companion_db_path(&fixture.path).exists());
 }
@@ -964,10 +975,10 @@ fn finish_writes_choices() {
     assert!(harness.state().dialogs.is_empty());
     let db = fixture.db();
     assert_eq!(db.get_setting(THEME_SETTING).unwrap(), "dark");
-    assert_eq!(
-        db.get_setting(SEAL_DIR_SETTING).unwrap(),
-        seals.path().display().to_string()
-    );
+    // in the user config, not in the database the verifier checks
+    assert_eq!(fixture.seal_folder_setting(), Some(seals.path().to_path_buf()));
+    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(harness.state().factum().seal_dir(), seals.path());
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
     let saved = Settings::load(&CompanionDb::open_for(&fixture.path).unwrap()).unwrap();
     assert_eq!((saved.preset, saved.model.as_str()), (Preset::Osint, "m"));
@@ -1046,21 +1057,24 @@ fn menu_opens_wizard() {
 fn clearing_the_seal_folder_in_the_wizard_clears_the_setting() {
     let fixture = Fixture::new();
     let seals = tempfile::tempdir().unwrap();
-    fixture
-        .db()
-        .set_setting(SEAL_DIR_SETTING, &seals.path().display().to_string())
-        .unwrap();
+    config::set_dotenv_value(
+        &fixture.user_env(),
+        SEAL_DIR_KEY,
+        Some(&seals.path().display().to_string()),
+    )
+    .unwrap();
     let mut harness = fixture.harness();
     harness.state_mut().open_wizard();
     harness.run_ok();
     wizard_to(&mut harness, "Next", Step::SealFolder);
+    assert_eq!(wizard(&harness).seal_folder, seals.path().display().to_string());
     if let Some(Dialog::Wizard(wizard)) = harness.state_mut().dialogs.last_mut() {
         wizard.seal_folder.clear();
     }
     wizard_to(&mut harness, "Next", Step::Summary);
     assert!(harness.query_by_label_contains("(next to the database)").is_some());
     click_label(&mut harness, "Finish");
-    assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(fixture.seal_folder_setting(), None);
 }
 
 #[test]
@@ -1369,7 +1383,7 @@ fn the_wizard_shows_the_seal_folder_in_use() {
     // the default may not exist yet, and leaving it writes no setting
     wizard_to(&mut harness, "Next", Step::Summary);
     click_label(&mut harness, "Finish");
-    assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(fixture.seal_folder_setting(), None);
 }
 
 #[test]
@@ -1388,7 +1402,7 @@ fn without_signing_the_wizard_leaves_out_key_and_seal_folder() {
     click_label(&mut harness, "Finish");
     let db = fixture.db();
     assert_eq!(db.get_setting(ACTIVE_KEY_SETTING).unwrap(), "");
-    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(fixture.seal_folder_setting(), None);
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
 }
 

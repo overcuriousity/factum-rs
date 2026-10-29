@@ -120,15 +120,38 @@ fn default_seal_dir_is_next_to_the_database() {
 }
 
 #[test]
-fn seal_dir_from_settings_and_environment() {
+fn seal_dir_from_the_configuration_never_from_the_database() {
     let f = Fixture::new();
     f.db.set_setting(SEAL_DIR_SETTING, f.path().join("usb").to_str().unwrap())
         .unwrap();
     let mut factum = f.factum_default_seals();
-    assert_eq!(factum.seal_dir(), f.path().join("usb"));
-    assert!(!factum.seal_dir_is_default());
+    assert_eq!(factum.seal_dir(), factum.default_seal_dir());
     factum.env_seal_dir = Some(f.path().join("env"));
     assert_eq!(factum.seal_dir(), f.path().join("env"));
+    assert!(!factum.seal_dir_is_default());
+}
+
+#[test]
+fn a_seal_folder_set_in_the_database_cannot_redirect_the_check() {
+    // a tamperer removes the newest entry and the database seals, then points the setting at an empty folder
+    let f = Fixture::new();
+    let factum = f.factum_default_seals();
+    let (case_id, _, notes) = verifier_case(&factum);
+    factum.seal(case_id, "checkpoint").unwrap();
+    let empty = f.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    f.db.set_setting(SEAL_DIR_SETTING, empty.to_str().unwrap()).unwrap();
+    f.exec(&format!(
+        "DELETE FROM entries WHERE id = {}; DELETE FROM tree_heads;",
+        notes[2]
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert!(
+        codes(&report, Some(Level::Fail)).contains("seal_truncated"),
+        "{:?}",
+        report.findings
+    );
+    assert_eq!(report.seal_dir, factum.default_seal_dir());
 }
 
 #[test]
@@ -333,6 +356,7 @@ fn sealed_case_with_external_folder_is_ok() {
     let report = factum.verify_case(case_id, None).unwrap();
     assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
     assert_eq!((report.tree_size, report.newest_seal_size), (5, Some(5)));
+    assert_eq!(report.seal_dir, f.seal_dir);
     assert_eq!(report.count(Level::Ok), 5);
     assert_eq!(
         report.signers,

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
 use serde_json::Value;
@@ -156,6 +156,8 @@ pub struct CaseReport {
     /// (fingerprint, username)
     pub signers: Vec<(String, Option<String>)>,
     pub newest_seal_size: Option<i64>,
+    /// the seal folder that was checked for external seal copies
+    pub seal_dir: PathBuf,
 }
 
 impl CaseReport {
@@ -675,6 +677,7 @@ impl Factum<'_> {
             findings,
             signers: signers.into_iter().collect(),
             newest_seal_size: newest,
+            seal_dir,
         })
     }
 

@@ -5,6 +5,12 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- The seal folder setting is stored as `FACTUM_SEAL_DIR` in the user config `.env`, no longer in the database: the
+  verifier no longer takes the folder it checks from the database it verifies, which a tamperer could point at an
+  empty folder. A folder set in the GUI of an earlier version is moved there once, when the database is opened. Verify
+  reports name the seal folder they checked; a change of the seal folder is written to the application log
+
 ### Fixed
 - A seal file that cannot be read or parsed is reported as a warning naming the file instead of being skipped
   silently, and a corrupt signed copy (`.asc`) no longer hides the unsigned seal file (`.json`) it replaces

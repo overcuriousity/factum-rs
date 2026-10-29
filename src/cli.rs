@@ -279,6 +279,7 @@ pub fn print_report(report: &CaseReport, verbose: bool, out: &mut dyn Write) -> 
         report.tree_size,
         head(&report.root_hash, 16)
     )?;
+    writeln!(out, "  seal folder checked: {}", report.seal_dir.display())?;
     for (fingerprint, username) in &report.signers {
         writeln!(
             out,
