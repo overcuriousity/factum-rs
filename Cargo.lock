@@ -1284,6 +1284,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "ttf-parser",
+ "unicode-segmentation",
  "ureq",
  "uuid",
  "which",

@@ -207,7 +207,8 @@ pub fn container_section(
             ui.label(small("File", p.muted));
             match (&summary.path, summary.missing) {
                 (Some(path), false) => {
-                    ui.add(egui::Label::new(small(path.display().to_string(), p.secondary)).truncate());
+                    let path = path.display().to_string();
+                    widgets::path_label(ui, &path, "", std::path::is_separator, |text| small(text, p.secondary));
                 }
                 _ => {
                     ui.horizontal(|ui| {
@@ -233,12 +234,13 @@ pub fn container_section(
             });
             ui.end_row();
             ui.label(small("Base path", p.muted));
-            let base = if detail.base_path.is_empty() {
-                "full paths"
+            if detail.base_path.is_empty() {
+                ui.label(small("full paths", p.secondary));
             } else {
-                detail.base_path.as_str()
-            };
-            ui.add(egui::Label::new(small(base, p.secondary)).truncate());
+                widgets::path_label(ui, &detail.base_path, "", std::path::is_separator, |text| {
+                    small(text, p.secondary)
+                });
+            }
             ui.end_row();
         });
 
@@ -309,17 +311,24 @@ pub fn container_section(
             for file in &files[range] {
                 ui.horizontal(|ui| {
                     ui.set_height(row_height);
-                    let mut path = file.path.clone();
-                    if file.metadata_only {
-                        path += "  (metadata only)";
+                    let suffix = if file.metadata_only {
+                        "  (metadata only)".to_string()
                     } else if let Some((from, to)) = file.excerpt {
-                        path += &format!("  (excerpt {from}–{to})");
+                        format!("  (excerpt {from}–{to})")
                     } else if let Some(target) = &file.link {
-                        path += &format!("  → {target}");
-                    }
+                        format!("  → {target}")
+                    } else {
+                        String::new()
+                    };
                     ui.allocate_ui(egui::vec2(width * 0.42, row_height), |ui| {
-                        ui.add(egui::Label::new(RichText::new(&path).color(p.text)).truncate())
-                            .on_hover_text(&path);
+                        // paths in a container are always written with "/"
+                        widgets::path_label(
+                            ui,
+                            &file.path,
+                            &suffix,
+                            |c| c == '/',
+                            |text| RichText::new(text).color(p.text),
+                        );
                     });
                     ui.allocate_ui(egui::vec2(width * 0.15, row_height), |ui| {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
