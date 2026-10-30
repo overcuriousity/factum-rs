@@ -174,6 +174,9 @@ Files: src/cli.rs, src/main.rs, examples/demo_db.rs, README.md, tests/cli.rs.
 4. User decision 5 (second half): when FACTUM_DB is set, print `Database: <path>` to stderr once per run.
 5. examples/demo_db.rs:8 uses `Db::open_default()`, writing a demo case into the user's real DB. Require FACTUM_DB
    (or a path argument) and refuse otherwise.
+6. Carry-over from Task 2: `factum --verify 1` with a malformed `cases` cell aborts with "Database error: ..." while
+   plain `--verify` reports it, and one bad case row can stop lookup by name for other cases (src/cli.rs:97-100). The
+   lookup must skip a row it cannot read (naming it) instead of failing, so verification can still report it.
 
 ### Task 6: Installers, scripts and repository housekeeping
 
@@ -334,6 +337,9 @@ otherwise, following existing patterns).
 6. If Task 9 item 3 adds replacedBy-vs-log checks, Python has no log; leave a comment that replacedBy is only
    cross-checked against the case log by factum, and make the Python verifier at least report every replacedBy as a
    WARN listing the pair (not silently OK).
+7. Carry-over from Task 2: verify_container.py:345,366-373 still rejects EXPKEYSIG, reports VALIDSIG field 0 (the
+   subkey), accepts any TRUST_ line and has no `--batch --pinentry-mode error`. Match what Task 2 did in
+   src/export/verify.py: the same single-signature rule, EXPKEYSIG handling, trust rule and primary fingerprint.
 
 ### Task 11: Export and bundles
 
