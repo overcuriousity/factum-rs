@@ -2071,6 +2071,66 @@ mod tests {
         assert_eq!(back, data);
     }
 
+    #[test]
+    fn a_crash_in_the_first_bevy_of_a_large_zip_recovers_by_itself() {
+        let setup = Setup::new();
+        // as a large ZIP starts: a header and data that does not compress, stored raw in the first chunk
+        let mut x = 0x1234_5678u32;
+        let noise: Vec<u8> = (0..40_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let zip = setup.dir.path().join("evidence.zip");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&zip)
+            .unwrap();
+        let mut app = Appender::new(file, 0, Vec::new()).unwrap();
+        app.add_bytes("inner", 0, &noise).unwrap();
+        app.add_bytes("second", 0, b"second").unwrap();
+        app.finish(&[], b"").unwrap();
+        drop(app);
+        std::fs::copy(&zip, setup.source.join("large.zip")).unwrap();
+
+        let mut volume = setup.create();
+        let first = volume.end();
+        add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        let second = volume.end();
+        volume.segment_limit = 1000;
+        let staged = volume
+            .stage_add(
+                &[setup.source.join("large.zip")],
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let bevy = member_name(&format!("{}/00000000", staged.records[0].arn), &volume.arn());
+        drop(volume);
+
+        // the bevy being written: its placeholders, and part of its content
+        let mut bytes = std::fs::read(setup.path()).unwrap();
+        let header = bytes.windows(bevy.len()).position(|w| w == bevy.as_bytes()).unwrap() - 30;
+        let data = header + 30 + bevy.len() + 20;
+        assert_eq!(bytes[data..data + 4], *b"PK\x03\x04");
+        bytes[header + 14..header + 18].fill(0);
+        bytes[header + 30 + bevy.len() + 4..data].fill(0);
+        bytes.truncate(data + 45_000);
+        std::fs::write(setup.path(), &bytes).unwrap();
+
+        for known in [Some(second), Some(first), None] {
+            std::fs::write(setup.path(), &bytes).unwrap();
+            let (volume, discarded) = Volume::open(&setup.path(), known).unwrap();
+            assert_eq!((volume.end(), discarded), (second, bytes.len() as u64 - second));
+        }
+    }
+
     /// Flips a bit in the CRC-32 of a central entry of the newest directory: the content stays as it is.
     fn flip_crc_field(path: &Path, name: &str) {
         let mut bytes = std::fs::read(path).unwrap();

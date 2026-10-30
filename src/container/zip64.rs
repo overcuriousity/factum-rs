@@ -437,8 +437,8 @@ fn walk_states(file: &mut File, start: u64, len: u64) -> io::Result<u64> {
 /// The member whose local header is at `pos`. Interrupted when it does not end in the file, and when it has no
 /// compressed size yet: factum writes the CRC, the size and the compressed size after the data, in that order, and
 /// what follows the header is then content, not a next header. Only a stored member without content has those same
-/// zeros when finished, and only metadata is stored empty: it counts as finished when a header or the end of the
-/// file follows.
+/// zeros when finished: it counts as finished when a header or the end of the file follows. Metadata can be stored
+/// empty; a bevy, the one stored member that holds evidence, never is, and evidence may start like a header.
 fn member_step(file: &mut File, pos: u64, len: u64) -> io::Result<Step> {
     if pos + 30 > len {
         return Ok(Step::Interrupted);
@@ -463,7 +463,8 @@ fn member_step(file: &mut File, pos: u64, len: u64) -> io::Result<Step> {
         }
         if entry.compressed_size == 0 {
             let empty = u16_at(&header, 8) == 0 && entry.size == 0 && u32_at(&header, 14) == 0;
-            if !empty || !header_or_end_at(file, data, len)? {
+            let name = read_at(file, pos + 30, name_len as usize)?;
+            if !empty || is_bevy_name(&name) || !header_or_end_at(file, data, len)? {
                 return Ok(Step::Interrupted);
             }
         }
@@ -473,6 +474,15 @@ fn member_step(file: &mut File, pos: u64, len: u64) -> io::Result<Step> {
         Some(next) if next <= len => Step::Member(next),
         _ => Step::Interrupted,
     })
+}
+
+/// Whether a member is named as the bevies of an ImageStream are: `<stream>/%08d`.
+fn is_bevy_name(name: &[u8]) -> bool {
+    let number = name
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map(|slash| &name[slash + 1..]);
+    number.is_some_and(|number| number.len() >= 8 && number.iter().all(u8::is_ascii_digit))
 }
 
 /// Whether a header starts at `pos`, whole or cut short by the end of the file, or the file ends there.
@@ -1282,8 +1292,8 @@ mod tests {
         std::io::Write::write_all(file, bytes).unwrap();
     }
 
-    /// A file that starts with `first state` and holds, not yet finished, a copy of a whole container as member z.
-    fn nested_container(method: u16) -> (tempfile::TempDir, u64) {
+    /// A file that starts with `first state` and holds, not yet finished, a copy of a whole container as a member.
+    fn nested_container(name: &str, method: u16) -> (tempfile::TempDir, u64) {
         // a ZIP file as evidence: its own headers and end records, with offsets that count from its own start
         let dir = tempfile::tempdir().unwrap();
         two_states(&dir);
@@ -1292,14 +1302,14 @@ mod tests {
         let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
         app.add_bytes("a", 8, b"first state").unwrap();
         let end1 = app.finish(&[], b"aff4://x").unwrap();
-        app.add_bytes("z", method, &nested).unwrap();
+        app.add_bytes(name, method, &nested).unwrap();
         (dir, end1)
     }
 
     #[test]
     fn an_interrupted_member_is_passed_whatever_it_holds() {
         for method in [0, 8] {
-            let (dir, end1) = nested_container(method);
+            let (dir, end1) = nested_container("z", method);
             let mut file = reopened(&dir);
             // the CRC of the stored one written, so it cannot be a finished empty member
             poke(&mut file, end1 + 30 + 1 + 4, &[0u8; 16]);
@@ -1324,13 +1334,41 @@ mod tests {
     #[test]
     fn a_stored_interrupted_member_that_starts_like_a_header_is_refused_not_cut() {
         // the same bytes as a finished empty member and what follows it: the safe reading is that it may be one
-        let (dir, end1) = nested_container(0);
+        let (dir, end1) = nested_container("z", 0);
         let mut file = reopened(&dir);
         interrupt_member(&mut file, end1, 1);
         assert_eq!(
             find_newest_end(&mut file, Some(end1)).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn an_interrupted_bevy_is_passed_though_it_starts_like_a_header() {
+        // a bevy is never empty, so these are the placeholders of one in writing
+        let name = "aff4%3A%2F%2Fs/00000000";
+        let (dir, end1) = nested_container(name, 0);
+        let mut file = reopened(&dir);
+        interrupt_member(&mut file, end1, name.len() as u64);
+        assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1));
+        assert_eq!(find_newest_end(&mut file, None).unwrap(), Some(end1));
+    }
+
+    #[test]
+    fn only_a_bevy_has_the_name_of_a_bevy() {
+        for name in ["aff4%3A%2F%2Fs/00000000", "s/00000012", "s/123456789"] {
+            assert!(is_bevy_name(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "00000000",
+            "s/00000000.index",
+            "s/0000000",
+            "s/0000000x",
+            "information.turtle.pubkey.asc",
+            "factum/history/1/information.turtle.pubkey.asc",
+        ] {
+            assert!(!is_bevy_name(name.as_bytes()), "{name}");
+        }
     }
 
     #[test]
