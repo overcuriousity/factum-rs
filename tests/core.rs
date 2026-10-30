@@ -294,7 +294,10 @@ fn a_case_created_while_signing_does_not_mismatch_the_id_in_the_payload() {
     let f = Fixture::new();
     let path = f.path().join("factum.db");
     let once = std::cell::Cell::new(true);
+    let signatures = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = signatures.clone();
     *f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        counted.set(counted.get() + 1);
         if once.replace(false) {
             // another process takes the id this case was prepared for
             add_case_row(&Db::open(&path).unwrap(), "OTHER", false);
@@ -303,6 +306,8 @@ fn a_case_created_while_signing_does_not_mismatch_the_id_in_the_payload() {
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
     assert_eq!(case_id, 2);
+    // the first signature was for a stale id, so it was made again
+    assert_eq!(signatures.get(), 2);
     assert_eq!(system_events(&f.db, case_id)[0]["case_id"], json!(case_id));
     assert_eq!(factum.require_case(case_id).unwrap().case_file, "C-1");
     // the other case has no log entry (it was added raw), ours has exactly one
@@ -362,9 +367,27 @@ fn an_open_case_file_number_cannot_be_used_twice() {
     factum.update_case(first, "C-1", "One, renamed", "").unwrap();
     assert!(factum.update_case(second, "C-1", "Lower", "").is_err());
     assert_eq!(factum.require_case(second).unwrap().case_file, "c-1");
-    // an archived case frees its number
+    // an archived case frees its number, but cannot take it back while another open case holds it
     factum.archive_case(first).unwrap();
-    factum.create_case("C-1", "Three", "").unwrap();
+    let third = factum.create_case("C-1", "Three", "").unwrap();
+    let err = factum.reopen_case(first).unwrap_err();
+    assert!(err.to_string().contains(&format!("#{third}")), "{err}");
+    assert!(factum.require_case(first).unwrap().is_archived());
+    factum.archive_case(third).unwrap();
+    factum.reopen_case(first).unwrap();
+}
+
+#[test]
+fn editing_a_case_whose_number_is_already_shared_by_an_older_database_still_works() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let one = factum.create_case("C-1", "One", "").unwrap();
+    add_case_row(&f.db, "C-1", false);
+    factum.update_case(one, "C-1", "One, renamed", "d").unwrap();
+    assert_eq!(factum.require_case(one).unwrap().case_name, "One, renamed");
+    // changing the number to a taken one is still refused
+    let other = factum.create_case("C-2", "Other", "").unwrap();
+    assert!(factum.update_case(other, "C-1", "Other", "").is_err());
 }
 
 #[test]

@@ -1920,6 +1920,7 @@ impl FactumApp {
                     .into_iter()
                     .map(|(tag, _)| tag)
                     .collect();
+                // an entry that is gone offers nothing
                 let known = self
                     .factum()
                     .get_entry_without_payload(entry_id)

@@ -217,15 +217,21 @@ impl Factum<'_> {
             return Err(FactumError::general("A case file number is required."));
         }
         let name = strip(case_name);
+        let renamed = case.case_file != case_file;
         let updated = Case {
             case_file: case_file.to_string(),
             case_name: if name.is_empty() { case_file } else { name }.to_string(),
             description: description.to_string(),
             ..case
         };
-        self.ensure_case_file_free(&updated.case_file, Some(case_id))?;
+        // an unchanged number is not checked: an older database may already hold two open cases with one number
+        if renamed {
+            self.ensure_case_file_free(&updated.case_file, Some(case_id))?;
+        }
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
-            ensure_case_file_free(conn, &updated.case_file, Some(case_id))?;
+            if renamed {
+                ensure_case_file_free(conn, &updated.case_file, Some(case_id))?;
+            }
             conn.execute(
                 "UPDATE cases SET case_file = ?, case_name = ?, description = ? WHERE id = ?",
                 params![updated.case_file, updated.case_name, updated.description, case_id],
@@ -289,10 +295,14 @@ impl Factum<'_> {
     }
 
     pub fn reopen_case(&self, case_id: i64) -> Result<()> {
-        if !self.require_case(case_id)?.is_archived() {
+        let case = self.require_case(case_id)?;
+        if !case.is_archived() {
             return Err(FactumError::general(format!("Case #{case_id} is not archived.")));
         }
+        // the number may have been taken by another case since the archive
+        self.ensure_case_file_free(&case.case_file, Some(case_id))?;
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
+            ensure_case_file_free(conn, &case.case_file, Some(case_id))?;
             conn.execute("UPDATE cases SET archived_utc = NULL WHERE id = ?", [case_id])?;
             Ok(())
         };
