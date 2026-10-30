@@ -715,7 +715,8 @@ impl Volume {
 
     /// Opens a container for writing. An interrupted Add left bytes after the last complete state: they are cut
     /// off (never a complete state); the second value says how many. `known` is where a complete state ends (the
-    /// case log's), from which the newest one is found quickly.
+    /// case log's), from which the newest one is found quickly. A read error, or bytes after that state that could
+    /// be more than an interrupted Add, refuse the open and leave the file as it is.
     pub fn open(path: &Path, known: Option<u64>) -> Result<(Volume, u64)> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -726,8 +727,19 @@ impl Volume {
         let not_container =
             |why: String| FactumError::general(format!("{} is not a factum container: {why}", path.display()));
         let len = file.seek(SeekFrom::End(0)).map_err(|e| io_error(path, e))?;
+        let refused = |e: io::Error| {
+            let why = if e.kind() == io::ErrorKind::InvalidData {
+                "it holds more than an interrupted addition"
+            } else {
+                "it could not be read"
+            };
+            FactumError::general(format!(
+                "The container {} was not opened, nothing in it was changed: {why} ({e}).",
+                path.display()
+            ))
+        };
         let end = find_newest_end(&mut file, known)
-            .map_err(|e| not_container(e.to_string()))?
+            .map_err(refused)?
             .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
         let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
         let read = |file: &mut File, name: &str| -> Result<Vec<u8>> {
@@ -1790,6 +1802,60 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains(&outside.display().to_string()));
         assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), end);
+    }
+
+    /// A state after the created one, and bytes an interrupted Add left after it; the end of each state.
+    fn two_states_and_a_tail(setup: &Setup) -> (u64, u64) {
+        let mut volume = setup.create();
+        let first = volume.end();
+        add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        let second = volume.end();
+        drop(volume);
+        let file = OpenOptions::new().write(true).open(setup.path()).unwrap();
+        file.set_len(second + 5000).unwrap();
+        (first, second)
+    }
+
+    #[test]
+    fn a_read_error_while_opening_cuts_nothing() {
+        let setup = Setup::new();
+        let (first, second) = two_states_and_a_tail(&setup);
+        let len = second + 5000;
+        // each read in turn fails once
+        for n in 1.. {
+            crate::container::zip64::FAIL_READ.with(|fail| fail.set(n));
+            let opened = Volume::open(&setup.path(), Some(first));
+            if crate::container::zip64::FAIL_READ.with(|fail| fail.replace(0)) != 0 {
+                let (volume, discarded) = opened.unwrap();
+                assert_eq!((volume.end(), discarded), (second, 5000));
+                break;
+            }
+            let error = opened.err().unwrap();
+            assert!(error.to_string().contains("error 5"), "{n}: {error}");
+            assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), len, "{n}");
+        }
+    }
+
+    #[test]
+    fn a_state_that_cannot_be_read_is_not_cut_off() {
+        let setup = Setup::new();
+        let (first, second) = two_states_and_a_tail(&setup);
+        // the classic end record of the newest state, damaged: bytes that end no directory, a state all the same
+        let mut bytes = std::fs::read(setup.path()).unwrap();
+        let locator = bytes[..second as usize]
+            .windows(4)
+            .rposition(|w| w == b"PK\x06\x07")
+            .unwrap();
+        bytes[locator + 20] ^= 1;
+        std::fs::write(setup.path(), &bytes).unwrap();
+        for known in [Some(first), None] {
+            let error = Volume::open(&setup.path(), known).err().unwrap();
+            assert!(
+                error.to_string().contains("more than an interrupted addition"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(setup.path()).unwrap(), bytes);
+        }
     }
 
     #[test]

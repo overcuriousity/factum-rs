@@ -32,6 +32,9 @@ All notable changes to this project are documented here. The format follows
   `install.ps1` keeps `%VAR%` entries of the user PATH unexpanded.
 
 ### Fixed
+- Opening a container for writing no longer cuts anything off after a read error, and refuses when the bytes after the
+  newest state could be more than an interrupted addition (a complete central directory that cannot be read); an
+  interrupted member is no longer taken for a finished empty one and its content read as ZIP headers
 - `factum --verify <id>` and the lookup by name no longer stop at a case row that cannot be read; it is skipped by
   name (and reported) and still reachable by id
 - IOC extraction: domains and emails with non-ASCII letters (`münchen.de`) are found; a URL keeps its final `/` and
