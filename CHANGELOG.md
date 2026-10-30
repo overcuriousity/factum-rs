@@ -35,11 +35,12 @@ All notable changes to this project are documented here. The format follows
 - Containers: reading a member checks it against the CRC-32 of the central directory; a mismatch fails verification
 - Containers: a central directory with entries behind its count (invisible to factum, read by other ZIP tools) is
   refused, and a member whose local header differs from the central directory in name, method or flags fails
-  verification; verifying reports a complete state that cannot be read as a failure, not as an interrupted addition
+  verification; verifying reports such bytes after the last state as a failure, not as an interrupted addition
 - Containers: a member keeps the time it was written; each later state rewrote the times of all earlier members
 - Opening a container for writing no longer cuts anything off after a read error, and refuses when the bytes after the
-  newest state could be more than an interrupted addition (a complete central directory that cannot be read); an
-  interrupted member is no longer taken for a finished empty one and its content read as ZIP headers
+  newest state could be more than an interrupted addition (a complete central directory that cannot be read, bytes no
+  crash of the writer leaves, an end before the state the case log records); an interrupted member is no longer taken
+  for a finished empty one and its content read as ZIP headers
 - `factum --verify <id>` and the lookup by name no longer stop at a case row that cannot be read; it is skipped by
   name (and reported) and still reachable by id
 - IOC extraction: domains and emails with non-ASCII letters (`münchen.de`) are found; a URL keeps its final `/` and

@@ -54,6 +54,21 @@ impl Setup {
         self.f.path().join("preserved.aff4l")
     }
 
+    /// What an Add leaves that dies before its finish: members after the newest state.
+    fn interrupted_add(&self) {
+        let source = self.file("interrupted.txt");
+        std::fs::write(&source, vec![1u8; 100_000]).unwrap();
+        let (mut volume, _) = Volume::open(&self.container_path(), None).unwrap();
+        volume
+            .stage_add(
+                &[source],
+                &self.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+    }
+
     fn create(&self) -> i64 {
         self.f
             .factum()
@@ -702,9 +717,9 @@ fn stale_end_setting_never_cuts_committed_data() {
     s.f.db
         .set_setting(&format!("container_end:{uuid}"), &before_add)
         .unwrap();
-    let mut bytes = std::fs::read(s.container_path()).unwrap();
-    bytes.extend(vec![1u8; 100_000]);
-    std::fs::write(s.container_path(), bytes).unwrap();
+    let committed = std::fs::metadata(s.container_path()).unwrap().len();
+    s.interrupted_add();
+    assert!(std::fs::metadata(s.container_path()).unwrap().len() > committed);
     s.add(id, &[s.file("b.txt")]);
     assert_eq!(s.f.factum().container(id).unwrap().summary.file_count, 2);
     let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
@@ -1239,20 +1254,35 @@ mod verify {
     }
 
     #[test]
-    fn trailing_bytes_are_a_warning_and_last_state_verifies() {
+    fn an_interrupted_addition_is_a_warning_and_last_state_verifies() {
         let s = Setup::new();
         closed_with_files(&s);
         let path = s.container_path();
-        let before = std::fs::read(&path).unwrap();
-        let mut junk = before.clone();
+        let before = std::fs::metadata(&path).unwrap().len();
+        s.interrupted_add();
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.len() as u64 > before);
+        let report = verify(&s, &path);
+        assert_eq!(report.discarded_tail, after.len() as u64 - before);
+        assert_eq!(codes(&report, Level::Warn), vec!["trailing_data"]);
+        assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
+        // verifying never repairs
+        assert_eq!(std::fs::read(&path).unwrap(), after);
+    }
+
+    #[test]
+    fn bytes_no_addition_leaves_fail_and_last_state_verifies() {
+        let s = Setup::new();
+        closed_with_files(&s);
+        let path = s.container_path();
+        let mut junk = std::fs::read(&path).unwrap();
         junk.extend(vec![7u8; 100_000]);
         std::fs::write(&path, &junk).unwrap();
         let report = verify(&s, &path);
         assert_eq!(report.discarded_tail, 100_000);
-        assert_eq!(codes(&report, Level::Warn), vec!["trailing_data"]);
-        assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
-        // verifying never repairs
-        assert_eq!(std::fs::read(&path).unwrap().len(), junk.len());
+        assert_eq!(codes(&report, Level::Fail), vec!["trailing_data"]);
+        assert_eq!(report.states.iter().filter(|s| s.close.is_some()).count(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), junk);
     }
 
     #[test]

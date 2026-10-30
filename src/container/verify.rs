@@ -563,7 +563,7 @@ pub fn verify_file(
                 Level::Fail,
                 "trailing_data",
                 format!(
-                    "{} bytes after the last complete state are more than an interrupted addition ({e}); the last \
+                    "{} bytes after the last complete state may be more than an interrupted addition ({e}); the last \
                      complete state was checked.",
                     len - end
                 ),

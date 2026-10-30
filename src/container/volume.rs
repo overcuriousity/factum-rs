@@ -729,7 +729,7 @@ impl Volume {
         let len = file.seek(SeekFrom::End(0)).map_err(|e| io_error(path, e))?;
         let refused = |e: io::Error| {
             let why = if e.kind() == io::ErrorKind::InvalidData {
-                "it holds more than an interrupted addition"
+                "it may hold more than an interrupted addition"
             } else {
                 "it could not be read"
             };
@@ -1804,30 +1804,37 @@ mod tests {
         assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), end);
     }
 
-    /// A state after the created one, and bytes an interrupted Add left after it; the end of each state.
-    fn two_states_and_a_tail(setup: &Setup) -> (u64, u64) {
+    /// A state after the created one, and an interrupted Add after it; the end of each state and the file's length.
+    fn two_states_and_a_tail(setup: &Setup) -> (u64, u64, u64) {
         let mut volume = setup.create();
         let first = volume.end();
         add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
         let second = volume.end();
+        volume
+            .stage_add(
+                std::slice::from_ref(&setup.source),
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
         drop(volume);
-        let file = OpenOptions::new().write(true).open(setup.path()).unwrap();
-        file.set_len(second + 5000).unwrap();
-        (first, second)
+        let len = std::fs::metadata(setup.path()).unwrap().len();
+        assert!(len > second);
+        (first, second, len)
     }
 
     #[test]
     fn a_read_error_while_opening_cuts_nothing() {
         let setup = Setup::new();
-        let (first, second) = two_states_and_a_tail(&setup);
-        let len = second + 5000;
+        let (first, second, len) = two_states_and_a_tail(&setup);
         // each read in turn fails once
         for n in 1.. {
             crate::container::zip64::FAIL_READ.with(|fail| fail.set(n));
             let opened = Volume::open(&setup.path(), Some(first));
             if crate::container::zip64::FAIL_READ.with(|fail| fail.replace(0)) != 0 {
                 let (volume, discarded) = opened.unwrap();
-                assert_eq!((volume.end(), discarded), (second, 5000));
+                assert_eq!((volume.end(), discarded), (second, len - second));
                 break;
             }
             let error = opened.err().unwrap();
@@ -1839,7 +1846,7 @@ mod tests {
     #[test]
     fn a_state_that_cannot_be_read_is_not_cut_off() {
         let setup = Setup::new();
-        let (first, second) = two_states_and_a_tail(&setup);
+        let (first, second, _) = two_states_and_a_tail(&setup);
         // the classic end record of the newest state, damaged: bytes that end no directory, a state all the same
         let mut bytes = std::fs::read(setup.path()).unwrap();
         let locator = bytes[..second as usize]
@@ -1856,6 +1863,32 @@ mod tests {
             );
             assert_eq!(std::fs::read(setup.path()).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn a_logged_state_is_not_cut_off_whatever_replaced_it() {
+        let setup = Setup::new();
+        let (first, second, _) = two_states_and_a_tail(&setup);
+        let directory = bytes_before_directory(&setup, second);
+        // the newest directory and all that follows it, zeroed
+        let mut bytes = std::fs::read(setup.path()).unwrap();
+        bytes[directory..].fill(0);
+        std::fs::write(setup.path(), &bytes).unwrap();
+        for known in [Some(second), Some(first), None] {
+            let error = Volume::open(&setup.path(), known).err().unwrap();
+            assert!(error.to_string().contains("nothing in it was changed"), "{error}");
+            assert_eq!(std::fs::read(setup.path()).unwrap(), bytes);
+        }
+    }
+
+    /// Where the directory of the state ending at `end` starts.
+    fn bytes_before_directory(setup: &Setup, end: u64) -> usize {
+        let bytes = std::fs::read(setup.path()).unwrap();
+        let record = bytes[..end as usize]
+            .windows(4)
+            .rposition(|w| w == b"PK\x06\x06")
+            .unwrap();
+        u64::from_le_bytes(bytes[record + 48..record + 56].try_into().unwrap()) as usize
     }
 
     #[test]
