@@ -1468,3 +1468,82 @@ fn an_entry_can_be_read_without_its_payload() {
     );
     assert!(factum.get_entry_without_payload(id + 100).unwrap().is_none());
 }
+
+/// A valid PNG of about `size` bytes: the signature, then padding that `guess_format` does not look at.
+fn big_png(size: usize, seed: u8) -> NoteImage {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.resize(size, seed);
+    NoteImage::from_bytes(bytes, None).unwrap()
+}
+
+#[test]
+fn the_images_of_one_note_are_limited_in_total() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (a, b, c) = (big_png(20_000_000, 1), big_png(20_000_000, 2), big_png(20_000_000, 3));
+    let text = |images: &[&NoteImage]| {
+        images
+            .iter()
+            .map(|i| format!("![x](factum-image:{})", i.id))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let all = [a.clone(), b.clone(), c.clone()];
+    let err = factum
+        .create_note_with_images(&text(&[&a, &b, &c]), &all, None, case_id)
+        .unwrap_err();
+    assert!(err.to_string().contains("50 MB"), "{err}");
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries WHERE kind = 'note'"), 0);
+    let note = factum
+        .create_note_with_images(&text(&[&a, &b]), &all, None, case_id)
+        .unwrap();
+    // a correction counts the same way
+    assert!(
+        factum
+            .correct_note_with_images(note, &text(&[&a, &b, &c]), &all)
+            .is_err()
+    );
+    factum.correct_note_with_images(note, &text(&[&a]), &all).unwrap();
+}
+
+#[test]
+fn a_note_already_over_the_limit_can_be_corrected_without_adding_images() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let (a, b, c) = (big_png(20_000_000, 1), big_png(20_000_000, 2), big_png(20_000_000, 3));
+    let refs = |images: &[&NoteImage]| {
+        images
+            .iter()
+            .map(|i| format!("![x](factum-image:{})", i.id))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // written before the limit existed
+    let payload = factum::images::to_payload(&[a.clone(), b.clone(), c.clone()]);
+    let old_text = refs(&[&a, &b, &c]);
+    factum
+        .append(
+            case_id,
+            "note",
+            &old_text,
+            Append {
+                payload,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let note = factum
+        .list_entries(case_id, &factum::notes::EntryFilter::notes())
+        .unwrap()[0];
+    // text only: the images stay
+    factum.correct_note(note, &format!("{old_text} fixed")).unwrap();
+    // but a new one may not join
+    let d = big_png(1_000, 4);
+    let newest = factum.latest_version_id(note).unwrap();
+    let with_new = format!("{old_text} {}", refs(&[&d]));
+    let mut images = vec![a, b, c];
+    images.push(d);
+    assert!(factum.correct_note_with_images(newest, &with_new, &images).is_err());
+}

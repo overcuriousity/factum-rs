@@ -290,6 +290,84 @@ fn failed_signature_leaves_no_case_behind() {
 }
 
 #[test]
+fn a_case_created_while_signing_does_not_mismatch_the_id_in_the_payload() {
+    let f = Fixture::new();
+    let path = f.path().join("factum.db");
+    let once = std::cell::Cell::new(true);
+    *f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        if once.replace(false) {
+            // another process takes the id this case was prepared for
+            add_case_row(&Db::open(&path).unwrap(), "OTHER", false);
+        }
+    }));
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    assert_eq!(case_id, 2);
+    assert_eq!(system_events(&f.db, case_id)[0]["case_id"], json!(case_id));
+    assert_eq!(factum.require_case(case_id).unwrap().case_file, "C-1");
+    // the other case has no log entry (it was added raw), ours has exactly one
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries"), 1);
+}
+
+#[test]
+fn evidence_created_while_signing_keeps_the_id_in_its_payload() {
+    let f = Fixture::new();
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    let path = f.path().join("factum.db");
+    let once = std::cell::Cell::new(true);
+    *f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        if once.replace(false) {
+            Db::open(&path)
+                .unwrap()
+                .conn
+                .execute(
+                    "INSERT INTO evidence (case_id, description, created_utc) VALUES (?, 'other', 'x')",
+                    [case_id],
+                )
+                .unwrap();
+        }
+    }));
+    let evidence_id = f.factum().create_evidence(case_id, "disk", "", "").unwrap();
+    assert_eq!(evidence_id, 2);
+    let events = system_events(&f.db, case_id);
+    assert_eq!(events.last().unwrap()["evidence_id"], json!(evidence_id));
+}
+
+#[test]
+fn failed_signature_leaves_no_evidence_behind() {
+    let f = Fixture::new();
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    f.signer.fail_next.set(true);
+    assert!(
+        f.factum()
+            .create_evidence(case_id, "disk", "", "")
+            .unwrap_err()
+            .is(ErrorKind::Signing)
+    );
+    assert_eq!(f.count("SELECT COUNT(*) FROM evidence"), 0);
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries"), 1);
+}
+
+#[test]
+fn an_open_case_file_number_cannot_be_used_twice() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let first = factum.create_case("C-1", "One", "").unwrap();
+    let err = factum.create_case(" C-1 ", "Two", "").unwrap_err();
+    assert!(err.to_string().contains("already used"), "{err}");
+    assert_eq!(f.count("SELECT COUNT(*) FROM cases"), 1);
+    // exact and case-sensitive
+    let second = factum.create_case("c-1", "Lower", "").unwrap();
+    // an edit that keeps the own number is fine, one that takes another open case's number is not
+    factum.update_case(first, "C-1", "One, renamed", "").unwrap();
+    assert!(factum.update_case(second, "C-1", "Lower", "").is_err());
+    assert_eq!(factum.require_case(second).unwrap().case_file, "c-1");
+    // an archived case frees its number
+    factum.archive_case(first).unwrap();
+    factum.create_case("C-1", "Three", "").unwrap();
+}
+
+#[test]
 fn case_file_is_required() {
     let f = Fixture::new();
     assert!(f.factum().create_case("  ", "x", "").is_err());
@@ -863,4 +941,59 @@ fn after_the_first_start_no_database_is_consulted() {
     planted.set_setting(SEAL_DIR_SETTING, "/tmp/empty").unwrap();
     assert_eq!(migrate_seal_dir_setting(&planted, &env).unwrap(), None);
     assert!(!env.exists());
+}
+
+#[test]
+fn a_correction_chain_that_loops_is_an_error_not_a_hang() {
+    let f = Fixture::new();
+    let case_id = add_case_row(&f.db, "C-1", false);
+    let a = add_raw_entry(&f.db, case_id, "a", None);
+    let b = add_raw_entry(&f.db, case_id, "b", Some(a));
+    f.exec(&format!("UPDATE entries SET corrects_id = {b} WHERE id = {a}"));
+    let factum = f.factum();
+    assert!(
+        factum
+            .latest_version_id(a)
+            .unwrap_err()
+            .to_string()
+            .contains("inconsistent")
+    );
+    assert!(factum.history(a).unwrap_err().to_string().contains("inconsistent"));
+    f.exec(&format!("UPDATE entries SET corrects_id = {a} WHERE id = {a}"));
+    assert!(factum.history(a).is_err());
+}
+
+#[test]
+fn url_fragments_are_not_tags_in_new_notes() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let note = factum
+        .create_note("see http://x/page#section, #real", None, case_id)
+        .unwrap();
+    let found: Vec<String> = tags::get_tags_for_entry(&f.db.conn, note)
+        .unwrap()
+        .into_iter()
+        .map(|(tag, _)| tag)
+        .collect();
+    assert_eq!(found, ["real"]);
+}
+
+#[test]
+fn tag_vocabulary_is_per_case() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let one = factum.create_case("C-1", "One", "").unwrap();
+    let two = factum.create_case("C-2", "Two", "").unwrap();
+    let note = factum.create_note("#alpha", None, one).unwrap();
+    tags::add_label(&f.db, note, "shared").unwrap();
+    factum.create_note("#beta #alpha", None, two).unwrap();
+    assert_eq!(
+        tags::tag_counts(&f.db.conn, one).unwrap(),
+        [("alpha".to_string(), 1), ("shared".to_string(), 1)]
+    );
+    assert_eq!(
+        tags::tag_counts(&f.db.conn, two).unwrap(),
+        [("alpha".to_string(), 1), ("beta".to_string(), 1)]
+    );
 }

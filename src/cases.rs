@@ -3,8 +3,8 @@ use serde_json::{Value, json};
 
 use crate::canonical::utc_now;
 use crate::db::Cells;
-use crate::error::{FactumError, Result};
-use crate::log_service::{Append, KIND_SYSTEM};
+use crate::error::{ErrorKind, FactumError, Result};
+use crate::log_service::{Append, KIND_SYSTEM, MAX_ATTEMPTS};
 use crate::pystr::strip;
 use crate::services::Factum;
 
@@ -50,6 +50,32 @@ pub fn case_payload(event: &str, case: &Case) -> Value {
            "description": case.description, "created_utc": case.created_utc})
 }
 
+/// The id a plain insert into `table` (rowid, no AUTOINCREMENT) would get.
+pub(crate) fn next_id(conn: &rusqlite::Connection, table: &str) -> Result<i64> {
+    Ok(
+        conn.query_row(&format!("SELECT COALESCE(MAX(id), 0) + 1 FROM {table}"), [], |row| {
+            row.get(0)
+        })?,
+    )
+}
+
+/// An open case may not share its file number with another open one (archived cases may).
+fn ensure_case_file_free(conn: &rusqlite::Connection, case_file: &str, own_id: Option<i64>) -> Result<()> {
+    let used: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM cases WHERE case_file = ? AND archived_utc IS NULL AND id != ?",
+            params![case_file, own_id.unwrap_or(-1)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match used {
+        Some(id) => Err(FactumError::general(format!(
+            "The case file number {case_file} is already used by the open case #{id}."
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl Factum<'_> {
     pub fn create_case(&self, case_file: &str, case_name: &str, description: &str) -> Result<i64> {
         let case_file = strip(case_file);
@@ -59,31 +85,71 @@ impl Factum<'_> {
         let case_name = Some(strip(case_name))
             .filter(|name| !name.is_empty())
             .unwrap_or(case_file);
-        let case_id = self.db.transaction(|conn| {
-            conn.execute(
-                "INSERT INTO cases (case_file, case_name, description, created_utc) VALUES (?, ?, ?, ?)",
-                params![case_file, case_name, description, utc_now()],
-            )?;
-            Ok(conn.last_insert_rowid())
-        })?;
-        let case = self.require_case(case_id)?;
-        let appended = self.append(
-            case_id,
-            KIND_SYSTEM,
-            &format!("Case created: {case_file} — {case_name}"),
-            Append {
-                payload: Some(case_payload("case_created", &case)),
-                ..Default::default()
-            },
-        );
-        if let Err(e) = appended {
-            // the row has no entries yet, so removing it leaves no trace in any log
-            self.db
-                .transaction(|conn| Ok(conn.execute("DELETE FROM cases WHERE id = ?", [case_id])?))?;
-            return Err(e);
+        self.ensure_case_file_free(case_file, None)?;
+        let created_utc = utc_now();
+        // the id is predicted and signed without the write lock (pinentry can take minutes); the row is inserted
+        // under the lock in the same transaction as the log entry, and a prediction that went stale is redone
+        for _ in 0..MAX_ATTEMPTS {
+            let case = Case {
+                id: self.next_id("cases")?,
+                case_file: case_file.to_string(),
+                case_name: case_name.to_string(),
+                description: description.to_string(),
+                created_utc: created_utc.clone(),
+                is_active: false,
+                archived_utc: None,
+            };
+            let reserve = |conn: &rusqlite::Connection| -> Result<()> {
+                ensure_case_file_free(conn, case_file, None)?;
+                if next_id(conn, "cases")? != case.id {
+                    return Err(FactumError::log_changed(
+                        "Another case was created meanwhile, nothing was saved — try again.",
+                    ));
+                }
+                conn.execute(
+                    "INSERT INTO cases (id, case_file, case_name, description, created_utc) VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        case.id,
+                        case.case_file,
+                        case.case_name,
+                        case.description,
+                        case.created_utc
+                    ],
+                )?;
+                Ok(())
+            };
+            let appended = self.append(
+                case.id,
+                KIND_SYSTEM,
+                &format!("Case created: {case_file} — {case_name}"),
+                Append {
+                    payload: Some(case_payload("case_created", &case)),
+                    allow_archived: true, // the case does not exist before reserve
+                    reserve: Some(&reserve),
+                    ..Default::default()
+                },
+            );
+            match appended {
+                Err(e) if e.is(ErrorKind::LogChanged) => continue,
+                Err(e) => return Err(e),
+                Ok(_) => {
+                    log::debug!("Case created with ID: {}", case.id);
+                    return Ok(case.id);
+                }
+            }
         }
-        log::debug!("Case created with ID: {case_id}");
-        Ok(case_id)
+        Err(FactumError::log_changed(
+            "Another case was created meanwhile, nothing was saved — try again.",
+        ))
+    }
+
+    /// The id the next row of `table` gets.
+    pub(crate) fn next_id(&self, table: &str) -> Result<i64> {
+        next_id(&self.db.conn, table)
+    }
+
+    fn ensure_case_file_free(&self, case_file: &str, own_id: Option<i64>) -> Result<()> {
+        ensure_case_file_free(&self.db.conn, case_file, own_id)
     }
 
     pub fn get_case(&self, case_id: i64) -> Result<Option<Case>> {
@@ -157,7 +223,9 @@ impl Factum<'_> {
             description: description.to_string(),
             ..case
         };
+        self.ensure_case_file_free(&updated.case_file, Some(case_id))?;
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
+            ensure_case_file_free(conn, &updated.case_file, Some(case_id))?;
             conn.execute(
                 "UPDATE cases SET case_file = ?, case_name = ?, description = ? WHERE id = ?",
                 params![updated.case_file, updated.case_name, updated.description, case_id],

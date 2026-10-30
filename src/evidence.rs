@@ -2,9 +2,10 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde_json::json;
 
 use crate::canonical::utc_now;
+use crate::cases::next_id;
 use crate::db::{Cells, ensure_case_open};
-use crate::error::{FactumError, Result};
-use crate::log_service::{Append, KIND_SYSTEM};
+use crate::error::{ErrorKind, FactumError, Result};
+use crate::log_service::{Append, KIND_SYSTEM, MAX_ATTEMPTS};
 use crate::pystr::strip;
 use crate::services::Factum;
 
@@ -58,34 +59,48 @@ impl Factum<'_> {
         }
         ensure_case_open(&self.db.conn, case_id)?;
         let created_utc = utc_now();
-        let evidence_id = self.db.transaction(|conn| {
-            conn.execute(
-                "INSERT INTO evidence (case_id, description, evidence_hash, created_utc, details) VALUES (?, ?, ?, ?, ?)",
-                params![case_id, description, evidence_hash, created_utc, details],
-            )?;
-            Ok(conn.last_insert_rowid())
-        })?;
-        let payload = json!({"event": "evidence_created", "evidence_id": evidence_id, "case_id": case_id,
-                             "description": description, "evidence_hash": evidence_hash, "created_utc": created_utc,
-                             "details": details});
-        let mut text = format!("Evidence #{evidence_id} created: {description}");
-        if !evidence_hash.is_empty() {
-            text += &format!(" · {evidence_hash}");
+        // like a case: the id is predicted and signed first, the row goes in with the log entry
+        for _ in 0..MAX_ATTEMPTS {
+            let evidence_id = self.next_id("evidence")?;
+            let payload = json!({"event": "evidence_created", "evidence_id": evidence_id, "case_id": case_id,
+                                 "description": description, "evidence_hash": evidence_hash,
+                                 "created_utc": created_utc, "details": details});
+            let mut text = format!("Evidence #{evidence_id} created: {description}");
+            if !evidence_hash.is_empty() {
+                text += &format!(" · {evidence_hash}");
+            }
+            let reserve = |conn: &rusqlite::Connection| -> Result<()> {
+                if next_id(conn, "evidence")? != evidence_id {
+                    return Err(FactumError::log_changed(
+                        "Other evidence was created meanwhile, nothing was saved — try again.",
+                    ));
+                }
+                conn.execute(
+                    "INSERT INTO evidence (id, case_id, description, evidence_hash, created_utc, details) \
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                    params![evidence_id, case_id, description, evidence_hash, created_utc, details],
+                )?;
+                Ok(())
+            };
+            let appended = self.append(
+                case_id,
+                KIND_SYSTEM,
+                &text,
+                Append {
+                    payload: Some(payload),
+                    reserve: Some(&reserve),
+                    ..Default::default()
+                },
+            );
+            match appended {
+                Err(e) if e.is(ErrorKind::LogChanged) => continue,
+                Err(e) => return Err(e),
+                Ok(_) => return Ok(evidence_id),
+            }
         }
-        if let Err(e) = self.append(
-            case_id,
-            KIND_SYSTEM,
-            &text,
-            Append {
-                payload: Some(payload),
-                ..Default::default()
-            },
-        ) {
-            self.db
-                .transaction(|conn| Ok(conn.execute("DELETE FROM evidence WHERE id = ?", [evidence_id])?))?;
-            return Err(e);
-        }
-        Ok(evidence_id)
+        Err(FactumError::log_changed(
+            "Other evidence was created meanwhile, nothing was saved — try again.",
+        ))
     }
 
     /// Changes the description of an evidence item; an unchanged text writes nothing.

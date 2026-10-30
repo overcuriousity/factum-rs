@@ -13,6 +13,9 @@ use crate::error::{FactumError, Result};
 use crate::markup::{self, Block, ImageTarget, Inline};
 
 pub const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// All images of one note version together. Every correction signs and stores the images again, so a note's size
+/// grows with each version; this keeps the database and the exports from growing without bound.
+pub const MAX_NOTE_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 /// URL scheme of an image reference inside note text
 pub const SCHEME: &str = "factum-image:";
 /// The only types a report embeds or writes out; a stored `mime` is untrusted data.

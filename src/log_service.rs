@@ -43,6 +43,10 @@ pub fn entry_signed_payload(leaf_hash: &str, tree_size: i64, root_hash: &str) ->
 /// Something to do inside the append transaction, after the entry row was inserted (gets the new entry id).
 pub type OnCommit<'f> = &'f dyn Fn(&Connection, i64) -> Result<()>;
 
+/// Something to do right after the write lock is taken, before the entry is checked and inserted: reserves the row
+/// the entry is about (a new case or evidence item). Fails with `log_changed` when what it was prepared for moved.
+pub type Reserve<'f> = &'f dyn Fn(&Connection) -> Result<()>;
+
 /// What to append; the defaults are a note without evidence, payload or correction.
 #[derive(Default)]
 pub struct Append<'f> {
@@ -51,6 +55,7 @@ pub struct Append<'f> {
     pub corrects_id: Option<i64>,
     pub allow_archived: bool,
     pub on_commit: Option<OnCommit<'f>>,
+    pub reserve: Option<Reserve<'f>>,
 }
 
 impl Factum<'_> {
@@ -109,6 +114,9 @@ impl Factum<'_> {
                 )));
             }
             let result = (|| -> Result<Option<i64>> {
+                if let Some(reserve) = options.reserve {
+                    reserve(conn)?;
+                }
                 let size: i64 = conn.query_row("SELECT COUNT(*) FROM entries WHERE case_id = ?", [case_id], |row| {
                     row.get(0)
                 })?;

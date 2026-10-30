@@ -1920,7 +1920,14 @@ impl FactumApp {
                     .into_iter()
                     .map(|(tag, _)| tag)
                     .collect();
-                let known = crate::tags::tag_counts(&self.db.conn)
+                let known = self
+                    .factum()
+                    .get_entry_without_payload(entry_id)
+                    .ok()
+                    .flatten()
+                    .map_or(Ok(Vec::new()), |entry| {
+                        crate::tags::tag_counts(&self.db.conn, entry.case_id)
+                    })
                     .inspect_err(|e| log::error!("The tags in use cannot be read: {e}"))
                     .unwrap_or_default()
                     .into_iter()
@@ -3313,6 +3320,7 @@ impl FactumApp {
             ui.visuals().widgets.inactive.bg_stroke
         };
         let inner = (ui.available_height() - 2.0 * stroke.width).max(24.0);
+        let case_id = self.current_case_id();
         let editor = egui::Frame::new()
             .fill(ui.visuals().text_edit_bg_color())
             .stroke(stroke)
@@ -3332,7 +3340,7 @@ impl FactumApp {
                             // the panel sets the height, not the default of four rows
                             .desired_rows(1)
                             .min_size(egui::vec2(0.0, inner));
-                        self.tag_completion.show(ui, &self.db, field, id)
+                        self.tag_completion.show(ui, &self.db, case_id, field, id)
                     })
                     .inner
             })

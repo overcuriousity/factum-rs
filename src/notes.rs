@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, Row, ToSql, params};
 use serde_json::Value;
 
@@ -185,6 +187,26 @@ fn referenced_images(text: &str, images: &[NoteImage]) -> Result<Vec<NoteImage>>
         .collect()
 }
 
+/// The images of one note version may not add up to more than the limit. A correction of a note that is over it
+/// already (from before the limit) may keep its images, but not add any.
+fn check_total_size(kept: &[NoteImage], previous: &[NoteImage]) -> Result<()> {
+    let total: usize = kept.iter().map(|image| image.bytes.len()).sum();
+    if total > images::MAX_NOTE_IMAGE_BYTES && kept.iter().any(|image| images::find(previous, &image.id).is_none()) {
+        return Err(FactumError::general(format!(
+            "The images of a note may add up to {} MB at most; these are {} MB.",
+            images::MAX_NOTE_IMAGE_BYTES / (1024 * 1024),
+            total.div_ceil(1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+fn inconsistent_chain(entry_id: i64) -> FactumError {
+    FactumError::general(format!(
+        "The correction chain of entry #{entry_id} is inconsistent (it loops); the database was changed outside factum."
+    ))
+}
+
 impl Factum<'_> {
     pub fn create_note(&self, note_text: &str, evidence_id: Option<i64>, case_id: i64) -> Result<i64> {
         self.create_note_with_images(note_text, &[], evidence_id, case_id)
@@ -228,6 +250,7 @@ impl Factum<'_> {
             }
         }
         let kept = referenced_images(note_text, images)?;
+        check_total_size(&kept, &[])?;
         self.append(
             case_id,
             KIND_NOTE,
@@ -265,6 +288,8 @@ impl Factum<'_> {
         let kept = referenced_images(new_text, images)?;
         // versions never branch: a correction always attaches to the newest version of the line
         let newest = self.latest_version_id(note_id)?;
+        let previous = self.get_entry(newest)?.map(|e| e.images()).unwrap_or_default();
+        check_total_size(&kept, &previous)?;
         // the pin and the labels follow the newest version
         let move_pin_and_labels = |conn: &rusqlite::Connection, new_id: i64| -> Result<()> {
             let pinned: i64 =
@@ -339,8 +364,12 @@ impl Factum<'_> {
     }
 
     pub fn latest_version_id(&self, entry_id: i64) -> Result<i64> {
+        let mut seen = HashSet::from([entry_id]);
         let mut current = entry_id;
         while let Some(successor) = self.successor_id(current)? {
+            if !seen.insert(successor) {
+                return Err(inconsistent_chain(entry_id));
+            }
             current = successor;
         }
         Ok(current)
@@ -349,6 +378,7 @@ impl Factum<'_> {
     /// All versions of the entry's line, oldest first.
     pub fn history(&self, entry_id: i64) -> Result<Vec<i64>> {
         let mut first = entry_id;
+        let mut seen = HashSet::from([entry_id]);
         loop {
             let corrects: Option<Option<i64>> = self
                 .db
@@ -358,12 +388,21 @@ impl Factum<'_> {
                 })
                 .optional()?;
             match corrects {
-                Some(Some(previous)) => first = previous,
+                Some(Some(previous)) => {
+                    if !seen.insert(previous) {
+                        return Err(inconsistent_chain(entry_id));
+                    }
+                    first = previous;
+                }
                 _ => break,
             }
         }
         let mut versions = vec![first];
+        let mut seen = HashSet::from([first]);
         while let Some(successor) = self.successor_id(*versions.last().unwrap())? {
+            if !seen.insert(successor) {
+                return Err(inconsistent_chain(entry_id));
+            }
             versions.push(successor);
         }
         Ok(versions)

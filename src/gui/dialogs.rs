@@ -387,6 +387,18 @@ pub(super) fn suggestions_shown(suggestions: &[(&str, usize, crate::tags::Match)
     !suggestions.is_empty() && !(suggestions.len() == 1 && suggestions[0].2 == crate::tags::Match::Exact)
 }
 
+/// `name` split around the `len` characters at character position `at`. `at` was counted in the lowercased name; when
+/// lowercasing changed the length (`İ` becomes two characters) it does not point into `name`: no highlight.
+fn highlight_parts(name: &str, at: usize, len: usize) -> Option<(String, String, String)> {
+    let chars: Vec<char> = name.chars().collect();
+    if len == 0 || at > chars.len() || name.to_lowercase().chars().count() != chars.len() {
+        return None;
+    }
+    let end = (at + len).min(chars.len());
+    let part = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    Some((part(0..at), part(at..end), part(end..chars.len())))
+}
+
 /// The suggestions under a text field, like a dropdown attached to it: the typed part of each name in bold, how
 /// many entries carry it on the right. Returns the clicked one.
 pub(super) fn suggestion_list(
@@ -416,17 +428,15 @@ pub(super) fn suggestion_list(
                     Match::Typo(_) => None,
                 };
                 let mut job = egui::text::LayoutJob::default();
-                let chars: Vec<char> = name.chars().collect();
                 let plain = egui::TextFormat::simple(egui::FontId::proportional(theme::BODY_SIZE), p.text);
                 let bold = egui::TextFormat::simple(egui::FontId::new(theme::BODY_SIZE, theme::bold()), p.accent);
-                match start {
-                    Some(at) if typed_len > 0 => {
-                        let end = (at + typed_len).min(chars.len());
-                        job.append(&chars[..at].iter().collect::<String>(), 0.0, plain.clone());
-                        job.append(&chars[at..end].iter().collect::<String>(), 0.0, bold);
-                        job.append(&chars[end..].iter().collect::<String>(), 0.0, plain);
+                match start.and_then(|at| highlight_parts(name, at, typed_len)) {
+                    Some((before, hit, after)) => {
+                        job.append(&before, 0.0, plain.clone());
+                        job.append(&hit, 0.0, bold);
+                        job.append(&after, 0.0, plain);
                     }
-                    _ => job.append(name, 0.0, plain),
+                    None => job.append(name, 0.0, plain),
                 }
                 let background = ui.painter().add(egui::Shape::Noop);
                 let row = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
@@ -1773,6 +1783,21 @@ impl VerifyWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlight_survives_names_that_change_length_when_lowercased() {
+        // 'İ' lowercases to two characters: the offset of the match is past the end of the name
+        let known = [("İZMİR".to_string(), 1)];
+        let found = crate::tags::suggest("r", &known, 5);
+        let crate::tags::Match::Substring(at) = found[0].2 else {
+            panic!("expected a substring match")
+        };
+        assert_eq!(highlight_parts("İZMİR", at, 1), None);
+        assert_eq!(
+            highlight_parts("Malware", 3, 4),
+            Some(("Mal".into(), "ware".into(), String::new()))
+        );
+    }
 
     #[test]
     fn signature_texts() {

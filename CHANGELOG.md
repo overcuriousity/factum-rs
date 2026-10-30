@@ -21,6 +21,15 @@ All notable changes to this project are documented here. The format follows
 - `verify.py` needs gpg 2.1 or newer and says so on an older one
 
 ### Fixed
+- A case or evidence item and its log entry are now written in one transaction, so a crash while signing can no
+  longer leave a row without its log event; the logged ids are unchanged
+- A case file number already used by an open case is refused, when creating a case and when editing one (archived cases
+  may share it)
+- A correction chain that loops in a tampered database gives an error instead of hanging
+- The images of one note version may add up to 50 MB; older notes over it can be corrected without adding images
+- `page#section` in a URL, `a#b` and `&#38;` no longer create tags in new notes; existing notes keep their tags
+- Tag and label suggestions come from the current case only
+- A tag such as `#İZMİR` no longer crashes the suggestion list
 - A signature made before its key expired is valid with a warning (`key_expired`) instead of invalid, in factum and in
   `verify.py`; one made after the expiry is invalid. gpg gives no trust level for an expired key, so it counts as
   trusted if it is ultimately trusted, or if only its signing subkey expired and the primary key is valid. An expired
