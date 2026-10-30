@@ -85,7 +85,7 @@ pub struct SignatureCheck {
     pub username: Option<String>,
     pub trust: Option<String>,
     pub signature_timestamp: Option<String>,
-    /// good, but the signing key has expired since
+    /// gpg found the signing key expired; with `valid`, the signature was made before that
     pub key_expired: bool,
     /// the subkey that signed, when it is not the primary key in `fingerprint`
     pub signing_subkey: Option<String>,
@@ -376,7 +376,7 @@ impl Factum<'_> {
             // gpg names no trust level for an expired key
             let message = if check.key_expired {
                 format!(
-                    "{what}: signing key {} has expired and is not ultimately trusted.",
+                    "{what}: signing key {} has expired and is not trusted as far as gpg can tell.",
                     or_none(&check.fingerprint)
                 )
             } else {

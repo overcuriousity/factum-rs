@@ -28,9 +28,9 @@ This archive is a self-contained, verifiable export of one factum case.
 
 On Windows, run `py verify.py <this-bundle>.zip` instead.
 
-Needs Python 3.8+ and gpg (on Windows: Gpg4win). By default your own keyring is used, so the signer's key must be in it and trusted.
-A signature made before its key expired still counts, with a warning; gpg gives no trust level for an expired key, so
-it must be ultimately trusted.
+Needs Python 3.8+ and gpg 2.1 or newer (on Windows: Gpg4win). By default your own keyring is used, so the signer's key must be in it and trusted.
+A signature made before its key expired still counts, with a warning. gpg gives no trust level for an expired key: it
+counts as trusted if ultimately trusted, or if only its signing subkey expired and the primary key is valid.
 Without the key: `python3 verify.py <bundle>.zip --use-bundled-keys` imports `public-keys.asc` into a temporary
 keyring. Keys shipped inside the bundle prove nothing about who signed — compare the printed fingerprints with a
 trusted source.

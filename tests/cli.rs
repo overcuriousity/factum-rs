@@ -495,6 +495,88 @@ fn expired_key_that_is_not_ultimately_trusted_stays_untrusted() {
     assert_eq!(result.trust, None);
 }
 
+/// A key valid only through this home's certification, whose signing subkey expired on 2020-02-01; and text it signed.
+fn certified_key_with_expired_subkey(home: &common::GpgHome) -> Option<String> {
+    let owner = common::GpgHome::at_time(Some("20200101T000000"), "Colleague <c@factum.invalid>", "cert", "never")?;
+    let fingerprint = owner.fingerprints("c@factum.invalid")[0].clone();
+    owner.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-add-key",
+        &fingerprint,
+        "ed25519",
+        "sign",
+        "2020-02-01",
+    ]);
+    let f = Fixture::new();
+    let signature = gpg(&f, &owner).sign_text(r#"{"a":1}"#).unwrap();
+    let path = home.path().join("key.asc");
+    std::fs::write(&path, owner.gpg_ok(&["--armor", "--export"]).stdout).unwrap();
+    home.gpg_ok(&["--batch", "--import", path.to_str().unwrap()]);
+    home.gpg_ok(&["--batch", "--yes", "--quick-lsign-key", &fingerprint]);
+    Some(signature)
+}
+
+#[test]
+fn an_expired_subkey_on_a_certified_primary_key_stays_trusted() {
+    let home = require_gpg!("Examiner <examiner@factum.invalid>");
+    let Some(signature) = certified_key_with_expired_subkey(&home) else {
+        return;
+    };
+    let listing = home
+        .gpg_ok(&["--list-keys", "--with-colons", "c@factum.invalid"])
+        .stdout;
+    assert!(String::from_utf8_lossy(&listing).contains("\npub:f:"));
+    let result = GnupgSigner::without_key(Some(home.path())).verify_signature(&signature);
+    assert!(result.valid && result.key_expired, "{result:?}");
+    assert_eq!(result.trust.as_deref(), Some("TRUST_FULLY"));
+}
+
+#[test]
+fn a_remembered_expired_key_refuses_to_sign_instead_of_going_unsigned() {
+    let Some(home) = expiring_home() else { return };
+    let f = Fixture::new();
+    let key = gpg(&f, &home).active_key().unwrap();
+    home.set_clock(None);
+    let signer = GnupgSigner::new(&f.db, Some(home.path()));
+    assert_eq!(signer.active_key(), Some(key.clone()));
+    let factum = factum::Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    let error = factum.create_case("C-1", "Case", "").unwrap_err();
+    assert_eq!(error.kind, factum::error::ErrorKind::Signing, "{error:?}");
+    assert_eq!(f.count("SELECT COUNT(*) FROM cases"), 0);
+    // the key dialog shows it as expired; it is not offered to anyone who has not chosen it
+    let listed = signer.list_keys();
+    assert!(listed.len() == 1 && listed[0].keyid == key && listed[0].expired());
+    assert!(GnupgSigner::without_key(Some(home.path())).list_keys().is_empty());
+}
+
+#[test]
+fn a_remembered_revoked_key_refuses_to_sign() {
+    let home = require_gpg!("Revoked <revoked@factum.invalid>");
+    let f = Fixture::new();
+    let key = gpg(&f, &home).active_key().unwrap();
+    revoke(&home, "revoked@factum.invalid");
+    let signer = GnupgSigner::new(&f.db, Some(home.path()));
+    assert_eq!(signer.active_key(), Some(key));
+    assert_eq!(signer.sign_text("text"), None);
+    assert!(signer.last_sign_failed());
+    assert!(signer.list_keys()[0].revoked());
+}
+
+#[test]
+fn a_remembered_key_gone_from_the_keyring_is_no_active_key() {
+    let home = require_gpg!("Gone <gone@factum.invalid>");
+    let f = Fixture::new();
+    gpg(&f, &home);
+    let fingerprint = home.fingerprints("gone@factum.invalid")[0].clone();
+    home.gpg_ok(&["--batch", "--yes", "--delete-secret-and-public-key", &fingerprint]);
+    let signer = GnupgSigner::new(&f.db, Some(home.path()));
+    assert_eq!(signer.active_key(), None);
+    let factum = factum::Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    assert!(factum.create_case("C-1", "Case", "").is_ok());
+}
+
 #[test]
 fn signature_made_after_the_key_expired_is_invalid() {
     let home = common::GpgHome::at_time(Some("20200101T000000"), "Late <late@factum.invalid>", "sign", "never");
@@ -671,7 +753,9 @@ fn a_good_signature_followed_by_garbage_does_not_count() {
     let signer = gpg(&f, &home);
     let signature = signer.sign_text("text").unwrap();
     assert!(signer.verify_signature(&signature).valid);
-    assert!(!signer.verify_signature(&format!("{signature}{signature}")).valid);
+    let result = signer.verify_signature(&format!("{signature}{signature}"));
+    assert!(!result.valid);
+    assert_eq!(result.status, "bad signature");
 }
 
 // --- the verification cache

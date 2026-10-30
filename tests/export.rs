@@ -633,6 +633,116 @@ fn verify_py_accepts_a_key_expired_since_with_a_warning() {
     );
 }
 
+fn expired_key_bundle(f: &Fixture) -> Option<(common::GpgHome, PathBuf)> {
+    let home = common::GpgHome::at_time(
+        Some("20200101T000000"),
+        "Expired Key <expired@factum.invalid>",
+        "sign",
+        "2020-02-01",
+    )?;
+    let signer = gpg_signer(&f.db, &home);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    Some((home, bundle))
+}
+
+#[test]
+fn verify_py_refuses_an_expired_key_gpg_cannot_say_is_trusted() {
+    let f = Fixture::new();
+    let Some((home, bundle)) = expired_key_bundle(&f) else {
+        return;
+    };
+    let elsewhere = require_gpg!("Someone Else <else@factum.invalid>");
+    let path = elsewhere.path().join("key.asc");
+    std::fs::write(&path, home.gpg_ok(&["--armor", "--export"]).stdout).unwrap();
+    elsewhere.gpg_ok(&["--batch", "--import", path.to_str().unwrap()]);
+    let Some((code, output)) = run_verify(&bundle, Some(&elsewhere.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 1, "{output}");
+    assert!(
+        output.contains("has expired and is not trusted as far as gpg can tell"),
+        "{output}"
+    );
+}
+
+#[test]
+fn verify_py_with_bundled_keys_accepts_an_expired_key_with_a_warning() {
+    let f = Fixture::new();
+    let Some((_home, bundle)) = expired_key_bundle(&f) else {
+        return;
+    };
+    let empty_home = tempfile::Builder::new().prefix("fe-").tempdir_in("/tmp").unwrap();
+    let Some((code, output)) = run_verify(&bundle, Some(empty_home.path()), &["--use-bundled-keys"]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("has expired since"), "{output}");
+    let _ = Command::new("gpgconf")
+        .arg("--homedir")
+        .arg(empty_home.path())
+        .args(["--kill", "gpg-agent"])
+        .output();
+}
+
+#[test]
+fn verify_py_accepts_an_expired_subkey_on_a_certified_primary_key() {
+    let user_id = "Colleague <c@factum.invalid>";
+    let Some(owner) = common::GpgHome::at_time(Some("20200101T000000"), user_id, "cert", "never") else {
+        return;
+    };
+    let fingerprint = owner.fingerprints("c@factum.invalid")[0].clone();
+    owner.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-add-key",
+        &fingerprint,
+        "ed25519",
+        "sign",
+        "2020-02-01",
+    ]);
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &owner);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    let home = require_gpg!("Examiner <examiner@factum.invalid>");
+    let path = home.path().join("key.asc");
+    std::fs::write(&path, owner.gpg_ok(&["--armor", "--export"]).stdout).unwrap();
+    home.gpg_ok(&["--batch", "--import", path.to_str().unwrap()]);
+    home.gpg_ok(&["--batch", "--yes", "--quick-lsign-key", &fingerprint]);
+    let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("has expired since"), "{output}");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_py_says_when_gpg_is_too_old() {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let dir = tempfile::tempdir().unwrap();
+    let gpg = dir.path().join("gpg");
+    std::fs::write(&gpg, "#!/bin/sh\necho 'gpg (GnuPG) 2.0.22'\necho 'libgcrypt 1.5.3'\n").unwrap();
+    std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = dir.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let output = Command::new(python)
+        .arg(&script)
+        .arg(&bundle)
+        .env("PATH", dir.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("needs gpg 2.1 or newer, this is gpg 2.0.22"), "{text}");
+    assert!(!text.contains("Result:"), "{text}");
+}
+
 #[test]
 fn verify_py_names_the_primary_key_of_a_subkey_signature() {
     let user_id = "Subkey Signer <subkey@factum.invalid>";

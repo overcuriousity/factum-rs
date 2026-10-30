@@ -59,7 +59,7 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 
 ### Requirements
 
-- **GPG** for signing and verification: `gpg` on the `PATH` (Linux: the `gnupg2`/`gnupg` package; macOS:
+- **GPG** for signing and verification: `gpg` 2.1 or newer on the `PATH` (Linux: the `gnupg2`/`gnupg` package; macOS:
   `brew install gnupg`; Windows: [Gpg4win](https://www.gpg4win.org/)). Without it, notes can still be written, unsigned.
 - **gpgsm** (part of GnuPG) only for X.509-signed evidence containers.
 - **GUI on Linux**: OpenGL (Mesa) and an X11 or Wayland session; nothing else is linked. The GUI's file dialogs use

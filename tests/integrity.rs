@@ -738,7 +738,7 @@ fn a_signature_of_an_expired_key_without_ultimate_trust_fails() {
     assert_eq!((findings[0].level, findings[0].code), (Level::Fail, "key_untrusted"));
     assert_eq!(
         findings[0].message,
-        "Entry #1: signing key F has expired and is not ultimately trusted."
+        "Entry #1: signing key F has expired and is not trusted as far as gpg can tell."
     );
 }
 

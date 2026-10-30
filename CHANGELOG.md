@@ -18,13 +18,17 @@ All notable changes to this project are documented here. The format follows
 - Reports and `verify.py` name the primary key's fingerprint of a signature made with a subkey (a primary key's
   fingerprint is unchanged); the entry's integrity lines also name the subkey
 - A signature counts only as exactly one good signature with a clean gpg exit code, in factum and in `verify.py`
+- `verify.py` needs gpg 2.1 or newer and says so on an older one
 
 ### Fixed
 - A signature made before its key expired is valid with a warning (`key_expired`) instead of invalid, in factum and in
   `verify.py`; one made after the expiry is invalid. gpg gives no trust level for an expired key, so it counts as
-  trusted only if ultimately trusted
-- Keys with a certify-only primary key and a signing subkey can be selected; expired and revoked keys are no longer
-  listed
+  trusted if it is ultimately trusted, or if only its signing subkey expired and the primary key is valid. An expired
+  primary key that was trusted only through certification by another key (a colleague's key you signed) still fails,
+  now as `key_untrusted`, not as an invalid signature
+- Keys with a certify-only primary key and a signing subkey can be selected; expired and revoked keys can no longer be
+  selected. A remembered key that expired or was revoked stays active and listed, so signing is still refused with an
+  error, never silently unsigned
 - Checking a tampered signature that holds a symmetric-encrypted message no longer opens a passphrase prompt
 - A malformed database cell (invalid UTF-8, wrong type) gives a FAIL for its row instead of stopping `--verify`
 - A database made by a newer factum says so and asks for an upgrade, instead of calling itself older

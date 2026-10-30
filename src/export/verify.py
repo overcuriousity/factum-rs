@@ -6,7 +6,7 @@
 
 On Windows, use "py" instead of "python3".
 
-Needs Python 3.8 or newer and gpg on the PATH; uses only the Python standard library.
+Needs Python 3.8 or newer and gpg 2.1 or newer on the PATH; uses only the Python standard library.
 Exit code 0: no failures (warnings are possible). Exit code 1: at least one failure.
 The format is specified in README.md next to this file.
 """
@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -157,13 +158,15 @@ class Gpg(object):
             handle.write(content)
         return path
 
-    def ultimately_trusted(self, fingerprint):
-        """gpg gives no trust level for an expired key; its owner trust is still there, and only "u" makes a key valid."""
+    def expired_key_trusted(self, fingerprint):
+        """gpg gives no trust level for a signature by an expired key, but the key listing still says what it can: the
+        validity of a live primary key whose signing subkey expired, and owner trust, of which only "u" makes a key
+        valid. An expired primary key that was valid through certification cannot be told apart."""
         output, _, _ = self.run(["--list-keys", "--with-colons", "--fixed-list-mode", fingerprint])
         for line in output.decode("utf-8", "replace").splitlines():
             fields = line.split(":")
             if fields[0] == "pub":
-                return len(fields) > 8 and fields[8] == "u"
+                return fields[1] in ("u", "f") or (len(fields) > 8 and fields[8] == "u")
         return False
 
     def check(self, what, signature, expected_text=None, data=None):
@@ -192,8 +195,8 @@ class Gpg(object):
             if not expired:
                 fail("%s: signing key %s is not trusted." % (what, fingerprint))
                 return False
-            if not self.ultimately_trusted(fingerprint):
-                fail("%s: signing key %s has expired and is not ultimately trusted." % (what, fingerprint))
+            if not self.expired_key_trusted(fingerprint):
+                fail("%s: signing key %s has expired and is not trusted as far as gpg can tell." % (what, fingerprint))
                 return False
         if expired:
             warn("%s: signing key %s has expired since." % (what, fingerprint))
@@ -201,6 +204,16 @@ class Gpg(object):
 
     def cleanup(self):
         shutil.rmtree(self.workdir, ignore_errors=True)
+
+
+def old_gpg():
+    """The version of gpg when it is older than 2.1, which has no --pinentry-mode; None otherwise."""
+    result = subprocess.run(["gpg", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = result.stdout.decode("utf-8", "replace").splitlines()
+    match = re.search(r"(\d+)\.(\d+)\S*", lines[0]) if lines else None
+    if match and (int(match.group(1)), int(match.group(2))) < (2, 1):
+        return match.group(0)
+    return None
 
 
 def check_manifest(files):
@@ -342,6 +355,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if shutil.which("gpg") is None:
         print("gpg is not installed or not on the PATH.")
+        return 1
+    version = old_gpg()
+    if version:
+        print("verify.py needs gpg 2.1 or newer, this is gpg %s. Nothing was checked." % version)
         return 1
     files = load_bundle(args.bundle)
     home = None

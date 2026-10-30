@@ -71,6 +71,17 @@ impl GpgKey {
     pub fn can_sign(&self) -> bool {
         self.cap.contains('S')
     }
+
+    /// Why a key that cannot sign cannot.
+    fn unusable_reason(&self) -> &'static str {
+        if self.revoked() {
+            "was revoked"
+        } else if self.expired() {
+            "has expired"
+        } else {
+            "has no usable signing key"
+        }
+    }
 }
 
 /// A Unix time from a --with-colons field as YYYY-MM-DD.
@@ -107,7 +118,7 @@ pub struct VerifyResult {
     pub username: Option<String>,
     pub signature_timestamp: Option<String>,
     pub trust: Option<String>,
-    /// good, made before the signing key expired, which it has since
+    /// gpg found the signing key expired; with `valid`, the signature was made before that
     pub key_expired: bool,
     /// the subkey that signed, when it is not the primary key in `fingerprint`
     pub signing_subkey: Option<String>,
@@ -117,7 +128,8 @@ pub trait Signer {
     /// false when gpg is not installed: notes can still be written, unsigned
     fn available(&self) -> bool;
     fn active_key(&self) -> Option<String>;
-    /// Only secret keys that have signing capability.
+    /// Only secret keys that have signing capability, and the active key whatever its state: it stays active after
+    /// expiring, and the list shows why it no longer signs.
     fn list_keys(&self) -> Vec<GpgKey>;
     /// Selects a signing key and remembers it in the database (shared by CLI and GUI).
     fn set_active_key(&self, db: &Db, key_id: &str) -> bool;
@@ -343,14 +355,17 @@ fn verify_result(output: &GpgOutput) -> VerifyResult {
     } else {
         Some(crate::pystr::strip(&String::from_utf8_lossy(&output.stdout)).to_string())
     };
-    // without any of these gpg did not get as far as checking the signature: its error says why
     result.status = if result.valid {
         "signature valid".to_string()
     } else if let Some(rejected) = rejected {
         rejected.to_string()
     } else if good > 1 || validsig > 1 {
         "more than one signature".to_string()
+    } else if good > 0 || validsig > 0 {
+        // gpg's own words would be a "Good signature" in a failure, in the user's locale
+        "bad signature".to_string()
     } else {
+        // gpg did not get as far as checking the signature: its error says why
         Some(gpg_error(&output.stderr))
             .filter(|e| !e.is_empty())
             .unwrap_or_else(|| "gpg gave no result".into())
@@ -414,10 +429,39 @@ impl GnupgSigner {
         let key_id = db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default();
         if key_id.is_empty() {
             log::debug!("No active GPG key ID found in settings.");
-        } else if self.set_active_key(db, &key_id) {
+            return;
+        }
+        let Some(key) = self.secret_keys().into_iter().find(|key| key.keyid == key_id) else {
+            log::warn!("Failed to set active GPG key from settings: {key_id}");
+            return;
+        };
+        // a key that no longer signs stays active: signing then fails, instead of notes going unsigned
+        if key.can_sign() {
             log::debug!("Loaded active GPG key from settings: {key_id}");
         } else {
-            log::warn!("Failed to set active GPG key from settings: {key_id}");
+            log::warn!(
+                "The active GPG key {key_id} {}: signing fails until another key is selected.",
+                key.unusable_reason()
+            );
+        }
+        *self.active_key_id.borrow_mut() = Some(key_id);
+    }
+
+    /// Every secret key, whether or not it can sign.
+    fn secret_keys(&self) -> Vec<GpgKey> {
+        let args = [
+            "--list-secret-keys",
+            "--with-colons",
+            "--fixed-list-mode",
+            "--with-fingerprint",
+        ];
+        match self.run(&args, b"") {
+            Some(Ok(output)) => parse_key_listing(&String::from_utf8_lossy(&output.stdout)),
+            Some(Err(e)) => {
+                log::warn!("Could not list GPG keys: {e}");
+                Vec::new()
+            }
+            None => Vec::new(),
         }
     }
 
@@ -525,8 +569,9 @@ impl GnupgSigner {
         result
     }
 
-    /// gpg gives no trust level for a signature by an expired key. Owner trust survives expiry, but says more than
-    /// validity only at `u`: that makes a key valid by itself, `f` does not.
+    /// gpg gives no trust level for a signature by an expired key, but the key listing still says what it can: the
+    /// validity of a live primary key whose signing subkey expired, and owner trust. Owner trust `u` makes a key valid
+    /// by itself, `f` does not. An expired primary key that was valid through certification cannot be told apart.
     fn trust_expired_key(&self, result: &mut VerifyResult) {
         if !(result.valid && result.key_expired && result.trust.is_none()) {
             return;
@@ -535,13 +580,15 @@ impl GnupgSigner {
             return;
         };
         let args = ["--list-keys", "--with-colons", "--fixed-list-mode", fingerprint];
-        if let Some(Ok(output)) = self.run_verify(&args, b"")
-            && parse_key_listing(&String::from_utf8_lossy(&output.stdout))
-                .first()
-                .is_some_and(|key| key.ownertrust == "u")
-        {
-            result.trust = Some("TRUST_ULTIMATE".into());
-        }
+        let Some(Ok(output)) = self.run_verify(&args, b"") else {
+            return;
+        };
+        let listing = parse_key_listing(&String::from_utf8_lossy(&output.stdout));
+        result.trust = listing.first().and_then(|key| match key.validity.as_str() {
+            "u" => Some("TRUST_ULTIMATE".to_string()),
+            "f" => Some("TRUST_FULLY".to_string()),
+            _ => (key.ownertrust == "u").then(|| "TRUST_ULTIMATE".to_string()),
+        });
     }
 
     fn verified(&self, output: &GpgOutput) -> VerifyResult {
@@ -561,23 +608,11 @@ impl Signer for GnupgSigner {
     }
 
     fn list_keys(&self) -> Vec<GpgKey> {
-        let args = [
-            "--list-secret-keys",
-            "--with-colons",
-            "--fixed-list-mode",
-            "--with-fingerprint",
-        ];
-        match self.run(&args, b"") {
-            Some(Ok(output)) => parse_key_listing(&String::from_utf8_lossy(&output.stdout))
-                .into_iter()
-                .filter(GpgKey::can_sign)
-                .collect(),
-            Some(Err(e)) => {
-                log::warn!("Could not list GPG keys: {e}");
-                Vec::new()
-            }
-            None => Vec::new(),
-        }
+        let active = self.active_key();
+        self.secret_keys()
+            .into_iter()
+            .filter(|key| key.can_sign() || active.as_ref() == Some(&key.keyid))
+            .collect()
     }
 
     fn set_active_key(&self, db: &Db, key_id: &str) -> bool {
@@ -1052,6 +1087,9 @@ mod tests {
         assert!(!verify_result(&output(&["GOODSIG 1 A", &valid], false)).valid);
         let failure = ["GOODSIG 1 A", &valid, "FAILURE gpg-exit 33554433"];
         assert!(!verify_result(&output(&failure, true)).valid);
+        let mut failed = output(&["GOODSIG 1 A", &valid], false);
+        failed.stderr = "[GNUPG:] GOODSIG 1 A\ngpg: Korrekte Signatur von \"A\"\n".into();
+        assert_eq!(verify_result(&failed).status, "bad signature");
     }
 
     #[test]
