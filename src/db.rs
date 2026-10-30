@@ -148,6 +148,12 @@ impl Db {
         if version == 3 {
             return self.migrate_from_3();
         }
+        if version > SCHEMA_VERSION {
+            return Err(FactumError::unsupported_database(format!(
+                "This database was created by a newer factum version. Upgrade factum to open it. ({})",
+                self.path.display()
+            )));
+        }
         // databases before version 3 are not carried forward
         Err(FactumError::unsupported_database(format!(
             "This database was created by an older factum version and is not supported. Set FACTUM_DB to a new file. ({})",
@@ -368,6 +374,22 @@ mod tests {
         let error = Db::open(&path).err().unwrap();
         assert!(error.is(ErrorKind::UnsupportedDatabase));
         assert!(error.message.contains("created by an older factum version"));
+    }
+
+    #[test]
+    fn database_of_a_newer_version_asks_for_an_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE notes(id INTEGER); PRAGMA user_version = {};",
+            SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+        drop(conn);
+        let error = Db::open(&path).err().unwrap();
+        assert!(error.message.contains("created by a newer factum version"));
+        assert!(error.message.contains("Upgrade factum"));
     }
 
     #[test]
