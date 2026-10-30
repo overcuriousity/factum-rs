@@ -40,9 +40,9 @@ pub static IOC_PATTERNS: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(||
 pub static DOMAIN_EXCLUDED_SUFFIXES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "exe", "dll", "sys", "bat", "cmd", "ps1", "psm1", "vbs", "js", "jse", "hta", "msi", "scr", "lnk", "jar", "pyc",
-        "elf", "dylib", "dmg", "deb", "rpm", "apk", "txt", "log", "csv", "json", "xml", "yml", "yaml", "ini", "cfg",
-        "conf", "html", "htm", "php", "asp", "aspx", "doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt", "pptx",
-        "pdf", "rtf", "odt", "rar", "7z", "gz", "tgz", "tar", "bz2", "xz", "cab", "iso", "img", "vhd", "vhdx", "vmdk",
+        "bin", "pkg", "elf", "dylib", "dmg", "deb", "rpm", "apk", "txt", "log", "csv", "json", "xml", "yml", "yaml",
+        "ini", "cfg", "conf", "html", "htm", "php", "asp", "aspx", "doc", "docx", "docm", "xls", "xlsx", "xlsm", "ppt",
+        "pptx", "pdf", "rtf", "odt", "rar", "7z", "gz", "tgz", "tar", "bz2", "xz", "iso", "img", "vhd", "vhdx", "vmdk",
         "e01", "dd", "raw", "mem", "dmp", "pcap", "pcapng", "evtx", "reg", "db", "sqlite", "dat", "tmp", "bak", "png",
         "jpg", "jpeg", "gif", "bmp", "ico", "svg", "mp3", "mp4", "avi", "wav",
     ]
@@ -77,11 +77,20 @@ fn trim_url(url: &str) -> &str {
 /// The stored form of a value: domains, emails and hashes lowercased, URLs with scheme and host lowercased.
 fn normalize(ioc_type: &str, value: &str) -> String {
     if ioc_type == "url" {
-        let host_end = value.find("://").map_or(0, |i| i + 3);
-        let host_end = value[host_end..]
+        let scheme_end = value.find("://").map_or(0, |i| i + 3);
+        let authority_end = value[scheme_end..]
             .find(['/', '?', '#'])
-            .map_or(value.len(), |i| host_end + i);
-        format!("{}{}", value[..host_end].to_lowercase(), &value[host_end..])
+            .map_or(value.len(), |i| scheme_end + i);
+        let authority = &value[scheme_end..authority_end];
+        // user:pass@ keeps its case, only the host is folded
+        let host_start = authority.rfind('@').map_or(0, |i| i + 1);
+        format!(
+            "{}{}{}{}",
+            value[..scheme_end].to_lowercase(),
+            &authority[..host_start],
+            authority[host_start..].to_lowercase(),
+            &value[authority_end..]
+        )
     } else {
         value.to_lowercase()
     }
@@ -94,6 +103,9 @@ pub fn extract_iocs(text: &str) -> Vec<(String, String)> {
             let mut value = found.as_str();
             if *ioc_type == "url" {
                 value = trim_url(value);
+                if value.ends_with("://") {
+                    continue; // nothing after the scheme
+                }
             }
             if *ioc_type == "domain" {
                 let suffix = value.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -213,7 +225,8 @@ mod tests {
 
     #[test]
     fn file_names_are_not_domains() {
-        assert!(of("domain", "ran evil.exe and notes.TXT").is_empty());
+        assert!(of("domain", "ran evil.exe and notes.TXT, a.bin b.pkg").is_empty());
+        assert_eq!(of("domain", "evil.cab"), vec!["evil.cab"]);
     }
 
     #[test]
@@ -250,6 +263,8 @@ mod tests {
         assert_eq!(of("url", "(see https://evil.com/x), then"), vec!["https://evil.com/x"]);
         assert_eq!(of("url", "[https://evil.com/x]"), vec!["https://evil.com/x"]);
         assert_eq!(of("url", "is it https://evil.com/x?!"), vec!["https://evil.com/x"]);
+        assert!(of("url", "see http://! now").is_empty());
+        assert!(of("url", "http://: and http://)").is_empty());
         assert_eq!(of("url", "<https://evil.com/x>"), vec!["https://evil.com/x"]);
         assert_eq!(of("url", "\"https://evil.com/x\", ok"), vec!["https://evil.com/x"]);
     }
@@ -278,6 +293,10 @@ mod tests {
             vec!["https://evil.com/Path"]
         );
         assert_eq!(of("url", "https://evil.com/A https://evil.com/a").len(), 2);
+        assert_eq!(
+            of("url", "https://Bob:PaSs@Evil.COM/x"),
+            vec!["https://Bob:PaSs@evil.com/x"]
+        );
     }
 
     #[test]
