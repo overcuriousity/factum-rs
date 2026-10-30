@@ -254,6 +254,11 @@ pub fn verification_summary(report: &CaseReport) -> String {
     )
 }
 
+/// The seal folder the verification checked for external seal copies; report text only, not part of case.json.
+pub fn seal_folder_line(report: &CaseReport) -> String {
+    format!("Seal folder checked: {}", report.seal_dir.display())
+}
+
 impl Factum<'_> {
     pub fn evidence_rows(&self, case_id: i64) -> Result<Vec<EvidenceRow>> {
         let mut statement = self.db.conn.prepare(

@@ -7,7 +7,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::html::{evidence_cells, technical_rows};
-use super::model::{ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
+use super::model::{
+    ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence, verification_summary,
+};
 use crate::images::{self, NoteImage};
 use crate::markup::{self, Block, ImageTarget, Inline};
 use crate::verifier::Level;
@@ -332,6 +334,8 @@ pub fn render_markdown(model: &ReportModel, image_dir: &str) -> String {
         format!("**Result: {overall}**"),
         String::new(),
         inline(&verification_summary(report)),
+        String::new(),
+        inline(&seal_folder_line(report)),
         String::new(),
     ]);
     let findings: Vec<String> = grouped_findings(report)

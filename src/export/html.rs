@@ -1,6 +1,8 @@
 //! Self-contained HTML report: the notes first, the verification data at the end.
 
-use super::model::{ReportEntry, ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
+use super::model::{
+    ReportEntry, ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence, verification_summary,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
@@ -316,6 +318,7 @@ pub fn render_html(model: &ReportModel, print_variant: bool) -> String {
     parts.push("<div class='technical'>".into());
     parts.push(format!("<h2>Verification: {overall}</h2>"));
     parts.push(format!("<p class='mono'>{}</p>", escape(&verification_summary(report))));
+    parts.push(format!("<p class='mono'>{}</p>", escape(&seal_folder_line(report))));
     let findings = grouped_findings(report);
     if !findings.is_empty() {
         let items: String = findings

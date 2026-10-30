@@ -13,7 +13,9 @@ use image::{ImageReader, Limits};
 use ttf_parser::{Face, GlyphId};
 
 use super::html::{ALERT, evidence_cells, meta_rows, technical_rows};
-use super::model::{ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
+use super::model::{
+    ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence, verification_summary,
+};
 use crate::images::{self, NoteImage};
 use crate::markup::{self, Block, ImageTarget, Inline};
 use crate::verifier::Level;
@@ -1335,6 +1337,7 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
     pdf.heading(&format!("Verification: {overall}"), 14.0, true);
     let mono = Style::new(FontId::Mono, 8.0, SECONDARY);
     pdf.paragraph(mono, &verification_summary(report), 0.0);
+    pdf.paragraph(mono, &seal_folder_line(report), 0.0);
     pdf.space(4.0);
     for (level, message) in grouped_findings(report) {
         let color = match level {

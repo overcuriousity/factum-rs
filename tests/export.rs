@@ -72,6 +72,19 @@ fn reports_show_the_evidence_description() {
 }
 
 #[test]
+fn reports_name_the_seal_folder_checked() {
+    let f = Fixture::new();
+    let model = model(&f);
+    let line = format!("Seal folder checked: {}", f.seal_dir.display());
+    assert!(render_html(&model, false).contains(&format!("<p class='mono'>{line}</p>")));
+    assert!(render_markdown(&model, "images").contains(&format!("\n{}\n", inline(&line))));
+    let pdf = factum::export::pdf::render_pdf(&model);
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(extracted.contains("Seal folder checked:"), "{extracted}");
+    }
+}
+
+#[test]
 fn short_line() {
     let f = Fixture::new();
     let model = model(&f);
