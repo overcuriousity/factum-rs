@@ -118,6 +118,12 @@ fn double_quoted(rest: &str) -> Option<String> {
 /// closing quote as an escaped quote. Anything else is double-quoted with \\, \" and \n escaped.
 fn quote_dotenv(value: &str) -> String {
     let plain = !value.is_empty() && !value.contains(|c: char| c.is_whitespace() || matches!(c, '#' | '"' | '\''));
+    // `${` goes in single quotes, which shells leave alone. python-dotenv 1.2 expands it in every form and has no
+    // escape for it, so there such a path reads back changed whatever is written here; factum never expands it.
+    // A value with ' or \ or a line break cannot be single-quoted, and stays as below.
+    if value.contains("${") && !value.contains(['\'', '\\', '\n']) {
+        return format!("'{value}'");
+    }
     if plain {
         return value.to_string();
     }
@@ -299,6 +305,26 @@ mod tests {
         assert_eq!(quote_dotenv("\\\\nas\\seals"), "\\\\nas\\seals");
         assert_eq!(quote_dotenv("/usb stick/O'Neil"), "\"/usb stick/O'Neil\"");
         assert_eq!(quote_dotenv("C:\\a b\\\"c\n"), "\"C:\\\\a b\\\\\\\"c\\n\"");
+    }
+
+    #[test]
+    fn dollar_braces_go_in_single_quotes_where_they_can() {
+        assert_eq!(quote_dotenv("/usb/${HOME}/x"), "'/usb/${HOME}/x'");
+        assert_eq!(quote_dotenv("/usb stick/${HOME}"), "'/usb stick/${HOME}'");
+        assert_eq!(quote_dotenv("/usb/$HOME"), "/usb/$HOME");
+        // these cannot be single-quoted
+        assert_eq!(quote_dotenv("D:\\${X}"), "D:\\${X}");
+        assert_eq!(quote_dotenv("/O'Neil/${X}"), "\"/O'Neil/${X}\"");
+        for value in [
+            "/usb/${HOME}/x",
+            "/usb stick/${HOME}",
+            "D:\\${X}",
+            "/O'Neil/${X}",
+            "/a\n${X}",
+        ] {
+            let parsed = parse_dotenv(&format!("KEY={}\n", quote_dotenv(value)));
+            assert_eq!(parsed["KEY"], value);
+        }
     }
 
     #[test]
