@@ -84,9 +84,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Entries and seals created without a key can be **signed later**; they are then shown as "signed later on <date>"
 
 ### Cases and evidence
+- Create cases (file number, name, description) and evidence items (name, hash, description), in the GUI or with
   `--new-case`/`--new-evidence`; both are recorded in the log. An open case cannot reuse the file number of another
   open case (archived cases may share it)
-  `--new-case`/`--new-evidence`; both are recorded in the log
 - **Edit Case** changes file number, name and description through a signed `case_edited` entry; earlier seals stay
   valid
 - **Edit Description…** on an evidence item changes its description through a signed `evidence_edited` entry; name
