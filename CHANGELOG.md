@@ -25,6 +25,11 @@ All notable changes to this project are documented here. The format follows
   fingerprint is unchanged); the entry's integrity lines also name the subkey
 - A signature counts only as exactly one good signature with a clean gpg exit code, in factum and in `verify.py`
 - `verify.py` needs gpg 2.1 or newer and says so on an older one
+- Installers and `scripts/airgap-download.sh` check the signature on `SHA256SUMS` with `gpg` when `SHA256SUMS.asc` is
+  there: a bad signature stops the install; a missing `gpg`, `.asc` or release key (never fetched) only warns that
+  integrity, not authenticity, was checked. The download script fails when a file is not listed in `SHA256SUMS` or a
+  `--target` matches nothing. `install.sh` quotes and escapes the install folder in the menu entry's `Exec=` line;
+  `install.ps1` keeps `%VAR%` entries of the user PATH unexpanded.
 
 ### Fixed
 - `factum --verify <id>` and the lookup by name no longer stop at a case row that cannot be read; it is skipped by

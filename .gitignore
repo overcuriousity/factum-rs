@@ -7,3 +7,5 @@
 /vendor
 /THIRD-PARTY-LICENSES.md
 .superpowers/
+__pycache__/
+*.pyc

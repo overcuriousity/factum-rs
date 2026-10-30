@@ -126,6 +126,28 @@ sha256() {
         die "neither sha256sum nor shasum is installed (use --skip-verify at your own risk)"
     fi
 }
+# the signature on SHA256SUMS: a bad one stops the install; a missing gpg, .asc or release key only
+# means authenticity was not checked (never fetches a key: this may run offline)
+check_signature() { # dir
+    if [ ! -f "$1/SHA256SUMS.asc" ]; then
+        say "warning: no SHA256SUMS.asc; only the integrity of the archive was checked, not who published it"
+        return 0
+    fi
+    if ! command -v gpg >/dev/null 2>&1; then
+        say "warning: gpg is not installed; only the integrity of the archive was checked, not who published it"
+        return 0
+    fi
+    status=$(gpg --batch --status-fd 1 --verify "$1/SHA256SUMS.asc" "$1/SHA256SUMS" 2>/dev/null) || true
+    if printf '%s\n' "$status" | grep -q '^\[GNUPG:\] \(BADSIG\|EXPSIG\|EXPKEYSIG\|REVKEYSIG\) '; then
+        die "the signature on SHA256SUMS is bad, expired or from a revoked key; nothing was installed"
+    elif printf '%s\n' "$status" | grep -q '^\[GNUPG:\] GOODSIG '; then
+        say "signature on SHA256SUMS is good ($(printf '%s\n' "$status" | sed -n 's/^\[GNUPG:\] GOODSIG [^ ]* //p' | head -n 1)); make sure that key is the release key you trust"
+    elif printf '%s\n' "$status" | grep -q '^\[GNUPG:\] \(NO_PUBKEY\|ERRSIG\) '; then
+        say "warning: the release key is not in your keyring; only the integrity of the archive was checked, not who published it"
+    else
+        die "SHA256SUMS.asc could not be checked with gpg; nothing was installed"
+    fi
+}
 
 tmp=$(mktemp -d 2>/dev/null || mktemp -d -t factum)
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -138,6 +160,7 @@ if [ -n "$ARCHIVE" ]; then
     if [ "$VERIFY" = 1 ]; then
         [ -f "$sums" ] || die "SHA256SUMS not found next to $ARCHIVE; copy it from the release too (or use --skip-verify)"
         cp "$sums" "$tmp/SHA256SUMS"
+        [ -f "$sums.asc" ] && cp "$sums.asc" "$tmp/SHA256SUMS.asc"
     fi
 else
     if [ "$VERSION" = latest ]; then
@@ -149,10 +172,12 @@ else
     fetch "$base/$asset" "$tmp/$asset" || die "download of $base/$asset failed"
     if [ "$VERIFY" = 1 ]; then
         fetch "$base/SHA256SUMS" "$tmp/SHA256SUMS" || die "download of SHA256SUMS failed"
+        fetch "$base/SHA256SUMS.asc" "$tmp/SHA256SUMS.asc" 2>/dev/null || rm -f "$tmp/SHA256SUMS.asc"
     fi
 fi
 
 if [ "$VERIFY" = 1 ]; then
+    check_signature "$tmp"
     expected=$(grep "  $asset\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)
     [ -n "$expected" ] || die "$asset is not listed in SHA256SUMS"
     actual=$(sha256 "$tmp/$asset")
@@ -172,7 +197,10 @@ if [ "$DESKTOP" = 1 ]; then
     mkdir -p "$SHARE/applications" "$SHARE/icons/hicolor/256x256/apps"
     cp "$share_src/factum.png" "$SHARE/icons/hicolor/256x256/apps/factum.png"
     # Exec needs an absolute path: a launcher does not see ~/.local/bin on every desktop
-    sed "s|^Exec=factum --gui|Exec=$DIR/factum --gui|" "$share_src/factum.desktop" > "$SHARE/applications/factum.desktop"
+    # Exec value per the Desktop Entry spec: quoted; \ " ` $ escaped for the command, each backslash doubled
+    # for the string, % doubled; then \ & | escaped for sed
+    exec_path=$(printf '%s' "$DIR/factum" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/&&/g' -e 's/%/%%/g' | sed -e 's/[\\&|]/\\&/g')
+    sed "s|^Exec=factum --gui|Exec=\"$exec_path\" --gui|" "$share_src/factum.desktop" > "$SHARE/applications/factum.desktop"
     command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$SHARE/applications" >/dev/null 2>&1 || true
     say "added Factum Notes to the application menu"
 fi
