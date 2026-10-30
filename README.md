@@ -114,8 +114,11 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Exporting seals the case first; a case that fails verification is still exported, with the failures on top
 
 ### IOC extraction
-- IPv4 addresses, domains, URLs, emails, MD5/SHA-1/SHA-256 hashes, grouped by type in the side panel
-- File names such as `evil.exe` or `notes.txt` are not reported as domains
+- IPv4 addresses, domains, URLs, emails, MD5/SHA-1/SHA-256/SHA-512 hashes, grouped by type in the side panel
+- Domains and emails may contain non-ASCII letters (`münchen.de`); they are stored as written, in lowercase. A URL
+  keeps its path and a final `/`, without the punctuation of the sentence around it
+- File names such as `evil.exe` or `notes.txt` are not reported as domains; real TLDs such as `.zip`, `.mov` or `.sh`
+  are
 
 ### Analytical companion
 - An optional mentor that reads the case log through an LLM and keeps a short list of open analytical questions per

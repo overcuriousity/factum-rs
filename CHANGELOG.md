@@ -21,6 +21,10 @@ All notable changes to this project are documented here. The format follows
 - `verify.py` needs gpg 2.1 or newer and says so on an older one
 
 ### Fixed
+- IOC extraction: domains and emails with non-ASCII letters (`münchen.de`) are found; a URL keeps its final `/` and
+  loses trailing punctuation and an unbalanced `)`/`]`; SHA-512 hashes are found; real TLDs such as `.zip`, `.mov`,
+  `.app`, `.sh`, `.py` are no longer taken for file names; domains, emails, hashes and the scheme and host of URLs are
+  lowercased, so `Evil.COM` and `evil.com` are one IOC (IOCs stored by earlier versions are matched regardless of case)
 - A case or evidence item and its log entry are now written in one transaction, so a crash while signing can no
   longer leave a row without its log event; the logged ids are unchanged
 - A case file number already used by an open case is refused, when creating a case and when editing one (archived cases
