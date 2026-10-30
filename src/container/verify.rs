@@ -176,6 +176,8 @@ fn gpg_check(signer: &dyn Signer, signature: &str, turtle: &[u8]) -> SignatureCh
         username: result.username,
         trust: result.trust,
         signature_timestamp: result.signature_timestamp,
+        key_expired: result.key_expired,
+        signing_subkey: result.signing_subkey,
     }
 }
 

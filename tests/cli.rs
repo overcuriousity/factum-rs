@@ -6,6 +6,7 @@ use common::Fixture;
 use factum::cli::{self, Args};
 use factum::notes::EntryFilter;
 use factum::signer::{FakeSigner, GnupgSigner, Signer};
+use factum::verifier::Level;
 
 fn run(f: &Fixture, signer: &dyn Signer, argv: &[&str]) -> (i32, String) {
     let mut out = Vec::new();
@@ -433,4 +434,242 @@ fn new_evidence_with_description() {
     assert_eq!(code, 0);
     let evidence_id = f.factum().list_evidence_for_case(case_id, false).unwrap()[0];
     assert_eq!(f.factum().get_evidence(evidence_id).unwrap().unwrap().details, "seized");
+}
+
+// --- gpg's verdicts, with real signatures
+
+const JANUARY: &str = "20200115T000000";
+const AFTER_EXPIRY: &str = "20200301T000000";
+
+/// A home with a key that expired on 2020-02-01, on a clock in January 2020 until `home.set_clock(None)`.
+fn expiring_home() -> Option<common::GpgHome> {
+    common::GpgHome::at_time(
+        Some("20200101T000000"),
+        "Expired Key <expired@factum.invalid>",
+        "sign",
+        "2020-02-01",
+    )
+}
+
+#[test]
+fn signature_of_a_key_expired_since_verifies_with_a_warning() {
+    let Some(home) = expiring_home() else { return };
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let factum = factum::Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let note = factum.create_note("signed before expiry", None, case_id).unwrap();
+    factum.seal(case_id, "checkpoint").unwrap();
+    assert_eq!(factum.verify_case(case_id, None).unwrap().overall(), Level::Ok);
+    home.set_clock(None);
+    let signer = GnupgSigner::without_key(Some(home.path()));
+    let factum = factum::Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Warn, "{:?}", report.findings);
+    let check = &report.entry_result(note).unwrap().signature;
+    assert!(check.valid && check.trusted && check.key_expired);
+    assert_eq!(check.status, "signature valid");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.code == "key_expired" && f.entry_id == Some(note) && f.message.contains("has expired since")),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn expired_key_that_is_not_ultimately_trusted_stays_untrusted() {
+    let Some(home) = expiring_home() else { return };
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let signature = signer.sign_text(r#"{"a":1}"#).unwrap();
+    let key = home.gpg_ok(&["--armor", "--export"]).stdout;
+    let elsewhere = require_gpg!("Someone Else <else@factum.invalid>");
+    let path = elsewhere.path().join("key.asc");
+    std::fs::write(&path, key).unwrap();
+    elsewhere.gpg_ok(&["--batch", "--import", path.to_str().unwrap()]);
+    let result = GnupgSigner::without_key(Some(elsewhere.path())).verify_signature(&signature);
+    assert!(result.valid && result.key_expired);
+    assert_eq!(result.trust, None);
+}
+
+#[test]
+fn signature_made_after_the_key_expired_is_invalid() {
+    let home = common::GpgHome::at_time(Some("20200101T000000"), "Late <late@factum.invalid>", "sign", "never");
+    let Some(home) = home else { return };
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    home.set_clock(Some(JANUARY));
+    let before = signer.sign_text("before").unwrap();
+    home.set_clock(Some(AFTER_EXPIRY));
+    let after = signer.sign_text("after").unwrap();
+    // gpg refuses to sign with an expired key: the expiry comes later, on a clock set back
+    home.set_clock(Some("20200120T000000"));
+    let fingerprint = &home.fingerprints("late@factum.invalid")[0];
+    home.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-set-expire",
+        fingerprint,
+        "2020-02-01",
+    ]);
+    home.set_clock(None);
+    assert!(signer.verify_signature(&before).valid);
+    let result = signer.verify_signature(&after);
+    assert!(!result.valid);
+    assert_eq!(result.status, "signature made after the signing key expired");
+}
+
+#[test]
+fn signature_of_a_revoked_key_stays_invalid() {
+    let home = require_gpg!("Revoked <revoked@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let signature = signer.sign_text(r#"{"a":1}"#).unwrap();
+    revoke(&home, "revoked@factum.invalid");
+    let result = signer.verify_signature(&signature);
+    assert!(!result.valid);
+    assert_eq!(result.status, "signing key was revoked");
+}
+
+/// Imports the revocation certificate gpg made with the key.
+fn revoke(home: &common::GpgHome, user_id: &str) {
+    let fingerprint = &home.fingerprints(user_id)[0];
+    let certificate = home.path().join(format!("openpgp-revocs.d/{fingerprint}.rev"));
+    let text = std::fs::read_to_string(&certificate).unwrap();
+    std::fs::write(&certificate, text.replace(":-----BEGIN", "-----BEGIN")).unwrap();
+    home.gpg_ok(&["--batch", "--import", certificate.to_str().unwrap()]);
+}
+
+#[test]
+fn a_key_with_a_signing_subkey_only_signs_and_reports_its_primary_fingerprint() {
+    let user_id = "Subkey Signer <subkey@factum.invalid>";
+    let Some(home) = common::GpgHome::with_key(user_id, "cert", "never") else {
+        return;
+    };
+    let primary = home.fingerprints("subkey@factum.invalid")[0].clone();
+    home.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-add-key",
+        &primary,
+        "ed25519",
+        "sign",
+        "never",
+    ]);
+    let subkey = home.fingerprints("subkey@factum.invalid")[1].clone();
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    assert_eq!(signer.list_keys()[0].fingerprint, primary);
+    let factum = factum::Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let note = factum.create_note("signed by the subkey", None, case_id).unwrap();
+    factum.seal(case_id, "checkpoint").unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+    assert_eq!(report.signers, vec![(primary.clone(), Some(user_id.to_string()))]);
+    let check = &report.entry_result(note).unwrap().signature;
+    assert_eq!(check.fingerprint.as_ref(), Some(&primary));
+    assert_eq!(check.signing_subkey.as_ref(), Some(&subkey));
+}
+
+#[test]
+fn a_primary_key_signature_keeps_its_fingerprint() {
+    let home = require_gpg!("Primary <primary@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let result = signer.verify_signature(&signer.sign_text("text").unwrap());
+    assert_eq!(
+        result.fingerprint.as_ref(),
+        Some(&home.fingerprints("primary@factum.invalid")[0])
+    );
+    assert_eq!(result.signing_subkey, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn checking_a_symmetric_message_asks_for_no_passphrase() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = require_gpg!("Factum Test <test@factum.invalid>");
+    let dir = home.path();
+    let marker = dir.join("pinentry-was-started");
+    let pinentry = dir.join("pinentry");
+    std::fs::write(&pinentry, format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display())).unwrap();
+    std::fs::set_permissions(&pinentry, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        dir.join("gpg-agent.conf"),
+        format!("pinentry-program {}\n", pinentry.display()),
+    )
+    .unwrap();
+    let message = dir.join("message.asc");
+    std::fs::write(dir.join("plain"), "text").unwrap();
+    home.gpg_ok(&[
+        "--batch",
+        "--pinentry-mode",
+        "loopback",
+        "--passphrase",
+        "secret",
+        "--symmetric",
+        "--armor",
+        "--output",
+        message.to_str().unwrap(),
+        dir.join("plain").to_str().unwrap(),
+    ]);
+    let _ = std::process::Command::new("gpgconf")
+        .arg("--homedir")
+        .arg(&dir)
+        .args(["--kill", "gpg-agent"])
+        .output();
+    let signer = GnupgSigner::without_key(Some(dir.clone()));
+    let text = std::fs::read_to_string(&message).unwrap();
+    assert!(!signer.verify_signature(&text).valid);
+    assert!(!signer.verify_detached(&text, b"data").valid);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn two_signatures_in_one_block_do_not_count() {
+    let home = require_gpg!("First <first@factum.invalid>");
+    home.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-gen-key",
+        "Second <second@factum.invalid>",
+        "ed25519",
+        "sign",
+        "never",
+    ]);
+    let input = home.path().join("input");
+    let output = home.path().join("output.asc");
+    std::fs::write(&input, "text").unwrap();
+    home.gpg_ok(&[
+        "--batch",
+        "--local-user",
+        "first@factum.invalid",
+        "--local-user",
+        "second@factum.invalid",
+        "--output",
+        output.to_str().unwrap(),
+        "--clearsign",
+        input.to_str().unwrap(),
+    ]);
+    let signature = std::fs::read_to_string(&output).unwrap();
+    let result = GnupgSigner::without_key(Some(home.path())).verify_signature(&signature);
+    assert!(!result.valid);
+    assert_eq!(result.status, "more than one signature");
+}
+
+#[test]
+fn a_good_signature_followed_by_garbage_does_not_count() {
+    let home = require_gpg!("Factum Test <test@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let signature = signer.sign_text("text").unwrap();
+    assert!(signer.verify_signature(&signature).valid);
+    assert!(!signer.verify_signature(&format!("{signature}{signature}")).valid);
 }

@@ -57,6 +57,8 @@ pub struct ReportEntry {
     /// last 8 hex digits of the fingerprint
     pub signer_key: Option<String>,
     pub fingerprint: Option<String>,
+    /// the subkey that signed, when it is not the primary key in `fingerprint`
+    pub signing_subkey: Option<String>,
     /// the clearsigned block that signs this entry
     pub signature: Option<String>,
     pub leaf_hash: String,
@@ -101,6 +103,11 @@ impl ReportEntry {
                     .as_ref()
                     .map(|f| format!(" by {f}"))
                     .unwrap_or_default()
+                    + &self
+                        .signing_subkey
+                        .as_ref()
+                        .map(|subkey| format!(" (subkey {subkey})"))
+                        .unwrap_or_default()
             ),
         ];
         if let Some(signature) = self.signature.as_deref().filter(|s| !s.is_empty()) {
@@ -410,6 +417,7 @@ impl Factum<'_> {
                     .filter(|f| !f.is_empty())
                     .map(|f| tail(f, 8).to_string()),
                 fingerprint: check.fingerprint.clone().filter(|f| !f.is_empty()),
+                signing_subkey: check.signing_subkey.clone(),
                 signature: entry.signature.clone().filter(|s| !s.is_empty()).or_else(|| {
                     late.get(&("entry".to_string(), entry.id))
                         .map(|(signature, _)| signature.clone())

@@ -85,6 +85,10 @@ pub struct SignatureCheck {
     pub username: Option<String>,
     pub trust: Option<String>,
     pub signature_timestamp: Option<String>,
+    /// good, but the signing key has expired since
+    pub key_expired: bool,
+    /// the subkey that signed, when it is not the primary key in `fingerprint`
+    pub signing_subkey: Option<String>,
 }
 
 impl SignatureCheck {
@@ -336,6 +340,8 @@ impl Factum<'_> {
             username: result.username,
             trust: result.trust,
             signature_timestamp: result.signature_timestamp,
+            key_expired: result.key_expired,
+            signing_subkey: result.signing_subkey,
         }
     }
 
@@ -367,24 +373,37 @@ impl Factum<'_> {
             );
         }
         if !check.trusted {
-            return finding(
-                Level::Fail,
-                "key_untrusted",
+            // gpg names no trust level for an expired key
+            let message = if check.key_expired {
+                format!(
+                    "{what}: signing key {} has expired and is not ultimately trusted.",
+                    or_none(&check.fingerprint)
+                )
+            } else {
                 format!(
                     "{what}: signing key {} is not trusted ({}).",
                     or_none(&check.fingerprint),
                     or_none(&check.trust)
-                ),
-            );
+                )
+            };
+            return finding(Level::Fail, "key_untrusted", message);
+        }
+        let mut findings = Vec::new();
+        if check.key_expired {
+            findings.extend(finding(
+                Level::Warn,
+                "key_expired",
+                format!("{what}: signing key {} has expired since.", or_none(&check.fingerprint)),
+            ));
         }
         if check.late {
-            return finding(
+            findings.extend(finding(
                 Level::Warn,
                 "signed_later",
                 format!("{what} was signed later on {}.", or_none(&check.late_signed_utc)),
-            );
+            ));
         }
-        Vec::new()
+        findings
     }
 
     /// One FAIL per cell of a row that could not be read.

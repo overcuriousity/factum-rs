@@ -111,6 +111,16 @@ pub struct GpgHome {
 
 impl GpgHome {
     pub fn new(user_id: &str) -> Option<Self> {
+        Self::with_key(user_id, "sign", "never")
+    }
+
+    /// With a key of these capabilities and this expiry.
+    pub fn with_key(user_id: &str, usage: &str, expiry: &str) -> Option<Self> {
+        Self::at_time(None, user_id, usage, expiry)
+    }
+
+    /// `with_key` on a clock set to `time` (YYYYMMDDTHHMMSS) for everything in this home, until `set_clock`.
+    pub fn at_time(time: Option<&str>, user_id: &str, usage: &str, expiry: &str) -> Option<Self> {
         which::which("gpg").ok()?;
         // short path: gpg-agent puts its socket here and socket paths are limited to ~107 characters
         let dir = tempfile::Builder::new()
@@ -118,33 +128,65 @@ impl GpgHome {
             .tempdir_in("/tmp")
             .or_else(|_| tempfile::tempdir())
             .ok()?;
-        let status = Command::new("gpg")
-            .arg("--homedir")
-            .arg(dir.path())
-            .args([
-                "--batch",
-                "--passphrase",
-                "",
-                "--quick-gen-key",
-                user_id,
-                "ed25519",
-                "sign",
-                "never",
-            ])
-            .output()
-            .ok()?;
-        if !status.status.success() {
+        let home = Self { dir };
+        home.set_clock(time);
+        let output = home.gpg(&[
+            "--batch",
+            "--passphrase",
+            "",
+            "--quick-gen-key",
+            user_id,
+            "ed25519",
+            usage,
+            expiry,
+        ]);
+        if !output.status.success() {
             eprintln!(
                 "cannot create a gpg test key: {}",
-                String::from_utf8_lossy(&status.stderr)
+                String::from_utf8_lossy(&output.stderr)
             );
             return None;
         }
-        Some(Self { dir })
+        Some(home)
     }
 
     pub fn path(&self) -> PathBuf {
         self.dir.path().to_path_buf()
+    }
+
+    /// Sets the clock of every gpg run in this home; None is the real time.
+    pub fn set_clock(&self, time: Option<&str>) {
+        let config = self.dir.path().join("gpg.conf");
+        match time {
+            Some(time) => std::fs::write(config, format!("faked-system-time {time}\n")).unwrap(),
+            None => drop(std::fs::remove_file(config)),
+        }
+    }
+
+    pub fn gpg(&self, args: &[&str]) -> std::process::Output {
+        Command::new("gpg")
+            .arg("--homedir")
+            .arg(self.dir.path())
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    /// Adds a key or subkey, or whatever else `args` say, and insists that it worked.
+    pub fn gpg_ok(&self, args: &[&str]) -> std::process::Output {
+        let output = self.gpg(args);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        output
+    }
+
+    /// The fingerprints of the key of this user ID: the primary key's first, then its subkeys'.
+    pub fn fingerprints(&self, user_id: &str) -> Vec<String> {
+        let listing = self.gpg_ok(&["--list-keys", "--with-colons", "--fixed-list-mode", user_id]);
+        String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("fpr:::::::::"))
+            .map(|line| line.trim_end_matches(':').to_string())
+            .collect()
     }
 }
 

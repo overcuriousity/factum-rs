@@ -13,7 +13,7 @@ use factum::log_service::{Append, entry_signed_payload, leaf_data};
 use factum::notes::parse_payload;
 use factum::seals::{SEAL_DIR_SETTING, seal_payload};
 use factum::signer::FakeSigner;
-use factum::verifier::{CaseReport, Level, SealSource};
+use factum::verifier::{CaseReport, Level, Ref, SealSource, SignatureCheck};
 use factum::{Factum, merkle};
 
 fn make_case(factum: &Factum, entries: usize, case_file: &str) -> i64 {
@@ -699,6 +699,47 @@ fn rewritten_hashes_without_the_key_fail_on_signatures() {
     }
     let report = factum.verify_case(case_id, None).unwrap();
     assert_eq!(codes(&report, Some(Level::Fail)), HashSet::from(["signature_mismatch"]));
+}
+
+fn expired_key_check(trusted: bool) -> SignatureCheck {
+    SignatureCheck {
+        present: true,
+        valid: true,
+        covers_payload: true,
+        trusted,
+        key_expired: true,
+        fingerprint: Some("F".into()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_signature_of_an_expired_key_warns() {
+    let findings = Factum::signature_findings(&expired_key_check(true), "Entry #1", Ref::default());
+    assert_eq!(findings.len(), 1);
+    assert_eq!((findings[0].level, findings[0].code), (Level::Warn, "key_expired"));
+    assert_eq!(findings[0].message, "Entry #1: signing key F has expired since.");
+}
+
+#[test]
+fn a_late_signature_of_an_expired_key_warns_of_both() {
+    let check = SignatureCheck {
+        late: true,
+        ..expired_key_check(true)
+    };
+    let findings = Factum::signature_findings(&check, "Entry #1", Ref::default());
+    let codes: Vec<_> = findings.iter().map(|f| f.code).collect();
+    assert_eq!(codes, ["key_expired", "signed_later"]);
+}
+
+#[test]
+fn a_signature_of_an_expired_key_without_ultimate_trust_fails() {
+    let findings = Factum::signature_findings(&expired_key_check(false), "Entry #1", Ref::default());
+    assert_eq!((findings[0].level, findings[0].code), (Level::Fail, "key_untrusted"));
+    assert_eq!(
+        findings[0].message,
+        "Entry #1: signing key F has expired and is not ultimately trusted."
+    );
 }
 
 #[test]

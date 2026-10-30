@@ -1342,6 +1342,7 @@ fn a_key_is_chosen_by_clicking_its_row() {
             String::new()
         },
         validity: validity.into(),
+        ..Default::default()
     };
     let keys = vec![
         key(1, "Ana Analyst", "u"),

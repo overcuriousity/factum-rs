@@ -611,6 +611,122 @@ fn non_ascii_case_file_seals_verify_outside_factum() {
 }
 
 #[test]
+fn verify_py_accepts_a_key_expired_since_with_a_warning() {
+    let home = common::GpgHome::at_time(
+        Some("20200101T000000"),
+        "Expired Key <expired@factum.invalid>",
+        "sign",
+        "2020-02-01",
+    );
+    let Some(home) = home else { return };
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &home);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    home.set_clock(None);
+    let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains("has expired since") && output.contains("Result: OK"),
+        "{output}"
+    );
+}
+
+#[test]
+fn verify_py_names_the_primary_key_of_a_subkey_signature() {
+    let user_id = "Subkey Signer <subkey@factum.invalid>";
+    let Some(home) = common::GpgHome::with_key(user_id, "cert", "never") else {
+        return;
+    };
+    let primary = home.fingerprints("subkey@factum.invalid")[0].clone();
+    home.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-add-key",
+        &primary,
+        "ed25519",
+        "sign",
+        "never",
+    ]);
+    let subkey = home.fingerprints("subkey@factum.invalid")[1].clone();
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &home);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains(&primary) && !output.contains(&subkey), "{output}");
+}
+
+/// The answer of verify.py's signature_problem to gpg's status lines and exit code; None without python3.
+fn signature_problem(status: &str, exit_code: i32) -> Option<String> {
+    let python = which::which("python3").ok()?;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("verify.py"), factum::export::bundle::VERIFY_PY).unwrap();
+    let code = "import sys, verify\n\
+                lines = [line.split(' ') for line in sys.argv[1].split('|')]\n\
+                print(verify.signature_problem([(p[0], p[1:]) for p in lines], int(sys.argv[2])))";
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(code)
+        .arg(status)
+        .arg(exit_code.to_string())
+        .env("PYTHONPATH", dir.path())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[test]
+fn verify_py_wants_exactly_one_good_signature() {
+    let valid = "VALIDSIG AAAA 2020-01-15 1000 0 4 0 22 10 01 AAAA";
+    let cases = [
+        (format!("GOODSIG 1 A|{valid}"), 0, "None"),
+        (format!("GOODSIG 1 A|{valid}"), 2, "bad signature"),
+        (format!("GOODSIG 1 A|{valid}|FAILURE gpg-exit 1"), 0, "bad signature"),
+        (
+            format!("GOODSIG 1 A|{valid}|GOODSIG 2 B|{valid}"),
+            0,
+            "more than one signature",
+        ),
+        (format!("GOODSIG 1 A|{valid}|BADSIG 2 B"), 1, "bad signature"),
+        (
+            format!("GOODSIG 1 A|{valid}|ERRSIG 2 22 10 01 1000 9"),
+            0,
+            "bad signature",
+        ),
+        ("GOODSIG 1 A".to_string(), 0, "bad signature"),
+        (format!("REVKEYSIG 1 A|{valid}"), 0, "signing key was revoked"),
+        (format!("EXPSIG 1 A|{valid}"), 1, "signature expired"),
+        (format!("KEYEXPIRED 2000|EXPKEYSIG 1 A|{valid}"), 0, "None"),
+        (format!("EXPKEYSIG 1 A|{valid}"), 0, "None"),
+        (
+            format!("KEYEXPIRED 500|EXPKEYSIG 1 A|{valid}"),
+            0,
+            "signature made after the signing key expired",
+        ),
+        // of the other subkeys, only the last one before EXPKEYSIG is the signing key's
+        (
+            format!("KEYEXPIRED 500|KEYEXPIRED 2000|EXPKEYSIG 1 A|{valid}|KEYEXPIRED 500"),
+            0,
+            "None",
+        ),
+        (format!("KEYEXPIRED 500|GOODSIG 1 A|{valid}"), 0, "None"),
+    ];
+    for (status, exit_code, expected) in cases {
+        let Some(answer) = signature_problem(&status, exit_code) else {
+            return;
+        };
+        assert_eq!(answer, expected, "{status}");
+    }
+}
+
+#[test]
 fn verify_py_accepts_seals_made_before_a_rename() {
     let home = require_gpg!("Factum Test <test@factum.invalid>");
     let f = Fixture::new();

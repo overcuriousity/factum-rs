@@ -78,9 +78,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   copy of the seal was removed too
 - **Verify Case** (GUI) / `factum --verify`: recomputes every leaf and tree head, checks all signatures, all seals
   (database and seal folder) and that case and evidence details match the log. Failures: changed or missing entries,
-  unsigned entries, invalid signatures, unknown or untrusted keys, broken seals. Warnings: entries signed later, entries
-  added after the newest seal, seal folder next to the database, a seal folder still named in the database but not in
-  use
+  unsigned entries, invalid signatures, unknown or untrusted keys, broken seals. Warnings: entries signed later,
+  signing keys expired since, entries added after the newest seal, seal folder next to the database, a seal folder
+  still named in the database but not in use
 - Entries and seals created without a key can be **signed later**; they are then shown as "signed later on <date>"
 
 ### Cases and evidence

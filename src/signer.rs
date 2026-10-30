@@ -10,6 +10,10 @@ use crate::db::Db;
 
 pub const ACTIVE_KEY_SETTING: &str = "active_gpg_key_id";
 
+/// gpg must not ask for anything while it checks a signature: what is checked comes from the database or a seal file
+/// and may hold a symmetric-encrypted message instead of a signature. Never for signing, which may need pinentry.
+const VERIFY_ARGS: [&str; 3] = ["--batch", "--pinentry-mode", "error"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GpgKey {
     pub keyid: String,
@@ -24,6 +28,8 @@ pub struct GpgKey {
     pub expires: String,
     /// gpg's validity: e expired, r revoked, ...
     pub validity: String,
+    /// gpg's owner trust: u ultimate, f full, ...
+    pub ownertrust: String,
 }
 
 impl GpgKey {
@@ -33,6 +39,12 @@ impl GpgKey {
 
     pub fn revoked(&self) -> bool {
         self.validity == "r"
+    }
+
+    /// Uppercase capabilities are what the whole key can do now: a certify-only primary key with a signing subkey has
+    /// them, an expired or revoked key does not.
+    pub fn can_sign(&self) -> bool {
+        self.cap.contains('S')
     }
 }
 
@@ -70,6 +82,10 @@ pub struct VerifyResult {
     pub username: Option<String>,
     pub signature_timestamp: Option<String>,
     pub trust: Option<String>,
+    /// good, made before the signing key expired, which it has since
+    pub key_expired: bool,
+    /// the subkey that signed, when it is not the primary key in `fingerprint`
+    pub signing_subkey: Option<String>,
 }
 
 pub trait Signer {
@@ -107,6 +123,8 @@ pub(crate) struct GpgOutput {
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: String,
     pub(crate) status: Vec<(String, Vec<String>)>,
+    /// the exit code was 0
+    pub(crate) success: bool,
 }
 
 impl GpgOutput {
@@ -168,6 +186,7 @@ pub(crate) fn run_program(mut command: Command, input: &[u8]) -> std::io::Result
         stdout: output.stdout,
         stderr,
         status,
+        success: output.status.success(),
     })
 }
 
@@ -208,6 +227,7 @@ pub fn parse_key_listing(listing: &str) -> Vec<GpgKey> {
                     created: colon_date(field(5)),
                     expires: colon_date(field(6)),
                     validity: field(1).into(),
+                    ownertrust: field(8).into(),
                     ..Default::default()
                 });
                 in_primary = true;
@@ -230,70 +250,85 @@ pub fn parse_key_listing(listing: &str) -> Vec<GpgKey> {
     keys
 }
 
-/// Reads gpg's status lines into a verification result, like python-gnupg's Verify.
+/// Reads gpg's status lines into a verification result, like python-gnupg's Verify but stricter: valid means exactly
+/// one good signature, no bad one, and an exit code that agrees.
 fn verify_result(output: &GpgOutput) -> VerifyResult {
     let mut result = VerifyResult::default();
-    let mut status: Option<&str> = None;
+    // why the signature does not count
+    let mut rejected: Option<&str> = None;
+    let (mut good, mut validsig) = (0, 0);
+    let (mut last_expiry, mut key_expiry) = (None, None);
     for (key, values) in &output.status {
         let first = values.first().cloned();
         let rest = || values.get(1..).map(|v| v.join(" ")).filter(|s| !s.is_empty());
         match key.as_str() {
-            "GOODSIG" => {
-                result.valid = true;
-                status = Some("signature good");
+            "GOODSIG" | "EXPKEYSIG" => {
+                good += 1;
+                if key == "EXPKEYSIG" {
+                    result.key_expired = true;
+                    key_expiry = last_expiry;
+                }
                 result.key_id = first;
                 result.username = rest();
             }
-            "BADSIG" => {
-                result.valid = false;
-                status = Some("signature bad");
-                result.key_id = first;
-                result.username = rest();
-            }
-            "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG" => {
-                result.valid = false;
-                status = Some(match key.as_str() {
+            "BADSIG" | "EXPSIG" | "REVKEYSIG" => {
+                rejected = Some(match key.as_str() {
+                    "BADSIG" => "signature bad",
                     "EXPSIG" => "signature expired",
-                    "EXPKEYSIG" => "signing key has expired",
                     _ => "signing key was revoked",
                 });
                 result.key_id = first;
                 result.username = rest();
             }
             "ERRSIG" => {
-                result.valid = false;
                 result.key_id = first;
-                status = Some(if values.get(5).map(String::as_str) == Some("9") {
+                rejected = Some(if values.get(5).map(String::as_str) == Some("9") {
                     "no public key"
                 } else {
                     "signature error"
                 });
             }
             "NO_PUBKEY" => {
-                result.valid = false;
                 result.key_id = first;
-                status = Some("no public key");
+                rejected = Some("no public key");
             }
+            // gpg also says this of other expired subkeys; the last one before EXPKEYSIG is the signing key's
+            "KEYEXPIRED" => last_expiry = first.and_then(|time| time.parse::<i64>().ok()),
             "VALIDSIG" => {
-                result.fingerprint = first;
+                validsig += 1;
+                let primary = values.get(9).filter(|f| !f.is_empty()).or(values.first()).cloned();
+                result.signing_subkey = first.filter(|signing| Some(signing) != primary.as_ref());
+                result.fingerprint = primary;
                 result.signature_timestamp = values.get(2).cloned();
-                status = Some("signature valid");
             }
             key if key.starts_with("TRUST_") => result.trust = Some(key.to_string()),
             _ => {}
         }
     }
+    let made = result
+        .signature_timestamp
+        .as_deref()
+        .and_then(|t| t.parse::<i64>().ok());
+    if result.key_expired && made.zip(key_expiry).is_some_and(|(made, expiry)| made > expiry) {
+        rejected = Some("signature made after the signing key expired");
+    }
+    result.valid = rejected.is_none() && good == 1 && validsig == 1 && output.success && !output.has("FAILURE");
     result.signed_text = if output.stdout.is_empty() {
         None
     } else {
         Some(crate::pystr::strip(&String::from_utf8_lossy(&output.stdout)).to_string())
     };
-    // without a status gpg did not get as far as checking the signature: its error says why
-    result.status = match status {
-        Some(status) => status.to_string(),
-        None => Some(gpg_error(&output.stderr))
+    // without any of these gpg did not get as far as checking the signature: its error says why
+    result.status = if result.valid {
+        "signature valid".to_string()
+    } else if let Some(rejected) = rejected {
+        rejected.to_string()
+    } else if good > 1 || validsig > 1 {
+        "more than one signature".to_string()
+    } else {
+        Some(gpg_error(&output.stderr))
             .filter(|e| !e.is_empty())
-            .unwrap_or_else(|| "gpg gave no result".into()),
+            .unwrap_or_else(|| "gpg gave no result".into())
     };
     result
 }
@@ -354,6 +389,12 @@ impl GnupgSigner {
         Some(run_gpg(binary, self.home.as_deref(), args, input))
     }
 
+    fn run_verify(&self, args: &[&str], input: &[u8]) -> Option<std::io::Result<GpgOutput>> {
+        let mut full = VERIFY_ARGS.to_vec();
+        full.extend(args);
+        self.run(&full, input)
+    }
+
     fn sign_with(&self, args: &[&str], data: &[u8], what: &str) -> Option<String> {
         let key = self.active_key_id.borrow().clone()?;
         if self.binary.is_none() {
@@ -373,6 +414,31 @@ impl GnupgSigner {
         }
         self.last_sign_failed.set(true);
         None
+    }
+
+    /// gpg gives no trust level for a signature by an expired key. Owner trust survives expiry, but says more than
+    /// validity only at `u`: that makes a key valid by itself, `f` does not.
+    fn trust_expired_key(&self, result: &mut VerifyResult) {
+        if !(result.valid && result.key_expired && result.trust.is_none()) {
+            return;
+        }
+        let Some(fingerprint) = result.fingerprint.as_deref() else {
+            return;
+        };
+        let args = ["--list-keys", "--with-colons", "--fixed-list-mode", fingerprint];
+        if let Some(Ok(output)) = self.run_verify(&args, b"")
+            && parse_key_listing(&String::from_utf8_lossy(&output.stdout))
+                .first()
+                .is_some_and(|key| key.ownertrust == "u")
+        {
+            result.trust = Some("TRUST_ULTIMATE".into());
+        }
+    }
+
+    fn verified(&self, output: &GpgOutput) -> VerifyResult {
+        let mut result = verify_result(output);
+        self.trust_expired_key(&mut result);
+        result
     }
 }
 
@@ -395,7 +461,7 @@ impl Signer for GnupgSigner {
         match self.run(&args, b"") {
             Some(Ok(output)) => parse_key_listing(&String::from_utf8_lossy(&output.stdout))
                 .into_iter()
-                .filter(|key| key.cap.contains('s'))
+                .filter(GpgKey::can_sign)
                 .collect(),
             Some(Err(e)) => {
                 log::warn!("Could not list GPG keys: {e}");
@@ -460,10 +526,10 @@ impl Signer for GnupgSigner {
                 ..Default::default()
             }
         };
-        match self.run(&["--decrypt"], clearsigned.as_bytes()) {
+        match self.run_verify(&["--decrypt"], clearsigned.as_bytes()) {
             None => error("gpg is not installed or not on the PATH".into()),
             Some(Err(e)) => error(e.to_string()),
-            Some(Ok(output)) => verify_result(&output),
+            Some(Ok(output)) => self.verified(&output),
         }
     }
 
@@ -481,11 +547,11 @@ impl Signer for GnupgSigner {
             Err(e) => return error(e.to_string()),
         };
         let path = file.path().display().to_string();
-        match self.run(&["--verify", &path, "-"], data) {
+        match self.run_verify(&["--verify", &path, "-"], data) {
             None => error("gpg is not installed or not on the PATH".into()),
             Some(Err(e)) => error(e.to_string()),
             Some(Ok(output)) => {
-                let mut result = verify_result(&output);
+                let mut result = self.verified(&output);
                 result.signed_text = None;
                 result
             }
@@ -663,6 +729,7 @@ impl Signer for FakeSigner {
             username: Some("Fake Signer".into()),
             signature_timestamp: None,
             trust: Some(self.trust.borrow().clone()),
+            ..Default::default()
         }
     }
     fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
@@ -677,6 +744,7 @@ impl Signer for FakeSigner {
             username: Some("Fake Signer".into()),
             signature_timestamp: None,
             trust: Some(self.trust.borrow().clone()),
+            ..Default::default()
         }
     }
     fn last_sign_failed(&self) -> bool {
@@ -733,6 +801,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: "[GNUPG:] NEWSIG\ngpg: can't connect to the keyboxd: IPC connect call failed\n".into(),
             status: vec![("NEWSIG".into(), vec![])],
+            success: false,
         };
         let result = verify_result(&output);
         assert!(!result.valid);
@@ -740,6 +809,158 @@ mod tests {
             result.status,
             "gpg: can't connect to the keyboxd: IPC connect call failed"
         );
+    }
+
+    /// gpg's output from status lines, without the `[GNUPG:] ` prefix.
+    fn output(lines: &[&str], success: bool) -> GpgOutput {
+        let status = lines
+            .iter()
+            .map(|line| {
+                let mut parts = line.split(' ').map(str::to_string);
+                (parts.next().unwrap(), parts.collect())
+            })
+            .collect();
+        GpgOutput {
+            stdout: b"text\n".to_vec(),
+            stderr: String::new(),
+            status,
+            success,
+        }
+    }
+
+    const PRIMARY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const SUBKEY: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    fn validsig(signing: &str, made: i64, primary: &str) -> String {
+        format!("VALIDSIG {signing} 2020-01-15 {made} 0 4 0 22 10 01 {primary}")
+    }
+
+    #[test]
+    fn expired_key_counts_for_signatures_made_before_its_expiry() {
+        let valid = validsig(PRIMARY, 1000, PRIMARY);
+        let result = verify_result(&output(&["KEYEXPIRED 2000", "EXPKEYSIG 1234 Name", &valid], true));
+        assert!(result.valid && result.key_expired);
+        assert_eq!(result.status, "signature valid");
+        assert_eq!(result.username.as_deref(), Some("Name"));
+    }
+
+    #[test]
+    fn expired_key_does_not_count_for_signatures_made_after_its_expiry() {
+        let valid = validsig(PRIMARY, 3000, PRIMARY);
+        let result = verify_result(&output(&["KEYEXPIRED 2000", "EXPKEYSIG 1234 Name", &valid], true));
+        assert!(!result.valid);
+        assert_eq!(result.status, "signature made after the signing key expired");
+    }
+
+    #[test]
+    fn expired_key_without_a_known_expiry_counts() {
+        let valid = validsig(PRIMARY, 3000, PRIMARY);
+        assert!(verify_result(&output(&["EXPKEYSIG 1234 Name", &valid], true)).valid);
+    }
+
+    #[test]
+    fn expiry_of_the_signing_key_is_the_line_before_expkeysig() {
+        // lines about other subkeys come before and after
+        let valid = validsig(SUBKEY, 1500, PRIMARY);
+        let lines = [
+            "KEYEXPIRED 1000",
+            "KEYEXPIRED 2000",
+            "EXPKEYSIG 1234 Name",
+            &valid,
+            "KEYEXPIRED 1000",
+        ];
+        assert!(verify_result(&output(&lines, true)).valid);
+        let lines = ["KEYEXPIRED 2000", "KEYEXPIRED 1000", "EXPKEYSIG 1234 Name", &valid];
+        assert!(!verify_result(&output(&lines, true)).valid);
+    }
+
+    #[test]
+    fn an_expired_subkey_next_to_a_good_signature_is_no_expired_key() {
+        let valid = validsig(PRIMARY, 3000, PRIMARY);
+        let result = verify_result(&output(&["KEYEXPIRED 2000", "GOODSIG 1234 Name", &valid], true));
+        assert!(result.valid && !result.key_expired);
+    }
+
+    #[test]
+    fn revoked_key_and_expired_signature_stay_invalid_and_say_why() {
+        let valid = validsig(PRIMARY, 1000, PRIMARY);
+        for (line, status) in [
+            ("REVKEYSIG 1234 Name", "signing key was revoked"),
+            ("EXPSIG 1234 Name", "signature expired"),
+        ] {
+            let result = verify_result(&output(&[line, &valid, "TRUST_ULTIMATE 0 pgp"], true));
+            assert!(!result.valid);
+            assert_eq!(result.status, status);
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_the_primary_key_with_the_subkey_beside_it() {
+        let valid = validsig(SUBKEY, 1000, PRIMARY);
+        let result = verify_result(&output(&["GOODSIG 1234 Name", &valid], true));
+        assert_eq!(result.fingerprint.as_deref(), Some(PRIMARY));
+        assert_eq!(result.signing_subkey.as_deref(), Some(SUBKEY));
+    }
+
+    #[test]
+    fn fingerprint_of_a_primary_key_signature_is_unchanged() {
+        let valid = validsig(PRIMARY, 1000, PRIMARY);
+        let result = verify_result(&output(&["GOODSIG 1234 Name", &valid], true));
+        assert_eq!(result.fingerprint.as_deref(), Some(PRIMARY));
+        assert_eq!(result.signing_subkey, None);
+    }
+
+    #[test]
+    fn fingerprint_falls_back_to_the_signing_key() {
+        let result = verify_result(&output(
+            &["GOODSIG 1234 Name", &format!("VALIDSIG {PRIMARY} 2020-01-15 1000")],
+            true,
+        ));
+        assert_eq!(result.fingerprint.as_deref(), Some(PRIMARY));
+        assert_eq!(result.signing_subkey, None);
+    }
+
+    #[test]
+    fn only_exactly_one_good_signature_counts() {
+        let valid = validsig(PRIMARY, 1000, PRIMARY);
+        let other = validsig(SUBKEY, 1000, SUBKEY);
+        let two = ["GOODSIG 1 A", &valid, "GOODSIG 2 B", &other];
+        let result = verify_result(&output(&two, true));
+        assert!(!result.valid);
+        assert_eq!(result.status, "more than one signature");
+        assert!(!verify_result(&output(&["GOODSIG 1 A", "BADSIG 2 B", &valid], false)).valid);
+        assert!(!verify_result(&output(&["GOODSIG 1 A", "ERRSIG 2 22 10 01 1000 9", &valid], true)).valid);
+        assert!(!verify_result(&output(&["GOODSIG 1 A"], true)).valid);
+        assert!(!verify_result(&output(&[&valid], true)).valid);
+    }
+
+    #[test]
+    fn a_good_signature_counts_only_if_gpg_exits_cleanly() {
+        let valid = validsig(PRIMARY, 1000, PRIMARY);
+        assert!(!verify_result(&output(&["GOODSIG 1 A", &valid], false)).valid);
+        let failure = ["GOODSIG 1 A", &valid, "FAILURE gpg-exit 33554433"];
+        assert!(!verify_result(&output(&failure, true)).valid);
+    }
+
+    #[test]
+    fn a_certify_only_primary_key_with_a_signing_subkey_can_sign() {
+        let listing = "sec:u:255:22:AAAABBBBCCCCDDDD:1700000000:::u:::cSC:::+::ed25519:::0:\n\
+                       fpr:::::::::0123456789ABCDEF0123456789ABCDEFAAAABBBB:\n\
+                       ssb:u:255:22:1111222233334444:1700000000::::::s:::+::ed25519::\n\
+                       fpr:::::::::FFFF:\n";
+        let keys = parse_key_listing(listing);
+        assert_eq!(keys.len(), 1);
+        assert!(keys[0].can_sign());
+        assert_eq!(keys[0].fingerprint, "0123456789ABCDEF0123456789ABCDEFAAAABBBB");
+        assert_eq!(keys[0].ownertrust, "u");
+    }
+
+    #[test]
+    fn expired_revoked_and_encrypt_only_keys_cannot_sign() {
+        for cap in ["sc", "c", "eE", "scE"] {
+            let listing = format!("sec:e:255:22:AAAABBBBCCCCDDDD:1700000000:::u:::{cap}:::+::ed25519:::0:\n");
+            assert!(!parse_key_listing(&listing)[0].can_sign(), "{cap}");
+        }
     }
 
     #[test]

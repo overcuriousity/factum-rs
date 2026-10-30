@@ -106,6 +106,31 @@ def load_bundle(path):
     return files
 
 
+def signature_problem(status, exit_code):
+    """Why gpg's status lines are not exactly one good signature; None when they are."""
+    keys = [key for key, _ in status]
+    if "NO_PUBKEY" in keys:
+        return "signing key not in keyring"
+    if "REVKEYSIG" in keys:
+        return "signing key was revoked"
+    if "EXPSIG" in keys:
+        return "signature expired"
+    if "BADSIG" in keys or "ERRSIG" in keys or "FAILURE" in keys or exit_code != 0:
+        return "bad signature"
+    good = sum(1 for key in keys if key in ("GOODSIG", "EXPKEYSIG"))
+    if good > 1 or keys.count("VALIDSIG") > 1:
+        return "more than one signature"
+    if good != 1 or keys.count("VALIDSIG") != 1:
+        return "bad signature"
+    if "EXPKEYSIG" in keys:
+        # gpg also says KEYEXPIRED of other subkeys; the last one before EXPKEYSIG is the signing key's
+        expiries = [values[0] for key, values in status[:keys.index("EXPKEYSIG")] if key == "KEYEXPIRED"]
+        made = dict(status)["VALIDSIG"][2]
+        if expiries and expiries[-1].isdigit() and made.isdigit() and int(made) > int(expiries[-1]):
+            return "signature made after the signing key expired"
+    return None
+
+
 class Gpg(object):
     def __init__(self, home, bundled_keys):
         self.home = home
@@ -114,16 +139,17 @@ class Gpg(object):
         self.signers = {}
 
     def run(self, args):
-        command = ["gpg", "--batch", "--status-fd", "2"]
+        # what is checked comes from the bundle: gpg must never ask for anything
+        command = ["gpg", "--batch", "--pinentry-mode", "error", "--status-fd", "2"]
         if self.home:
             command += ["--homedir", self.home]
         result = subprocess.run(command + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        status = {}
+        status = []
         for line in result.stderr.decode("utf-8", "replace").splitlines():
             if line.startswith("[GNUPG:] "):
                 parts = line[9:].split(" ")
-                status[parts[0]] = parts[1:]
-        return result.stdout, status
+                status.append((parts[0], parts[1:]))
+        return result.stdout, status, result.returncode
 
     def write(self, name, content):
         path = os.path.join(self.workdir, name)
@@ -131,26 +157,46 @@ class Gpg(object):
             handle.write(content)
         return path
 
+    def ultimately_trusted(self, fingerprint):
+        """gpg gives no trust level for an expired key; its owner trust is still there, and only "u" makes a key valid."""
+        output, _, _ = self.run(["--list-keys", "--with-colons", "--fixed-list-mode", fingerprint])
+        for line in output.decode("utf-8", "replace").splitlines():
+            fields = line.split(":")
+            if fields[0] == "pub":
+                return len(fields) > 8 and fields[8] == "u"
+        return False
+
     def check(self, what, signature, expected_text=None, data=None):
         """Verify a clearsigned block against expected_text, or a detached signature over data."""
         signature_path = self.write("signature.asc", signature)
         if data is None:
-            output, status = self.run(["--decrypt", signature_path])
+            output, status, exit_code = self.run(["--decrypt", signature_path])
         else:
-            output, status = self.run(["--verify", signature_path, self.write("data", data)])
-        if "GOODSIG" not in status or "VALIDSIG" not in status:
-            reason = "signing key not in keyring" if "NO_PUBKEY" in status else "bad signature"
+            output, status, exit_code = self.run(["--verify", signature_path, self.write("data", data)])
+        reason = signature_problem(status, exit_code)
+        if reason:
             fail("%s: signature invalid (%s)." % (what, reason))
             return False
         if expected_text is not None and output.decode("utf-8").strip() != expected_text:
             fail("%s: the signature was made over different data." % what)
             return False
-        fingerprint = status["VALIDSIG"][0]
-        self.signers[fingerprint] = " ".join(status["GOODSIG"][1:])
-        trusted = any(key in TRUSTED for key in status)
+        values = dict(status)
+        validsig = values["VALIDSIG"]
+        # the primary key, as factum reports it; field 0 may be a subkey
+        fingerprint = validsig[9] if len(validsig) > 9 and validsig[9] else validsig[0]
+        self.signers[fingerprint] = " ".join(values.get("GOODSIG", values.get("EXPKEYSIG"))[1:])
+        expired = "EXPKEYSIG" in values
+        trust = [key for key, _ in status if key.startswith("TRUST_")]
+        trusted = bool(trust) and all(key in TRUSTED for key in trust)
         if not trusted and not self.bundled_keys:
-            fail("%s: signing key %s is not trusted." % (what, fingerprint))
-            return False
+            if not expired:
+                fail("%s: signing key %s is not trusted." % (what, fingerprint))
+                return False
+            if not self.ultimately_trusted(fingerprint):
+                fail("%s: signing key %s has expired and is not ultimately trusted." % (what, fingerprint))
+                return False
+        if expired:
+            warn("%s: signing key %s has expired since." % (what, fingerprint))
         return True
 
     def cleanup(self):
