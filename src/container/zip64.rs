@@ -487,20 +487,19 @@ fn is_bevy_name(name: &[u8]) -> bool {
 
 /// Whether a header starts at `pos`, whole or cut short by the end of the file, or the file ends there.
 fn header_or_end_at(file: &mut File, pos: u64, len: u64) -> io::Result<bool> {
+    signature_at(file, pos, len, &[LOCAL_SIG, CENTRAL_SIG])
+}
+
+/// Whether one of `signatures` starts at `pos`, whole or cut short by the end of the file.
+fn signature_at(file: &mut File, pos: u64, len: u64, signatures: &[u32]) -> io::Result<bool> {
     let start = read_at(file, pos, (len - pos).min(4) as usize)?;
-    Ok([LOCAL_SIG, CENTRAL_SIG]
-        .iter()
-        .any(|sig| sig.to_le_bytes().starts_with(&start)))
+    Ok(signatures.iter().any(|sig| sig.to_le_bytes().starts_with(&start)))
 }
 
 /// Where the state whose central directory starts at `pos` ends. None for a directory that runs into the end of the
 /// file (interrupted while it was written); a complete one that cannot be read is an error.
 fn state_end(file: &mut File, pos: u64, len: u64) -> io::Result<Option<u64>> {
-    let unreadable = || {
-        invalid(format!(
-            "the central directory at offset {pos} is complete but cannot be read"
-        ))
-    };
+    let unreadable = || invalid(format!("the central directory at offset {pos} cannot be read"));
     let mut at = pos;
     while at + 46 <= len {
         let entry = read_at(file, at, 46)?;
@@ -508,6 +507,12 @@ fn state_end(file: &mut File, pos: u64, len: u64) -> io::Result<Option<u64>> {
             break;
         }
         at += 46 + u16_at(&entry, 28) as u64 + u16_at(&entry, 30) as u64 + u16_at(&entry, 32) as u64;
+    }
+    if at >= len {
+        return Ok(None);
+    }
+    if !signature_at(file, at, len, &[CENTRAL_SIG, EOCD64_SIG, EOCD_SIG])? {
+        return Err(unreadable());
     }
     if at + 4 > len {
         return Ok(None);
@@ -517,13 +522,16 @@ fn state_end(file: &mut File, pos: u64, len: u64) -> io::Result<Option<u64>> {
         EOCD64_SIG => at += EOCD64_LEN + LOCATOR_LEN,
         _ => {}
     }
+    if at >= len {
+        return Ok(None);
+    }
+    if !signature_at(file, at, len, &[EOCD_SIG])? {
+        return Err(unreadable());
+    }
     if at + EOCD_LEN > len {
         return Ok(None);
     }
     let record = read_at(file, at, EOCD_LEN as usize)?;
-    if u32_at(&record, 0) != EOCD_SIG {
-        return Err(unreadable());
-    }
     // only the comment missing: that its length is damaged cannot be ruled out
     let end = at + EOCD_LEN + u16_at(&record, 20) as u64;
     if end <= len && is_state(file, end)? {
@@ -1548,6 +1556,43 @@ mod tests {
         assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1));
         poke(&mut file, directory, b"\0\0");
         assert!(find_newest_end(&mut file, Some(end1)).is_err());
+    }
+
+    #[test]
+    fn what_follows_a_directory_is_an_end_record_or_a_part_of_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (end1, end2) = two_states(&dir);
+        let mut file = reopened(&dir);
+        let good = std::fs::read(dir.path().join("c.aff4l")).unwrap();
+        let record = end2 - 8 - EOCD_LEN - LOCATOR_LEN - EOCD64_LEN;
+        let cases: [(&[u8], bool); 6] = [
+            (b"PK", true),
+            (b"PK\x06", true),
+            (b"PK\x06\x06 a part of the record", true),
+            (b"PK\x05\x06 part of it", true),
+            (b"\0\0\0", false),
+            (b"under twenty-two", false),
+        ];
+        for (bytes, cut) in cases {
+            file.set_len(record).unwrap();
+            poke(&mut file, record, bytes);
+            let found = find_newest_end(&mut file, Some(end1));
+            if cut {
+                assert_eq!(found.unwrap(), Some(end1), "{bytes:?}");
+            } else {
+                assert_eq!(found.unwrap_err().kind(), io::ErrorKind::InvalidData, "{bytes:?}");
+            }
+        }
+        // behind the ZIP64 records only the classic record can follow
+        let classic = end2 - 8 - EOCD_LEN;
+        let cases: [(&[u8], bool); 3] = [(b"PK\x05", true), (b"\0\0\0", false), (b"under twenty-two", false)];
+        for (bytes, cut) in cases {
+            poke(&mut file, 0, &good);
+            file.set_len(classic).unwrap();
+            poke(&mut file, classic, bytes);
+            let found = find_newest_end(&mut file, Some(end1));
+            assert_eq!(found.is_ok(), cut, "{bytes:?} {found:?}");
+        }
     }
 
     #[test]

@@ -967,6 +967,23 @@ mod verify {
     }
 
     #[test]
+    fn an_unreadable_information_turtle_is_one_failure() {
+        let s = Setup::new();
+        closed_with_files(&s);
+        let path = s.container_path();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let entry = read_archive(&mut file, len).unwrap().get(TURTLE).unwrap().clone();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[entry.header_offset as usize + 30] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let report = verify(&s, &path);
+        let turtle: Vec<_> = report.findings.iter().filter(|f| f.message.contains(TURTLE)).collect();
+        assert_eq!(turtle.len(), 1, "{turtle:?}");
+        assert!(turtle[0].message.contains("cannot be read"), "{}", turtle[0].message);
+    }
+
+    #[test]
     fn an_entry_hidden_behind_a_lowered_count_fails() {
         let s = Setup::new();
         closed_with_files(&s);
@@ -2146,6 +2163,49 @@ fn add_again(s: &Setup, id: i64, recheck: &factum::container::volume::Recheck) -
         entry = factum.commit_container_add(id, &mut volume, staged).unwrap();
     }
     entry
+}
+
+#[test]
+fn a_crc_field_on_a_replaced_copy_is_reported_as_what_it_is() {
+    use factum::container::zip64::read_archive;
+    use std::io::{Seek, SeekFrom, Write};
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    let arn = first_arn(&s, id);
+    add_again(&s, id, &recheck);
+    let factum = s.f.factum();
+    factum.close_container(id).unwrap();
+    let path = s.container_path();
+    // the content as it was before it was damaged, and only the CRC field different
+    damage_content(&path, &arn);
+    let mut file = std::fs::File::open(&path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let entry = read_archive(&mut file, len).unwrap().get_arn(&arn).unwrap().clone();
+    let good = std::fs::read(&path).unwrap();
+    let name = [entry.name.as_slice(), &[1, 0, 24, 0]].concat();
+    let at = good.windows(name.len()).rposition(|w| w == name).unwrap() as u64;
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(at - 46 + 16)).unwrap();
+    file.write_all(&(entry.crc32 ^ 1).to_le_bytes()).unwrap();
+    let report = factum
+        .verify_container_file(&path, &factum.gpgsm(), &|_, _| {}, &AtomicBool::new(false))
+        .unwrap();
+    let stream: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.code == "stream_hash" || f.code == "replaced_copy")
+        .map(|f| f.message.as_str())
+        .collect();
+    assert_eq!(stream.len(), 1, "{stream:?}");
+    assert!(stream[0].contains("CRC-32 differs"), "{stream:?}");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.code == "stream_hash" && f.level == factum::verifier::Level::Fail),
+        "{:?}",
+        report.findings
+    );
 }
 
 #[test]

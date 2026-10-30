@@ -34,7 +34,8 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - Containers: reading a member checks it against the CRC-32 of the central directory. In verification a mismatch is a
   failure of its own, next to the hash results, and all other checks go on; the re-check before a close goes by the
-  hashes
+  hashes. A container whose version, description or metadata differs from its CRC-32 is not opened, and the message
+  says so and points to Verify Container
 - Containers: a central directory with entries behind its count (invisible to factum, read by other ZIP tools) is
   refused, and a member whose local header differs from the central directory in name, method or flags fails
   verification; verifying reports such bytes after the last state as a failure, not as an interrupted addition

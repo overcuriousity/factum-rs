@@ -14,6 +14,9 @@ pub enum ErrorKind {
     LogChanged,
     Confirmation,
     LogBroken,
+    /// a container member differs from the CRC-32 of the directory, so the container is not opened; Verify tells
+    /// whether its content is intact
+    ContainerCrc,
     /// a database or file system error that is not a user error
     Internal,
 }
@@ -82,4 +85,5 @@ constructors! {
     log_changed => LogChanged,
     confirmation => Confirmation,
     log_broken => LogBroken,
+    container_crc => ContainerCrc,
 }

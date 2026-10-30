@@ -14,7 +14,8 @@ use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_b
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
 use super::zip64::{
-    Appender, Archive, CdEntry, find_last_end, find_newest_end, member_bytes, member_reader, member_text, read_archive,
+    Appender, Archive, CdEntry, crc_mismatch, find_last_end, find_newest_end, member_bytes, member_reader, member_text,
+    read_archive,
 };
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS, RDF_NS, XSD_NS, ZIP_SEGMENT_LIMIT, member_name};
 use crate::error::{FactumError, Result};
@@ -262,6 +263,18 @@ pub fn new_arn() -> String {
 
 fn io_error(path: &Path, e: io::Error) -> FactumError {
     FactumError::general(format!("The container {} could not be written: {e}", path.display()))
+}
+
+/// A failed read of a member while opening: `crc_mismatch`, a kind of its own that says so, or what `other` makes of it.
+fn member_error(path: &Path, e: io::Error, other: impl Fn(String) -> FactumError) -> FactumError {
+    match crc_mismatch(&e) {
+        Some(member) => FactumError::container_crc(format!(
+            "The container {} was not opened, nothing in it was changed: {member} differs from the CRC-32 of the \
+             directory. Verify Container shows whether the content is intact.",
+            path.display()
+        )),
+        None => other(e.to_string()),
+    }
 }
 
 /// What a re-check read back from the container file (spec 5.2).
@@ -749,7 +762,7 @@ impl Volume {
             let entry = archive
                 .get(name)
                 .ok_or_else(|| not_container(format!("{name} is missing")))?;
-            member_bytes(file, entry).map_err(|e| not_container(e.to_string()))
+            member_bytes(file, entry).map_err(|e| member_error(path, e, not_container))
         };
         let version = String::from_utf8_lossy(&read(&mut file, "version.txt")?).into_owned();
         if !(version.contains("major=2") && version.contains("minor=1")) {
@@ -798,7 +811,7 @@ impl Volume {
         let entry = archive
             .get("container.description")
             .ok_or_else(|| not_container("container.description is missing".into()))?;
-        let description = member_text(&mut file, entry).map_err(|e| not_container(e.to_string()))?;
+        let description = member_text(&mut file, entry).map_err(|e| member_error(path, e, not_container))?;
         let description = description.trim();
         if description.as_bytes() != archive.comment.as_slice() {
             return Err(not_container("its description and its ZIP comment differ".into()));
@@ -2192,6 +2205,45 @@ mod tests {
             drop(volume);
             flip_crc_field(&setup.path(), name);
         }
+    }
+
+    #[test]
+    fn a_crc_field_refuses_the_open_and_says_what_to_do() {
+        let setup = Setup::new();
+        drop(setup.create());
+        let good = std::fs::read(setup.path()).unwrap();
+        for name in ["version.txt", "container.description", TURTLE] {
+            std::fs::write(setup.path(), &good).unwrap();
+            flip_crc_field(&setup.path(), name);
+            let flipped = std::fs::read(setup.path()).unwrap();
+            let mut errors = vec![Volume::open(&setup.path(), None).err().unwrap()];
+            if name == "container.description" {
+                errors.push(Volume::uuid_of(&setup.path()).unwrap_err());
+            }
+            for error in errors {
+                assert!(error.is(crate::error::ErrorKind::ContainerCrc), "{error}");
+                let text = error.to_string();
+                assert!(text.contains("was not opened, nothing in it was changed"), "{text}");
+                assert!(text.contains(&format!("{name} differs from the CRC-32")), "{text}");
+                assert!(text.contains("Verify Container"), "{text}");
+                assert!(!text.contains("not a factum container"), "{text}");
+            }
+            assert_eq!(std::fs::read(setup.path()).unwrap(), flipped);
+        }
+        // other failures stay what they were
+        std::fs::write(setup.path(), &good).unwrap();
+        rewrite_local_name(&setup.path(), "version.txt");
+        let error = Volume::open(&setup.path(), None).err().unwrap();
+        assert!(!error.is(crate::error::ErrorKind::ContainerCrc), "{error}");
+        assert!(error.to_string().contains("not a factum container"), "{error}");
+    }
+
+    /// Changes the name in a member's local header.
+    fn rewrite_local_name(path: &Path, name: &str) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes.windows(name.len()).position(|w| w == name.as_bytes()).unwrap();
+        bytes[at] ^= 1;
+        std::fs::write(path, bytes).unwrap();
     }
 
     #[test]

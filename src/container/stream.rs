@@ -225,7 +225,8 @@ pub fn store_image_stream(
     })
 }
 
-/// Hashes without storing (metadata-only files).
+/// Hashes without storing (metadata-only files). For source files only: a differing CRC-32 of a member would go
+/// unnoticed, so content read from a container goes through `hash_stored`.
 pub fn hash_only(src: &mut dyn Read, progress: &dyn Fn(u64), cancel: &AtomicBool) -> io::Result<(u64, Digests)> {
     hash_stored(src, progress, cancel).map(|(size, digests, _)| (size, digests))
 }

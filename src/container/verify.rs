@@ -487,8 +487,11 @@ fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: 
         for store in imports {
             done.insert(store.clone());
             let name = super::member_name(&store, &volume);
-            let Some(data) = read_checked(file, archive, &name, "turtle_hash", &mut findings) else {
+            if archive.get(&name).is_none() {
                 findings.push(fail(format!("{label}: the secondary store {name} is missing.")));
+                continue;
+            }
+            let Some(data) = read_checked(file, archive, &name, "turtle_hash", &mut findings) else {
                 continue;
             };
             let expected: Vec<(&str, String)> = [("SHA512", "SHA512"), ("SHA256", "SHA256")]
@@ -669,11 +672,9 @@ pub fn verify_file(
 
     // the states: every closed one, and the current one when it is not the newest close
     let Some(current_turtle) = read_checked(&mut file, &archive, TURTLE, "turtle_hash", &mut report.findings) else {
-        report.finding(
-            Level::Fail,
-            "turtle_hash",
-            "information.turtle is missing or unreadable.",
-        );
+        if archive.get(TURTLE).is_none() {
+            report.finding(Level::Fail, "turtle_hash", "information.turtle is missing.");
+        }
         return Ok(report);
     };
     // every closed state kept, numbered from 1 without gaps: a gap is a closed state that was removed
@@ -900,6 +901,7 @@ pub fn verify_file(
                 record.path.clone()
             };
             let findings_before = report.findings.len();
+            let mut crc_differs = Vec::new();
             // content longer than its listed size (a damaged or crafted container) never shows more than all of it
             let report_progress = |read: u64| progress((done + read).min(total), total);
             match hash_content(&mut file, &archive, graph, &record.arn, &report_progress, cancel) {
@@ -939,13 +941,7 @@ pub fn verify_file(
                             }
                         }
                     }
-                    for member in crc {
-                        report.finding(
-                            Level::Fail,
-                            "stream_hash",
-                            format!("{name}: CRC-32 differs from the central directory ({member})."),
-                        );
-                    }
+                    crc_differs = crc;
                     if number(graph, &record.arn, "size").is_some_and(|listed| listed != size) {
                         report.finding(
                             Level::Fail,
@@ -983,10 +979,12 @@ pub fn verify_file(
                     Term::Iri(arn) => Some(arn.clone()),
                     Term::Literal { .. } => None,
                 });
+            let mut damage_replaced = false;
             if let Some(replacement) = replacement {
                 let failed = report.findings[findings_before..]
                     .iter()
                     .any(|f| f.code == "stream_hash");
+                damage_replaced = failed;
                 if failed {
                     let tail = report.findings.split_off(findings_before);
                     report
@@ -1019,6 +1017,16 @@ pub fn verify_file(
                             ),
                         );
                     }
+                }
+            }
+            // content that was replaced for its damage explains its CRC-32; otherwise it is a fault of its own
+            if !damage_replaced {
+                for member in crc_differs {
+                    report.finding(
+                        Level::Fail,
+                        "stream_hash",
+                        format!("{name}: CRC-32 differs from the central directory ({member})."),
+                    );
                 }
             }
             if counted(record) {
@@ -1354,6 +1362,36 @@ mod crafted {
     use crate::container::XSD_NS;
     use crate::container::stream::ZLIB;
     use std::io::Write;
+
+    #[test]
+    fn an_unreadable_secondary_store_is_one_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = Graph::default();
+        let store = "aff4://secondary";
+        graph.add(
+            &format!("aff4://{VOLUME}"),
+            &format!("{AFF4L_NS}imports"),
+            Term::Iri(store.to_string()),
+        );
+        let name = crate::container::member_name(store, &format!("aff4://{VOLUME}"));
+        let path = foreign(
+            &dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes(&name, 0, b"secondary").unwrap();
+            },
+            V21,
+        );
+        // its local header differs from the directory
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.windows(name.len()).position(|w| w == name.as_bytes()).unwrap();
+        bytes[at] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let report = check(&path);
+        let store: Vec<_> = report.findings.iter().filter(|f| f.message.contains(&name)).collect();
+        assert_eq!(store.len(), 1, "{store:?}");
+        assert!(store[0].message.contains("cannot be read"), "{}", store[0].message);
+    }
 
     #[test]
     fn implausible_chunk_size_is_reported() {
