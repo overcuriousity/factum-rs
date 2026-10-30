@@ -61,7 +61,7 @@ fn run_gui(db: Db, notice: Option<String>) {
 #[cfg(not(feature = "gui"))]
 fn run_gui(_db: Db, _notice: Option<String>) {
     log::error!("This factum binary was built without the GUI (cargo feature 'gui').");
-    std::process::exit(1);
+    std::process::exit(2);
 }
 
 /// A shortcut that starts `factum --gui` gets a console window of its own; close it. A console the GUI was

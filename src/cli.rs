@@ -21,7 +21,7 @@ pub const ACTIVE: &str = "";
     name = "factum",
     version,
     about = "Factum Notes Application",
-    after_help = "Exit codes: 0 done (a verification with warnings only is done), 1 a verification failed (also \
+    after_help = "A case or evidence is given as #<id>, a file number or name, or an id (digits only, no sign). Exit codes: 0 done (a verification with warnings only is done), 1 a verification failed (also \
                   --export of a case that fails it; the files are still written), 2 an error: unknown case, bad \
                   arguments, database or file problem"
 )]
@@ -102,11 +102,9 @@ fn parse_int(text: &str) -> Option<i64> {
     strip(text).parse().ok()
 }
 
-/// a plain number: digits only
+/// a plain number: digits only, no sign and no whitespace
 fn plain_id(text: &str) -> Option<i64> {
-    let text = strip(text);
-    text.bytes()
-        .all(|b| b.is_ascii_digit())
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
         .then(|| text.parse().ok())
         .flatten()
 }
@@ -423,10 +421,11 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         let case_id = resolve_case(factum, query)?;
         warn_unsigned(factum.signer);
         let formats: Vec<&str> = args.format.split(',').map(strip).filter(|f| !f.is_empty()).collect();
-        for path in factum.export(case_id, &formats, &args.out)? {
+        let (paths, verdict) = factum.export_checked(case_id, &formats, &args.out)?;
+        for path in paths {
             writeln!(out, "{}", path.display())?;
         }
-        if factum.verify_case(case_id, None)?.overall() == Level::Fail {
+        if verdict == Level::Fail {
             log::warn!("The case fails verification: the exported files document a log that does not verify.");
             return Ok(1);
         }

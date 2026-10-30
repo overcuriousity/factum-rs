@@ -13,12 +13,18 @@ use crate::error::{FactumError, Result};
 use crate::files::safe_filename;
 use crate::seals::REASON_EXPORT;
 use crate::services::Factum;
+use crate::verifier::Level;
 
 pub const FORMATS: [&str; 4] = ["html", "pdf", "md", "bundle"];
 
 impl Factum<'_> {
     /// Seals the case, verifies it and writes the requested formats; returns the written files.
     pub fn export(&self, case_id: i64, formats: &[&str], out_dir: &Path) -> Result<Vec<PathBuf>> {
+        Ok(self.export_checked(case_id, formats, out_dir)?.0)
+    }
+
+    /// Like [`export`](Self::export), with the verdict of the verification the files describe.
+    pub fn export_checked(&self, case_id: i64, formats: &[&str], out_dir: &Path) -> Result<(Vec<PathBuf>, Level)> {
         let mut unique: Vec<&str> = Vec::new();
         for format in formats {
             if !unique.contains(format) {
@@ -41,6 +47,7 @@ impl Factum<'_> {
         // seal first, so the report and the bundle describe exactly the sealed state
         let seal_id = self.seal(case_id, REASON_EXPORT)?;
         let report = self.verify_case(case_id, None)?;
+        let verdict = report.overall();
         let exported_utc = utc_now();
         let seal = self.get_tree_head(seal_id)?.expect("the seal was just created");
         let model = self.build_model(report, seal, self.signer.active_key(), &exported_utc)?;
@@ -87,6 +94,6 @@ impl Factum<'_> {
             let reports = [("report.html", html), ("report.pdf", pdf), ("report.md", markdown)];
             written.push(self.build_bundle(&model, &reports, &images, &out_dir.join(format!("{stem}.zip")))?);
         }
-        Ok(written)
+        Ok((written, verdict))
     }
 }

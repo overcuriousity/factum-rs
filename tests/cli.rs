@@ -928,9 +928,25 @@ fn a_case_row_that_cannot_be_read_does_not_stop_the_lookup_or_verify() {
 #[test]
 fn a_note_with_an_action_flag_is_refused() {
     use clap::Parser;
-    for flags in [["--list-cases"], ["--checkpoint"]] {
-        let error = Args::try_parse_from(["factum", "a note", flags[0]]).unwrap_err();
-        assert_eq!(error.exit_code(), 2);
+    // flag plus the values it needs; every action flag of the conflict list
+    let flags: [&[&str]; 12] = [
+        &["--gui"],
+        &["--list-cases"],
+        &["--list-evidence"],
+        &["--list-gpg"],
+        &["--new-case", "N1"],
+        &["--new-evidence", "E"],
+        &["--set-active", "case", "1"],
+        &["--correct", "1", "text"],
+        &["--verify"],
+        &["--checkpoint"],
+        &["--sign-unsigned"],
+        &["--export"],
+    ];
+    for flag in flags {
+        let argv: Vec<&str> = ["factum", "a note"].into_iter().chain(flag.iter().copied()).collect();
+        let error = Args::try_parse_from(argv).unwrap_err();
+        assert_eq!(error.exit_code(), 2, "{flag:?}");
     }
     assert!(Args::try_parse_from(["factum", "a note", "--log-level", "DEBUG"]).is_ok());
 }
@@ -1002,4 +1018,38 @@ fn the_database_line_goes_to_stderr_only_when_factum_db_is_set() {
     // clap's own usage errors exit 2, and a note with an action flag is one
     assert_eq!(run_with_db(&["--no-such-flag"]).status.code(), Some(2));
     assert_eq!(run_with_db(&["a note", "--list-cases"]).status.code(), Some(2));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_missing_hash_id_or_a_padded_query_exits_2_through_the_binary() {
+    let home = tempfile::tempdir().unwrap();
+    let work = home.path();
+    assert_eq!(
+        run_binary(work, work, &["--new-case", "5", "Five"]).status.code(),
+        Some(0)
+    );
+    for query in ["#99", "#2", " 5", "#5 ", "Five two", "F ive"] {
+        let output = run_binary(work, work, &["--verify", query]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // id 2 does not exist and the number 5 is not matched by a padded query: no name fallback
+        assert_eq!(output.status.code(), Some(2), "{query:?}: {stderr}");
+        assert!(
+            stderr.contains(&format!("No case found matching '{query}'")),
+            "{stderr}"
+        );
+    }
+    let output = run_binary(work, work, &["--verify", "5"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Case 5:"));
+}
+
+#[test]
+fn a_padded_or_signed_id_is_not_an_id() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let id = factum.create_case("C-1", "Case", "").unwrap();
+    assert_eq!(cli::find_case_id(&factum, &id.to_string()).unwrap(), Some(id));
+    for query in [format!(" {id}"), format!("#{id} "), format!("+{id}"), format!("# {id}")] {
+        assert_eq!(cli::find_case_id(&factum, &query).unwrap(), None, "{query:?}");
+    }
 }
