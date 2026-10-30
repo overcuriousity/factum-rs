@@ -152,6 +152,69 @@ fn a_seal_folder_set_in_the_database_cannot_redirect_the_check() {
         report.findings
     );
     assert_eq!(report.seal_dir, factum.default_seal_dir());
+    assert!(codes(&report, Some(Level::Warn)).contains("seal_dir_unused"));
+}
+
+#[test]
+fn a_seal_folder_left_in_the_database_is_named_but_never_read() {
+    // the real database's folder was never moved: its seal files stay where the setting says
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, notes) = verifier_case(&factum);
+    let old = f.path().join("old-seals");
+    std::fs::create_dir(&old).unwrap();
+    Factum::with_seal_dir(&f.db, &f.signer, Some(old.clone()))
+        .seal(case_id, "checkpoint")
+        .unwrap();
+    f.db.set_setting(SEAL_DIR_SETTING, old.to_str().unwrap()).unwrap();
+    f.exec(&format!(
+        "DELETE FROM entries WHERE id = {}; DELETE FROM tree_heads;",
+        notes[2]
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    let warning = report.findings.iter().find(|f| f.code == "seal_dir_unused").unwrap();
+    assert_eq!(warning.level, Level::Warn);
+    assert!(
+        warning.message.contains(&format!("'{}'", old.display())),
+        "{}",
+        warning.message
+    );
+    // that seal covers the removed entry, so reading it would be a FAIL
+    assert!(
+        !codes(&report, None).contains("seal_truncated"),
+        "{:?}",
+        report.findings
+    );
+    assert!(report.tree_heads.is_empty());
+    assert_eq!(report.seal_dir, f.seal_dir);
+}
+
+#[test]
+fn a_stored_seal_folder_that_is_in_use_or_empty_is_not_mentioned() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, _) = verifier_case(&factum);
+    factum.seal(case_id, "checkpoint").unwrap();
+    let in_use = f.seal_dir.to_str().unwrap();
+    for stored in [None, Some(""), Some(in_use), Some(&format!("{in_use}/"))] {
+        if let Some(stored) = stored {
+            f.db.set_setting(SEAL_DIR_SETTING, stored).unwrap();
+        }
+        let report = factum.verify_case(case_id, None).unwrap();
+        assert_eq!(report.overall(), Level::Ok, "{stored:?}: {:?}", report.findings);
+    }
+}
+
+#[test]
+fn a_stored_seal_folder_changes_the_verdict_by_a_warning_only() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, _) = verifier_case(&factum);
+    factum.seal(case_id, "checkpoint").unwrap();
+    f.db.set_setting(SEAL_DIR_SETTING, "/somewhere/else").unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Warn, "{:?}", report.findings);
+    assert_eq!(codes(&report, Some(Level::Warn)), HashSet::from(["seal_dir_unused"]));
 }
 
 #[test]

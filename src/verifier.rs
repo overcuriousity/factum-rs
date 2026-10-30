@@ -9,12 +9,13 @@ use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use crate::cases::Case;
+use crate::config::expand_user;
 use crate::error::{FactumError, Result};
 use crate::evidence::Evidence;
 use crate::log_service::{entry_signed_payload, leaf_data};
 use crate::merkle::{self, MerkleAccumulator};
 use crate::notes::{Entry, parse_payload};
-use crate::seals::seal_payload;
+use crate::seals::{SEAL_DIR_SETTING, seal_payload};
 use crate::services::Factum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -649,6 +650,20 @@ impl Factum<'_> {
                 Level::Warn,
                 "seal_dir_default",
                 "Seal copies are stored next to the database, not externally. Set FACTUM_SEAL_DIR or choose a seal folder.",
+                Ref::default(),
+            ));
+        }
+        // a hint only: compared as text, so the path a database names is never opened, not even to resolve it
+        let stored = self.db.get_setting(SEAL_DIR_SETTING).unwrap_or_default();
+        if !stored.is_empty() && expand_user(&stored) != seal_dir {
+            findings.push(Finding::new(
+                Level::Warn,
+                "seal_dir_unused",
+                format!(
+                    "This database still names the seal folder {}, which is not used: seal files there were not \
+                     checked. If it is yours, set it as the seal folder.",
+                    crate::pystr::repr(&stored)
+                ),
                 Ref::default(),
             ));
         }

@@ -79,7 +79,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - **Verify Case** (GUI) / `factum --verify`: recomputes every leaf and tree head, checks all signatures, all seals
   (database and seal folder) and that case and evidence details match the log. Failures: changed or missing entries,
   unsigned entries, invalid signatures, unknown or untrusted keys, broken seals. Warnings: entries signed later, entries
-  added after the newest seal, seal folder next to the database
+  added after the newest seal, seal folder next to the database, a seal folder still named in the database but not in
+  use
 - Entries and seals created without a key can be **signed later**; they are then shown as "signed later on <date>"
 
 ### Cases and evidence
@@ -279,7 +280,8 @@ The seal folder is never taken from the database: someone who can edit the datab
 at an empty folder. On the first start of this version, a seal folder chosen in the GUI of factum up to
 2.7.1 (stored in the database opened then) is moved to the user config `.env`, unless that already sets one; factum
 warns when it does, and asks to check the folder. A marker file `seal-dir-migrated` next to the `.env` records the first
-start, so no database is read for this again. Every verify report (CLI, GUI, HTML/Markdown/PDF) names the seal folder
+start, so no database is read for this again. A folder still named in the database but not in use is only mentioned
+in a warning, as a hint: it is not checked; choosing a seal folder in the GUI removes it. Every verify report (CLI, GUI, HTML/Markdown/PDF) names the seal folder
 it checked.
 
 ## What the integrity checks protect against

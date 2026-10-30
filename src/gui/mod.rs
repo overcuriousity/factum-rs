@@ -2317,7 +2317,8 @@ impl FactumApp {
     }
 
     /// Stores the seal folder in the user config (None: next to the database), never in the database that the
-    /// verifier checks. The change goes to the application log.
+    /// verifier checks. This decides the question seal_dir_unused asks, so a folder still named by the open database
+    /// is dropped. The change goes to the application log.
     fn set_seal_folder(&mut self, folder: Option<&str>) {
         let before = self.factum().seal_dir();
         if let Err(e) = config::set_seal_dir(&self.user_env, folder) {
@@ -2327,6 +2328,7 @@ impl FactumApp {
             return;
         }
         self.seal_dir = config::file_seal_dir(&self.user_env);
+        let _ = self.db.delete_setting(crate::seals::SEAL_DIR_SETTING);
         log::info!(
             "Seal folder changed from {} to {}.",
             before.display(),

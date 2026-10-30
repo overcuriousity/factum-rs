@@ -1058,6 +1058,8 @@ fn clearing_the_seal_folder_in_the_wizard_clears_the_setting() {
     let fixture = Fixture::new();
     let seals = tempfile::tempdir().unwrap();
     config::set_seal_dir(&fixture.user_env(), Some(&seals.path().display().to_string())).unwrap();
+    // left behind by an earlier version: the choice below answers the verifier's seal_dir_unused hint
+    fixture.db().set_setting(SEAL_DIR_SETTING, "/old/seals").unwrap();
     let mut harness = fixture.harness();
     harness.state_mut().open_wizard();
     harness.run_ok();
@@ -1070,6 +1072,7 @@ fn clearing_the_seal_folder_in_the_wizard_clears_the_setting() {
     assert!(harness.query_by_label_contains("(next to the database)").is_some());
     click_label(&mut harness, "Finish");
     assert_eq!(fixture.seal_folder_setting(), None);
+    assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
 }
 
 #[test]

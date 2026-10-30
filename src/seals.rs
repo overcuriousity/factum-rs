@@ -14,7 +14,8 @@ use crate::merkle;
 use crate::notes::parse_payload;
 use crate::services::Factum;
 
-/// where the GUI kept the seal folder up to 2.7.1; only read once, to move it to the user config
+/// where the GUI kept the seal folder up to 2.7.1; read once to move it to the user config, and by the verifier
+/// only to mention a folder left there (seal_dir_unused), never to use it
 pub const SEAL_DIR_SETTING: &str = "seal_dir";
 /// the case file number's share of a seal file name; the rest (`_<id>_size<n>_<time>.asc`) stays under 70 bytes,
 /// together well below the 255 bytes most file systems allow

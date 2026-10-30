@@ -10,7 +10,8 @@ All notable changes to this project are documented here. The format follows
   verifier no longer takes the folder it checks from the database it verifies, which a tamperer could point at an
   empty folder. A folder set in the GUI of an earlier version is moved there on the first start (with a warning), and no
   database is read for it afterwards. Verify reports (CLI, GUI, HTML, Markdown, PDF) name the seal folder they
-  checked; a change of the seal folder is written to the application log
+  checked; a change of the seal folder is written to the application log. A folder still named in the database but
+  not in use is mentioned in a warning and not checked; choosing a seal folder in the GUI removes it
 - A `.env` in the current directory is no longer read, only the one in the user config directory
 
 ### Fixed
