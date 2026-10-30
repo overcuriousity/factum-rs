@@ -177,6 +177,8 @@ Files: src/cli.rs, src/main.rs, examples/demo_db.rs, README.md, tests/cli.rs.
 6. Carry-over from Task 2: `factum --verify 1` with a malformed `cases` cell aborts with "Database error: ..." while
    plain `--verify` reports it, and one bad case row can stop lookup by name for other cases (src/cli.rs:97-100). The
    lookup must skip a row it cannot read (naming it) instead of failing, so verification can still report it.
+7. Carry-over from Task 2: `list_gpg` (src/cli.rs:177-190) prints an expired or revoked active key as `[active]` with no
+   state, so the listing doesn't say it cannot sign. Add its state (expired, revoked) to that line.
 
 ### Task 6: Installers, scripts and repository housekeeping
 
