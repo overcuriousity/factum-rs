@@ -318,6 +318,14 @@ Files: src/containers.rs, src/container/volume.rs, src/container/verify.rs, test
 10. Misplaced doc comments (first round): containers.rs:1041 — `close_container_damaged` carries
     `close_container_without_file`'s doc; move each paragraph to its function. Same at volume.rs:32 for `readme_text`
     / `history_member`.
+11. Carry-over from Task 7: a CRC mismatch on `information.turtle`, `version.txt` or `container.description` makes
+    `Volume::open` refuse, so every later add and close stops, and the case could never be archived. Rule: a container
+    with a proven directory fault is not appended to or signed; Close as Damaged is the way out. Offer it when opening
+    stops for this reason (the core path; GUI wiring in Task 13 if it needs a new button state). Close as Damaged
+    writes nothing to the container.
+12. Carry-over from Task 7: `recheck` goes by the hashes, so a content CRC mismatch alone is not damage, but a close can
+    then sign a state Verify reports as Fail. Have `Recheck` carry CRC mismatches and apply the same rule as item 11:
+    the close refuses to sign, naming the members, and Close as Damaged is offered.
 
 ### Task 10: Python container verifier parity
 
@@ -342,6 +350,10 @@ otherwise, following existing patterns).
 7. Carry-over from Task 2: verify_container.py:345,366-373 still rejects EXPKEYSIG, reports VALIDSIG field 0 (the
    subkey), accepts any TRUST_ line and has no `--batch --pinentry-mode error`. Match what Task 2 did in
    src/export/verify.py: the same single-signature rule, EXPKEYSIG handling, trust rule and primary fingerprint.
+8. Carry-over from Task 7: Rust now reports a complete state it cannot read, and junk past the newest end, as Fail
+   `trailing_data`; Python must match (this replaces the WARN in item 2 for those cases; an interrupted addition stays
+   a WARN). Python's zipfile raises on a CRC mismatch: separate it like Rust, so hashes still finish and "CRC-32
+   differs" is a finding beside them, and metadata checks continue. Mirror Task 7's end-of-directory checks.
 
 ### Task 11: Export and bundles
 
