@@ -13,6 +13,8 @@ All notable changes to this project are documented here. The format follows
   checked; a change of the seal folder is written to the application log. A folder still named in the database but
   not in use is mentioned in a warning and not checked; choosing a seal folder in the GUI removes it
 - A `.env` in the current directory is no longer read, only the one in the user config directory
+- Verifying a case again in the same session reuses good signature results as long as the keyring is unchanged (for at
+  most 10 minutes, never on disk), so late signing and repeated checks no longer run gpg for every signature
 - Reports and `verify.py` name the primary key's fingerprint of a signature made with a subkey (a primary key's
   fingerprint is unchanged); the entry's integrity lines also name the subkey
 - A signature counts only as exactly one good signature with a clean gpg exit code, in factum and in `verify.py`

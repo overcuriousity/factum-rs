@@ -2,9 +2,14 @@
 //! trust and pinentry work exactly as before; [`FakeSigner`] is a deterministic stand-in for tests.
 
 use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use sha2::{Digest, Sha256};
 
 use crate::db::Db;
 
@@ -13,6 +18,26 @@ pub const ACTIVE_KEY_SETTING: &str = "active_gpg_key_id";
 /// gpg must not ask for anything while it checks a signature: what is checked comes from the database or a seal file
 /// and may hold a symmetric-encrypted message instead of a signature. Never for signing, which may need pinentry.
 const VERIFY_ARGS: [&str; 3] = ["--batch", "--pinentry-mode", "error"];
+/// what gpg's verdict on a signature depends on, besides the clock; under the gpg home folder
+const KEYRING_FILES: [&str; 8] = [
+    "pubring.kbx",
+    "pubring.gpg",
+    "public-keys.d/pubring.db",
+    "public-keys.d/pubring.db-wal",
+    "trustdb.gpg",
+    "tofu.db",
+    "gpg.conf",
+    "common.conf",
+];
+/// a good result can go stale without a file changing, when a key or signature expires; this bounds for how long
+const VERIFIED_LIFETIME: Duration = Duration::from_secs(600);
+/// a good result takes well under a kilobyte; old keyring states are dropped this way too
+const VERIFIED_MAX: usize = 100_000;
+
+/// Good verification results of this process, by [`GnupgSigner::verified_key`]; workers each have their own signer,
+/// so this is shared. Never on disk.
+static VERIFIED: LazyLock<Mutex<VerifiedResults>> = LazyLock::new(Default::default);
+type VerifiedResults = HashMap<[u8; 32], (Instant, VerifyResult)>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GpgKey {
@@ -338,6 +363,8 @@ pub struct GnupgSigner {
     home: Option<PathBuf>,
     active_key_id: RefCell<Option<String>>,
     last_sign_failed: Cell<bool>,
+    /// the folder gpg uses; None when that cannot be told
+    resolved_home: OnceCell<Option<PathBuf>>,
 }
 
 impl GnupgSigner {
@@ -360,6 +387,7 @@ impl GnupgSigner {
             home,
             active_key_id: RefCell::new(None),
             last_sign_failed: Cell::new(false),
+            resolved_home: OnceCell::new(),
         }
     }
 
@@ -370,6 +398,15 @@ impl GnupgSigner {
             home,
             active_key_id: RefCell::new(None),
             last_sign_failed: Cell::new(false),
+            resolved_home: OnceCell::new(),
+        }
+    }
+
+    /// For tests: runs `binary` as gpg.
+    pub fn with_binary(binary: PathBuf, home: Option<PathBuf>) -> Self {
+        Self {
+            binary: Some(binary),
+            ..Self::unavailable(home)
         }
     }
 
@@ -414,6 +451,78 @@ impl GnupgSigner {
         }
         self.last_sign_failed.set(true);
         None
+    }
+
+    /// The gpg home folder: as set, else gpg's own answer (GNUPGHOME, the Windows registry, ...).
+    fn resolved_home(&self) -> Option<&Path> {
+        self.resolved_home
+            .get_or_init(|| {
+                self.home.clone().or_else(|| {
+                    let mut command = Command::new(which::which("gpgconf").ok()?);
+                    command.args(["--list-dirs", "homedir"]);
+                    let output = run_program(command, b"").ok().filter(|output| output.success)?;
+                    let home = String::from_utf8_lossy(&output.stdout);
+                    Some(PathBuf::from(home.trim_end())).filter(|home| !home.as_os_str().is_empty())
+                })
+            })
+            .as_deref()
+    }
+
+    /// Identifies a check: the signature, the data (None: it is inside a clearsigned signature) and the state of the
+    /// keyring. The size and time of its files change with every key or trust change. None when gpg's home is unknown.
+    fn verified_key(&self, signature: &str, data: Option<&[u8]>) -> Option<[u8; 32]> {
+        self.binary.as_ref()?;
+        let home = self.resolved_home()?;
+        let mut hash = Sha256::new();
+        let mut field = |bytes: &[u8]| {
+            hash.update((bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        };
+        field(signature.as_bytes());
+        field(if data.is_some() { b"detached" } else { b"clearsigned" });
+        field(data.unwrap_or_default());
+        field(home.to_string_lossy().as_bytes());
+        for file in KEYRING_FILES {
+            let metadata = std::fs::metadata(home.join(file)).ok();
+            let size = metadata.as_ref().map_or(0, |m| m.len());
+            let modified = metadata
+                .and_then(|m| m.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |time| time.as_nanos());
+            field(file.as_bytes());
+            field(&size.to_le_bytes());
+            field(&modified.to_le_bytes());
+        }
+        Some(hash.finalize().into())
+    }
+
+    /// The result of `check`, from the cache if nothing it depends on has changed. Only good results are kept: a
+    /// failure may be passing (gpg-agent not reachable), and the next run decides it anyway.
+    fn verify_cached(
+        &self,
+        signature: &str,
+        data: Option<&[u8]>,
+        check: impl FnOnce() -> VerifyResult,
+    ) -> VerifyResult {
+        let Some(key) = self.verified_key(signature, data) else {
+            return check();
+        };
+        if let Ok(verified) = VERIFIED.lock()
+            && let Some((at, result)) = verified.get(&key)
+            && at.elapsed() < VERIFIED_LIFETIME
+        {
+            return result.clone();
+        }
+        let result = check();
+        if result.valid
+            && let Ok(mut verified) = VERIFIED.lock()
+        {
+            if verified.len() >= VERIFIED_MAX {
+                verified.clear();
+            }
+            verified.insert(key, (Instant::now(), result.clone()));
+        }
+        result
     }
 
     /// gpg gives no trust level for a signature by an expired key. Owner trust survives expiry, but says more than
@@ -526,11 +635,13 @@ impl Signer for GnupgSigner {
                 ..Default::default()
             }
         };
-        match self.run_verify(&["--decrypt"], clearsigned.as_bytes()) {
-            None => error("gpg is not installed or not on the PATH".into()),
-            Some(Err(e)) => error(e.to_string()),
-            Some(Ok(output)) => self.verified(&output),
-        }
+        self.verify_cached(clearsigned, None, || {
+            match self.run_verify(&["--decrypt"], clearsigned.as_bytes()) {
+                None => error("gpg is not installed or not on the PATH".into()),
+                Some(Err(e)) => error(e.to_string()),
+                Some(Ok(output)) => self.verified(&output),
+            }
+        })
     }
 
     fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
@@ -541,21 +652,24 @@ impl Signer for GnupgSigner {
                 ..Default::default()
             }
         };
-        // the signature goes through a file, the data through stdin
-        let file = match tempfile::NamedTempFile::new().and_then(|mut f| f.write_all(signature.as_bytes()).map(|_| f)) {
-            Ok(file) => file,
-            Err(e) => return error(e.to_string()),
-        };
-        let path = file.path().display().to_string();
-        match self.run_verify(&["--verify", &path, "-"], data) {
-            None => error("gpg is not installed or not on the PATH".into()),
-            Some(Err(e)) => error(e.to_string()),
-            Some(Ok(output)) => {
-                let mut result = self.verified(&output);
-                result.signed_text = None;
-                result
+        self.verify_cached(signature, Some(data), || {
+            // the signature goes through a file, the data through stdin
+            let file =
+                match tempfile::NamedTempFile::new().and_then(|mut f| f.write_all(signature.as_bytes()).map(|_| f)) {
+                    Ok(file) => file,
+                    Err(e) => return error(e.to_string()),
+                };
+            let path = file.path().display().to_string();
+            match self.run_verify(&["--verify", &path, "-"], data) {
+                None => error("gpg is not installed or not on the PATH".into()),
+                Some(Err(e)) => error(e.to_string()),
+                Some(Ok(output)) => {
+                    let mut result = self.verified(&output);
+                    result.signed_text = None;
+                    result
+                }
             }
-        }
+        })
     }
 
     fn last_sign_failed(&self) -> bool {
@@ -702,7 +816,6 @@ impl Signer for FakeSigner {
         })
     }
     fn sign_detached(&self, data: &[u8]) -> Option<String> {
-        use sha2::Digest;
         self.active_key_id.borrow().as_ref()?;
         match self.fail_detached_after.get() {
             Some(0) => {
@@ -733,7 +846,6 @@ impl Signer for FakeSigner {
         }
     }
     fn verify_detached(&self, signature: &str, data: &[u8]) -> VerifyResult {
-        use sha2::Digest;
         let ok = signature == format!("FAKE DETACHED {}", hex::encode(sha2::Sha256::digest(data)));
         VerifyResult {
             valid: ok,

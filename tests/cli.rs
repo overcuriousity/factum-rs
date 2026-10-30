@@ -673,3 +673,86 @@ fn a_good_signature_followed_by_garbage_does_not_count() {
     assert!(signer.verify_signature(&signature).valid);
     assert!(!signer.verify_signature(&format!("{signature}{signature}")).valid);
 }
+
+// --- the verification cache
+
+/// A signer that cannot run gpg: whatever it says good comes from the cache.
+fn cache_only(home: &common::GpgHome) -> GnupgSigner {
+    GnupgSigner::with_binary("/nonexistent/gpg".into(), Some(home.path()))
+}
+
+#[test]
+fn repeated_checks_do_not_run_gpg_again() {
+    let home = require_gpg!("Factum Test <test@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let factum = factum::Factum::with_seal_dir(&f.db, &signer, Some(f.seal_dir.clone()));
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("cached", None, case_id).unwrap();
+    factum.seal(case_id, "checkpoint").unwrap();
+    let first = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(first.overall(), Level::Ok);
+    let signature = signer.sign_detached(b"data").unwrap();
+    assert!(signer.verify_detached(&signature, b"data").valid);
+    let cached = cache_only(&home);
+    let factum = factum::Factum::with_seal_dir(&f.db, &cached, Some(f.seal_dir.clone()));
+    let second = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(second.overall(), Level::Ok, "{:?}", second.findings);
+    assert_eq!(second.signers, first.signers);
+    assert!(cached.verify_detached(&signature, b"data").valid);
+}
+
+#[test]
+fn a_changed_signature_or_changed_data_is_checked_again() {
+    let home = require_gpg!("Factum Test <test@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let clearsigned = signer.sign_text("text").unwrap();
+    let detached = signer.sign_detached(b"data").unwrap();
+    assert!(signer.verify_signature(&clearsigned).valid);
+    assert!(signer.verify_detached(&detached, b"data").valid);
+    assert!(!signer.verify_signature(&clearsigned.replace("text", "tExt")).valid);
+    assert!(!signer.verify_detached(&detached, b"other data").valid);
+    let cached = cache_only(&home);
+    assert!(!cached.verify_signature(&format!("x{clearsigned}")).valid);
+    assert!(!cached.verify_detached(&detached, b"other data").valid);
+}
+
+#[test]
+fn a_key_removed_or_revoked_after_a_check_is_seen_at_once() {
+    let home = require_gpg!("Removed <removed@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let signature = signer.sign_text("text").unwrap();
+    assert!(signer.verify_signature(&signature).valid);
+    assert!(signer.verify_signature(&signature).valid);
+    revoke(&home, "removed@factum.invalid");
+    let result = signer.verify_signature(&signature);
+    assert!(!result.valid);
+    assert_eq!(result.status, "signing key was revoked");
+    let fingerprint = &home.fingerprints("removed@factum.invalid")[0];
+    home.gpg_ok(&["--batch", "--yes", "--delete-secret-and-public-key", fingerprint]);
+    let result = signer.verify_signature(&signature);
+    assert!(!result.valid);
+    assert_eq!(result.status, "no public key");
+}
+
+#[test]
+fn a_trust_change_after_a_check_is_seen_at_once() {
+    let home = require_gpg!("Trust <trust@factum.invalid>");
+    let f = Fixture::new();
+    let signer = gpg(&f, &home);
+    let signature = signer.sign_text("text").unwrap();
+    assert_eq!(
+        signer.verify_signature(&signature).trust.as_deref(),
+        Some("TRUST_ULTIMATE")
+    );
+    let fingerprint = &home.fingerprints("trust@factum.invalid")[0];
+    let path = home.path().join("ownertrust");
+    std::fs::write(&path, format!("{fingerprint}:3:\n")).unwrap();
+    home.gpg_ok(&["--batch", "--import-ownertrust", path.to_str().unwrap()]);
+    assert_ne!(
+        signer.verify_signature(&signature).trust.as_deref(),
+        Some("TRUST_ULTIMATE")
+    );
+}
