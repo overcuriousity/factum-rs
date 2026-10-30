@@ -397,11 +397,7 @@ fn walk_states(file: &mut File, start: u64, len: u64) -> io::Result<u64> {
     let mut pos = start;
     while pos < len {
         let step = if pos + 4 > len {
-            let fragment = read_at(file, pos, (len - pos) as usize)?;
-            if [LOCAL_SIG, CENTRAL_SIG]
-                .iter()
-                .any(|sig| sig.to_le_bytes().starts_with(&fragment))
-            {
+            if header_or_end_at(file, pos, len)? {
                 Step::Interrupted
             } else {
                 Step::Unknown
@@ -479,9 +475,12 @@ fn member_step(file: &mut File, pos: u64, len: u64) -> io::Result<Step> {
     })
 }
 
-/// Whether what is at `pos` could be where a member ended.
+/// Whether a header starts at `pos`, whole or cut short by the end of the file, or the file ends there.
 fn header_or_end_at(file: &mut File, pos: u64, len: u64) -> io::Result<bool> {
-    Ok(pos + 4 > len || matches!(u32_at(&read_at(file, pos, 4)?, 0), LOCAL_SIG | CENTRAL_SIG))
+    let start = read_at(file, pos, (len - pos).min(4) as usize)?;
+    Ok([LOCAL_SIG, CENTRAL_SIG]
+        .iter()
+        .any(|sig| sig.to_le_bytes().starts_with(&start)))
 }
 
 /// Where the state whose central directory starts at `pos` ends. None for a directory that runs into the end of the
@@ -1306,12 +1305,17 @@ mod tests {
             poke(&mut file, end1 + 30 + 1 + 4, &[0u8; 16]);
             assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1), "{method}");
             assert_eq!(find_newest_end(&mut file, None).unwrap(), Some(end1), "{method}");
-            // its size written, its compressed size not (two writes)
+            // its size written, its compressed size not (two writes), whatever the CRC
             poke(&mut file, end1 + 30 + 1 + 4, &7u64.to_le_bytes());
             assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1), "{method}");
-            // neither sizes nor CRC: deflated, it cannot be finished
+            poke(&mut file, end1 + 14, &[0u8; 4]);
+            assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1), "{method}");
+            // neither sizes nor CRC: deflated, it cannot be finished, even when a header seems to follow
             if method == 8 {
                 interrupt_member(&mut file, end1, 1);
+                let mut entry = [0u8; 46];
+                entry[..4].copy_from_slice(b"PK\x01\x02");
+                poke(&mut file, end1 + 30 + 1 + 20, &entry);
                 assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1));
             }
         }
@@ -1365,6 +1369,37 @@ mod tests {
                 let error = find_newest_end(&mut file, known).unwrap_err();
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{damage:?} {known:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_crash_at_any_byte_of_an_addition_leaves_the_state_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
+        app.add_bytes("a", 8, b"first state").unwrap();
+        let end1 = app.finish(&[], b"aff4://x").unwrap();
+        let mut members = Vec::new();
+        for (name, method) in [("t", 8), ("h", 0), ("s", 8)] {
+            let start = app.position();
+            app.add_bytes(name, method, &pattern(300)).unwrap();
+            members.push((start, app.position()));
+        }
+        let directory = app.position();
+        drop(app);
+        let good = std::fs::read(dir.path().join("c.aff4l")).unwrap();
+        let mut file = reopened(&dir);
+        for len in end1..directory {
+            poke(&mut file, 0, &good);
+            file.set_len(len).unwrap();
+            // the member being written has its placeholders still
+            if let Some((start, _)) = members
+                .iter()
+                .find(|(start, end)| (*start + 30 + 1 + 20..*end).contains(&len))
+            {
+                interrupt_member(&mut file, *start, 1);
+            }
+            assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1), "{len}");
+            assert_eq!(find_newest_end(&mut file, None).unwrap(), Some(end1), "{len}");
         }
     }
 
