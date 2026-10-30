@@ -306,7 +306,7 @@ fn search_back<T>(
 ) -> io::Result<Option<T>> {
     // backwards in blocks that overlap by 3 bytes, so a signature across a block boundary is found
     let mut block_end = len;
-    while block_end >= from + EOCD_LEN {
+    while block_end >= from + 4 {
         let start = block_end.saturating_sub(BUFFER as u64).max(from);
         let block = read_at(file, start, (block_end - start) as usize)?;
         for at in (0..block.len().saturating_sub(3)).rev() {
@@ -466,11 +466,9 @@ fn state_end(file: &mut File, pos: u64, len: u64) -> io::Result<Option<u64>> {
     if u32_at(&record, 0) != EOCD_SIG {
         return Err(unreadable());
     }
+    // only the comment missing: that its length is damaged cannot be ruled out
     let end = at + EOCD_LEN + u16_at(&record, 20) as u64;
-    if end > len {
-        return Ok(None);
-    }
-    if is_state(file, end)? {
+    if end <= len && is_state(file, end)? {
         Ok(Some(end))
     } else {
         Err(unreadable())
@@ -515,14 +513,46 @@ pub fn member_reader<'f>(file: &'f mut File, entry: &CdEntry) -> io::Result<Box<
     let data = entry.header_offset + 30 + u16_at(&header, 26) as u64 + u16_at(&header, 28) as u64;
     file.seek(SeekFrom::Start(data))?;
     let raw = Read::take(file, entry.compressed_size);
+    let checked = |inner: Box<dyn Read + 'f>| -> Box<dyn Read + 'f> {
+        Box::new(CrcChecked {
+            inner,
+            crc: crc32fast::Hasher::new(),
+            expected: entry.crc32,
+            name: entry.name_lossy(),
+        })
+    };
     match entry.method {
-        0 => Ok(Box::new(raw)),
+        0 => Ok(checked(Box::new(raw))),
         // no more than the size the directory gives, whatever the data inflates to
-        8 => Ok(Box::new(flate2::read::DeflateDecoder::new(raw).take(entry.size))),
+        8 => Ok(checked(Box::new(
+            flate2::read::DeflateDecoder::new(raw).take(entry.size),
+        ))),
         other => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("compression method {other} of {}", entry.name_lossy()),
         )),
+    }
+}
+
+/// Passes a member's content through; once it has been read to its end, fails unless it has the directory's CRC-32.
+struct CrcChecked<'f> {
+    inner: Box<dyn Read + 'f>,
+    crc: crc32fast::Hasher,
+    expected: u32,
+    name: String,
+}
+
+impl Read for CrcChecked<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.crc.update(&buf[..read]);
+        if read == 0 && !buf.is_empty() && self.crc.clone().finalize() != self.expected {
+            return Err(invalid(format!(
+                "{} does not match the CRC-32 of the central directory",
+                self.name
+            )));
+        }
+        Ok(read)
     }
 }
 
@@ -984,6 +1014,49 @@ mod tests {
     }
 
     #[test]
+    fn a_member_is_checked_against_the_crc_of_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
+        // without content both have the CRC-32 0 of nothing
+        app.add_bytes("empty", 0, b"").unwrap();
+        app.add_bytes("nothing", 8, b"").unwrap();
+        let stored = app.add_bytes("stored", 0, b"stored content").unwrap();
+        let deflated = app.add_bytes("deflated", 8, &pattern(1 << 16)).unwrap();
+        let end = app.finish(&[], b"").unwrap();
+        let mut file = app.into_file();
+        let archive = read_archive(&mut file, end).unwrap();
+        assert_eq!(archive.get("empty").unwrap().crc32, 0);
+        for entry in &archive.entries {
+            member_bytes(&mut file, entry).unwrap();
+        }
+        // one byte of the stored content changed
+        let at = stored.header_offset + 30 + 6 + 20;
+        poke(&mut file, at, b"S");
+        let error = member_bytes(&mut file, &stored).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("CRC-32"), "{error}");
+        // the directory's CRC changed, the content not
+        let wrong = CdEntry {
+            crc32: deflated.crc32 ^ 1,
+            ..deflated
+        };
+        assert!(
+            member_bytes(&mut file, &wrong)
+                .unwrap_err()
+                .to_string()
+                .contains("CRC-32")
+        );
+        // content where the directory says there is none
+        let wrong = CdEntry {
+            crc32: 0,
+            size: 4,
+            compressed_size: 4,
+            ..stored
+        };
+        assert!(member_bytes(&mut file, &wrong).is_err());
+    }
+
+    #[test]
     fn a_member_keeps_the_time_it_was_written() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
@@ -1161,7 +1234,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (end1, end2) = two_states(&dir);
         let mut file = reopened(&dir);
-        for len in (end1..end2).rev() {
+        let comment = end2 - 8;
+        for len in (comment..end2).rev() {
+            file.set_len(len).unwrap();
+            // all but the comment: the same as a damaged comment length, and not cut off
+            assert!(find_newest_end(&mut file, Some(end1)).is_err(), "{len}");
+        }
+        for len in (end1..comment).rev() {
             file.set_len(len).unwrap();
             assert_eq!(find_newest_end(&mut file, Some(end1)).unwrap(), Some(end1), "{len}");
             assert_eq!(find_newest_end(&mut file, None).unwrap(), Some(end1), "{len}");
@@ -1176,11 +1255,12 @@ mod tests {
         let directory = directory_offset(&mut file, end2, 8);
         let record = end2 - 8 - EOCD_LEN - LOCATOR_LEN - EOCD64_LEN;
         let good = std::fs::read(dir.path().join("c.aff4l")).unwrap();
-        let damaged: [(u64, &[u8]); 4] = [
+        let damaged: [(u64, &[u8]); 5] = [
             (directory, b"XX"),                 // its first entry
             (directory + 46 + 1, b"\xFF\xFF"),  // an entry's name, cut from the next
             (record + 32, &9u64.to_le_bytes()), // a count beyond what is there
             (end2 - 8 - EOCD_LEN, b"XX"),       // the classic record
+            (end2 - 8 - 2, b"\xFF\xFF"),        // a comment length beyond the file
         ];
         for (at, bytes) in damaged {
             for tail in [0, 1000] {
@@ -1197,6 +1277,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_state_is_found_at_the_very_start_of_the_bytes_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, end) = two_states(&dir);
+        let mut file = reopened(&dir);
+        // the blocks of the search end 13 bytes after `from`, short of a whole record
+        let from = end - 8 - EOCD_LEN - 5;
+        file.set_len(from + 10 + BUFFER as u64).unwrap();
+        assert_eq!(
+            search_tail(&mut file, from, from + 10 + BUFFER as u64).unwrap(),
+            Some(end)
+        );
     }
 
     #[test]

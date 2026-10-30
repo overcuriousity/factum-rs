@@ -868,6 +868,43 @@ mod verify {
     }
 
     #[test]
+    fn a_member_that_fails_its_crc_is_a_failure() {
+        use std::io::{Seek, SeekFrom, Write};
+        let s = Setup::new();
+        let id = closed_with_files(&s);
+        let arn = s.f.factum().container(id).unwrap().adds[0].files[0].arn.clone();
+        let path = s.container_path();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let good = std::fs::read(&path).unwrap();
+        // the CRC field of each central entry: 46 bytes of fixed fields, then name and extra
+        for (entry, code) in [
+            (archive.get_arn(&arn).unwrap(), "stream_hash"),
+            (archive.get("factum/history/1/information.turtle").unwrap(), "history"),
+            (
+                archive.get("factum/history/1/information.turtle.hashes").unwrap(),
+                "turtle_hash",
+            ),
+        ] {
+            std::fs::write(&path, &good).unwrap();
+            // the name as the directory has it: followed by the ZIP64 extra
+            let name = [entry.name.as_slice(), &[1, 0, 24, 0]].concat();
+            let name_at = good.windows(name.len()).rposition(|w| w == name).unwrap() as u64;
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(name_at - 46 + 16)).unwrap();
+            file.write_all(&(entry.crc32 ^ 1).to_le_bytes()).unwrap();
+            let report = verify(&s, &path);
+            assert!(codes(&report, Level::Fail).contains(&code), "{:?}", report.findings);
+            assert!(
+                report.findings.iter().any(|f| f.message.contains("CRC-32")),
+                "{:?}",
+                report.findings
+            );
+        }
+    }
+
+    #[test]
     fn an_entry_hidden_behind_a_lowered_count_fails() {
         let s = Setup::new();
         closed_with_files(&s);
