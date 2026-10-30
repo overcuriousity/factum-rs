@@ -16,7 +16,7 @@ use super::volume::{
     CER_X509, FileRecord, HASHES, KEY_GPG, SIG_GPG, SIG_X509, TURTLE, content_reader, file_records, history_member,
 };
 use super::x509::{Gpgsm, X509Check};
-use super::zip64::{Archive, find_last_end, member_bytes, read_archive};
+use super::zip64::{Archive, find_last_end, find_newest_end, member_bytes, read_archive};
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS};
 use crate::error::{FactumError, Result};
 use crate::services::Factum;
@@ -537,7 +537,7 @@ pub fn verify_file(
     let len = file.seek(SeekFrom::End(0))?;
     let end = match find_last_end(&mut file, None) {
         Ok(Some(end)) => end,
-        _ => {
+        Ok(None) => {
             report.finding(
                 Level::Fail,
                 "not_aff4",
@@ -545,17 +545,31 @@ pub fn verify_file(
             );
             return Ok(report);
         }
+        Err(e) => return Err(FactumError::general(format!("{} cannot be read: {e}", path.display()))),
     };
     if end < len {
         report.discarded_tail = len - end;
-        report.finding(
-            Level::Warn,
-            "trailing_data",
-            format!(
-                "{} bytes after the last complete state (an interrupted addition); the last complete state was checked.",
-                len - end
+        match find_newest_end(&mut file, Some(end)) {
+            Ok(_) => report.finding(
+                Level::Warn,
+                "trailing_data",
+                format!(
+                    "{} bytes after the last complete state (an interrupted addition); the last complete state was \
+                     checked.",
+                    len - end
+                ),
             ),
-        );
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => report.finding(
+                Level::Fail,
+                "trailing_data",
+                format!(
+                    "{} bytes after the last complete state are more than an interrupted addition ({e}); the last \
+                     complete state was checked.",
+                    len - end
+                ),
+            ),
+            Err(e) => return Err(FactumError::general(format!("{} cannot be read: {e}", path.display()))),
+        }
     }
     let archive = read_archive(&mut file, end)?;
     for name in archive.duplicates() {
@@ -565,7 +579,7 @@ pub fn verify_file(
             format!("{name} is listed more than once; ZIP tools may read a different one than this check did."),
         );
     }
-    let version = read_member(&mut file, &archive, "version.txt").and_then(|r| r.ok());
+    let version = read_checked(&mut file, &archive, "version.txt", "history", &mut report.findings);
     let Some(version) = version.map(|v| String::from_utf8_lossy(&v).into_owned()) else {
         report.format = ContainerFormat::Legacy;
         report.finding(
@@ -618,14 +632,19 @@ pub fn verify_file(
             ),
         );
     }
-    report.uuid = read_member(&mut file, &archive, "container.description")
-        .and_then(|r| r.ok())
-        .map(|d| {
-            String::from_utf8_lossy(&d)
-                .trim()
-                .trim_start_matches("aff4://")
-                .to_string()
-        });
+    report.uuid = read_checked(
+        &mut file,
+        &archive,
+        "container.description",
+        "history",
+        &mut report.findings,
+    )
+    .map(|d| {
+        String::from_utf8_lossy(&d)
+            .trim()
+            .trim_start_matches("aff4://")
+            .to_string()
+    });
 
     // the states: every closed one, and the current one when it is not the newest close
     let Some(Ok(current_turtle)) = read_member(&mut file, &archive, TURTLE) else {

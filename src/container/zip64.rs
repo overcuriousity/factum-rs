@@ -12,17 +12,26 @@ const LOCATOR_SIG: u32 = 0x0706_4b50;
 const ZIP64_EXTRA: u16 = 0x0001;
 const VERSION: u16 = 45; // ZIP64
 const FLAG_UTF8: u16 = 1 << 11;
+/// The flags a local header has to share with its central entry, because they change how the member is read:
+/// encrypted (0), sizes in a data descriptor (3) and UTF-8 name (11). factum writes 0 and 3 clear and 11 set in both;
+/// the others (compression options) say nothing a reader acts on.
+const FLAGS_COMPARED: u16 = 1 | (1 << 3) | FLAG_UTF8;
 const EOCD_LEN: u64 = 22;
 const LOCATOR_LEN: u64 = 20;
 const EOCD64_LEN: u64 = 56;
 const BUFFER: usize = 1 << 20;
 
 /// One member as the central directory lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CdEntry {
     pub name: Vec<u8>,
+    /// general purpose bit flags
+    pub flags: u16,
     /// 0 stored, 8 deflated
     pub method: u16,
+    /// MS-DOS time and date the member was written
+    pub time: u16,
+    pub date: u16,
     pub crc32: u32,
     pub compressed_size: u64,
     pub size: u64,
@@ -233,7 +242,10 @@ pub fn read_archive(file: &mut File, end: u64) -> io::Result<Archive> {
         }
         let mut entry = CdEntry {
             name: directory[at + 46..at + 46 + name_len].to_vec(),
+            flags: u16_at(&directory, at + 8),
             method: u16_at(&directory, at + 10),
+            time: u16_at(&directory, at + 12),
+            date: u16_at(&directory, at + 14),
             crc32: u32_at(&directory, at + 16),
             compressed_size: u32_at(&directory, at + 20) as u64,
             size: u32_at(&directory, at + 24) as u64,
@@ -246,6 +258,10 @@ pub fn read_archive(file: &mut File, end: u64) -> io::Result<Archive> {
         }
         entries.push(entry);
         at = next;
+    }
+    // an entry behind the count is one factum would not see, and other ZIP readers would
+    if at != directory.len() {
+        return Err(invalid("the central directory holds more than its entry count"));
     }
     Ok(Archive::new(entries, comment, end))
 }
@@ -406,12 +422,9 @@ fn member_end(file: &mut File, pos: u64, len: u64) -> io::Result<Option<u64>> {
         }
         let extra = read_at(file, pos + 30 + name_len, extra_len as usize)?;
         let mut entry = CdEntry {
-            name: Vec::new(),
-            method: 0,
-            crc32: 0,
             compressed_size: 0xFFFF_FFFF,
             size: 0xFFFF_FFFF,
-            header_offset: 0,
+            ..CdEntry::default()
         };
         apply_zip64_extra(&mut entry, &extra);
         if entry.compressed_size == 0xFFFF_FFFF || (entry.compressed_size, entry.size) == (0, 0) {
@@ -482,11 +495,22 @@ fn search_tail(file: &mut File, from: u64, len: u64) -> io::Result<Option<u64>> 
     })
 }
 
-/// The uncompressed content of a member.
+/// The uncompressed content of a member. Its local header has to agree with the central directory: ZIP readers go
+/// by one or the other.
 pub fn member_reader<'f>(file: &'f mut File, entry: &CdEntry) -> io::Result<Box<dyn Read + 'f>> {
     let header = read_at(file, entry.header_offset, 30)?;
     if u32_at(&header, 0) != LOCAL_SIG {
         return Err(invalid(format!("no local header for {}", entry.name_lossy())));
+    }
+    let name = read_at(file, entry.header_offset + 30, u16_at(&header, 26) as usize)?;
+    if name != entry.name
+        || u16_at(&header, 8) != entry.method
+        || (u16_at(&header, 6) ^ entry.flags) & FLAGS_COMPARED != 0
+    {
+        return Err(invalid(format!(
+            "the local header of {} differs from the central directory",
+            entry.name_lossy()
+        )));
     }
     let data = entry.header_offset + 30 + u16_at(&header, 26) as u64 + u16_at(&header, 28) as u64;
     file.seek(SeekFrom::Start(data))?;
@@ -666,7 +690,10 @@ impl Appender {
         self.position = data_end;
         let entry = CdEntry {
             name: name_bytes.to_vec(),
+            flags: FLAG_UTF8,
             method,
+            time,
+            date,
             crc32,
             compressed_size,
             size,
@@ -715,7 +742,6 @@ impl Appender {
             .into_iter()
             .filter(|e| !omit.iter().any(|name| e.name == name.as_bytes()))
             .collect();
-        let (time, date) = dos_now();
         let cd_offset = self.position;
         self.out.seek(SeekFrom::Start(cd_offset))?;
         let mut directory = Vec::new();
@@ -723,10 +749,10 @@ impl Appender {
             directory.extend(CENTRAL_SIG.to_le_bytes());
             directory.extend(VERSION.to_le_bytes()); // made by
             directory.extend(VERSION.to_le_bytes()); // needed
-            directory.extend(FLAG_UTF8.to_le_bytes());
+            directory.extend(entry.flags.to_le_bytes());
             directory.extend(entry.method.to_le_bytes());
-            directory.extend(time.to_le_bytes());
-            directory.extend(date.to_le_bytes());
+            directory.extend(entry.time.to_le_bytes());
+            directory.extend(entry.date.to_le_bytes());
             directory.extend(entry.crc32.to_le_bytes());
             directory.extend(0xFFFF_FFFFu32.to_le_bytes());
             directory.extend(0xFFFF_FFFFu32.to_le_bytes());
@@ -883,12 +909,14 @@ mod tests {
         assert_eq!(find_last_end(&mut file, Some(end1 + 1)).unwrap(), Some(end1));
     }
 
-    /// Renames the central directory entry of `from` to `to` (same length): a crafted duplicate name.
-    pub(crate) fn rename_in_directory(path: &std::path::Path, from: &str, to: &str) {
+    /// Renames a member `from` to `to` (same length) in its local header and in the central directory: a crafted
+    /// duplicate name.
+    fn rename_member(path: &std::path::Path, from: &str, to: &str) {
         assert_eq!(from.len(), to.len());
         let mut bytes = std::fs::read(path).unwrap();
-        let at = bytes.windows(from.len()).rposition(|w| w == from.as_bytes()).unwrap();
-        bytes[at..at + to.len()].copy_from_slice(to.as_bytes());
+        while let Some(at) = bytes.windows(from.len()).position(|w| w == from.as_bytes()) {
+            bytes[at..at + to.len()].copy_from_slice(to.as_bytes());
+        }
         std::fs::write(path, bytes).unwrap();
     }
 
@@ -900,7 +928,7 @@ mod tests {
         app.add_bytes("bbbb", 0, b"second").unwrap();
         let end = app.finish(&[], b"").unwrap();
         drop(app);
-        rename_in_directory(&dir.path().join("c.aff4l"), "bbbb", "aaaa");
+        rename_member(&dir.path().join("c.aff4l"), "bbbb", "aaaa");
         let mut file = std::fs::File::open(dir.path().join("c.aff4l")).unwrap();
         let archive = read_archive(&mut file, end).unwrap();
         assert_eq!(archive.duplicates(), vec!["aaaa".to_string()]);
@@ -909,15 +937,86 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_behind_the_count_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (end1, end2) = two_states(&dir);
+        let mut file = reopened(&dir);
+        let record = end2 - 8 - EOCD_LEN - LOCATOR_LEN - EOCD64_LEN;
+        poke(&mut file, record + 32, &1u64.to_le_bytes());
+        let error = read_archive(&mut file, end2).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("more than its entry count"), "{error}");
+        // the state is complete: reading on from the one before does not pass it
+        assert_eq!(
+            find_newest_end(&mut file, Some(end1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(read_archive(&mut file, end1).unwrap().entries.len(), 1);
+    }
+
+    #[test]
+    fn a_local_header_has_to_agree_with_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, end) = two_states(&dir);
+        let good = std::fs::read(dir.path().join("c.aff4l")).unwrap();
+        let mut file = reopened(&dir);
+        let archive = read_archive(&mut file, end).unwrap();
+        let entry = archive.get("b").unwrap();
+        let at = entry.header_offset;
+        assert_eq!(content(&mut file, &archive, "b"), b"second state");
+        let damaged: [(u64, &[u8]); 5] = [
+            (at + 30, b"c"),       // another name
+            (at + 26, b"\x02"),    // a longer name
+            (at + 8, b"\x08"),     // deflated
+            (at + 6, b"\x08\x08"), // a data descriptor
+            (at + 6 + 1, b"\x00"), // no UTF-8 flag
+        ];
+        for (offset, bytes) in damaged {
+            poke(&mut file, offset, bytes);
+            let error = member_bytes(&mut file, entry).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{offset}");
+            assert!(error.to_string().contains("differs from the central"), "{error}");
+            poke(&mut file, 0, &good);
+        }
+        // a flag no reader acts on (compression option) is not compared
+        poke(&mut file, at + 6, b"\x02\x08");
+        assert_eq!(member_bytes(&mut file, entry).unwrap(), b"second state");
+    }
+
+    #[test]
+    fn a_member_keeps_the_time_it_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = Appender::new(new_file(&dir), 0, Vec::new()).unwrap();
+        app.add_bytes("a", 8, b"first").unwrap();
+        let end1 = app.finish(&[], b"").unwrap();
+        let mut file = app.into_file();
+        let mut entries = read_archive(&mut file, end1).unwrap().entries;
+        // the local header and the directory say the same
+        let header = read_at(&mut file, 0, 30).unwrap();
+        assert_eq!(
+            (entries[0].time, entries[0].date),
+            (u16_at(&header, 10), u16_at(&header, 12))
+        );
+        // written long ago: no later finish changes that
+        (entries[0].time, entries[0].date) = (0x1234, 0x4321);
+        let mut app = Appender::new(file, end1, entries).unwrap();
+        app.add_bytes("b", 0, b"second").unwrap();
+        let end2 = app.finish(&[], b"").unwrap();
+        let end3 = app.finish(&[], b"").unwrap();
+        let mut file = app.into_file();
+        for end in [end2, end3] {
+            let a = read_archive(&mut file, end).unwrap().get("a").unwrap().clone();
+            assert_eq!((a.time, a.date), (0x1234, 0x4321));
+        }
+    }
+
+    #[test]
     fn lookups_stay_fast_with_many_members() {
         let entries: Vec<CdEntry> = (0..50_000)
             .map(|i| CdEntry {
                 name: format!("aff4://{i:036}").into_bytes(),
-                method: 0,
-                crc32: 0,
-                compressed_size: 0,
-                size: 0,
                 header_offset: i,
+                ..CdEntry::default()
             })
             .collect();
         let archive = Archive::new(entries, Vec::new(), 0);

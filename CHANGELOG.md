@@ -32,6 +32,10 @@ All notable changes to this project are documented here. The format follows
   `install.ps1` keeps `%VAR%` entries of the user PATH unexpanded.
 
 ### Fixed
+- Containers: a central directory with entries behind its count (invisible to factum, read by other ZIP tools) is
+  refused, and a member whose local header differs from the central directory in name, method or flags fails
+  verification; verifying reports a complete state that cannot be read as a failure, not as an interrupted addition
+- Containers: a member keeps the time it was written; each later state rewrote the times of all earlier members
 - Opening a container for writing no longer cuts anything off after a read error, and refuses when the bytes after the
   newest state could be more than an interrupted addition (a complete central directory that cannot be read); an
   interrupted member is no longer taken for a finished empty one and its content read as ZIP headers

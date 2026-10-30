@@ -868,6 +868,53 @@ mod verify {
     }
 
     #[test]
+    fn an_entry_hidden_behind_a_lowered_count_fails() {
+        let s = Setup::new();
+        closed_with_files(&s);
+        let path = s.container_path();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let record = bytes.windows(4).rposition(|w| w == b"PK\x06\x06").unwrap();
+        let count = u64::from_le_bytes(bytes[record + 32..record + 40].try_into().unwrap()) - 1;
+        bytes[record + 24..record + 32].copy_from_slice(&count.to_le_bytes());
+        bytes[record + 32..record + 40].copy_from_slice(&count.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let report = verify(&s, &path);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.level == Level::Fail && f.code == "trailing_data"),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_local_header_that_differs_from_the_directory_fails() {
+        let s = Setup::new();
+        let id = closed_with_files(&s);
+        let arn = s.f.factum().container(id).unwrap().adds[0].files[0].arn.clone();
+        let path = s.container_path();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let good = std::fs::read(&path).unwrap();
+        for (entry, code) in [
+            (archive.get_arn(&arn).unwrap(), "stream_hash"),
+            (archive.get("factum/history/1/information.turtle").unwrap(), "history"),
+            (archive.get("version.txt").unwrap(), "history"),
+        ] {
+            let mut bytes = good.clone();
+            // the first letter of its name
+            bytes[entry.header_offset as usize + 30] ^= 1;
+            std::fs::write(&path, bytes).unwrap();
+            let report = verify(&s, &path);
+            assert!(codes(&report, Level::Fail).contains(&code), "{:?}", report.findings);
+        }
+    }
+
+    #[test]
     fn edited_turtle_fails_turtle_hash_and_signature() {
         let s = Setup::new();
         closed_with_files(&s);
