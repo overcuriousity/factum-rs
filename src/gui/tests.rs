@@ -1057,12 +1057,7 @@ fn menu_opens_wizard() {
 fn clearing_the_seal_folder_in_the_wizard_clears_the_setting() {
     let fixture = Fixture::new();
     let seals = tempfile::tempdir().unwrap();
-    config::set_dotenv_value(
-        &fixture.user_env(),
-        SEAL_DIR_KEY,
-        Some(&seals.path().display().to_string()),
-    )
-    .unwrap();
+    config::set_seal_dir(&fixture.user_env(), Some(&seals.path().display().to_string())).unwrap();
     let mut harness = fixture.harness();
     harness.state_mut().open_wizard();
     harness.run_ok();

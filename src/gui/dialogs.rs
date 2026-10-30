@@ -807,7 +807,7 @@ impl Dialog {
                 );
                 let folder_label = ui.label("Folder");
                 folder_field(ui, folder, Some(folder_label.id));
-                let default_name = format!("{}.aff4l", crate::seals::safe_filename(strip(name)));
+                let default_name = format!("{}.aff4l", crate::files::safe_filename(strip(name)));
                 field(ui, "File name", file_name, &default_name, false);
                 error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Create", true);

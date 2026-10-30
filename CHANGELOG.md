@@ -8,13 +8,15 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - The seal folder setting is stored as `FACTUM_SEAL_DIR` in the user config `.env`, no longer in the database: the
   verifier no longer takes the folder it checks from the database it verifies, which a tamperer could point at an
-  empty folder. A folder set in the GUI of an earlier version is moved there once, when the database is opened. Verify
-  reports name the seal folder they checked; a change of the seal folder is written to the application log
+  empty folder. A folder set in the GUI of an earlier version is moved there on the first start (with a warning), and no
+  database is read for it afterwards. Verify reports (CLI, GUI, HTML, Markdown, PDF) name the seal folder they
+  checked; a change of the seal folder is written to the application log
 - A `.env` in the current directory is no longer read, only the one in the user config directory
 
 ### Fixed
 - A seal file that cannot be read or parsed is reported as a warning naming the file instead of being skipped
-  silently, and a corrupt signed copy (`.asc`) no longer hides the unsigned seal file (`.json`) it replaces
+  silently, and a corrupt or incomplete signed copy (`.asc`) no longer hides the unsigned seal file (`.json`) it
+  replaces
 - Seal files of a case whose file number contains U+2028, U+2029 or U+0085 are no longer ignored by the verifier
 - Seal files are written to a temporary file and renamed, so a crash leaves no half-written seal
 - Very long case file numbers (e.g. 80 CJK characters) no longer fail to seal with "File name too long": the file

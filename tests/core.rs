@@ -9,7 +9,7 @@ use factum::config::{SEAL_DIR_KEY, file_seal_dir, set_dotenv_value};
 use factum::error::ErrorKind;
 use factum::log_service::{Append, entry_signed_payload};
 use factum::notes::EntryFilter;
-use factum::seals::{SEAL_DIR_MIGRATED_SETTING, SEAL_DIR_SETTING, migrate_seal_dir_setting};
+use factum::seals::{SEAL_DIR_SETTING, migrate_seal_dir_setting, seal_dir_migration_marker};
 use factum::signer::FakeSigner;
 use factum::{Db, Factum, iocs, merkle, tags};
 use serde_json::json;
@@ -830,11 +830,14 @@ fn seal_folder_setting_moves_to_the_user_config_once() {
     let f = Fixture::new();
     let env = f.path().join("config").join(".env");
     f.db.set_setting(SEAL_DIR_SETTING, "/media/usb/seals").unwrap();
-    migrate_seal_dir_setting(&f.db, &env).unwrap();
+    assert_eq!(
+        migrate_seal_dir_setting(&f.db, &env).unwrap().as_deref(),
+        Some("/media/usb/seals")
+    );
     assert_eq!(file_seal_dir(&env), Some(PathBuf::from("/media/usb/seals")));
     // reset to the default afterwards: opening the database again does not bring the old folder back
     set_dotenv_value(&env, SEAL_DIR_KEY, None).unwrap();
-    migrate_seal_dir_setting(&f.db, &env).unwrap();
+    assert_eq!(migrate_seal_dir_setting(&f.db, &env).unwrap(), None);
     assert_eq!(file_seal_dir(&env), None);
 }
 
@@ -844,15 +847,20 @@ fn seal_folder_in_the_user_config_wins_over_the_database_setting() {
     let env = f.path().join(".env");
     std::fs::write(&env, "FACTUM_SEAL_DIR=/mine\n").unwrap();
     f.db.set_setting(SEAL_DIR_SETTING, "/theirs").unwrap();
-    migrate_seal_dir_setting(&f.db, &env).unwrap();
+    assert_eq!(migrate_seal_dir_setting(&f.db, &env).unwrap(), None);
     assert_eq!(file_seal_dir(&env), Some(PathBuf::from("/mine")));
-    assert_eq!(f.db.get_setting(SEAL_DIR_MIGRATED_SETTING).unwrap(), "1");
+    assert!(seal_dir_migration_marker(&env).exists());
 }
 
 #[test]
-fn without_a_seal_folder_setting_nothing_is_written() {
+fn after_the_first_start_no_database_is_consulted() {
+    // the marker lives in the user config, not in a database a tamperer controls
     let f = Fixture::new();
     let env = f.path().join("config").join(".env");
-    migrate_seal_dir_setting(&f.db, &env).unwrap();
-    assert!(!env.exists() && !env.parent().unwrap().exists());
+    assert_eq!(migrate_seal_dir_setting(&f.db, &env).unwrap(), None);
+    assert!(seal_dir_migration_marker(&env).exists() && !env.exists());
+    let planted = Db::open(&f.path().join("planted.db")).unwrap();
+    planted.set_setting(SEAL_DIR_SETTING, "/tmp/empty").unwrap();
+    assert_eq!(migrate_seal_dir_setting(&planted, &env).unwrap(), None);
+    assert!(!env.exists());
 }

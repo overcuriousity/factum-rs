@@ -6,8 +6,9 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::canonical::utc_now;
 use crate::error::{FactumError, Result};
+use crate::files::write_atomically;
 use crate::log_service::entry_signed_payload;
-use crate::seals::{TreeHead, seal_payload, write_atomically};
+use crate::seals::{TreeHead, seal_payload};
 use crate::services::Factum;
 use crate::verifier::{CaseReport, EntryResult, Level, SealSource};
 

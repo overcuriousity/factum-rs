@@ -1,26 +1,21 @@
 //! Signed tree heads: stored in tree_heads and, as the copy that matters, written to the seal folder.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
-use regex::Regex;
 use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::canonical::{canonical_json, compact_utc, extract_clearsigned_text, utc_now};
-use crate::config::{SEAL_DIR_KEY, file_seal_dir, set_dotenv_value};
+use crate::config::{file_seal_dir, set_seal_dir};
 use crate::db::Db;
 use crate::error::{FactumError, Result};
+use crate::files::{parent_of, safe_filename_capped, write_atomically};
 use crate::merkle;
 use crate::notes::parse_payload;
 use crate::services::Factum;
 
 /// where the GUI kept the seal folder up to 2.7.1; only read once, to move it to the user config
 pub const SEAL_DIR_SETTING: &str = "seal_dir";
-/// set once SEAL_DIR_SETTING was moved, so a folder reset to the default later does not come back
-pub const SEAL_DIR_MIGRATED_SETTING: &str = "seal_dir_migrated";
 /// the case file number's share of a seal file name; the rest (`_<id>_size<n>_<time>.asc`) stays under 70 bytes,
 /// together well below the 255 bytes most file systems allow
 const SEAL_NAME_MAX_BYTES: usize = 100;
@@ -100,82 +95,50 @@ pub fn seal_payload(
     )
 }
 
-static UNSAFE_CHARACTERS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[^\w.-]+").unwrap());
-
-/// case file numbers like "2026/04 Müller" must not create folders or escape the target folder
-pub fn safe_filename(text: &str) -> String {
-    let replaced = UNSAFE_CHARACTERS.replace_all(text, "-");
-    let trimmed = replaced.trim_matches(|c| c == '.' || c == '-');
-    if trimmed.is_empty() {
-        "case".into()
-    } else {
-        trimmed.into()
-    }
+/// Next to the user config `.env`: written on the first start of a factum that keeps the seal folder there.
+pub fn seal_dir_migration_marker(env_file: &Path) -> PathBuf {
+    parent_of(env_file).join("seal-dir-migrated")
 }
 
-/// safe_filename, at most `max_bytes` long (UTF-8; at least 16): a longer name is cut at a character boundary
-/// and ends in 8 hex digits of the SHA-256 of `text`, so names cut to the same start stay distinct. Names that
-/// fit are returned unchanged.
-pub fn safe_filename_capped(text: &str, max_bytes: usize) -> String {
-    let name = safe_filename(text);
-    if name.len() <= max_bytes {
-        return name;
+/// On the first start of a factum that keeps the seal folder in the user config `.env`, moves the folder the GUI
+/// stored up to 2.7.1 in the database opened then, unless the `.env` names one already. The marker in the user
+/// config records that first start, moved or not: after it no database is consulted again, so a tampered one
+/// cannot plant a folder. Returns the folder that was moved.
+pub fn migrate_seal_dir_setting(db: &Db, env_file: &Path) -> Result<Option<String>> {
+    let marker = seal_dir_migration_marker(env_file);
+    if marker.exists() {
+        return Ok(None);
     }
-    let suffix = format!("-{}", &hex::encode(Sha256::digest(text.as_bytes()))[..8]);
-    let mut end = max_bytes.saturating_sub(suffix.len());
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", name[..end].trim_end_matches(['.', '-']))
-}
-
-/// Writes a file that is afterwards complete or not there: a temporary file in the same folder, synced, renamed
-/// over `path`, then the folder synced (not possible on Windows). An existing file keeps its permissions.
-pub fn write_atomically(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let folder = parent_of(path);
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".factum-").suffix(".tmp");
-    #[cfg(unix)]
-    let permissions = std::fs::metadata(path).map(|m| m.permissions()).unwrap_or_else(|_| {
-        // like fs::write: what the umask leaves of rw-rw-rw-
-        std::os::unix::fs::PermissionsExt::from_mode(0o666)
-    });
-    #[cfg(unix)]
-    builder.permissions(permissions);
-    let mut file = builder.tempfile_in(&folder)?;
-    file.write_all(content)?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|e| e.error)?;
-    #[cfg(unix)]
-    if let Ok(folder) = std::fs::File::open(&folder) {
-        let _ = folder.sync_all();
-    }
-    Ok(())
-}
-
-/// Moves the seal folder of a database written by factum up to 2.7.1 to the user config `.env`, once, unless the
-/// config already names one. Afterwards the database setting is never used: the verifier must not learn from
-/// the database it checks where the external copies are.
-pub fn migrate_seal_dir_setting(db: &Db, env_file: &Path) -> Result<()> {
+    let failed = |e: std::io::Error| {
+        FactumError::general(format!(
+            "The seal folder setting could not be moved to {}: {e}",
+            env_file.display()
+        ))
+    };
     let stored = db.get_setting(SEAL_DIR_SETTING)?;
-    if stored.is_empty() || !db.get_setting(SEAL_DIR_MIGRATED_SETTING)?.is_empty() {
-        return Ok(());
-    }
-    if file_seal_dir(env_file).is_none() {
-        set_dotenv_value(env_file, SEAL_DIR_KEY, Some(&stored)).map_err(|e| {
-            FactumError::general(format!(
-                "The seal folder setting could not be moved to {}: {e}",
-                env_file.display()
-            ))
-        })?;
-        log::info!("The seal folder {stored} is now set in {}.", env_file.display());
-    } else {
+    let moved = !stored.is_empty() && file_seal_dir(env_file).is_none();
+    if moved {
+        set_seal_dir(env_file, Some(&stored)).map_err(failed)?;
+        log::warn!(
+            "The seal folder {stored} was taken from the database {} and is now set in {}.",
+            db.path.display(),
+            env_file.display()
+        );
+    } else if !stored.is_empty() {
         log::info!(
             "The seal folder {stored} of this database is ignored: {} sets one already.",
             env_file.display()
         );
     }
-    db.set_setting(SEAL_DIR_MIGRATED_SETTING, "1")
+    std::fs::create_dir_all(parent_of(&marker))
+        .and_then(|_| {
+            write_atomically(
+                &marker,
+                b"factum keeps the seal folder in .env (FACTUM_SEAL_DIR); seal folders in databases are not read.\n",
+            )
+        })
+        .map_err(failed)?;
+    Ok(moved.then_some(stored))
 }
 
 /// Python's Path.resolve(): absolute, with the symlinks of the existing part resolved.
@@ -201,14 +164,6 @@ pub fn resolve(path: &Path) -> PathBuf {
         resolved.push(name);
     }
     resolved
-}
-
-/// Python's Path.parent: "." for a bare file name.
-fn parent_of(path: &Path) -> PathBuf {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    }
 }
 
 /// True for integer JSON numbers (Python's isinstance(value, int)).
@@ -364,7 +319,7 @@ impl Factum<'_> {
         signed.sort();
         unsigned.sort();
         // an unsigned seal that was signed later has a .asc with the same name; the .json is then superseded,
-        // but only by a .asc that could be read
+        // but only by a .asc that is a valid seal of this case
         let mut superseding = Vec::new();
         let unsigned: Vec<_> = unsigned.into_iter().map(|path| (path, false)).collect();
         for (path, is_signed) in signed.into_iter().map(|path| (path, true)).chain(unsigned) {
@@ -379,9 +334,6 @@ impl Factum<'_> {
                     continue;
                 }
             };
-            if is_signed {
-                superseding.push(stem);
-            }
             if payload.get("case_id").and_then(Value::as_i64) != Some(case_id)
                 || !case_files.contains(payload.get("case_file").unwrap_or(&Value::Null))
             {
@@ -392,6 +344,9 @@ impl Factum<'_> {
                     .unreadable
                     .push((path, "has no valid tree size or root hash".into()));
                 continue;
+            }
+            if is_signed {
+                superseding.push(stem);
             }
             result.found.push(SealFile {
                 path,
@@ -445,50 +400,5 @@ mod tests {
             seal_payload(1, "C-1", 2, "ab", "2026-01-01T00:00:00.000Z", "checkpoint"),
             r#"{"case_file":"C-1","case_id":1,"created_utc":"2026-01-01T00:00:00.000Z","format":1,"reason":"checkpoint","root_hash":"ab","tree_size":2}"#
         );
-    }
-
-    #[test]
-    fn safe_filenames() {
-        assert_eq!(safe_filename("2026/04 Müller"), "2026-04-Müller");
-        assert_eq!(safe_filename("../x"), "x");
-        assert_eq!(safe_filename("///"), "case");
-    }
-
-    #[test]
-    fn capped_filenames_cut_at_a_character_boundary_and_stay_distinct() {
-        assert_eq!(safe_filename_capped("2026/04 Müller", 100), "2026-04-Müller");
-        let long = "案".repeat(80);
-        let capped = safe_filename_capped(&long, 100);
-        assert!(capped.len() <= 100, "{}", capped.len());
-        // 91 bytes for the text: 30 three-byte characters, then "-" and 8 hex digits
-        assert_eq!(capped, format!("{}-{}", "案".repeat(30), &capped[capped.len() - 8..]));
-        let other = safe_filename_capped(&format!("{long}2"), 100);
-        assert_eq!(other.len(), capped.len());
-        assert_ne!(other, capped);
-        // the cut does not leave a separator before the hash
-        assert!(!safe_filename_capped(&format!("{}/{}", "a".repeat(90), "b".repeat(20)), 100).contains("--"));
-    }
-
-    #[test]
-    fn atomic_writes_replace_and_leave_no_temporary_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("seal.asc");
-        write_atomically(&path, b"one").unwrap();
-        write_atomically(&path, b"two").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"two");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-        assert!(write_atomically(&dir.path().join("missing").join("x"), b"x").is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_writes_keep_the_permissions_of_the_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".env");
-        std::fs::write(&path, "x").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        write_atomically(&path, b"y").unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

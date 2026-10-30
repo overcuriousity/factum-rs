@@ -257,16 +257,46 @@ fn a_dotenv_in_the_current_directory_is_not_read() {
 #[test]
 fn starting_factum_moves_the_seal_folder_setting_to_the_user_config() {
     let home = tempfile::tempdir().unwrap();
-    let db = factum::Db::open(&home.path().join("data/factum/factum.db")).unwrap();
-    db.set_setting(factum::seals::SEAL_DIR_SETTING, "/media/usb/seals")
-        .unwrap();
-    drop(db);
+    let env = home.path().join("config/factum/.env");
+    let db_path = home.path().join("data/factum/factum.db");
+    let plant = |folder: &str| {
+        let db = factum::Db::open(&db_path).unwrap();
+        db.set_setting(factum::seals::SEAL_DIR_SETTING, folder).unwrap();
+    };
+    plant("/media/usb/seals");
     let output = run_binary(home.path(), home.path(), &["--list-cases"]);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("WARNING:root:The seal folder /media/usb/seals was taken"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
-        factum::config::file_seal_dir(&home.path().join("config/factum/.env")),
+        factum::config::file_seal_dir(&env),
         Some(std::path::PathBuf::from("/media/usb/seals"))
     );
+    // a database changed later cannot replace it
+    plant("/tmp/empty");
+    assert!(run_binary(home.path(), home.path(), &["--list-cases"]).status.success());
+    assert_eq!(
+        factum::config::file_seal_dir(&env),
+        Some(std::path::PathBuf::from("/media/usb/seals"))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn after_a_clean_first_start_a_planted_seal_folder_is_never_moved() {
+    let home = tempfile::tempdir().unwrap();
+    let env = home.path().join("config/factum/.env");
+    assert!(run_binary(home.path(), home.path(), &["--list-cases"]).status.success());
+    let db = factum::Db::open(&home.path().join("data/factum/factum.db")).unwrap();
+    db.set_setting(factum::seals::SEAL_DIR_SETTING, "/tmp/empty").unwrap();
+    drop(db);
+    let before = std::fs::read(&env).ok();
+    assert!(run_binary(home.path(), home.path(), &["--list-cases"]).status.success());
+    assert_eq!(std::fs::read(&env).ok(), before);
+    assert_eq!(factum::config::file_seal_dir(&env), None);
 }
 
 // --- real gpg

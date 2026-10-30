@@ -234,6 +234,32 @@ fn unreadable_seal_files_warn_and_a_broken_asc_does_not_hide_its_json() {
 }
 
 #[test]
+fn an_asc_without_a_tree_size_does_not_hide_its_json() {
+    let f = Fixture::with_signer(FakeSigner::new(false));
+    let factum = f.factum();
+    let case_id = make_case(&factum, 2, "C-1");
+    let head = factum
+        .get_tree_head(factum.seal(case_id, "checkpoint").unwrap())
+        .unwrap()
+        .unwrap();
+    let json = PathBuf::from(head.file_path.unwrap());
+    let payload = format!(r#"{{"case_file":"C-1","case_id":{case_id},"root_hash":"00"}}"#);
+    std::fs::write(json.with_extension("asc"), FakeSigner::fake_signature(&payload)).unwrap();
+    let seal_files = factum.read_seal_files(case_id).unwrap();
+    assert_eq!(
+        seal_files.found.iter().map(|s| s.path.clone()).collect::<Vec<_>>(),
+        vec![json.clone()]
+    );
+    assert_eq!(
+        seal_files.unreadable,
+        vec![(
+            json.with_extension("asc"),
+            "has no valid tree size or root hash".to_string()
+        )]
+    );
+}
+
+#[test]
 fn a_line_separator_in_the_case_file_number_keeps_the_seal_file_readable() {
     // canonical JSON leaves U+2028 unescaped; splitting the clearsigned text there lost the whole seal
     let f = Fixture::new();

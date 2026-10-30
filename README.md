@@ -276,9 +276,11 @@ database or seal folder it uses. See [.env.example](.env.example).
 | `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                                 |
 
 The seal folder is never taken from the database: someone who can edit the database could otherwise point the check
-at an empty folder. A seal folder chosen in the GUI of factum up to 2.7.1 (stored in the database) is moved to the
-user config `.env` once, the first time that database is opened, unless the `.env` already sets one. Every verify
-report names the seal folder it checked.
+at an empty folder. On the first start of this version, a seal folder chosen in the GUI of factum up to
+2.7.1 (stored in the database opened then) is moved to the user config `.env`, unless that already sets one; factum
+warns when it does, and asks to check the folder. A marker file `seal-dir-migrated` next to the `.env` records the first
+start, so no database is read for this again. Every verify report (CLI, GUI, HTML/Markdown/PDF) names the seal folder
+it checked.
 
 ## What the integrity checks protect against
 

@@ -28,7 +28,7 @@ use crate::cases::Case;
 use crate::companion::ask::Answer;
 use crate::companion::thread::{Command, CompanionHandle, Status};
 use crate::companion::{CompanionDb, Settings, companion_db_path};
-use crate::config::{self, SEAL_DIR_KEY};
+use crate::config;
 use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
@@ -87,7 +87,8 @@ const SHOW_SYSTEM: KeyboardShortcut = shortcut(CTRL_SHIFT, Key::S);
 const SIDE_PANEL: KeyboardShortcut = shortcut(Modifiers::COMMAND, Key::B);
 const HELP: KeyboardShortcut = shortcut(Modifiers::NONE, Key::F1);
 
-pub fn run(db: Db) -> std::result::Result<(), String> {
+/// `notice`: a message shown once at the start (the seal folder taken from the database)
+pub fn run(db: Db, notice: Option<String>) -> std::result::Result<(), String> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Factum")
         .with_app_id("factum") // on Wayland the window gets the icon of the factum.desktop launcher
@@ -105,7 +106,11 @@ pub fn run(db: Db) -> std::result::Result<(), String> {
         options,
         Box::new(|creation| {
             theme::install_fonts(&creation.egui_ctx);
-            Ok(Box::new(FactumApp::new(db, &creation.egui_ctx)))
+            let mut app = FactumApp::new(db, &creation.egui_ctx);
+            if let Some(text) = notice {
+                app.message("Seal folder", text);
+            }
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| e.to_string())
@@ -2315,7 +2320,7 @@ impl FactumApp {
     /// verifier checks. The change goes to the application log.
     fn set_seal_folder(&mut self, folder: Option<&str>) {
         let before = self.factum().seal_dir();
-        if let Err(e) = config::set_dotenv_value(&self.user_env, SEAL_DIR_KEY, folder) {
+        if let Err(e) = config::set_seal_dir(&self.user_env, folder) {
             let text = format!("The seal folder could not be saved to {}: {e}", self.user_env.display());
             log::error!("{text}");
             self.message("Seal folder", text);

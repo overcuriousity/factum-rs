@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use crate::canonical::{compact_utc, utc_now};
 use crate::error::{FactumError, Result};
-use crate::seals::{REASON_EXPORT, safe_filename};
+use crate::files::safe_filename;
+use crate::seals::REASON_EXPORT;
 use crate::services::Factum;
 
 pub const FORMATS: [&str; 4] = ["html", "pdf", "md", "bundle"];
