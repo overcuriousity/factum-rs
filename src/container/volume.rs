@@ -265,15 +265,26 @@ fn io_error(path: &Path, e: io::Error) -> FactumError {
     FactumError::general(format!("The container {} could not be written: {e}", path.display()))
 }
 
-/// A failed read of a member while opening: `crc_mismatch`, a kind of its own that says so, or what `other` makes of it.
-fn member_error(path: &Path, e: io::Error, other: impl Fn(String) -> FactumError) -> FactumError {
+/// A read that failed for a reason other than what the file holds: it says nothing about the file.
+fn read_refused(path: &Path, e: io::Error) -> FactumError {
+    FactumError::general(format!(
+        "The container {} was not opened, nothing in it was changed: it could not be read ({e}).",
+        path.display()
+    ))
+}
+
+/// A failed read while opening: a differing CRC-32 (`crc_mismatch`, a kind of its own that says so), a read error, or
+/// what `other` makes of the file's content.
+fn open_error(path: &Path, e: io::Error, other: impl Fn(String) -> FactumError) -> FactumError {
+    use io::ErrorKind::{InvalidData, UnexpectedEof, Unsupported};
     match crc_mismatch(&e) {
         Some(member) => FactumError::container_crc(format!(
             "The container {} was not opened, nothing in it was changed: {member} differs from the CRC-32 of the \
              directory. Verify Container shows whether the content is intact.",
             path.display()
         )),
-        None => other(e.to_string()),
+        None if matches!(e.kind(), InvalidData | UnexpectedEof | Unsupported) => other(e.to_string()),
+        None => read_refused(path, e),
     }
 }
 
@@ -744,25 +755,24 @@ impl Volume {
             |why: String| FactumError::general(format!("{} is not a factum container: {why}", path.display()));
         let len = file.seek(SeekFrom::End(0)).map_err(|e| io_error(path, e))?;
         let refused = |e: io::Error| {
-            let why = if e.kind() == io::ErrorKind::InvalidData {
-                "it may hold more than an interrupted addition"
-            } else {
-                "it could not be read"
-            };
+            if e.kind() != io::ErrorKind::InvalidData {
+                return read_refused(path, e);
+            }
             FactumError::general(format!(
-                "The container {} was not opened, nothing in it was changed: {why} ({e}).",
+                "The container {} was not opened, nothing in it was changed: it may hold more than an interrupted \
+                 addition ({e}).",
                 path.display()
             ))
         };
         let end = find_newest_end(&mut file, known)
             .map_err(refused)?
             .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
-        let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
+        let archive = read_archive(&mut file, end).map_err(|e| open_error(path, e, not_container))?;
         let read = |file: &mut File, name: &str| -> Result<Vec<u8>> {
             let entry = archive
                 .get(name)
                 .ok_or_else(|| not_container(format!("{name} is missing")))?;
-            member_bytes(file, entry).map_err(|e| member_error(path, e, not_container))
+            member_bytes(file, entry).map_err(|e| open_error(path, e, not_container))
         };
         let version = String::from_utf8_lossy(&read(&mut file, "version.txt")?).into_owned();
         if !(version.contains("major=2") && version.contains("minor=1")) {
@@ -805,13 +815,13 @@ impl Volume {
             |why: String| FactumError::general(format!("{} is not a factum container: {why}", path.display()));
         let mut file = File::open(path).map_err(|e| not_container(e.to_string()))?;
         let end = find_last_end(&mut file, None)
-            .map_err(|e| not_container(e.to_string()))?
+            .map_err(|e| open_error(path, e, not_container))?
             .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
-        let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
+        let archive = read_archive(&mut file, end).map_err(|e| open_error(path, e, not_container))?;
         let entry = archive
             .get("container.description")
             .ok_or_else(|| not_container("container.description is missing".into()))?;
-        let description = member_text(&mut file, entry).map_err(|e| member_error(path, e, not_container))?;
+        let description = member_text(&mut file, entry).map_err(|e| open_error(path, e, not_container))?;
         let description = description.trim();
         if description.as_bytes() != archive.comment.as_slice() {
             return Err(not_container("its description and its ZIP comment differ".into()));
@@ -1853,10 +1863,39 @@ mod tests {
                 assert_eq!((volume.end(), discarded), (second, len - second));
                 break;
             }
-            let error = opened.err().unwrap();
-            assert!(error.to_string().contains("error 5"), "{n}: {error}");
+            assert_read_refused(&opened.err().unwrap());
             assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), len, "{n}");
         }
+    }
+
+    fn assert_read_refused(error: &FactumError) {
+        let text = error.to_string();
+        assert!(text.contains("was not opened, nothing in it was changed"), "{text}");
+        assert!(text.contains("could not be read") && text.contains("error 5"), "{text}");
+        assert!(!text.contains("not a factum container"), "{text}");
+        assert!(!error.is(crate::error::ErrorKind::ContainerCrc), "{text}");
+    }
+
+    #[test]
+    fn a_read_error_on_a_member_says_so() {
+        let setup = Setup::new();
+        drop(setup.create());
+        // every read in turn fails once, those of version.txt, the description and the metadata among them
+        let refused = |read: &dyn Fn() -> Result<()>| {
+            for n in 1.. {
+                crate::container::zip64::FAIL_READ.with(|fail| fail.set(n));
+                let result = read();
+                if crate::container::zip64::FAIL_READ.with(|fail| fail.replace(0)) != 0 {
+                    result.unwrap();
+                    return n - 1;
+                }
+                assert_read_refused(&result.err().unwrap());
+            }
+            unreachable!()
+        };
+        let opens = refused(&|| Volume::open(&setup.path(), None).map(|_| ()));
+        let descriptions = refused(&|| Volume::uuid_of(&setup.path()).map(|_| ()));
+        assert!(opens > descriptions && descriptions > 0, "{opens} {descriptions}");
     }
 
     #[test]
