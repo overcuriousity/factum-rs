@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- CLI: a case or evidence item is found by `#<id>`, then an exact file number, then an exact name; a plain number is an
+  id only when nothing matches, several matches are an error that lists them, `_` is no longer dropped from numbers.
+  Exit codes: 0 done, 1 verification failed (also `--export` of a failing case, which warns and still writes the
+  files), 2 any error (no case found, bad arguments, I/O; was 1). A note together with an option is refused. With
+  `FACTUM_DB` set the CLI prints `Database: <path>` on stderr. `--list-gpg` names an expired or revoked active key.
+  The demo example refuses without `FACTUM_DB` or a path.
 - The seal folder setting is stored as `FACTUM_SEAL_DIR` in the user config `.env`, no longer in the database: the
   verifier no longer takes the folder it checks from the database it verifies, which a tamperer could point at an
   empty folder. A folder set in the GUI of an earlier version is moved there on the first start (with a warning), and no
@@ -21,6 +27,8 @@ All notable changes to this project are documented here. The format follows
 - `verify.py` needs gpg 2.1 or newer and says so on an older one
 
 ### Fixed
+- `factum --verify <id>` and the lookup by name no longer stop at a case row that cannot be read; it is skipped by
+  name (and reported) and still reachable by id
 - IOC extraction: domains and emails with non-ASCII letters (`münchen.de`) are found; a URL keeps its final `/` and
   loses trailing punctuation and an unbalanced `)`/`]`; SHA-512 hashes are found; real TLDs such as `.zip`, `.mov`,
   `.app`, `.sh`, `.py` are no longer taken for file names; domains, emails, hashes and the scheme and host of URLs are

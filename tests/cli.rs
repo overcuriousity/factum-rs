@@ -107,7 +107,7 @@ fn new_case_and_evidence_from_the_cli() {
             .count(),
         0
     );
-    assert_eq!(run(&f, &f.signer, &["--new-case", "  "]).0, 1);
+    assert_eq!(run(&f, &f.signer, &["--new-case", "  "]).0, 2);
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn set_active_on_archived_case_fails() {
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
     factum.archive_case(case_id).unwrap();
-    assert_eq!(run(&f, &f.signer, &["--set-active", "case", "C-1"]).0, 1);
+    assert_eq!(run(&f, &f.signer, &["--set-active", "case", "C-1"]).0, 2);
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn verify_exit_codes() {
 #[test]
 fn verify_without_active_case_fails() {
     let f = Fixture::new();
-    assert_eq!(run(&f, &f.signer, &["--verify"]).0, 1);
+    assert_eq!(run(&f, &f.signer, &["--verify"]).0, 2);
 }
 
 #[test]
@@ -189,7 +189,7 @@ fn cli_export() {
 fn no_command_prints_usage() {
     let f = Fixture::new();
     let (code, out) = run(&f, &f.signer, &[]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 2);
     assert!(out.starts_with("cli usage: factum"));
 }
 
@@ -217,7 +217,7 @@ fn unsupported_database_exits_cleanly() {
         .env("FACTUM_DB", &path)
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("ERROR:root:This database was created by an older factum version")
@@ -839,4 +839,167 @@ fn a_trust_change_after_a_check_is_seen_at_once() {
         signer.verify_signature(&signature).trust.as_deref(),
         Some("TRUST_ULTIMATE")
     );
+}
+
+fn two_cases_sharing_a_number(f: &Fixture) -> (i64, i64) {
+    let factum = f.factum();
+    let first = factum.create_case("2026/1", "Alpha", "").unwrap();
+    factum.archive_case(first).unwrap();
+    let second = factum.create_case("2026/1", "Beta", "").unwrap();
+    (first, second)
+}
+
+#[test]
+fn an_exact_number_or_name_beats_a_numeric_id() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let first = factum.create_case("2", "Alpha", "").unwrap();
+    let second = factum.create_case("7", "Beta", "").unwrap();
+    let named_two = factum.create_case("C-9", "1", "").unwrap();
+    assert_eq!(cli::find_case_id(&factum, "2").unwrap(), Some(first));
+    assert_eq!(cli::find_case_id(&factum, "1").unwrap(), Some(named_two));
+    // nothing matches by number or name: an id
+    assert_eq!(
+        cli::find_case_id(&factum, &named_two.to_string()).unwrap(),
+        Some(named_two)
+    );
+    assert_eq!(cli::find_case_id(&factum, "#2").unwrap(), Some(second));
+    assert_eq!(cli::find_case_id(&factum, "#1").unwrap(), Some(first));
+    assert_eq!(cli::find_case_id(&factum, "#99").unwrap(), None);
+    assert_eq!(cli::find_case_id(&factum, "Beta").unwrap(), Some(second));
+    // underscores are no longer dropped
+    assert_eq!(cli::find_case_id(&factum, "1_0").unwrap(), None);
+}
+
+#[test]
+fn an_ambiguous_case_lookup_lists_the_candidates() {
+    let f = Fixture::new();
+    let (first, second) = two_cases_sharing_a_number(&f);
+    let (code, _) = run(&f, &f.signer, &["--set-active", "case", "2026/1"]);
+    assert_eq!(code, 2);
+    let error = cli::find_case_id(&f.factum(), "2026/1").unwrap_err().message;
+    assert!(
+        error.contains(&format!("#{first} 2026/1 Alpha")) && error.contains(&format!("#{second} 2026/1 Beta")),
+        "{error}"
+    );
+    let (code, out) = run(&f, &f.signer, &["--set-active", "case", &format!("#{second}")]);
+    assert_eq!(code, 0, "{out}");
+}
+
+#[test]
+fn an_ambiguous_evidence_lookup_lists_the_candidates() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.set_active_case(case_id).unwrap();
+    let a = factum.create_evidence(case_id, "disk", "", "").unwrap();
+    let b = factum.create_evidence(case_id, "disk", "", "").unwrap();
+    let error = cli::find_evidence_id(&factum, "disk", case_id).unwrap_err().message;
+    assert!(
+        error.contains(&format!("#{a} disk")) && error.contains(&format!("#{b} disk")),
+        "{error}"
+    );
+    assert_eq!(
+        cli::find_evidence_id(&factum, &format!("#{b}"), case_id).unwrap(),
+        Some(b)
+    );
+    assert_eq!(
+        cli::find_evidence_id(&factum, &a.to_string(), case_id).unwrap(),
+        Some(a)
+    );
+    assert_eq!(run(&f, &f.signer, &["--set-active", "evidence", "disk"]).0, 2);
+}
+
+#[test]
+fn a_case_row_that_cannot_be_read_does_not_stop_the_lookup_or_verify() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let bad = factum.create_case("C-1", "Bad", "").unwrap();
+    let good = factum.create_case("C-2", "Good", "").unwrap();
+    f.exec(&format!("UPDATE cases SET case_name = X'00' WHERE id = {bad}"));
+    assert_eq!(cli::find_case_id(&factum, "C-2").unwrap(), Some(good));
+    assert_eq!(cli::find_case_id(&factum, &bad.to_string()).unwrap(), Some(bad));
+    assert_eq!(cli::find_case_id(&factum, &format!("#{bad}")).unwrap(), Some(bad));
+    let (code, out) = run(&f, &f.signer, &["--verify", &bad.to_string()]);
+    assert!(out.contains("column 'case_name'"), "{out}");
+    assert_eq!(code, 1, "{out}");
+}
+
+#[test]
+fn a_note_with_an_action_flag_is_refused() {
+    use clap::Parser;
+    for flags in [["--list-cases"], ["--checkpoint"]] {
+        let error = Args::try_parse_from(["factum", "a note", flags[0]]).unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+    }
+    assert!(Args::try_parse_from(["factum", "a note", "--log-level", "DEBUG"]).is_ok());
+}
+
+#[test]
+fn export_of_a_failing_case_warns_and_exits_1_with_the_files_written() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("hello", None, case_id).unwrap();
+    f.exec("UPDATE entries SET text = 'tampered' WHERE kind = 'note'");
+    let out_dir = f.path().join("out");
+    let (code, out) = run(
+        &f,
+        &f.signer,
+        &["--export", "C-1", "--format", "md", "--out", out_dir.to_str().unwrap()],
+    );
+    assert_eq!(code, 1, "{out}");
+    assert!(out.lines().any(|l| l.ends_with(".md")) && out_dir.read_dir().unwrap().count() == 1);
+}
+
+#[test]
+fn an_expired_or_revoked_active_key_is_listed_with_its_state() {
+    let key = |validity: &str| factum::signer::GpgKey {
+        keyid: "ABCD1234".into(),
+        uids: vec!["Jane <j@example.org>".into()],
+        validity: validity.into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        cli::gpg_line(&key("u"), true),
+        "  ABCD1234 [active]  Jane <j@example.org>"
+    );
+    assert_eq!(
+        cli::gpg_line(&key("e"), true),
+        "  ABCD1234 [active] (expired)  Jane <j@example.org>"
+    );
+    assert_eq!(
+        cli::gpg_line(&key("r"), false),
+        "  ABCD1234 (revoked)  Jane <j@example.org>"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_database_line_goes_to_stderr_only_when_factum_db_is_set() {
+    let home = tempfile::tempdir().unwrap();
+    let output = run_binary(home.path(), home.path(), &["--list-cases"]);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Database:"));
+    let db = home.path().join("x.db");
+    let run_with_db = |argv: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_factum"))
+            .args(argv)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_DATA_HOME", home.path().join("data"))
+            .env("FACTUM_DB", &db)
+            .output()
+            .unwrap()
+    };
+    let output = run_with_db(&["--list-cases"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches(&format!("Database: {}\n", db.display())).count(),
+        1,
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Database:"));
+    // clap's own usage errors exit 2, and a note with an action flag is one
+    assert_eq!(run_with_db(&["--no-such-flag"]).status.code(), Some(2));
+    assert_eq!(run_with_db(&["a note", "--list-cases"]).status.code(), Some(2));
 }

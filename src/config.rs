@@ -11,6 +11,8 @@ pub const SEAL_DIR_KEY: &str = "FACTUM_SEAL_DIR";
 pub struct Config {
     pub log_level: String,
     pub db_path: PathBuf,
+    /// FACTUM_DB (environment or user .env) chose the path
+    pub db_from_env: bool,
 }
 
 /// The per-user configuration folder (Linux: ~/.config/factum, macOS: ~/Library/Application Support/factum,
@@ -213,10 +215,15 @@ impl Config {
         let log_level = non_empty("LOG_LEVEL")
             .map(|level| level.to_uppercase())
             .unwrap_or_else(|| "INFO".into());
-        let db_path = non_empty("FACTUM_DB")
+        let db_from_env = non_empty("FACTUM_DB");
+        let db_path = db_from_env
             .map(|path| expand_user(path))
             .unwrap_or_else(|| user_data_dir().join("factum.db"));
-        Self { log_level, db_path }
+        Self {
+            log_level,
+            db_path,
+            db_from_env: db_from_env.is_some(),
+        }
     }
 }
 

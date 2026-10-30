@@ -217,7 +217,7 @@ factum --list-cases [--all]
 factum --set-active case 1              # by ID, file number or name; clears the active evidence
 factum --list-evidence                  # evidence of the active case
 factum --set-active evidence none       # notes go to the case itself again
-factum --verify [case] [-v]             # exit code 1 if verification fails
+factum --verify [case] [-v]             # exit code 1 if it fails
 factum --checkpoint [case]              # seal the current state
 factum --sign-unsigned [case]           # sign entries and seals created without a key
 factum --export [case] --format html,pdf,md,bundle --out ./reports
@@ -225,6 +225,12 @@ factum --list-gpg
 factum --set-active gpg <key-id>
 factum --log-level DEBUG --list-cases
 ```
+
+A case is given by `#<id>`, its file number, its name or its id. An exact file number or name wins over an id (so a
+case numbered `2` is not case #2), several matches are an error that lists them, and `#12` always means id 12. A note
+cannot be combined with an option. Exit codes: 0 done (a verification with only warnings is done), 1 a verification
+failed (`--export` of a case that fails it writes the files, warns on stderr and exits 1), 2 an error (unknown case,
+bad arguments, database or file problem). With `FACTUM_DB` set, the CLI prints `Database: <path>` on stderr.
 
 Without a case argument, `--verify`, `--checkpoint`, `--sign-unsigned` and `--export` use the active case. Archiving,
 reopening and permanent deletion are only available in the GUI, so the typed confirmation cannot be scripted away.
@@ -311,7 +317,7 @@ cargo test
 ```
 
 Requires Rust 1.95 or newer. On Linux no development packages are needed: SQLite is compiled in, and OpenGL,
-X11 and Wayland are loaded at runtime. `cargo run --example demo_db` fills a database (`FACTUM_DB`) with a demo case.
+X11 and Wayland are loaded at runtime. `FACTUM_DB=/tmp/demo.db cargo run --example demo_db` fills a database with a demo case (it refuses without `FACTUM_DB` or a path argument).
 GUI screenshots for review: `FACTUM_SCREENSHOTS=/tmp/shots cargo test --lib gui::` (needs a GPU or Mesa's lavapipe).
 
 Releases: `scripts/release.sh 2.0.1 && git push origin HEAD v2.0.1` — the release workflow builds and publishes

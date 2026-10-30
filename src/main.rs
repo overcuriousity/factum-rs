@@ -16,7 +16,7 @@ fn main() {
         Ok(db) => db,
         Err(e) => {
             log::error!("{e}");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     };
     // up to 2.7.1 the GUI kept the seal folder in the database
@@ -37,6 +37,9 @@ fn main() {
     if args.gui {
         run_gui(db, notice);
     } else {
+        if config::settings().db_from_env {
+            eprintln!("Database: {}", db.path.display());
+        }
         let mut stdout = std::io::stdout().lock();
         let code = cli::run(&db, &args, None, None, &mut stdout);
         drop(db);
@@ -51,7 +54,7 @@ fn run_gui(db: Db, notice: Option<String>) {
     detach_console();
     if let Err(e) = factum::gui::run(db, notice) {
         log::error!("The GUI could not be started: {e}");
-        std::process::exit(1);
+        std::process::exit(2);
     }
 }
 

@@ -10,16 +10,27 @@ use crate::error::{FactumError, Result};
 use crate::pystr::{head, splitlines, strip};
 use crate::seals::REASON_CHECKPOINT;
 use crate::services::Factum;
-use crate::signer::{LazySigner, Signer};
+use crate::signer::{GpgKey, LazySigner, Signer};
 use crate::verifier::{CaseReport, Level};
 
 /// value of an optional CASE argument given without a value: use the active case
 pub const ACTIVE: &str = "";
 
 #[derive(Debug, Parser, Default, Clone)]
-#[command(name = "factum", version, about = "Factum Notes Application")]
+#[command(
+    name = "factum",
+    version,
+    about = "Factum Notes Application",
+    after_help = "Exit codes: 0 done (a verification with warnings only is done), 1 a verification failed (also \
+                  --export of a case that fails it; the files are still written), 2 an error: unknown case, bad \
+                  arguments, database or file problem"
+)]
 pub struct Args {
-    /// Note text to add to the active case/evidence
+    /// Note text to add to the active case/evidence (not combined with the options below)
+    #[arg(conflicts_with_all = [
+        "gui", "list_cases", "list_evidence", "list_gpg", "new_case", "new_evidence", "set_active", "correct",
+        "verify", "checkpoint", "sign_unsigned", "export",
+    ])]
     pub note: Option<String>,
     /// Run with GUI
     #[arg(long)]
@@ -88,22 +99,65 @@ impl Args {
 
 /// Python's int(): surrounding whitespace and a sign are fine.
 fn parse_int(text: &str) -> Option<i64> {
-    strip(text).replace('_', "").parse().ok()
+    strip(text).parse().ok()
 }
 
-/// by id, case file number or name; archived cases count too (verify/export work on them)
-pub fn find_case_id(factum: &Factum, query: &str) -> Result<Option<i64>> {
-    if let Some(case_id) = parse_int(query) {
-        return Ok(factum.get_case(case_id)?.map(|_| case_id));
+/// a plain number: digits only
+fn plain_id(text: &str) -> Option<i64> {
+    let text = strip(text);
+    text.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+/// a row a query can match: its id, the texts it is matched by (file number, name) and how an error names it
+struct Candidate {
+    id: i64,
+    keys: [Option<String>; 2],
+    label: String,
+}
+
+/// `#N` is id N. Otherwise an exact file number, then an exact name; several rows are an error. Only a query that
+/// matched nothing and is a plain number is an id. `ids` holds every row, readable or not.
+fn pick(query: &str, ids: &[i64], rows: &[Candidate]) -> Result<Option<i64>> {
+    if let Some(id) = query.strip_prefix('#').and_then(plain_id) {
+        return Ok(ids.contains(&id).then_some(id));
     }
-    for candidate in factum.list_cases(true)? {
-        if let Some(case) = factum.get_case(candidate)?
-            && (query == case.case_file || query == case.case_name)
-        {
-            return Ok(Some(candidate));
+    for tier in 0..2 {
+        let matches: Vec<&Candidate> = rows.iter().filter(|c| c.keys[tier].as_deref() == Some(query)).collect();
+        match matches.as_slice() {
+            [] => {}
+            [only] => return Ok(Some(only.id)),
+            several => {
+                let labels: Vec<&str> = several.iter().map(|c| c.label.as_str()).collect();
+                return Err(FactumError::general(format!(
+                    "'{query}' matches several: {}. Use #<id> to pick one.",
+                    labels.join("; ")
+                )));
+            }
         }
     }
-    Ok(None)
+    Ok(plain_id(query).filter(|id| ids.contains(id)))
+}
+
+/// by #id, case file number, name or id; archived cases count too (verify/export work on them)
+pub fn find_case_id(factum: &Factum, query: &str) -> Result<Option<i64>> {
+    let ids = factum.list_cases(true)?;
+    let mut rows = Vec::new();
+    for &id in &ids {
+        // a row that cannot be read stays reachable by id, so verification can still report it
+        match factum.get_case(id) {
+            Ok(Some(case)) => rows.push(Candidate {
+                id,
+                label: format!("#{id} {} {}", case.case_file, case.case_name),
+                keys: [Some(case.case_file), Some(case.case_name)],
+            }),
+            Ok(None) => {}
+            Err(e) => log::warn!("Case #{id} cannot be read and is skipped in the lookup by name: {e}"),
+        }
+    }
+    pick(query, &ids, &rows)
 }
 
 pub fn resolve_case(factum: &Factum, query: &str) -> Result<i64> {
@@ -116,16 +170,20 @@ pub fn resolve_case(factum: &Factum, query: &str) -> Result<i64> {
 }
 
 pub fn find_evidence_id(factum: &Factum, query: &str, active_case_id: i64) -> Result<Option<i64>> {
-    let evidence_ids = factum.list_evidence_for_case(active_case_id, false)?;
-    if let Some(id) = parse_int(query) {
-        return Ok(evidence_ids.contains(&id).then_some(id));
-    }
-    for id in evidence_ids {
-        if factum.get_evidence(id)?.is_some_and(|e| e.description == query) {
-            return Ok(Some(id));
+    let ids = factum.list_evidence_for_case(active_case_id, false)?;
+    let mut rows = Vec::new();
+    for &id in &ids {
+        match factum.get_evidence(id) {
+            Ok(Some(evidence)) => rows.push(Candidate {
+                id,
+                label: format!("#{id} {}", evidence.description),
+                keys: [None, Some(evidence.description)],
+            }),
+            Ok(None) => {}
+            Err(e) => log::warn!("Evidence #{id} cannot be read and is skipped in the lookup by name: {e}"),
         }
     }
-    Ok(None)
+    pick(query, &ids, &rows)
 }
 
 fn list_cases(factum: &Factum, include_archived: bool, out: &mut dyn Write) -> Result<()> {
@@ -181,15 +239,22 @@ fn list_gpg(signer: &dyn Signer, out: &mut dyn Write) -> Result<()> {
     }
     let active = signer.active_key();
     for key in keys {
-        let marker = if Some(&key.keyid) == active.as_ref() {
-            " [active]"
-        } else {
-            ""
-        };
-        let uid = key.uids.first().map(String::as_str).unwrap_or("(no uid)");
-        writeln!(out, "  {}{marker}  {uid}", key.keyid)?;
+        writeln!(out, "{}", gpg_line(&key, Some(&key.keyid) == active.as_ref()))?;
     }
     Ok(())
+}
+
+/// an active key that is expired or revoked stays active but cannot sign; the line says so
+pub fn gpg_line(key: &GpgKey, active: bool) -> String {
+    let state = if key.revoked() {
+        " (revoked)"
+    } else if key.expired() {
+        " (expired)"
+    } else {
+        ""
+    };
+    let uid = key.uids.first().map(String::as_str).unwrap_or("(no uid)");
+    format!("  {}{}{state}  {uid}", key.keyid, if active { " [active]" } else { "" })
 }
 
 fn set_active(factum: &Factum, type_str: &str, query: &str, out: &mut dyn Write) -> Result<()> {
@@ -361,6 +426,10 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         for path in factum.export(case_id, &formats, &args.out)? {
             writeln!(out, "{}", path.display())?;
         }
+        if factum.verify_case(case_id, None)?.overall() == Level::Fail {
+            log::warn!("The case fails verification: the exported files document a log that does not verify.");
+            return Ok(1);
+        }
     } else if let Some(note) = args.note.as_deref().filter(|n| !n.is_empty()) {
         let active_case_id = factum
             .get_active_case_id()?
@@ -369,7 +438,7 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         writeln!(out, "Note #{note_id} added.")?;
     } else {
         writeln!(out, "{}", usage())?;
-        return Ok(1);
+        return Ok(2);
     }
     Ok(0)
 }
@@ -386,7 +455,7 @@ pub fn run(db: &Db, args: &Args, signer: Option<&dyn Signer>, seal_dir: Option<P
         Ok(code) => code,
         Err(e) => {
             log::error!("{e}");
-            1
+            2
         }
     }
 }
