@@ -2,6 +2,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Value, json};
 
 use crate::canonical::utc_now;
+use crate::db::Cells;
 use crate::error::{FactumError, Result};
 use crate::log_service::{Append, KIND_SYSTEM};
 use crate::pystr::strip;
@@ -23,18 +24,23 @@ impl Case {
         self.archived_utc.is_some()
     }
 
-    const COLUMNS: &'static str = "id, case_file, case_name, description, created_utc, is_active, archived_utc";
+    pub(crate) const COLUMNS: &'static str =
+        "id, case_file, case_name, description, created_utc, is_active, archived_utc";
+
+    pub(crate) fn read(cells: &mut Cells) -> Self {
+        Self {
+            id: cells.int(0),
+            case_file: cells.text(1),
+            case_name: cells.text(2),
+            description: cells.text(3),
+            created_utc: cells.text(4),
+            is_active: cells.int(5) != 0,
+            archived_utc: cells.optional_text(6),
+        }
+    }
 
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            case_file: row.get(1)?,
-            case_name: row.get(2)?,
-            description: row.get(3)?,
-            created_utc: row.get(4)?,
-            is_active: row.get::<_, i64>(5)? != 0,
-            archived_utc: row.get(6)?,
-        })
+        Cells::strict(row, Self::read)
     }
 }
 

@@ -38,6 +38,7 @@ notes and corrections from both; bundles from factum pass `verify.py`.
 | unreadable seal files skipped silently | WARN `seal_file_unreadable` naming the file; a `.asc` replaces its `.json` only when it is a valid seal | a broken copy must not hide a seal |
 | a seal folder in the database is what the verifier checks | WARN `seal_dir_unused` when a folder still stored in the database differs from the one in use; the stored folder is only named, never read | a real folder that was not moved must not go unnoticed, and a tampered database can plant no more than a hint |
 | `--verify` and the HTML/Markdown/PDF reports do not say where seal files were looked for | `  seal folder checked: <path>` after the `--verify` summary; `Seal folder checked: <path>` in the reports' verification section | every verify report names the seal folder it checked (decided in review) |
+| a malformed cell stops verification | FAIL `malformed` per cell, the report is still produced | one tampered cell must not hide the rest of the report |
 | seal file names as long as the case file number | the case file number's part is cut at 100 bytes, with a short hash | names over 255 bytes cannot be written |
 
 Unicode details follow Python where it matters: `str.strip()`/`splitlines()` semantics (`pystr.rs`), `\w` in tags and

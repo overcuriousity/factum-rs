@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::error::{FactumError, Result};
 
@@ -93,6 +94,107 @@ CREATE TABLE settings(
     value TEXT
 );
 "#;
+
+/// Reads a row cell by cell. A cell that is not what the schema promises is noted and read as far as it can be, so
+/// the verifier can report a tampered cell instead of stopping at it.
+pub struct Cells<'a, 'b> {
+    row: &'a Row<'b>,
+    /// column index and what is wrong with it
+    problems: Vec<(usize, String)>,
+}
+
+impl<'a, 'b> Cells<'a, 'b> {
+    /// Reads a row with `read`; any malformed cell is an error.
+    pub fn strict<T>(row: &'a Row<'b>, read: impl FnOnce(&mut Self) -> T) -> rusqlite::Result<T> {
+        let mut cells = Self {
+            row,
+            problems: Vec::new(),
+        };
+        let value = read(&mut cells);
+        match cells.problems.into_iter().next() {
+            None => Ok(value),
+            Some((index, problem)) => {
+                let data_type = row.get_ref(index)?.data_type();
+                Err(rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    data_type,
+                    problem.into(),
+                ))
+            }
+        }
+    }
+
+    /// Reads a row with `read`; returns what could be read and what is wrong with the rest.
+    pub fn tolerant<T>(row: &'a Row<'b>, read: impl FnOnce(&mut Self) -> T) -> (T, Vec<String>) {
+        let mut cells = Self {
+            row,
+            problems: Vec::new(),
+        };
+        let value = read(&mut cells);
+        (value, cells.problems.into_iter().map(|(_, problem)| problem).collect())
+    }
+
+    fn note(&mut self, index: usize, problem: &str) {
+        let column = self.row.as_ref().column_name(index).unwrap_or("?");
+        self.problems.push((index, format!("column '{column}' {problem}")));
+    }
+
+    fn cell(&self, index: usize) -> ValueRef<'_> {
+        self.row.get_ref(index).unwrap_or(ValueRef::Null)
+    }
+
+    pub fn optional_text(&mut self, index: usize) -> Option<String> {
+        match self.cell(index) {
+            ValueRef::Null => None,
+            ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => Some(text.to_string()),
+                Err(_) => {
+                    let text = String::from_utf8_lossy(bytes).into_owned();
+                    self.note(index, "is not valid UTF-8");
+                    Some(text)
+                }
+            },
+            ValueRef::Blob(bytes) => {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                self.note(index, "holds binary data, not text");
+                Some(text)
+            }
+            ValueRef::Integer(number) => {
+                self.note(index, "holds a number, not text");
+                Some(number.to_string())
+            }
+            ValueRef::Real(number) => {
+                self.note(index, "holds a number, not text");
+                Some(number.to_string())
+            }
+        }
+    }
+
+    pub fn text(&mut self, index: usize) -> String {
+        if matches!(self.cell(index), ValueRef::Null) {
+            self.note(index, "is empty");
+        }
+        self.optional_text(index).unwrap_or_default()
+    }
+
+    pub fn optional_int(&mut self, index: usize) -> Option<i64> {
+        match self.cell(index) {
+            ValueRef::Null => None,
+            ValueRef::Integer(number) => Some(number),
+            _ => {
+                self.note(index, "is not an integer");
+                Some(0)
+            }
+        }
+    }
+
+    pub fn int(&mut self, index: usize) -> i64 {
+        if matches!(self.cell(index), ValueRef::Null) {
+            self.note(index, "is empty");
+        }
+        self.optional_int(index).unwrap_or_default()
+    }
+}
 
 /// The database connection. Schema v3 was shared with factum-notes (Python); v4 added evidence.details.
 pub struct Db {

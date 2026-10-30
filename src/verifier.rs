@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::cases::Case;
 use crate::config::expand_user;
+use crate::db::Cells;
 use crate::error::{FactumError, Result};
 use crate::evidence::Evidence;
 use crate::log_service::{entry_signed_payload, leaf_data};
@@ -176,6 +177,21 @@ impl CaseReport {
 }
 
 pub type LateSignatures = HashMap<(String, i64), (String, String)>;
+/// A row of late_signatures that could not be read as the schema says.
+struct MalformedLateSignature {
+    row_id: i64,
+    /// what it signs; None when that is what could not be read
+    target: Option<(String, i64)>,
+    problems: Vec<String>,
+}
+
+impl MalformedLateSignature {
+    fn findings(&self, reference: Ref) -> Vec<Finding> {
+        let what = format!("Late signature #{}", self.row_id);
+        Factum::malformed_findings(&what, &self.problems, reference)
+    }
+}
+
 pub type Progress<'p> = &'p mut dyn FnMut(usize, usize);
 
 /// Python's repr() of a JSON value as it appears in messages.
@@ -231,25 +247,63 @@ impl fmt::Display for IdKey {
 
 impl Factum<'_> {
     pub fn load_case_row(&self, case_id: i64) -> Result<Case> {
-        self.require_case(case_id)
+        Ok(self.load_case_tolerant(case_id)?.0)
     }
 
+    /// The case row and what could not be read of it.
+    fn load_case_tolerant(&self, case_id: i64) -> Result<(Case, Vec<String>)> {
+        self.db
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM cases WHERE id = ?", Case::COLUMNS),
+                [case_id],
+                |row| Ok(Cells::tolerant(row, Case::read)),
+            )
+            .optional()?
+            .ok_or_else(|| FactumError::case_not_found(format!("Case #{case_id} does not exist.")))
+    }
+
+    /// Every entry of the case; a cell that cannot be read is kept as far as it can be and named in `malformed`.
     pub fn load_entries(&self, case_id: i64) -> Result<Vec<Entry>> {
         let mut statement = self.db.conn.prepare(&format!(
             "SELECT {} FROM entries WHERE case_id = ? ORDER BY leaf_index",
             Entry::COLUMNS
         ))?;
-        let rows = statement.query_map([case_id], Entry::from_row)?;
+        let rows = statement.query_map([case_id], Entry::from_row_tolerant)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn late_signatures(&self) -> Result<LateSignatures> {
+        Ok(self.late_signatures_tolerant()?.0)
+    }
+
+    fn late_signatures_tolerant(&self) -> Result<(LateSignatures, Vec<MalformedLateSignature>)> {
         let mut statement = self
             .db
             .conn
-            .prepare("SELECT target, target_id, signature, signed_utc FROM late_signatures")?;
-        let rows = statement.query_map([], |row| Ok(((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?))))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            .prepare("SELECT id, target, target_id, signature, signed_utc FROM late_signatures")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                Cells::tolerant(row, |cells| (cells.text(1), cells.int(2))),
+                Cells::tolerant(row, |cells| (cells.int(0), cells.text(3), cells.text(4))),
+            ))
+        })?;
+        let mut signatures = LateSignatures::new();
+        let mut malformed = Vec::new();
+        for row in rows {
+            let ((target, target_problems), ((row_id, signature, signed_utc), mut problems)) = row?;
+            let target_known = target_problems.is_empty();
+            problems.extend(target_problems);
+            if !problems.is_empty() {
+                malformed.push(MalformedLateSignature {
+                    row_id,
+                    target: target_known.then(|| target.clone()),
+                    problems,
+                });
+            }
+            signatures.insert(target, (signature, signed_utc));
+        }
+        Ok((signatures, malformed))
     }
 
     pub fn check_signature(
@@ -333,6 +387,14 @@ impl Factum<'_> {
         Vec::new()
     }
 
+    /// One FAIL per cell of a row that could not be read.
+    fn malformed_findings(what: &str, problems: &[String], reference: Ref) -> Vec<Finding> {
+        problems
+            .iter()
+            .map(|problem| Finding::new(Level::Fail, "malformed", format!("{what}: {problem}."), reference))
+            .collect()
+    }
+
     /// Recompute every leaf and tree head in order. Signatures are checked for all entries, or only for the
     /// ids in signatures_for. Returns the results and the recomputed root for every tree size.
     pub fn check_entries(
@@ -355,6 +417,7 @@ impl Factum<'_> {
                 tree_head_id: None,
             };
             let what = format!("Entry #{} (leaf {})", row.id, row.leaf_index);
+            findings.extend(Self::malformed_findings(&what, &row.malformed, reference));
             if row.leaf_index != position as i64 {
                 findings.push(Finding::new(
                     Level::Fail,
@@ -491,10 +554,10 @@ impl Factum<'_> {
     }
 
     pub fn verify_case(&self, case_id: i64, mut progress: Option<Progress<'_>>) -> Result<CaseReport> {
-        let case = self.load_case_row(case_id)?;
+        let (case, case_problems) = self.load_case_tolerant(case_id)?;
         let rows = self.load_entries(case_id)?;
-        let late = self.late_signatures()?;
-        let db_heads = self.list_tree_heads(case_id)?;
+        let (late, malformed_late) = self.late_signatures_tolerant()?;
+        let db_heads = self.list_tree_heads_tolerant(case_id)?;
         let total = rows.len() + db_heads.len();
         let (mut results, roots) = self.check_entries(
             case_id,
@@ -505,17 +568,45 @@ impl Factum<'_> {
             Some(total),
         );
         let size = rows.len() as i64;
+        for row in &malformed_late {
+            if let Some(("entry", id)) = row.target.as_ref().map(|(target, id)| (target.as_str(), *id))
+                && let Some(result) = results.iter_mut().find(|result| result.entry.id == id)
+            {
+                let reference = Ref {
+                    entry_id: Some(id),
+                    tree_head_id: None,
+                };
+                result.findings.extend(row.findings(reference));
+            }
+        }
         let mut findings: Vec<Finding> = results.iter().flat_map(|r| r.findings.clone()).collect();
+        findings.extend(Self::malformed_findings("Case", &case_problems, Ref::default()));
+        // the table is shared by all cases: a row that does not say what it signs is reported in every case
+        for row in malformed_late.iter().filter(|row| row.target.is_none()) {
+            findings.extend(row.findings(Ref::default()));
+        }
 
         let mut heads = Vec::new();
-        for (number, head) in db_heads.iter().enumerate() {
+        for (number, (head, problems)) in db_heads.iter().enumerate() {
             let reference = Ref {
                 entry_id: None,
                 tree_head_id: Some(head.id),
             };
             let what = format!("Seal #{} (size {}, {})", head.id, head.tree_size, head.reason);
-            let mut head_findings =
-                Self::head_findings(head.tree_size, &head.root_hash, &roots, size, &what, reference);
+            let mut head_findings = Self::malformed_findings(&what, problems, reference);
+            for row in &malformed_late {
+                if row.target.as_ref() == Some(&("tree_head".to_string(), head.id)) {
+                    head_findings.extend(row.findings(reference));
+                }
+            }
+            head_findings.extend(Self::head_findings(
+                head.tree_size,
+                &head.root_hash,
+                &roots,
+                size,
+                &what,
+                reference,
+            ));
             let expected = seal_payload(
                 case_id,
                 &head.case_file,
@@ -754,12 +845,14 @@ impl Factum<'_> {
             .db
             .conn
             .prepare(&format!("SELECT {} FROM evidence WHERE case_id = ?", Evidence::COLUMNS))?;
-        let evidence_rows: BTreeMap<i64, Evidence> = statement
-            .query_map([case.id], Evidence::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(|evidence| (evidence.id, evidence))
-            .collect();
+        let mut malformed = Vec::new();
+        let mut evidence_rows: BTreeMap<i64, Evidence> = BTreeMap::new();
+        for row in statement.query_map([case.id], |row| Ok(Cells::tolerant(row, Evidence::read)))? {
+            let (evidence, problems) = row?;
+            let what = format!("Evidence #{}", evidence.id);
+            malformed.extend(Self::malformed_findings(&what, &problems, Ref::default()));
+            evidence_rows.insert(evidence.id, evidence);
+        }
         let mut created_events: BTreeMap<IdKey, serde_json::Map<String, Value>> = BTreeMap::new();
         let mut deleted_events: BTreeMap<IdKey, serde_json::Map<String, Value>> = BTreeMap::new();
         // the description: the newest edit, else the creation; a payload before schema 4 has none
@@ -830,6 +923,7 @@ impl Factum<'_> {
                 ));
             }
         }
+        failures.extend(malformed);
         Ok(failures)
     }
 }

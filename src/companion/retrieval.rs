@@ -283,6 +283,7 @@ mod tests {
             is_pinned: false,
             format: 1,
             late_signature: None,
+            malformed: Vec::new(),
         }
     }
 

@@ -1,7 +1,7 @@
 use rusqlite::{OptionalExtension, Row, ToSql, params};
 use serde_json::Value;
 
-use crate::db::ensure_entry_case_open;
+use crate::db::{Cells, ensure_entry_case_open};
 use crate::error::{FactumError, Result};
 use crate::images::{self, NoteImage};
 use crate::log_service::{Append, KIND_NOTE};
@@ -34,6 +34,8 @@ pub struct Entry {
     pub is_pinned: bool,
     pub format: i64,
     pub late_signature: Option<LateSignature>,
+    /// cells that could not be read as the schema says (only from [`Entry::from_row_tolerant`])
+    pub malformed: Vec<String>,
 }
 
 /// The columns [`Entry::from_row`] reads, in its order, with `$payload` in the place of the payload.
@@ -52,25 +54,36 @@ impl Entry {
     /// [`Self::COLUMNS`] with `NULL` for the payload, which may hold megabytes of images.
     const COLUMNS_WITHOUT_PAYLOAD: &'static str = entry_columns!("NULL");
 
-    pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            case_id: row.get(1)?,
-            leaf_index: row.get(2)?,
-            kind: row.get(3)?,
-            evidence_id: row.get(4)?,
-            text: row.get(5)?,
-            payload_json: row.get(6)?,
-            corrects_id: row.get(7)?,
-            created_utc: row.get(8)?,
-            leaf_hash: row.get(9)?,
-            tree_size: row.get(10)?,
-            root_hash: row.get(11)?,
-            signature: row.get(12)?,
-            is_pinned: row.get::<_, i64>(13)? != 0,
-            format: row.get(14)?,
+    fn read(cells: &mut Cells) -> Self {
+        Self {
+            id: cells.int(0),
+            case_id: cells.int(1),
+            leaf_index: cells.int(2),
+            kind: cells.text(3),
+            evidence_id: cells.optional_int(4),
+            text: cells.text(5),
+            payload_json: cells.optional_text(6),
+            corrects_id: cells.optional_int(7),
+            created_utc: cells.text(8),
+            leaf_hash: cells.text(9),
+            tree_size: cells.int(10),
+            root_hash: cells.text(11),
+            signature: cells.optional_text(12),
+            is_pinned: cells.int(13) != 0,
+            format: cells.int(14),
             late_signature: None,
-        })
+            malformed: Vec::new(),
+        }
+    }
+
+    pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Cells::strict(row, Self::read)
+    }
+
+    /// [`Self::from_row`] for the verifier: a cell that cannot be read goes into `malformed`.
+    pub fn from_row_tolerant(row: &Row) -> rusqlite::Result<Self> {
+        let (entry, malformed) = Cells::tolerant(row, Self::read);
+        Ok(Self { malformed, ..entry })
     }
 
     /// The parsed payload; an edited row whose JSON does not parse is kept as a string, so verification

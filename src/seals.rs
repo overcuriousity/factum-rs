@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::canonical::{canonical_json, compact_utc, extract_clearsigned_text, utc_now};
 use crate::config::{file_seal_dir, set_seal_dir};
-use crate::db::Db;
+use crate::db::{Cells, Db};
 use crate::error::{FactumError, Result};
 use crate::files::{parent_of, safe_filename_capped, write_atomically};
 use crate::merkle;
@@ -43,18 +43,22 @@ impl TreeHead {
     const COLUMNS: &'static str =
         "id, case_id, case_file, tree_size, root_hash, created_utc, reason, signature, file_path";
 
+    fn read(cells: &mut Cells) -> Self {
+        Self {
+            id: cells.int(0),
+            case_id: cells.int(1),
+            case_file: cells.text(2),
+            tree_size: cells.int(3),
+            root_hash: cells.text(4),
+            created_utc: cells.text(5),
+            reason: cells.text(6),
+            signature: cells.optional_text(7),
+            file_path: cells.optional_text(8),
+        }
+    }
+
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            case_id: row.get(1)?,
-            case_file: row.get(2)?,
-            tree_size: row.get(3)?,
-            root_hash: row.get(4)?,
-            created_utc: row.get(5)?,
-            reason: row.get(6)?,
-            signature: row.get(7)?,
-            file_path: row.get(8)?,
-        })
+        Cells::strict(row, Self::read)
     }
 }
 
@@ -200,12 +204,22 @@ impl Factum<'_> {
 
     /// Every case file number this case has had: the current one and those recorded in its log.
     pub fn known_case_files(&self, case_id: i64) -> Result<Vec<Value>> {
-        let mut known = vec![Value::String(self.case_file(case_id)?)];
+        // read tolerantly: the verifier gets here with whatever is in the row, and reports it
+        let current = self
+            .db
+            .conn
+            .query_row("SELECT case_file FROM cases WHERE id = ?", [case_id], |row| {
+                Ok(Cells::tolerant(row, |cells| cells.text(0)).0)
+            })
+            .optional()?
+            .ok_or_else(|| FactumError::case_not_found(format!("Case #{case_id} does not exist.")))?;
+        let mut known = vec![Value::String(current)];
         let mut statement = self
             .db
             .conn
             .prepare("SELECT payload_json FROM entries WHERE case_id = ? AND kind = 'system'")?;
-        let rows = statement.query_map([case_id], |row| row.get::<_, Option<String>>(0))?;
+        // a cell that cannot be read names no case file number; the verifier reports it
+        let rows = statement.query_map([case_id], |row| Ok(row.get::<_, Option<String>>(0).ok().flatten()))?;
         for row in rows {
             let payload_json = row?;
             // json.loads(payload_json or "null"); unparsable rows are skipped
@@ -292,6 +306,16 @@ impl Factum<'_> {
             TreeHead::COLUMNS
         ))?;
         let rows = statement.query_map([case_id], TreeHead::from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// [`Self::list_tree_heads`] for the verifier: each seal with what could not be read of its row.
+    pub(crate) fn list_tree_heads_tolerant(&self, case_id: i64) -> Result<Vec<(TreeHead, Vec<String>)>> {
+        let mut statement = self.db.conn.prepare(&format!(
+            "SELECT {} FROM tree_heads WHERE case_id = ? ORDER BY tree_size, id",
+            TreeHead::COLUMNS
+        ))?;
+        let rows = statement.query_map([case_id], |row| Ok(Cells::tolerant(row, TreeHead::read)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

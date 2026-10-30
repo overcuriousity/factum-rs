@@ -476,6 +476,183 @@ fn unicode_and_crlf_text_verifies() {
 }
 
 #[test]
+fn a_cell_that_is_not_valid_text_is_reported_not_fatal() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, notes) = verifier_case(&factum);
+    factum.seal(case_id, "checkpoint").unwrap();
+    f.exec(&format!(
+        "UPDATE entries SET text = CAST(X'6e6f74ff' AS TEXT) WHERE id = {}",
+        notes[1]
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert_eq!(report.overall(), Level::Fail);
+    assert_eq!(report.entries.len(), 5, "the rest of the report is there");
+    let result = report.entry_result(notes[1]).unwrap();
+    assert_eq!(result.status(), Level::Fail);
+    let finding = result.findings.iter().find(|f| f.code == "malformed").unwrap();
+    assert!(
+        finding.message.contains("column 'text' is not valid UTF-8"),
+        "{finding:?}"
+    );
+    assert_eq!(finding.entry_id, Some(notes[1]));
+    assert!(report.findings.contains(finding));
+    let earlier = report.entry_result(notes[0]).unwrap();
+    assert_ne!(earlier.status(), Level::Fail, "{:?}", earlier.findings);
+}
+
+#[test]
+fn cells_of_the_wrong_type_are_reported_for_their_row() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, notes) = verifier_case(&factum);
+    f.exec(&format!(
+        "UPDATE entries SET created_utc = X'00ff', tree_size = 'x', payload_json = X'ff' WHERE id = {};
+         UPDATE entries SET is_pinned = 1.5 WHERE id = {};",
+        notes[0], notes[1]
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    let messages = |id| {
+        report
+            .entry_result(id)
+            .unwrap()
+            .findings
+            .iter()
+            .filter(|f| f.code == "malformed")
+            .map(|f| f.message.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(messages(notes[0]).len(), 3, "{:?}", messages(notes[0]));
+    assert!(
+        messages(notes[0])
+            .iter()
+            .any(|m| m.contains("'created_utc' holds binary data"))
+    );
+    assert!(
+        messages(notes[0])
+            .iter()
+            .any(|m| m.contains("'tree_size' is not an integer"))
+    );
+    assert!(messages(notes[1])[0].contains("'is_pinned' is not an integer"));
+    assert!(messages(notes[2]).is_empty());
+}
+
+#[test]
+fn a_malformed_seal_row_is_reported_for_that_seal() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, _) = verifier_case(&factum);
+    let bad = factum.seal(case_id, "checkpoint").unwrap();
+    let good = factum.seal(case_id, "export").unwrap();
+    f.exec(&format!(
+        "UPDATE tree_heads SET case_file = CAST(X'ff' AS TEXT), root_hash = X'00' WHERE id = {bad}"
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    let head = |id| report.tree_heads.iter().find(|h| h.tree_head_id == Some(id)).unwrap();
+    let malformed = head(bad).findings.iter().filter(|f| f.code == "malformed");
+    assert_eq!(malformed.count(), 2);
+    assert!(head(bad).findings.iter().all(|f| f.tree_head_id == Some(bad)));
+    assert_eq!(head(good).status(), Level::Ok);
+    assert_eq!(report.newest_seal_size, Some(head(good).tree_size));
+}
+
+#[test]
+fn malformed_evidence_and_case_rows_are_reported() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, evidence_id, _) = verifier_case(&factum);
+    f.exec(&format!(
+        "UPDATE evidence SET evidence_hash = X'ff' WHERE id = {evidence_id};
+         UPDATE cases SET case_file = CAST(X'ff' AS TEXT), case_name = X'00' WHERE id = {case_id};"
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    let malformed: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.code == "malformed")
+        .map(|f| f.message.as_str())
+        .collect();
+    assert!(
+        malformed.contains(
+            &format!("Evidence #{evidence_id}: column 'evidence_hash' holds binary data, not text.").as_str()
+        ),
+        "{malformed:?}"
+    );
+    assert!(
+        malformed.contains(&"Case: column 'case_file' is not valid UTF-8."),
+        "{malformed:?}"
+    );
+    assert!(
+        malformed.contains(&"Case: column 'case_name' holds binary data, not text."),
+        "{malformed:?}"
+    );
+    assert!(report.entries.len() > 3);
+}
+
+#[test]
+fn a_system_entry_with_an_unreadable_payload_does_not_stop_the_report() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, _) = verifier_case(&factum);
+    f.exec(&format!(
+        "UPDATE entries SET payload_json = CAST(X'7bff' AS TEXT) WHERE case_id = {case_id} AND leaf_index = 0"
+    ));
+    let report = factum.verify_case(case_id, None).unwrap();
+    assert!(report.findings.iter().any(|f| f.code == "malformed"));
+}
+
+#[test]
+fn a_malformed_late_signature_is_reported_for_what_it_signs() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    f.signer.set_active(false);
+    let (case_id, _, notes) = verifier_case(&factum);
+    let head = factum.seal(case_id, "checkpoint").unwrap();
+    f.signer.set_active(true);
+    factum.sign_all_unsigned(case_id).unwrap();
+    f.exec(&format!(
+        "UPDATE late_signatures SET signed_utc = X'ff' WHERE target = 'entry' AND target_id = {};
+         UPDATE late_signatures SET signed_utc = X'ff' WHERE target = 'tree_head' AND target_id = {head};",
+        notes[0]
+    ));
+    let other = factum.create_case("C-2", "Other", "").unwrap();
+    let report = factum.verify_case(case_id, None).unwrap();
+    let result = report.entry_result(notes[0]).unwrap();
+    assert!(
+        result.findings.iter().any(|f| f.code == "malformed"),
+        "{:?}",
+        result.findings
+    );
+    let seal = report.tree_heads.iter().find(|h| h.tree_head_id == Some(head)).unwrap();
+    assert!(
+        seal.findings.iter().any(|f| f.code == "malformed"),
+        "{:?}",
+        seal.findings
+    );
+    let elsewhere = factum.verify_case(other, None).unwrap();
+    assert!(
+        !elsewhere.findings.iter().any(|f| f.code == "malformed"),
+        "{:?}",
+        elsewhere.findings
+    );
+}
+
+#[test]
+fn a_late_signature_that_does_not_say_what_it_signs_is_reported_in_every_case() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let (case_id, _, _) = verifier_case(&factum);
+    f.exec(
+        "PRAGMA ignore_check_constraints = ON;
+         INSERT INTO late_signatures (target, target_id, signature, signed_utc) VALUES (X'ff', 'x', 's', 'u');
+         PRAGMA ignore_check_constraints = OFF;",
+    );
+    let report = factum.verify_case(case_id, None).unwrap();
+    let malformed = report.findings.iter().filter(|f| f.code == "malformed");
+    assert_eq!(malformed.count(), 2, "{:?}", report.findings);
+}
+
+#[test]
 fn modified_text_fails() {
     let f = Fixture::new();
     let factum = f.factum();

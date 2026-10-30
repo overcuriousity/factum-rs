@@ -15,6 +15,7 @@ All notable changes to this project are documented here. The format follows
 - A `.env` in the current directory is no longer read, only the one in the user config directory
 
 ### Fixed
+- A malformed database cell (invalid UTF-8, wrong type) gives a FAIL for its row instead of stopping `--verify`
 - A database made by a newer factum says so and asks for an upgrade, instead of calling itself older
 - A seal file that cannot be read or parsed is reported as a warning naming the file instead of being skipped
   silently, and a corrupt or incomplete signed copy (`.asc`) no longer hides the unsigned seal file (`.json`) it

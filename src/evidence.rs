@@ -2,7 +2,7 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde_json::json;
 
 use crate::canonical::utc_now;
-use crate::db::ensure_case_open;
+use crate::db::{Cells, ensure_case_open};
 use crate::error::{FactumError, Result};
 use crate::log_service::{Append, KIND_SYSTEM};
 use crate::pystr::strip;
@@ -30,17 +30,21 @@ impl Evidence {
     pub const COLUMNS: &'static str =
         "id, case_id, description, evidence_hash, created_utc, is_active, deleted_utc, details";
 
+    pub(crate) fn read(cells: &mut Cells) -> Self {
+        Self {
+            id: cells.int(0),
+            case_id: cells.int(1),
+            description: cells.text(2),
+            evidence_hash: cells.text(3),
+            created_utc: cells.text(4),
+            is_active: cells.int(5) != 0,
+            deleted_utc: cells.optional_text(6),
+            details: cells.text(7),
+        }
+    }
+
     pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            case_id: row.get(1)?,
-            description: row.get(2)?,
-            evidence_hash: row.get(3)?,
-            created_utc: row.get(4)?,
-            is_active: row.get::<_, i64>(5)? != 0,
-            deleted_utc: row.get(6)?,
-            details: row.get(7)?,
-        })
+        Cells::strict(row, Self::read)
     }
 }
 
