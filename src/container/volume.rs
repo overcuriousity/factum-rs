@@ -341,7 +341,10 @@ pub fn recheck(
         let done = result.bytes;
         let report = |read: u64| progress.bytes.store(done + read, Ordering::Relaxed);
         let hashed = match content_reader(&mut file, &archive, &graph, &record.arn) {
-            Ok(Some(mut reader)) => stream::hash_only(&mut reader, &report, cancel).map(Some),
+            // a differing CRC-32 alone is the directory's, not the content's: the hashes decide
+            Ok(Some(mut reader)) => {
+                stream::hash_stored(&mut reader, &report, cancel).map(|(size, digests, _)| Some((size, digests)))
+            }
             Ok(None) => Ok(None),
             Err(e) => Err(e),
         };
@@ -2066,6 +2069,69 @@ mod tests {
         let mut back = Vec::new();
         volume.read_file(&arn).unwrap().read_to_end(&mut back).unwrap();
         assert_eq!(back, data);
+    }
+
+    /// Flips a bit in the CRC-32 of a central entry of the newest directory: the content stays as it is.
+    fn flip_crc_field(path: &Path, name: &str) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let name = [name.as_bytes(), &[1, 0, 24, 0]].concat();
+        let at = bytes.windows(name.len()).rposition(|w| w == name).unwrap();
+        assert_eq!(bytes[at - 46..at - 42], *b"PK\x01\x02");
+        bytes[at - 46 + 16] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_crc_field_alone_is_a_finding_of_its_own_and_no_damage_to_the_content() {
+        let setup = Setup::new();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(setup.source.join("big"), &data).unwrap();
+        let mut volume = setup.create();
+        let small = add(
+            &mut volume,
+            &[setup.source.join("Users/x/notes.txt")],
+            &setup.options(),
+            1,
+        );
+        volume.segment_limit = 1000;
+        let big = add(&mut volume, &[setup.source.join("big")], &setup.options(), 2);
+        let records = [small.records[0].clone(), big.records[0].clone()];
+        let segment = volume.archive().get_arn(&records[0].arn).unwrap().name_lossy();
+        let bevy = member_name(&format!("{}/00000000", records[1].arn), &volume.arn());
+        drop(volume);
+        let (progress, cancel) = (AddProgress::default(), AtomicBool::new(false));
+
+        // the content matches: the re-check says so, Verify says that and the CRC, a plain read fails
+        for (name, record) in [(&segment, &records[0]), (&bevy, &records[1])] {
+            flip_crc_field(&setup.path(), name);
+            let recheck = recheck(&setup.path(), None, &records, &progress, &cancel).unwrap();
+            assert_eq!(recheck.mismatches, Vec::new(), "{name}");
+
+            let report = crate::container::verify::verify_file(
+                &setup.path(),
+                &crate::signer::FakeSigner::new(false),
+                &crate::container::x509::Gpgsm::unavailable(),
+                &|_, _| {},
+                &cancel,
+            )
+            .unwrap();
+            assert_eq!(report.checked_files, 2);
+            let fails: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|f| f.level == crate::verifier::Level::Fail)
+                .collect();
+            assert_eq!(fails.len(), 1, "{fails:?}");
+            assert_eq!(fails[0].code, "stream_hash");
+            assert!(fails[0].message.contains("CRC-32 differs"), "{}", fails[0].message);
+            assert!(fails[0].message.contains(name.as_str()), "{}", fails[0].message);
+
+            let (mut volume, _) = Volume::open(&setup.path(), None).unwrap();
+            let error = volume.read_file(&record.arn).unwrap().read_to_end(&mut Vec::new());
+            assert!(error.unwrap_err().to_string().contains("CRC-32"));
+            drop(volume);
+            flip_crc_field(&setup.path(), name);
+        }
     }
 
     #[test]

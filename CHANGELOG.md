@@ -32,7 +32,9 @@ All notable changes to this project are documented here. The format follows
   `install.ps1` keeps `%VAR%` entries of the user PATH unexpanded.
 
 ### Fixed
-- Containers: reading a member checks it against the CRC-32 of the central directory; a mismatch fails verification
+- Containers: reading a member checks it against the CRC-32 of the central directory. In verification a mismatch is a
+  failure of its own, next to the hash results, and all other checks go on; the re-check before a close goes by the
+  hashes
 - Containers: a central directory with entries behind its count (invisible to factum, read by other ZIP tools) is
   refused, and a member whose local header differs from the central directory in name, method or flags fails
   verification; verifying reports such bytes after the last state as a failure, not as an interrupted addition

@@ -893,7 +893,8 @@ mod verify {
         let len = file.metadata().unwrap().len();
         let archive = read_archive(&mut file, len).unwrap();
         let good = std::fs::read(&path).unwrap();
-        // the CRC field of each central entry: 46 bytes of fixed fields, then name and extra
+        let base = verify(&s, &path);
+        // the CRC field of each central entry: the content is as it was, so every verdict but that stays
         for (entry, code) in [
             (archive.get_arn(&arn).unwrap(), "stream_hash"),
             (archive.get("factum/history/1/information.turtle").unwrap(), "history"),
@@ -901,22 +902,68 @@ mod verify {
                 archive.get("factum/history/1/information.turtle.hashes").unwrap(),
                 "turtle_hash",
             ),
+            (archive.get("information.turtle").unwrap(), "turtle_hash"),
+            (archive.get("version.txt").unwrap(), "history"),
+            (archive.get("container.description").unwrap(), "history"),
         ] {
             std::fs::write(&path, &good).unwrap();
             // the name as the directory has it: followed by the ZIP64 extra
             let name = [entry.name.as_slice(), &[1, 0, 24, 0]].concat();
-            let name_at = good.windows(name.len()).rposition(|w| w == name).unwrap() as u64;
+            let name_at = good
+                .windows(name.len())
+                .enumerate()
+                .rev()
+                .find(|(at, w)| *w == name && good[at - 46..at - 42] == *b"PK\x01\x02")
+                .unwrap()
+                .0 as u64;
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.seek(SeekFrom::Start(name_at - 46 + 16)).unwrap();
             file.write_all(&(entry.crc32 ^ 1).to_le_bytes()).unwrap();
             let report = verify(&s, &path);
-            assert!(codes(&report, Level::Fail).contains(&code), "{:?}", report.findings);
-            assert!(
-                report.findings.iter().any(|f| f.message.contains("CRC-32")),
-                "{:?}",
-                report.findings
-            );
+            let fails: Vec<_> = report.findings.iter().filter(|f| f.level == Level::Fail).collect();
+            assert_eq!(fails.len(), 1, "{fails:?}");
+            assert_eq!(fails[0].code, code);
+            assert!(fails[0].message.contains("CRC-32 differs"), "{}", fails[0].message);
+            assert_eq!(report.checked_files, base.checked_files);
+            assert_eq!(report.format, base.format);
+            assert_eq!(report.states.len(), base.states.len());
+            assert_eq!(codes(&report, Level::Warn), codes(&base, Level::Warn));
         }
+    }
+
+    #[test]
+    fn a_damaged_member_is_told_by_its_digest_and_by_its_crc() {
+        let s = Setup::new();
+        closed_with_files(&s);
+        let path = s.container_path();
+        let name = "factum/history/1/information.turtle.hashes";
+        let hashes = member(&path, name).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let entry = read_archive(&mut file, len).unwrap().get(name).unwrap().clone();
+        assert_eq!(entry.method, 0);
+        // one digit of the SHA-256 in a stored member, read back in full by the check
+        let digit = hashes
+            .windows(64)
+            .position(|w| w.iter().all(u8::is_ascii_hexdigit))
+            .unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let header = entry.header_offset as usize;
+        let data = header + 30 + name.len() + 20;
+        bytes[data + digit] = if bytes[data + digit] == b'0' { b'1' } else { b'0' };
+        std::fs::write(&path, bytes).unwrap();
+        let report = verify(&s, &path);
+        let messages: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.level == Level::Fail)
+            .map(|f| f.message.as_str())
+            .collect();
+        assert!(messages.iter().any(|m| m.contains("CRC-32 differs")), "{messages:?}");
+        assert!(
+            messages.iter().any(|m| m.contains("does not match its SHA256")),
+            "{messages:?}"
+        );
     }
 
     #[test]

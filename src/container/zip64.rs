@@ -583,6 +583,29 @@ pub fn member_reader<'f>(file: &'f mut File, entry: &CdEntry) -> io::Result<Box<
     }
 }
 
+/// The error in place of the end of a member that does not have the directory's CRC-32.
+#[derive(Debug)]
+struct CrcMismatch(String);
+
+impl std::fmt::Display for CrcMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} does not match the CRC-32 of the central directory", self.0)
+    }
+}
+
+impl std::error::Error for CrcMismatch {}
+
+pub fn crc_error(name: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, CrcMismatch(name.to_string()))
+}
+
+/// The member a CRC-32 error names. All its content was read by then: a check can go by the content, and report the
+/// CRC as what it is, one more field of the directory.
+pub fn crc_mismatch(error: &io::Error) -> Option<&str> {
+    let mismatch = error.get_ref()?.downcast_ref::<CrcMismatch>()?;
+    Some(&mismatch.0)
+}
+
 /// Passes a member's content through; once it has been read to its end, fails unless it has the directory's CRC-32.
 struct CrcChecked<'f> {
     inner: Box<dyn Read + 'f>,
@@ -596,10 +619,7 @@ impl Read for CrcChecked<'_> {
         let read = self.inner.read(buf)?;
         self.crc.update(&buf[..read]);
         if read == 0 && !buf.is_empty() && self.crc.clone().finalize() != self.expected {
-            return Err(invalid(format!(
-                "{} does not match the CRC-32 of the central directory",
-                self.name
-            )));
+            return Err(crc_error(&self.name));
         }
         Ok(read)
     }
@@ -611,16 +631,29 @@ pub const MAX_IN_MEMORY: u64 = 1 << 30;
 
 /// A member's content in memory; refused when it is larger than MAX_IN_MEMORY.
 pub fn member_bytes(file: &mut File, entry: &CdEntry) -> io::Result<Vec<u8>> {
+    match member_bytes_and_crc(file, entry)? {
+        (data, true) => Ok(data),
+        (_, false) => Err(crc_error(&entry.name_lossy())),
+    }
+}
+
+/// A member's content in memory, and whether it has the directory's CRC-32: for what reports that itself.
+pub fn member_bytes_and_crc(file: &mut File, entry: &CdEntry) -> io::Result<(Vec<u8>, bool)> {
     member_bytes_up_to(file, entry, MAX_IN_MEMORY)
 }
 
-fn member_bytes_up_to(file: &mut File, entry: &CdEntry, limit: u64) -> io::Result<Vec<u8>> {
+fn member_bytes_up_to(file: &mut File, entry: &CdEntry, limit: u64) -> io::Result<(Vec<u8>, bool)> {
     let mut data = Vec::with_capacity(entry.size.min(limit).min(1 << 24) as usize);
-    member_reader(file, entry)?.take(limit + 1).read_to_end(&mut data)?;
+    let read = member_reader(file, entry)?.take(limit + 1).read_to_end(&mut data);
+    let crc_matches = match read {
+        Ok(_) => true,
+        Err(e) if crc_mismatch(&e).is_some() => false,
+        Err(e) => return Err(e),
+    };
     if data.len() as u64 > limit {
         return Err(invalid(format!("{} is larger than {limit} bytes", entry.name_lossy())));
     }
-    Ok(data)
+    Ok((data, crc_matches))
 }
 
 /// A member's content as UTF-8 text (see `member_bytes`).
@@ -1084,16 +1117,21 @@ mod tests {
         let error = member_bytes(&mut file, &stored).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("CRC-32"), "{error}");
-        // the directory's CRC changed, the content not
+        // the directory's CRC changed, the content not: a hard error, or the content and the verdict
         let wrong = CdEntry {
             crc32: deflated.crc32 ^ 1,
-            ..deflated
+            ..deflated.clone()
         };
-        assert!(
-            member_bytes(&mut file, &wrong)
-                .unwrap_err()
-                .to_string()
-                .contains("CRC-32")
+        let error = member_bytes(&mut file, &wrong).unwrap_err();
+        assert_eq!(crc_mismatch(&error), Some("deflated"));
+        assert!(error.to_string().contains("CRC-32"), "{error}");
+        assert_eq!(
+            member_bytes_and_crc(&mut file, &wrong).unwrap(),
+            (pattern(1 << 16), false)
+        );
+        assert_eq!(
+            member_bytes_and_crc(&mut file, &deflated).unwrap(),
+            (pattern(1 << 16), true)
         );
         // content where the directory says there is none
         let wrong = CdEntry {
@@ -1163,7 +1201,7 @@ mod tests {
         let error = member_bytes_up_to(&mut file, &entry, 1 << 20).unwrap_err();
         assert!(error.to_string().contains("larger than"), "{error}");
         entry.size = 4 << 20;
-        assert_eq!(member_bytes_up_to(&mut file, &entry, 4 << 20).unwrap().len(), 4 << 20);
+        assert_eq!(member_bytes_up_to(&mut file, &entry, 4 << 20).unwrap().0.len(), 4 << 20);
     }
 
     #[test]

@@ -16,7 +16,7 @@ use super::volume::{
     CER_X509, FileRecord, HASHES, KEY_GPG, SIG_GPG, SIG_X509, TURTLE, content_reader, file_records, history_member,
 };
 use super::x509::{Gpgsm, X509Check};
-use super::zip64::{Archive, find_last_end, find_newest_end, member_bytes, read_archive};
+use super::zip64::{Archive, find_last_end, find_newest_end, member_bytes_and_crc, read_archive};
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS};
 use crate::error::{FactumError, Result};
 use crate::services::Factum;
@@ -88,11 +88,13 @@ impl ContainerReport {
     }
 }
 
-fn read_member(file: &mut File, archive: &Archive, name: &str) -> Option<io::Result<Vec<u8>>> {
-    Some(member_bytes(file, archive.get(name)?))
+/// A member's content, and whether it has the directory's CRC-32.
+fn read_member(file: &mut File, archive: &Archive, name: &str) -> Option<io::Result<(Vec<u8>, bool)>> {
+    Some(member_bytes_and_crc(file, archive.get(name)?))
 }
 
-/// A member's content; one that is listed but cannot be read is a failure (with `code`), not an error.
+/// A member's content; one that is listed but cannot be read is a failure (with `code`), not an error. So is a CRC-32
+/// that differs, and the content then still counts: what is wrong may be the field, and the checks say the rest.
 fn read_checked(
     file: &mut File,
     archive: &Archive,
@@ -101,7 +103,13 @@ fn read_checked(
     findings: &mut Vec<Finding>,
 ) -> Option<Vec<u8>> {
     match read_member(file, archive, name)? {
-        Ok(data) => Some(data),
+        Ok((data, crc_matches)) => {
+            let message = format!("{name}: CRC-32 differs from the central directory.");
+            if !crc_matches && !findings.iter().any(|f| f.message == message) {
+                findings.push(Finding::new(Level::Fail, code, message, Ref::default()));
+            }
+            Some(data)
+        }
         Err(e) => {
             findings.push(Finding::new(
                 Level::Fail,
@@ -231,7 +239,8 @@ fn signature_names(close: Option<u32>) -> (String, String) {
 enum Content {
     /// nothing stored (metadata only, a link, a folder)
     None,
-    Hashed(u64, stream::Digests),
+    /// size, digests and the members that differ from the directory's CRC-32
+    Hashed(u64, stream::Digests, Vec<String>),
     /// stored in a way factum does not read (another codec, special map targets)
     NotChecked(String),
 }
@@ -247,8 +256,8 @@ fn number(graph: &Graph, subject: &str, local: &str) -> Option<u64> {
 }
 
 fn hash_reader(reader: &mut dyn Read, progress: &dyn Fn(u64), cancel: &AtomicBool) -> io::Result<Content> {
-    let (size, digests) = stream::hash_only(reader, progress, cancel)?;
-    Ok(Content::Hashed(size, digests))
+    let (size, digests, crc) = stream::hash_stored(reader, progress, cancel)?;
+    Ok(Content::Hashed(size, digests, crc.into_iter().collect()))
 }
 
 /// The content of `arn`: a ZipSegment, an ImageStream, data in the metadata (`aff4:dataStream`, also as the
@@ -311,7 +320,16 @@ fn hash_map(
     cancel: &AtomicBool,
 ) -> io::Result<Content> {
     let missing = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("{map}: {what} is missing"));
-    let read_arn = |file: &mut File, arn: String| archive.get_arn(&arn).map(|entry| member_bytes(file, entry));
+    let mut crc = Vec::new();
+    let mut read_arn = |file: &mut File, arn: String| {
+        archive.get_arn(&arn).map(|entry| {
+            let (data, crc_matches) = member_bytes_and_crc(file, entry)?;
+            if !crc_matches {
+                crc.push(entry.name_lossy());
+            }
+            Ok::<_, io::Error>(data)
+        })
+    };
     let entries = read_arn(file, format!("{map}/map")).ok_or_else(|| missing("its map"))??;
     let index = read_arn(file, format!("{map}/idx")).ok_or_else(|| missing("its idx"))??;
     let targets: Vec<String> = String::from_utf8_lossy(&index)
@@ -419,6 +437,7 @@ fn hash_map(
                     format!("{target} ends early"),
                 ));
             }
+            crc.extend(reader.crc_mismatch().map(str::to_string));
         } else {
             return Ok(Content::NotChecked(format!(
                 "its map target {target} is not an ImageStream"
@@ -430,7 +449,9 @@ fn hash_map(
     if size > position {
         fill(&mut hasher, position, size - position, 0)?;
     }
-    Ok(Content::Hashed(size.max(position), hasher.finish()))
+    crc.sort();
+    crc.dedup();
+    Ok(Content::Hashed(size.max(position), hasher.finish(), crc))
 }
 
 struct HashWriter<'h>(&'h mut stream::Hasher);
@@ -466,7 +487,7 @@ fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: 
         for store in imports {
             done.insert(store.clone());
             let name = super::member_name(&store, &volume);
-            let Some(Ok(data)) = read_member(file, archive, &name) else {
+            let Some(data) = read_checked(file, archive, &name, "turtle_hash", &mut findings) else {
                 findings.push(fail(format!("{label}: the secondary store {name} is missing.")));
                 continue;
             };
@@ -647,7 +668,7 @@ pub fn verify_file(
     });
 
     // the states: every closed one, and the current one when it is not the newest close
-    let Some(Ok(current_turtle)) = read_member(&mut file, &archive, TURTLE) else {
+    let Some(current_turtle) = read_checked(&mut file, &archive, TURTLE, "turtle_hash", &mut report.findings) else {
         report.finding(
             Level::Fail,
             "turtle_hash",
@@ -903,7 +924,7 @@ pub fn verify_file(
                 Ok(Content::NotChecked(why)) => {
                     report.finding(Level::Warn, "not_checked", format!("{name}: not checked ({why})."));
                 }
-                Ok(Content::Hashed(size, digests)) => {
+                Ok(Content::Hashed(size, digests, crc)) => {
                     report.checked_files += 1;
                     let mut compared = 0;
                     for (algorithm, actual) in digests.typed() {
@@ -917,6 +938,13 @@ pub fn verify_file(
                                 );
                             }
                         }
+                    }
+                    for member in crc {
+                        report.finding(
+                            Level::Fail,
+                            "stream_hash",
+                            format!("{name}: CRC-32 differs from the central directory ({member})."),
+                        );
                     }
                     if number(graph, &record.arn, "size").is_some_and(|listed| listed != size) {
                         report.finding(
