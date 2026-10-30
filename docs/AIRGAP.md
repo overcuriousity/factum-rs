@@ -58,7 +58,7 @@ then extract the ZIP and put `factum.exe` anywhere (it needs no installation).
 If the release has a signed `SHA256SUMS.asc`, import the release key once (from a trusted source) and check it:
 `gpg --verify SHA256SUMS.asc SHA256SUMS`. `install.sh`, `install.ps1` and `scripts/airgap-download.sh` do this
 themselves when `gpg` and the `.asc` are present: a bad signature stops them, while a missing `gpg`, `.asc` or
-release key in the keyring only prints a warning that integrity, not authenticity, was checked. They never fetch a key.
+release key in the keyring, or a key that has expired since signing, only prints a warning that integrity, not authenticity, was checked. They never fetch a key.
 
 ## 2. Build from source offline
 

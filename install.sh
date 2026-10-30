@@ -138,8 +138,10 @@ check_signature() { # dir
         return 0
     fi
     status=$(gpg --batch --status-fd 1 --verify "$1/SHA256SUMS.asc" "$1/SHA256SUMS" 2>/dev/null) || true
-    if printf '%s\n' "$status" | grep -q '^\[GNUPG:\] \(BADSIG\|EXPSIG\|EXPKEYSIG\|REVKEYSIG\) '; then
+    if printf '%s\n' "$status" | grep -q '^\[GNUPG:\] \(BADSIG\|EXPSIG\|REVKEYSIG\) '; then
         die "the signature on SHA256SUMS is bad, expired or from a revoked key; nothing was installed"
+    elif printf '%s\n' "$status" | grep -q '^\[GNUPG:\] EXPKEYSIG '; then
+        say "warning: the signature on SHA256SUMS is good, but the signing key has expired since; make sure that key is the release key you trust"
     elif printf '%s\n' "$status" | grep -q '^\[GNUPG:\] GOODSIG '; then
         say "signature on SHA256SUMS is good ($(printf '%s\n' "$status" | sed -n 's/^\[GNUPG:\] GOODSIG [^ ]* //p' | head -n 1)); make sure that key is the release key you trust"
     elif printf '%s\n' "$status" | grep -q '^\[GNUPG:\] \(NO_PUBKEY\|ERRSIG\) '; then

@@ -40,8 +40,10 @@ if [[ $have_asc == 1 ]]; then
         echo "warning: gpg is not installed; SHA256SUMS.asc was not checked, only integrity, not authenticity"
     else
         status=$(gpg --batch --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null || true)
-        if grep -q '^\[GNUPG:\] \(BADSIG\|EXPSIG\|EXPKEYSIG\|REVKEYSIG\) ' <<<"$status"; then
+        if grep -q '^\[GNUPG:\] \(BADSIG\|EXPSIG\|REVKEYSIG\) ' <<<"$status"; then
             echo "error: the signature on SHA256SUMS is bad, expired or from a revoked key" >&2; exit 1
+        elif grep -q '^\[GNUPG:\] EXPKEYSIG ' <<<"$status"; then
+            echo "warning: the signature on SHA256SUMS is good, but the signing key has expired since"
         elif grep -q '^\[GNUPG:\] GOODSIG ' <<<"$status"; then
             echo "signature on SHA256SUMS is good; make sure that key is the release key you trust"
         elif grep -q '^\[GNUPG:\] \(NO_PUBKEY\|ERRSIG\) ' <<<"$status"; then
@@ -76,7 +78,7 @@ for f in "${assets[@]}" install.sh install.ps1; do
     [[ -n $line ]] || { echo "error: $f is not listed in SHA256SUMS" >&2; exit 1; }
     printf '%s\n' "$line" >> downloaded.sums
 done
-sha256sum -c downloaded.sums
+sha256sum -c downloaded.sums || { rm -f downloaded.sums; exit 1; }
 rm -f downloaded.sums
 cd ..
 tar -cf "$out.tar" "$out"

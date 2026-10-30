@@ -49,7 +49,7 @@ function Set-UserPath($value) {
 function Remove-FromPath($folder) {
     $path = Get-UserPath
     if ($path) {
-        $parts = $path.Split(";") | Where-Object { $_ -and ($_.TrimEnd("\") -ne $folder.TrimEnd("\")) }
+        $parts = $path.Split(";") | Where-Object { $_ -and ([Environment]::ExpandEnvironmentVariables($_).TrimEnd("\") -ne $folder.TrimEnd("\")) }
         Set-UserPath ($parts -join ";")
     }
 }
@@ -82,7 +82,7 @@ try {
         Invoke-WebRequest -UseBasicParsing "$Base/$Asset" -OutFile (Join-Path $Tmp $Asset)
         if (-not $SkipVerify) {
             Invoke-WebRequest -UseBasicParsing "$Base/SHA256SUMS" -OutFile (Join-Path $Tmp "SHA256SUMS")
-            try { Invoke-WebRequest -UseBasicParsing "$Base/SHA256SUMS.asc" -OutFile (Join-Path $Tmp "SHA256SUMS.asc") } catch { }
+            try { Invoke-WebRequest -UseBasicParsing "$Base/SHA256SUMS.asc" -OutFile (Join-Path $Tmp "SHA256SUMS.asc") } catch { Remove-Item -ErrorAction SilentlyContinue (Join-Path $Tmp "SHA256SUMS.asc") }
         }
     }
     if (-not $SkipVerify) {
@@ -93,9 +93,12 @@ try {
         } elseif (-not (Get-Command gpg -ErrorAction SilentlyContinue)) {
             Say "warning: gpg is not installed; only the integrity of the archive was checked, not who published it"
         } else {
-            $status = (& gpg --batch --status-fd 1 --verify $Asc (Join-Path $Tmp "SHA256SUMS") 2>$null) -join "`n"
-            if ($status -match "(?m)^\[GNUPG:\] (BADSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ") {
+            $ErrorActionPreference = "Continue"
+            try { $status = (& gpg --batch --status-fd 1 --verify $Asc (Join-Path $Tmp "SHA256SUMS") 2>$null) -join "`n" } finally { $ErrorActionPreference = "Stop" }
+            if ($status -match "(?m)^\[GNUPG:\] (BADSIG|EXPSIG|REVKEYSIG) ") {
                 throw "the signature on SHA256SUMS is bad, expired or from a revoked key; nothing was installed"
+            } elseif ($status -match "(?m)^\[GNUPG:\] EXPKEYSIG ") {
+                Say "warning: the signature on SHA256SUMS is good, but the signing key has expired since; make sure that key is the release key you trust"
             } elseif ($status -match "(?m)^\[GNUPG:\] GOODSIG ") {
                 Say "signature on SHA256SUMS is good; make sure that key is the release key you trust"
             } elseif ($status -match "(?m)^\[GNUPG:\] (NO_PUBKEY|ERRSIG) ") {
@@ -120,7 +123,7 @@ try {
     Say "installed $Dir\factum.exe"
 
     $path = Get-UserPath
-    if (-not ($path -split ";" | Where-Object { $_.TrimEnd("\") -eq $Dir.TrimEnd("\") })) {
+    if (-not ($path -split ";" | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd("\") -eq $Dir.TrimEnd("\") })) {
         Set-UserPath (($path, $Dir) -ne "" -join ";")
         Say "added $Dir to your PATH (open a new terminal to use 'factum')"
     }
