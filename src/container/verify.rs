@@ -738,12 +738,26 @@ pub fn verify_file(
         );
     }
     let count = closes.last().copied().unwrap_or(0);
-    for missing in (1..count).filter(|n| !closes.contains(n)) {
-        report.finding(
-            Level::Fail,
-            "history",
-            format!("The closed state of close {missing} is missing from the container."),
-        );
+    // from one kept state to the next: a crafted number must not make this count up to it
+    let mut next = 1;
+    for &n in &closes {
+        match n - next {
+            0 => {}
+            1 => report.finding(
+                Level::Fail,
+                "history",
+                format!("The closed state of close {next} is missing from the container."),
+            ),
+            _ => report.finding(
+                Level::Fail,
+                "history",
+                format!(
+                    "The closed states of closes {next} to {} are missing from the container.",
+                    n - 1
+                ),
+            ),
+        }
+        next = n.saturating_add(1);
     }
     let mut parsed = Vec::new();
     for n in closes.iter().copied() {

@@ -5,9 +5,12 @@ use crate::canonical::utc_now;
 use crate::cases::next_id;
 use crate::db::{Cells, ensure_case_open};
 use crate::error::{ErrorKind, FactumError, Result};
-use crate::log_service::{Append, KIND_SYSTEM, MAX_ATTEMPTS};
+use crate::log_service::{Append, FollowUp, KIND_SYSTEM, MAX_ATTEMPTS};
 use crate::pystr::strip;
 use crate::services::Factum;
+
+/// Appends the entry of a new evidence item, with what follows it.
+pub(crate) type AppendEvidence<'a> = &'a dyn for<'f> Fn(Option<FollowUp<'f>>) -> Result<i64>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
@@ -53,18 +56,18 @@ impl Evidence {
 impl Factum<'_> {
     /// `name` is stored in the `description` column; `details` is the free-text description.
     pub fn create_evidence(&self, case_id: i64, name: &str, evidence_hash: &str, details: &str) -> Result<i64> {
-        self.create_evidence_then(case_id, name, evidence_hash, details, &|_| Ok(()))
+        self.create_evidence_with(case_id, name, evidence_hash, details, &|_, append| append(None))
     }
 
-    /// `create_evidence`, and `then` (given the new id) inside its append transaction: if `then` fails, there is no
-    /// evidence item and no entry.
-    pub(crate) fn create_evidence_then(
+    /// `create_evidence`, with a second entry in its transaction: `attempt` gets the predicted id and calls the
+    /// function it gets with what follows. When the id moved it is called again, with the next one.
+    pub(crate) fn create_evidence_with(
         &self,
         case_id: i64,
         name: &str,
         evidence_hash: &str,
         details: &str,
-        then: &dyn Fn(i64) -> Result<()>,
+        attempt: &dyn Fn(i64, AppendEvidence<'_>) -> Result<i64>,
     ) -> Result<i64> {
         let (description, evidence_hash, details) = (strip(name), strip(evidence_hash), strip(details));
         if description.is_empty() {
@@ -95,18 +98,19 @@ impl Factum<'_> {
                 )?;
                 Ok(())
             };
-            let on_commit = |_: &rusqlite::Connection, _: i64| then(evidence_id);
-            let appended = self.append(
-                case_id,
-                KIND_SYSTEM,
-                &text,
-                Append {
-                    payload: Some(payload),
-                    reserve: Some(&reserve),
-                    on_commit: Some(&on_commit),
-                    ..Default::default()
-                },
-            );
+            let appended = attempt(evidence_id, &|follow_up| {
+                self.append(
+                    case_id,
+                    KIND_SYSTEM,
+                    &text,
+                    Append {
+                        payload: Some(payload.clone()),
+                        reserve: Some(&reserve),
+                        follow_up,
+                        ..Default::default()
+                    },
+                )
+            });
             match appended {
                 Err(e) if e.is(ErrorKind::LogChanged) => continue,
                 Err(e) => return Err(e),

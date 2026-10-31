@@ -160,7 +160,7 @@ pub enum Dialog {
     /// a close's re-check found files that do not match their hashes
     Damaged {
         container_id: i64,
-        mismatches: Vec<crate::container::volume::FileRecord>,
+        recheck: crate::container::volume::Recheck,
         /// how to add them again, or why that is not possible
         add_again: std::result::Result<Vec<(Vec<PathBuf>, AddOptions)>, String>,
         /// the case to archive once every container is closed (Close and Archive)
@@ -230,7 +230,7 @@ pub enum DialogResult {
     },
     CloseDamaged {
         container_id: i64,
-        mismatches: Vec<crate::container::volume::FileRecord>,
+        recheck: crate::container::volume::Recheck,
         then_archive: Option<i64>,
     },
     X509 {
@@ -900,10 +900,11 @@ impl Dialog {
             }
             Dialog::Damaged {
                 container_id,
-                mismatches,
+                recheck,
                 add_again,
                 then_archive,
             } => {
+                let mismatches = &recheck.mismatches;
                 title(ui, "Container Damaged");
                 note(
                     ui,
@@ -940,7 +941,7 @@ impl Dialog {
                     if ui.button("Close as Damaged").clicked() {
                         result = Some(DialogResult::CloseDamaged {
                             container_id: *container_id,
-                            mismatches: mismatches.clone(),
+                            recheck: recheck.clone(),
                             then_archive: *then_archive,
                         });
                     }

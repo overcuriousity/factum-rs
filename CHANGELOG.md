@@ -103,23 +103,28 @@ All notable changes to this project are documented here. The format follows
 - A container close signs only the state that was re-checked: it compares under the volume lock, and asks for a new
   re-check when another process changed the container since
 - An addition is refused when the container was closed meanwhile; Close as Damaged, Close Without File and Reopen
-  fail with "in use" while another process writes to the file
+  fail with "in use" while another process holds the file, and go through when it cannot be reached at all (a dead
+  mount)
+- Opening a container goes by the log as it is once the lock is held, so a late signature can no longer drop an
+  addition that another process committed while it waited
 - A `factum:replacedBy` that no addition in the case log records (or the reverse) fails Verify Container, so a forged
   replacement no longer turns a failed hash into a warning
 - The container list says signed only when the newest close is, as the container's own view does: a late signature of
   an older close no longer counts
 - Comparing a container with the case log no longer takes seconds with many folders (20,000: 4.9 s to 0.11 s, debug
   build); Add Again plans and replaced files are looked up by ARN
-- A new evidence item with a container is two entries in one transaction: a failure leaves no entry and no file, and
-  trying again makes no duplicate
+- A new evidence item with a container is two entries in one transaction, both signed before it: a failure leaves no
+  entry and no file, and trying again makes no duplicate
 - A close signs the stored `information.turtle` bytes, not a new serialization, so the closed state and the root stay
   the same bytes whatever wrote them
-- A read error during the re-check that repeats while the rest of the file reads (EIO from a bad sector) counts as
-  damage, so Close as Damaged and Add Again are offered; permissions, removed media and interrupted calls stay
-  retryable
+- A read error during the re-check that repeats while the start or end of the file reads (EIO from a bad sector)
+  counts as damage, so Close as Damaged and Add Again are offered; permissions, removed media and interrupted calls
+  stay retryable
 - A CRC-32 fault of a container's directory stops additions and signatures, even when the hashes match; Close as
-  Damaged works then too, writes nothing, and logs `directory_fault` so the log does not claim lost files
-- A hostile `factum/history/0/` member is a failure in Verify Container instead of a crash
+  Damaged works then too, writes nothing, and logs `directory_fault` so the log does not claim lost files, nor
+  undamaged ones it never reached (`unchecked_files`)
+- A hostile `factum/history/0/` member is a failure in Verify Container instead of a crash, a crafted high close
+  number no longer exhausts memory (one finding per gap) and a container cannot be closed past the highest number
 
 ## [2.7.1] - 2026-10-29
 

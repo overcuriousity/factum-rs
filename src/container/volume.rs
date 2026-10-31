@@ -399,13 +399,23 @@ fn counts_as_damage(e: &io::Error, rest_reads: impl FnOnce() -> bool) -> bool {
     is_damage(e.kind()) || (!is_transient(e) && rest_reads())
 }
 
-/// Whether the start of a container file can be read from the disk.
-fn start_reads(path: &Path) -> bool {
+/// Whether the medium is still there: the start or the end of the file can be read from the disk. A dead sector
+/// takes one of them at most, and a re-check reads the metadata at both ends first; a removed drive fails both.
+fn medium_reads(path: &Path) -> bool {
     let Ok(mut file) = File::open(path) else {
         return false;
     };
     drop_cache(&file);
-    file.read(&mut [0; 4096]).is_ok_and(|read| read > 0)
+    let mut buffer = [0; 4096];
+    let head = file.read(&mut buffer).is_ok_and(|read| read > 0);
+    let tail = file
+        .seek(SeekFrom::End(-4096))
+        .or_else(|_| file.rewind().map(|_| 0))
+        .is_ok()
+        && file.read(&mut buffer).is_ok_and(|read| read > 0);
+    #[cfg(test)]
+    let (head, tail) = tests::probed(head, tail);
+    head || tail
 }
 
 /// A state as a re-check finds it.
@@ -419,6 +429,10 @@ struct RecheckState {
 
 /// Reads the directory of the state at `end` (the newest when None) and its metadata; None without a complete one.
 fn read_recheck_state(file: &mut File, end: Option<u64>) -> io::Result<Option<RecheckState>> {
+    #[cfg(test)]
+    if let Some(e) = tests::failed_metadata() {
+        return Err(e);
+    }
     let Some(end) = find_last_end(file, end)? else {
         return Ok(None);
     };
@@ -449,6 +463,14 @@ fn read_recheck_state(file: &mut File, end: Option<u64>) -> io::Result<Option<Re
     }))
 }
 
+fn open_for_recheck(path: &Path) -> io::Result<File> {
+    #[cfg(test)]
+    if let Some(e) = tests::failed_open() {
+        return Err(e);
+    }
+    File::open(path)
+}
+
 /// Reads the stored content of `records` back from the state that ends at `end` (the newest when None) and
 /// compares it with their hashes. A read error that stays on a second attempt counts as damage when the file can
 /// otherwise be read (`counts_as_damage`); until then it is an error and nothing is decided.
@@ -460,14 +482,21 @@ pub fn recheck(
     cancel: &AtomicBool,
 ) -> Result<Recheck> {
     let unreadable = |e: String| FactumError::general(format!("The container {} cannot be read: {e}", path.display()));
-    let mut file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
-    let uncached = drop_cache(&file);
     let mut result = Recheck {
-        uncached,
         logged_end: end,
         arns: records.iter().map(|r| r.arn.clone()).collect(),
         ..Default::default()
     };
+    let mut file = match open_for_recheck(path).or_else(|_| open_for_recheck(path)) {
+        Ok(file) => file,
+        // it is there, but what it stands on cannot be read: no state to go through
+        Err(e) if !is_damage(e.kind()) && !is_transient(&e) && std::fs::metadata(path).is_ok() => {
+            result.directory_faults.push(format!("the file cannot be opened ({e})"));
+            return Ok(result);
+        }
+        Err(e) => return Err(unreadable(e.to_string())),
+    };
+    result.uncached = drop_cache(&file);
     let state = match read_recheck_state(&mut file, end) {
         Err(e) if !is_damage(e.kind()) && !is_transient(&e) => read_recheck_state(&mut file, end),
         state => state,
@@ -475,7 +504,7 @@ pub fn recheck(
     let state = match state {
         Ok(state) => state.ok_or_else(|| unreadable("no complete ZIP directory".into()))?,
         // the directory itself is what cannot be read: nothing to go through, and nothing to sign
-        Err(e) if !is_damage(e.kind()) && counts_as_damage(&e, || start_reads(path)) => {
+        Err(e) if !is_damage(e.kind()) && counts_as_damage(&e, || medium_reads(path)) => {
             result
                 .directory_faults
                 .push(format!("the directory cannot be read ({e})"));
@@ -526,7 +555,7 @@ pub fn recheck(
         let (matches, crc) = match hashed {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(cancelled()),
             // not damage: the check stops, the container stays open and nothing is logged
-            Err(e) if !counts_as_damage(&e, || start_reads(path)) => return Err(unreadable(e.to_string())),
+            Err(e) if !counts_as_damage(&e, || medium_reads(path)) => return Err(unreadable(e.to_string())),
             Ok(Some((size, digests, crc))) => (
                 size == record.size
                     && digests.md5 == record.md5
@@ -831,46 +860,53 @@ fn try_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
     file.try_lock()
 }
 
-/// Locks the file for this process. A lock held for a moment (a child process between fork and exec still shares
-/// the open file) is waited for, briefly.
-fn lock(file: &File) -> Result<()> {
-    for attempt in 0..20 {
+/// Locks the file, waiting briefly for a lock held for a moment (a child process between fork and exec still shares
+/// the open file). The last error is what stayed: `WouldBlock`, another process holds the lock.
+fn wait_for_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    for _ in 0..19 {
         match try_lock(file) {
-            Ok(()) => return Ok(()),
-            Err(std::fs::TryLockError::WouldBlock) if attempt < 19 => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => break,
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(FactumError::general(format!("The container cannot be locked: {e}")));
-            }
+            Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            result => return result,
         }
     }
-    Err(FactumError::general(
-        "The container is in use by another factum process.",
-    ))
+    try_lock(file)
 }
 
-/// Holds the writer's lock of a container file while the log alone changes (the returned handle keeps it); None when
-/// there is no file to lock. Nothing is written, so a write-protected file is locked as well.
+fn in_use() -> FactumError {
+    FactumError::general("The container is in use by another factum process.")
+}
+
+/// Locks the file for this process.
+fn lock(file: &File) -> Result<()> {
+    match wait_for_lock(file) {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(in_use()),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(FactumError::general(format!("The container cannot be locked: {e}")))
+        }
+    }
+}
+
+/// Holds the writer's lock of a container file while the log alone changes (the returned handle keeps it). Only
+/// another writer refuses: a file that cannot be opened or locked (missing, a dead mount, no permission) has none
+/// that could be waited for, and these steps are the way out then. Nothing is written through the handle.
 pub fn lock_file(path: &Path) -> Result<Option<File>> {
     let opened = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .or_else(|_| File::open(path));
-    let file = match opened {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(FactumError::general(format!(
-                "The container {} cannot be opened: {e}",
-                path.display()
-            )));
-        }
+    let Ok(file) = opened else {
+        return Ok(None);
     };
-    lock(&file)?;
-    Ok(Some(file))
+    match wait_for_lock(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(in_use()),
+        Err(std::fs::TryLockError::Error(e)) => {
+            log::warn!("{} could not be locked: {e}", path.display());
+            Ok(None)
+        }
+    }
 }
 
 /// The writer of a volume; gone only after a failed rollback left the file in an unknown state.
@@ -1500,7 +1536,9 @@ impl Volume {
     /// Closes the current state: its signatures at the root, and a copy of the signed state under
     /// factum/history/<n>/, byte for byte the root `information.turtle`. Returns n.
     pub fn close(&mut self, signatures: &Signatures) -> Result<u32> {
-        let n = self.history_count() + 1;
+        let n = self.history_count().checked_add(1).ok_or_else(|| {
+            FactumError::general("The container lists a closed state with the highest number; it cannot be closed.")
+        })?;
         let turtle = self.member(TURTLE)?;
         let hashes = hashes_bytes(&self.uuid, &turtle);
         let mut members: Vec<(String, Vec<u8>)> =
@@ -1587,12 +1625,37 @@ mod tests {
         pub static FAIL_READ: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
     }
 
-    pub fn failed_read() -> Option<io::Error> {
-        let (code, times) = FAIL_READ.get();
+    thread_local! {
+        /// what the next read of the metadata and the next opens fail with, as for FAIL_READ
+        pub static FAIL_METADATA: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+        pub static FAIL_OPEN: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+        /// (head, tail) that a probe of the medium does not get
+        pub static DEAD: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+    }
+
+    fn next_failure(failure: &'static std::thread::LocalKey<std::cell::Cell<(i32, u32)>>) -> Option<io::Error> {
+        let (code, times) = failure.get();
         (times > 0).then(|| {
-            FAIL_READ.set((code, times - 1));
+            failure.set((code, times - 1));
             io::Error::from_raw_os_error(code)
         })
+    }
+
+    pub fn failed_metadata() -> Option<io::Error> {
+        next_failure(&FAIL_METADATA)
+    }
+
+    pub fn failed_open() -> Option<io::Error> {
+        next_failure(&FAIL_OPEN)
+    }
+
+    pub fn probed(head: bool, tail: bool) -> (bool, bool) {
+        let (dead_head, dead_tail) = DEAD.get();
+        (head && !dead_head, tail && !dead_tail)
+    }
+
+    pub fn failed_read() -> Option<io::Error> {
+        next_failure(&FAIL_READ)
     }
 
     fn eio() -> io::Error {
@@ -1675,6 +1738,93 @@ mod tests {
             assert!(error.to_string().contains("cannot be read"), "{error}");
             assert_eq!(left, 1, "retried: {code}");
         }
+    }
+
+    /// A re-check with a failing setup, one small file listed.
+    fn recheck_set_up(fail: impl FnOnce()) -> Result<Recheck> {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let records = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1).records;
+        drop(volume);
+        fail();
+        let result = recheck(
+            &setup.path(),
+            None,
+            &records,
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        );
+        FAIL_METADATA.set((0, 0));
+        FAIL_OPEN.set((0, 0));
+        DEAD.set((false, false));
+        result
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dead_sector_at_the_start_is_not_a_removed_drive() {
+        let dead = |head, tail| {
+            recheck_set_up(|| {
+                FAIL_METADATA.set((libc::EIO, 2));
+                DEAD.set((head, tail));
+            })
+        };
+        for (head, tail) in [(true, false), (false, true), (false, false)] {
+            let result = dead(head, tail).unwrap();
+            assert_eq!(result.directory_faults.len(), 1, "{head} {tail}");
+            assert!(
+                result.directory_faults[0].contains("directory"),
+                "{:?}",
+                result.directory_faults
+            );
+            assert_eq!(result.files, 0);
+        }
+        // a removed drive
+        let error = dead(true, true).unwrap_err();
+        assert!(error.to_string().contains("cannot be read"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_open_that_fails_is_a_fault_only_while_the_file_is_there() {
+        let result = recheck_set_up(|| FAIL_OPEN.set((libc::EIO, 2))).unwrap();
+        assert!(
+            result.directory_faults[0].contains("cannot be opened"),
+            "{:?}",
+            result.directory_faults
+        );
+        assert_eq!((result.files, result.arns.is_empty()), (0, false));
+        // once is nothing, and a transient error stays one
+        assert!(
+            recheck_set_up(|| FAIL_OPEN.set((libc::EIO, 1)))
+                .unwrap()
+                .directory_faults
+                .is_empty()
+        );
+        assert!(recheck_set_up(|| FAIL_OPEN.set((libc::EACCES, 2))).is_err());
+        // gone altogether: the stat fails as well
+        let missing = recheck(
+            &PathBuf::from("/nonexistent/c.aff4l"),
+            None,
+            &[],
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        );
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn the_last_close_number_is_refused() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let comment = volume.archive.comment.clone();
+        let app = volume.app().unwrap();
+        app.add_bytes(&history_member(u32::MAX, TURTLE), 8, b"# nothing")
+            .unwrap();
+        let end = app.finish(&[], &comment).unwrap();
+        volume.archive = Archive::new(app.entries(), comment, end);
+        let error = volume.close(&Signatures::default()).unwrap_err();
+        assert!(error.to_string().contains("cannot be closed"), "{error}");
     }
 
     #[test]

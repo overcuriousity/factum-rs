@@ -21,7 +21,7 @@ use crate::container::volume::{
 use crate::container::x509::{Gpgsm, X509_CERT_SETTING, X509_CHAIN_SETTING};
 use crate::db::ensure_case_open;
 use crate::error::{FactumError, Result};
-use crate::log_service::{Append, KIND_SYSTEM};
+use crate::log_service::{Append, FollowUp, KIND_SYSTEM};
 use crate::pystr::strip;
 use crate::services::Factum;
 use crate::verifier::{Finding, Level, Ref};
@@ -185,6 +185,55 @@ struct NewContainer {
     path: PathBuf,
     file_name: String,
     base_path: String,
+}
+
+/// The `container_created` entry of a new container and what its file is made from. All of it is known before the
+/// entry is signed, the file is written in the transaction.
+struct ContainerEntry {
+    uuid: String,
+    text: String,
+    payload: Value,
+    info: VolumeInfo,
+}
+
+impl NewContainer {
+    /// `evidence`: id, name, description.
+    fn entry(&self, evidence: (i64, String, String)) -> ContainerEntry {
+        let (name, uuid, created_utc) = (&self.name, uuid::Uuid::new_v4().to_string(), utc_now());
+        let evidence_id = evidence.0;
+        ContainerEntry {
+            text: format!("Container \"{name}\" created (from evidence #{evidence_id})"),
+            payload: json!({"event": "container_created", "case_id": self.case_id, "container_id": uuid, "name": name,
+                            "evidence_id": evidence_id, "file_name": self.file_name, "base_path": self.base_path,
+                            "created_utc": created_utc}),
+            info: VolumeInfo {
+                name: name.clone(),
+                case_file: self.case_file.clone(),
+                case_id: self.case_id,
+                evidence: Some(evidence),
+                created_utc,
+            },
+            uuid,
+        }
+    }
+
+    /// Creates the file and remembers where it is, in the transaction of its entry; the file goes when that fails.
+    fn write(&self, conn: &rusqlite::Connection, entry: &ContainerEntry) -> Result<()> {
+        let volume = Volume::create(&self.path, &entry.uuid, &entry.info)?;
+        let remembered = conn
+            .execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![path_setting(&entry.uuid), self.path.display().to_string()],
+            )
+            .map_err(FactumError::from)
+            .and_then(|_| store_end(conn, &entry.uuid, volume.end()));
+        drop(volume);
+        remembered.inspect_err(|_| self.remove())
+    }
+
+    fn remove(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// The signatures of one state and who made them.
@@ -704,58 +753,8 @@ impl Factum<'_> {
         })
     }
 
-    /// Creates the container file, then logs `container_created`; the file goes again when that fails. `evidence`:
-    /// id, name, description. `in_transaction`: the entry joins the transaction of an append that runs this.
-    fn create_logged(&self, new: &NewContainer, evidence: (i64, String, String), in_transaction: bool) -> Result<i64> {
-        let NewContainer {
-            case_id,
-            name,
-            path,
-            file_name,
-            base_path,
-            ..
-        } = new;
-        let uuid = uuid::Uuid::new_v4().to_string();
-        let created_utc = utc_now();
-        let evidence_id = evidence.0;
-        let info = VolumeInfo {
-            name: name.clone(),
-            case_file: new.case_file.clone(),
-            case_id: *case_id,
-            evidence: Some(evidence),
-            created_utc: created_utc.clone(),
-        };
-        let volume = Volume::create(path, &uuid, &info)?;
-        let text = format!("Container \"{name}\" created (from evidence #{evidence_id})");
-        let payload = json!({"event": "container_created", "case_id": case_id, "container_id": uuid, "name": name,
-                             "evidence_id": evidence_id, "file_name": file_name, "base_path": base_path,
-                             "created_utc": created_utc});
-        let end = volume.end();
-        let remember = |conn: &rusqlite::Connection, _: i64| -> Result<()> {
-            conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                rusqlite::params![path_setting(&uuid), path.display().to_string()],
-            )?;
-            store_end(conn, &uuid, end)
-        };
-        let appended = self.append(
-            *case_id,
-            KIND_SYSTEM,
-            &text,
-            Append {
-                payload: Some(payload),
-                on_commit: Some(&remember),
-                in_transaction,
-                ..Default::default()
-            },
-        );
-        drop(volume);
-        appended.inspect_err(|_| {
-            let _ = std::fs::remove_file(path);
-        })
-    }
-
-    /// Creates the container file, then logs `container_created`; returns the container's number (its entry id).
+    /// Logs `container_created` and creates the container file in that transaction; returns the container's number
+    /// (its entry id).
     pub fn create_container(
         &self,
         case_id: i64,
@@ -773,14 +772,37 @@ impl Factum<'_> {
                 )));
             }
         };
-        let id = self.create_logged(&new, evidence, false)?;
+        let entry = new.entry(evidence);
+        let written = Cell::new(false);
+        let write = |conn: &rusqlite::Connection, _: i64| -> Result<()> {
+            new.write(conn, &entry)?;
+            written.set(true);
+            Ok(())
+        };
+        let id = self
+            .append(
+                case_id,
+                KIND_SYSTEM,
+                &entry.text,
+                Append {
+                    payload: Some(entry.payload.clone()),
+                    on_commit: Some(&write),
+                    ..Default::default()
+                },
+            )
+            .inspect_err(|_| {
+                // a failed commit, after the file was written
+                if written.get() {
+                    new.remove();
+                }
+            })?;
         log::info!("Container #{id} created: {}", new.path.display());
         Ok(id)
     }
 
     /// A new evidence item and a container for it, named alike: two log entries in one transaction, the evidence's
-    /// first, with the file created between them. Returns (evidence id, container id); a failure leaves neither
-    /// entry nor file, so it can simply be tried again.
+    /// first, both signed before it, the file written in it. Returns (evidence id, container id); a failure leaves
+    /// neither entry nor file, so it can simply be tried again.
     pub fn create_evidence_with_container(
         &self,
         case_id: i64,
@@ -792,17 +814,27 @@ impl Factum<'_> {
     ) -> Result<(i64, i64)> {
         let new = self.new_container(case_id, name, path, base_path)?;
         let container_id = Cell::new(None);
-        let created = self.create_evidence_then(case_id, name, hash, details, &|evidence_id| {
-            let evidence = (evidence_id, strip(name).to_string(), strip(details).to_string());
-            container_id.set(Some(self.create_logged(&new, evidence, true)?));
-            Ok(())
-        });
-        let evidence_id = created.inspect_err(|_| {
-            // a failed commit, after the file was written
-            if container_id.get().is_some() {
-                let _ = std::fs::remove_file(&new.path);
-            }
-        })?;
+        let evidence_id = self
+            .create_evidence_with(case_id, name, hash, details, &|evidence_id, append| {
+                let entry = new.entry((evidence_id, strip(name).to_string(), strip(details).to_string()));
+                let write = |conn: &rusqlite::Connection, entry_id: i64| -> Result<()> {
+                    new.write(conn, &entry)?;
+                    container_id.set(Some(entry_id));
+                    Ok(())
+                };
+                append(Some(FollowUp {
+                    kind: KIND_SYSTEM,
+                    text: &entry.text,
+                    payload: Some(entry.payload.clone()),
+                    on_commit: Some(&write),
+                }))
+            })
+            .inspect_err(|_| {
+                // a failed commit, after the file was written
+                if container_id.get().is_some() {
+                    new.remove();
+                }
+            })?;
         let id = container_id.get().expect("set inside the append");
         log::info!("Container #{id} created: {}", new.path.display());
         Ok((evidence_id, id))
@@ -820,12 +852,16 @@ impl Factum<'_> {
                 )));
             }
         };
-        let hint = self
-            .db
-            .get_setting(&end_setting(&detail.summary.uuid))
-            .ok()
-            .and_then(|end| end.parse().ok());
-        let (mut volume, discarded) = Volume::open(&path, hint)?;
+        let logged_end = || {
+            self.db
+                .get_setting(&end_setting(&detail.summary.uuid))
+                .ok()
+                .and_then(|end| end.parse::<u64>().ok())
+        };
+        let (mut volume, discarded) = Volume::open(&path, logged_end())?;
+        // locked only now: what another process logged while this one waited for the lock counts
+        let hint = logged_end();
+        let detail = &self.container(id)?;
         if volume.uuid() != detail.summary.uuid {
             return Err(FactumError::general(format!(
                 "{} is not container #{id} (it is {}).",
@@ -1196,11 +1232,12 @@ impl Factum<'_> {
         Ok((self.container(id)?, lock))
     }
 
-    /// Closes a container that cannot be signed, without signing or writing anything (spec 5.2): `damaged`, the files
-    /// its re-check found damaged, or `directory_faults`, what it found wrong with the directory (`Recheck`). The
-    /// container need not open for this: a directory fault is why it does not.
-    pub fn close_container_damaged(&self, id: i64, damaged: &[FileRecord], directory_faults: &[String]) -> Result<i64> {
-        if damaged.is_empty() && directory_faults.is_empty() {
+    /// Closes a container that cannot be signed, without signing or writing anything (spec 5.2), for what `recheck`
+    /// found: damaged files, faults of the directory, or both. The container need not open for this: a directory
+    /// fault is why it does not. The log says what was not checked: an early end proves nothing about the files.
+    pub fn close_container_damaged(&self, id: i64, recheck: &Recheck) -> Result<i64> {
+        let (damaged, faults) = (&recheck.mismatches, &recheck.directory_faults);
+        if damaged.is_empty() && faults.is_empty() {
             return Err(FactumError::general(format!(
                 "Container #{id} is not damaged; close it as usual."
             )));
@@ -1212,16 +1249,25 @@ impl Factum<'_> {
         }
         let file_count = detail.summary.file_count;
         let paths: Vec<&str> = damaged.iter().map(|r| r.path.as_str()).collect();
-        let reason = match (damaged.len(), directory_faults.len()) {
+        let unchecked = (recheck.arns.len() as u64).saturating_sub(recheck.files);
+        let found = match (damaged.len(), faults.len()) {
             (files, 0) => mismatch_text(files),
-            (0, faults) => format!("{}, no file found damaged", plural(faults, "directory fault")),
+            (0, faults) => plural(faults, "directory fault"),
             (files, faults) => format!("{} · {}", mismatch_text(files), plural(faults, "directory fault")),
+        };
+        let reason = match (unchecked, damaged.is_empty()) {
+            (0, true) => format!("{found}, no file found damaged"),
+            (0, false) => found,
+            (_, _) => format!("{found}, files not checked"),
         };
         let mut payload = json!({"event": "container_closed", "case_id": detail.summary.case_id,
                                  "container_id": detail.summary.uuid, "damaged": paths,
                                  "file_count": file_count, "closed_utc": utc_now()});
-        if !directory_faults.is_empty() {
-            payload["directory_fault"] = json!(directory_faults);
+        if !faults.is_empty() {
+            payload["directory_fault"] = json!(faults);
+        }
+        if unchecked > 0 {
+            payload["unchecked_files"] = json!(unchecked);
         }
         self.append(
             detail.summary.case_id,

@@ -236,16 +236,18 @@ logged.
     "closed · damaged". Reopen works as for any closed container.
   - **Cancel**: the container stays open; the next Close re-checks again.
 - A read error counts as a mismatch at once when it is about the content (invalid data, a missing member, an early
-  end), and otherwise when it stays on a second attempt while the start of the file still reads from the disk (EIO
-  from a bad sector). Permission errors, interrupted calls, locks, timeouts and devices or shares that went away, and
-  an EIO for the whole file (a removed drive), only stop the check: nothing is logged and Close can be tried again.
+  end), and otherwise when it stays on a second attempt while the start or the end of the file still reads from the
+  disk (EIO from a bad sector). Permission errors, interrupted calls, locks, timeouts and devices or shares that went
+  away, and an EIO for both ends (a removed drive), only stop the check: nothing is logged and Close can be tried
+  again. An open that fails the same way while the file can still be stat'ed is a fault of the directory.
 - A close signs the re-checked state only: under the volume lock it compares the logged end, the files and the end of
   the volume with what the re-check read, and asks for a new re-check when they differ. It signs the stored bytes of
   the root `information.turtle`, so that closed state and root stay the same bytes.
 - A fault of the directory (a metadata member or, with matching hashes, a file that differs from the directory's
   CRC-32; a directory that cannot be read) means no addition and no signature. The re-check returns it apart from the
   mismatches, and the only way to close is Close as Damaged, with `damaged: []` and `directory_fault: [...]` when no
-  file failed: the log text says "no file found damaged". Nothing is written to the file.
+  file failed: the log text says "no file found damaged", or "files not checked" with `unchecked_files: n` when the
+  re-check could not reach them (metadata that cannot be read). Nothing is written to the file.
 - Verify Container… reports a replaced copy as a warning (naming the replacement) and an unreplaced mismatch as a
   fail, as for any stream today.
 - Closing with nothing added since the last close re-checks nothing (`files: 0`).

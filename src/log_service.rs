@@ -47,6 +47,30 @@ pub type OnCommit<'f> = &'f dyn Fn(&Connection, i64) -> Result<()>;
 /// the entry is about (a new case or evidence item). Fails with `log_changed` when what it was prepared for moved.
 pub type Reserve<'f> = &'f dyn Fn(&Connection) -> Result<()>;
 
+/// A second entry that belongs to the first: both are signed before the write lock is taken, go in one transaction,
+/// and neither stays without the other.
+pub struct FollowUp<'f> {
+    pub kind: &'f str,
+    pub text: &'f str,
+    pub payload: Option<Value>,
+    /// runs in the transaction, like `Append::on_commit`
+    pub on_commit: Option<OnCommit<'f>>,
+}
+
+/// One entry, hashed and signed, ready to be inserted.
+struct SignedEntry<'e> {
+    leaf_index: i64,
+    kind: &'e str,
+    text: &'e str,
+    evidence_id: Option<i64>,
+    payload: Option<&'e Value>,
+    corrects_id: Option<i64>,
+    created_utc: String,
+    leaf: String,
+    root: String,
+    signature: Option<String>,
+}
+
 /// What to append; the defaults are a note without evidence, payload or correction.
 #[derive(Default)]
 pub struct Append<'f> {
@@ -56,8 +80,7 @@ pub struct Append<'f> {
     pub allow_archived: bool,
     pub on_commit: Option<OnCommit<'f>>,
     pub reserve: Option<Reserve<'f>>,
-    /// run from the `on_commit` of another append: the entry joins that transaction, and is signed inside it
-    pub in_transaction: bool,
+    pub follow_up: Option<FollowUp<'f>>,
 }
 
 impl Factum<'_> {
@@ -79,40 +102,107 @@ impl Factum<'_> {
         Ok(signature)
     }
 
+    /// Hashes the next leaf after `leaves` and signs the new tree head.
+    fn next_entry<'e>(
+        &self,
+        case_id: i64,
+        leaves: &mut Vec<merkle::Hash>,
+        (kind, text): (&'e str, &'e str),
+        (evidence_id, corrects_id): (Option<i64>, Option<i64>),
+        payload: Option<&'e Value>,
+    ) -> Result<SignedEntry<'e>> {
+        let leaf_index = leaves.len() as i64;
+        let created_utc = utc_now();
+        let data = leaf_data(
+            case_id,
+            leaf_index,
+            kind,
+            evidence_id,
+            text,
+            payload.unwrap_or(&Value::Null),
+            corrects_id,
+            &created_utc,
+            FORMAT,
+        );
+        let leaf = merkle::leaf_hash(data.as_bytes());
+        leaves.push(leaf);
+        let leaf = hex::encode(leaf);
+        let root = hex::encode(merkle::root(&*leaves));
+        let signature = self.sign_or_fail(
+            &entry_signed_payload(&leaf, leaf_index + 1, &root),
+            "GPG signing failed — nothing was saved.",
+        )?;
+        Ok(SignedEntry {
+            leaf_index,
+            kind,
+            text,
+            evidence_id,
+            payload,
+            corrects_id,
+            created_utc,
+            leaf,
+            root,
+            signature,
+        })
+    }
+
+    fn insert_entry(conn: &Connection, case_id: i64, entry: &SignedEntry<'_>) -> Result<i64> {
+        conn.execute(
+            "INSERT INTO entries (case_id, leaf_index, kind, evidence_id, text, payload_json, corrects_id, \
+             created_utc, leaf_hash, tree_size, root_hash, signature, format) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                case_id,
+                entry.leaf_index,
+                entry.kind,
+                entry.evidence_id,
+                entry.text,
+                entry.payload.map(canonical_json),
+                entry.corrects_id,
+                entry.created_utc,
+                entry.leaf,
+                entry.leaf_index + 1,
+                entry.root,
+                entry.signature,
+                FORMAT
+            ],
+        )?;
+        let entry_id = conn.last_insert_rowid();
+        if entry.kind == KIND_NOTE {
+            crate::tags::parse_tags_from_note(conn, entry_id, entry.text)?;
+            crate::iocs::parse_ioc_from_note(conn, entry_id, entry.text)?;
+        }
+        Ok(entry_id)
+    }
+
     pub fn append(&self, case_id: i64, kind: &str, text: &str, options: Append<'_>) -> Result<i64> {
         let conn = &self.db.conn;
-        let payload = options.payload.clone().unwrap_or(Value::Null);
         for attempt in 1..=MAX_ATTEMPTS {
             if !options.allow_archived {
                 ensure_case_open(conn, case_id)?;
             }
             let hashes = self.leaf_hashes(case_id)?;
             let leaf_index = hashes.len() as i64;
-            let created_utc = utc_now();
-            let data = leaf_data(
-                case_id,
-                leaf_index,
-                kind,
-                options.evidence_id,
-                text,
-                &payload,
-                options.corrects_id,
-                &created_utc,
-                FORMAT,
-            );
-            let leaf = merkle::leaf_hash(data.as_bytes());
-            let mut parsed: Vec<merkle::Hash> = hashes.iter().map(|h| merkle::from_hex(h)).collect();
-            parsed.push(leaf);
-            let leaf = hex::encode(leaf);
-            let root = hex::encode(merkle::root(&parsed));
+            let mut leaves: Vec<merkle::Hash> = hashes.iter().map(|h| merkle::from_hex(h)).collect();
             // signing may open a pinentry dialog, so it happens before the write lock is taken
-            let signature = self.sign_or_fail(
-                &entry_signed_payload(&leaf, leaf_index + 1, &root),
-                "GPG signing failed — nothing was saved.",
+            let entry = self.next_entry(
+                case_id,
+                &mut leaves,
+                (kind, text),
+                (options.evidence_id, options.corrects_id),
+                options.payload.as_ref(),
             )?;
-            if !options.in_transaction
-                && let Err(e) = conn.execute_batch("BEGIN IMMEDIATE")
-            {
+            let second = match &options.follow_up {
+                Some(follow_up) => Some(self.next_entry(
+                    case_id,
+                    &mut leaves,
+                    (follow_up.kind, follow_up.text),
+                    (None, None),
+                    follow_up.payload.as_ref(),
+                )?),
+                None => None,
+            };
+            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
                 return Err(FactumError::general(format!(
                     "The database is locked by another factum process ({e}) — nothing was saved. Try again."
                 )));
@@ -144,44 +234,19 @@ impl Factum<'_> {
                         )));
                     }
                 }
-                conn.execute(
-                    "INSERT INTO entries (case_id, leaf_index, kind, evidence_id, text, payload_json, corrects_id, \
-                     created_utc, leaf_hash, tree_size, root_hash, signature, format) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        case_id,
-                        leaf_index,
-                        kind,
-                        options.evidence_id,
-                        text,
-                        options.payload.as_ref().map(canonical_json),
-                        options.corrects_id,
-                        created_utc,
-                        leaf,
-                        leaf_index + 1,
-                        root,
-                        signature,
-                        FORMAT
-                    ],
-                )?;
-                let entry_id = conn.last_insert_rowid();
-                if kind == KIND_NOTE {
-                    crate::tags::parse_tags_from_note(conn, entry_id, text)?;
-                    crate::iocs::parse_ioc_from_note(conn, entry_id, text)?;
-                }
+                let entry_id = Self::insert_entry(conn, case_id, &entry)?;
                 if let Some(on_commit) = options.on_commit {
                     on_commit(conn, entry_id)?;
+                }
+                if let Some(second) = &second {
+                    let second_id = Self::insert_entry(conn, case_id, second)?;
+                    if let Some(on_commit) = options.follow_up.as_ref().and_then(|f| f.on_commit) {
+                        on_commit(conn, second_id)?;
+                    }
                 }
                 Ok(Some(entry_id))
             })();
             match result {
-                // the outer append ends the transaction, whichever way this went
-                Ok(Some(entry_id)) if options.in_transaction => return Ok(entry_id),
-                Ok(None) | Err(_) if options.in_transaction => {
-                    return result.and(Err(FactumError::log_changed(
-                        "The case log changed while signing, nothing was saved — try again.",
-                    )));
-                }
                 Ok(Some(entry_id)) => {
                     if let Err(e) = conn.execute_batch("COMMIT") {
                         let _ = conn.execute_batch("ROLLBACK");

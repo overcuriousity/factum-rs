@@ -2440,7 +2440,7 @@ fn damaged_close_logs_and_writes_nothing() {
     let (id, recheck) = damaged(&s);
     let length = std::fs::metadata(s.container_path()).unwrap().len();
     let factum = s.f.factum();
-    let entry = factum.close_container_damaged(id, &recheck.mismatches, &[]).unwrap();
+    let entry = factum.close_container_damaged(id, &recheck).unwrap();
     let event = &s.events("container_closed")[0];
     assert_eq!(event["damaged"], serde_json::json!([recheck.mismatches[0].path]));
     assert!(event.get("signatures").is_none());
@@ -2462,7 +2462,7 @@ fn reopen_after_damaged_close_rechecks_again() {
     let s = Setup::new();
     let (id, recheck) = damaged(&s);
     let factum = s.f.factum();
-    factum.close_container_damaged(id, &recheck.mismatches, &[]).unwrap();
+    factum.close_container_damaged(id, &recheck).unwrap();
     factum.reopen_container(id).unwrap();
     let input = factum.recheck_input(id).unwrap();
     assert!(input.records.iter().any(|r| r.arn == recheck.mismatches[0].arn));
@@ -2672,7 +2672,7 @@ fn verify_after_damaged_close_names_it() {
     let s = Setup::new();
     let (id, recheck) = damaged(&s);
     let factum = s.f.factum();
-    let entry = factum.close_container_damaged(id, &recheck.mismatches, &[]).unwrap();
+    let entry = factum.close_container_damaged(id, &recheck).unwrap();
     let report = factum
         .verify_container_file(
             &s.container_path(),
@@ -2733,6 +2733,14 @@ fn replacement_with_other_content_fails_verification() {
         "{:?}",
         report.findings
     );
+}
+
+/// A re-check that found `record` damaged.
+fn damage_of(record: &factum::container::volume::FileRecord) -> factum::container::volume::Recheck {
+    factum::container::volume::Recheck {
+        mismatches: vec![record.clone()],
+        ..Default::default()
+    }
 }
 
 /// Changes the CRC-32 the directory has for one member; its content stays as it was.
@@ -2860,15 +2868,11 @@ fn log_only_steps_wait_for_no_writer_and_need_no_file() {
     let factum = s.f.factum();
     let record = factum.container(id).unwrap().adds[0].files[0].clone();
     let writer = Volume::open(&s.container_path(), None).unwrap();
-    let error = factum
-        .close_container_damaged(id, std::slice::from_ref(&record), &[])
-        .unwrap_err();
+    let error = factum.close_container_damaged(id, &damage_of(&record)).unwrap_err();
     assert!(error.to_string().contains("in use"), "{error}");
     assert!(s.events("container_closed").is_empty());
     drop(writer);
-    factum
-        .close_container_damaged(id, std::slice::from_ref(&record), &[])
-        .unwrap();
+    factum.close_container_damaged(id, &damage_of(&record)).unwrap();
 
     let writer = Volume::open(&s.container_path(), None).unwrap();
     let error = factum.reopen_container(id).unwrap_err();
@@ -3020,7 +3024,7 @@ fn list_and_detail_agree_on_which_close_is_signed() {
     factum.reopen_container(id).unwrap();
     agree(true, false);
     let record = factum.container(id).unwrap().adds[0].files[0].clone();
-    factum.close_container_damaged(id, &[record], &[]).unwrap();
+    factum.close_container_damaged(id, &damage_of(&record)).unwrap();
     agree(false, true);
     factum.reopen_container(id).unwrap();
     let aside = s.f.path().join("aside");
@@ -3173,13 +3177,12 @@ fn a_directory_fault_of_the_metadata_can_only_be_closed_as_damaged() {
         assert!(s.events("container_closed").is_empty());
 
         // the way out: nothing written, and the log says what the reason was
-        let entry = factum
-            .close_container_damaged(id, &[], &recheck.directory_faults)
-            .unwrap();
+        let entry = factum.close_container_damaged(id, &recheck).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
         let event = &s.events("container_closed")[0];
         assert_eq!(event["damaged"], serde_json::json!([]));
         assert_eq!(event["directory_fault"], serde_json::json!([member_name]));
+        assert!(event.get("unchecked_files").is_none());
         let text = s.entry_text(entry);
         assert!(text.contains("1 directory fault, no file found damaged"), "{text}");
         assert!(!text.contains("match"), "{text}");
@@ -3189,9 +3192,7 @@ fn a_directory_fault_of_the_metadata_can_only_be_closed_as_damaged() {
         assert_eq!(factum.list_containers(s.case_id).unwrap()[0], detail.summary);
         // the case can be archived now
         factum.reopen_container(id).unwrap();
-        factum
-            .close_container_damaged(id, &[], &recheck.directory_faults)
-            .unwrap();
+        factum.close_container_damaged(id, &recheck).unwrap();
         factum.archive_case(s.case_id).unwrap();
     }
 }
@@ -3207,11 +3208,13 @@ fn metadata_that_differs_from_its_crc_and_cannot_be_read_is_a_directory_fault() 
     let recheck = s.f.factum().recheck_container(id).unwrap();
     assert_eq!(recheck.directory_faults, [TURTLE]);
     assert_eq!(recheck.files, 0);
-    assert!(
-        s.f.factum()
-            .close_container_damaged(id, &[], &recheck.directory_faults)
-            .is_ok()
-    );
+    let factum = s.f.factum();
+    let entry = factum.close_container_damaged(id, &recheck).unwrap();
+    // nobody looked at the file, so nothing is claimed about it
+    let text = s.entry_text(entry);
+    assert!(text.contains("1 directory fault, files not checked"), "{text}");
+    assert!(!text.contains("no file found damaged"), "{text}");
+    assert_eq!(s.events("container_closed")[0]["unchecked_files"], 1);
 }
 
 #[test]
@@ -3239,9 +3242,7 @@ fn a_content_crc_fault_stops_the_signature_and_names_the_member() {
     assert!(error.is(ErrorKind::ContainerCrc), "{error}");
     assert!(error.to_string().contains(&member), "{error}");
     assert!(s.events("container_closed").is_empty());
-    let entry = factum
-        .close_container_damaged(id, &[], &recheck.directory_faults)
-        .unwrap();
+    let entry = factum.close_container_damaged(id, &recheck).unwrap();
     assert!(
         s.entry_text(entry).contains("no file found damaged"),
         "{}",
@@ -3254,10 +3255,7 @@ fn content_that_differs_from_its_hashes_is_damage_not_a_directory_fault() {
     let s = Setup::new();
     let (id, recheck) = damaged(&s);
     assert!(recheck.directory_faults.is_empty(), "{:?}", recheck.directory_faults);
-    let entry =
-        s.f.factum()
-            .close_container_damaged(id, &recheck.mismatches, &[])
-            .unwrap();
+    let entry = s.f.factum().close_container_damaged(id, &recheck).unwrap();
     assert!(s.events("container_closed")[0].get("directory_fault").is_none());
     assert!(
         s.entry_text(entry).contains("1 file doesn't match"),
@@ -3270,6 +3268,210 @@ fn content_that_differs_from_its_hashes_is_damage_not_a_directory_fault() {
 fn a_close_as_damaged_needs_a_reason() {
     let s = Setup::new();
     let id = s.create();
-    assert!(s.f.factum().close_container_damaged(id, &[], &[]).is_err());
+    assert!(s.f.factum().close_container_damaged(id, &Default::default()).is_err());
     assert!(s.events("container_closed").is_empty());
+}
+
+#[test]
+fn both_entries_of_a_new_evidence_container_are_signed_outside_the_write_lock() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let s = Setup::new();
+    let db_path = s.f.path().join("factum.db");
+    let signatures = Rc::new(Cell::new(0));
+    let counted = signatures.clone();
+    *s.f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        counted.set(counted.get() + 1);
+        // another process can take the write lock at every signature: no prompt holds it up
+        let other = rusqlite::Connection::open(&db_path).unwrap();
+        other.busy_timeout(std::time::Duration::ZERO).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        other.execute_batch("ROLLBACK").unwrap();
+    }));
+    let factum = s.f.factum();
+    let before = factum.leaf_hashes(s.case_id).unwrap().len();
+    let path = s.container_path();
+    factum
+        .create_evidence_with_container(s.case_id, "disk 2", "", "seized", &path, "")
+        .unwrap();
+    assert_eq!(signatures.get(), 2);
+    assert_eq!(factum.leaf_hashes(s.case_id).unwrap().len(), before + 2);
+    let report = factum.verify_case(s.case_id, None).unwrap();
+    assert!(
+        report.findings.iter().all(|f| f.code == "not_sealed"),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn a_new_evidence_container_retries_both_entries_when_the_log_moved() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let s = Setup::new();
+    let db_path = s.f.path().join("factum.db");
+    let case_id = s.case_id;
+    let once = Rc::new(Cell::new(true));
+    *s.f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        // another process takes the predicted evidence id while the first entry is being signed
+        if once.replace(false) {
+            let other = rusqlite::Connection::open(&db_path).unwrap();
+            other
+                .execute(
+                    "INSERT INTO evidence (case_id, description, evidence_hash, created_utc, details) \
+                     VALUES (?, 'other', '', 'x', '')",
+                    [case_id],
+                )
+                .unwrap();
+        }
+    }));
+    let factum = s.f.factum();
+    let path = s.container_path();
+    let (evidence_id, id) = factum
+        .create_evidence_with_container(s.case_id, "disk 2", "", "seized", &path, "")
+        .unwrap();
+    assert_eq!(factum.container(id).unwrap().evidence_id, Some(evidence_id));
+    assert_eq!(factum.get_evidence(evidence_id).unwrap().unwrap().description, "disk 2");
+    assert_eq!(s.events("container_created").len(), 1);
+    let (volume, _) = Volume::open(&path, None).unwrap();
+    let arn = volume.arn();
+    assert_eq!(
+        volume
+            .graph()
+            .first_value(&arn, &format!("{}evidenceId", factum::container::FACTUM_NS)),
+        Some(evidence_id.to_string().as_str())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_that_cannot_be_reached_does_not_stop_the_log_only_steps() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path, mode| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    let s = Setup::new();
+    let folder = s.f.path().join("mount");
+    std::fs::create_dir(&folder).unwrap();
+    let path = folder.join("c.aff4l");
+    let factum = s.f.factum();
+    let id = factum
+        .create_container(s.case_id, "dead", s.evidence_id, &path, "")
+        .unwrap();
+    // a folder without permissions, as a dead mount: is_file says no, without the file being gone
+    mode(&folder, 0o000);
+    let reachable = path.is_file();
+    let closed = (!reachable).then(|| factum.close_container_without_file(id));
+    let reopened = (!reachable).then(|| factum.reopen_container(id));
+    mode(&folder, 0o755);
+    if reachable {
+        return; // root reads everything
+    }
+    closed.unwrap().unwrap();
+    reopened.unwrap().unwrap();
+    // a file it may not open: close as damaged goes through all the same
+    let record = factum::container::volume::FileRecord {
+        arn: "aff4://x".into(),
+        path: "x".into(),
+        size: 0,
+        md5: String::new(),
+        sha1: String::new(),
+        sha256: String::new(),
+        metadata_only: false,
+        excerpt: None,
+        link: None,
+        source: None,
+        source_raw: None,
+    };
+    mode(&path, 0o000);
+    let closed = factum.close_container_damaged(id, &damage_of(&record));
+    mode(&path, 0o644);
+    closed.unwrap();
+}
+
+#[test]
+fn a_late_signature_keeps_what_was_logged_while_it_waited_for_the_lock() {
+    use factum::container::x509::Gpgsm;
+    let s = Setup::with_signer(FakeSigner::new(false));
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    factum.close_container(id).unwrap();
+    factum.reopen_container(id).unwrap();
+    s.f.signer.set_active(true);
+    let (ready, go) = std::sync::mpsc::channel();
+    let db_path = s.f.path().join("factum.db");
+    let (source, options) = (s.file("b.txt"), s.options());
+    let other = std::thread::spawn(move || {
+        // another process, in the middle of an addition: it holds the lock until its log entry is committed
+        let db = factum::Db::open(&db_path).unwrap();
+        let signer = FakeSigner::new(true);
+        let other = factum::Factum::with_seal_dir(&db, &signer, None);
+        let mut volume = other.open_container_for_add(id).unwrap();
+        let staged = volume
+            .stage_add(&[source], &options, &AddProgress::default(), &AtomicBool::new(false))
+            .unwrap();
+        ready.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        other.commit_container_add(id, &mut volume, staged).unwrap();
+    });
+    go.recv().unwrap();
+    // reads the log, then waits for the lock
+    assert_eq!(factum.sign_unsigned_containers(s.case_id).unwrap(), (1, vec![]));
+    other.join().unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
+    assert!(factum.compare_with_log(id, &volume).unwrap().is_empty());
+    assert_eq!(factum::container::volume::file_records(volume.graph()).len(), 2);
+    drop(volume);
+    s.add(id, &[s.file("c.txt")]);
+    let close = factum.close_container(id).unwrap();
+    assert_eq!(close.file_count, 3);
+    let report = factum
+        .verify_container_file(
+            &s.container_path(),
+            &Gpgsm::unavailable(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        !report.findings.iter().any(|f| f.code == "log_mismatch"),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn closed_states_a_crafted_number_claims_are_one_finding() {
+    use factum::container::zip64::{Appender, read_archive};
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    factum.close_container(id).unwrap();
+    let path = s.container_path();
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let mut app = Appender::new(file, len, archive.entries).unwrap();
+    app.add_bytes(&history_member(u32::MAX, TURTLE), 8, b"# nothing")
+        .unwrap();
+    app.finish(&[], &archive.comment).unwrap();
+    drop(app);
+    let report = factum::container::verify::verify_file(
+        &path,
+        &FakeSigner::new(true),
+        &factum.gpgsm(),
+        &|_, _| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let gaps: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.message.contains("are missing from the container"))
+        .map(|f| f.message.as_str())
+        .collect();
+    assert_eq!(
+        gaps,
+        ["The closed states of closes 2 to 4294967294 are missing from the container."]
+    );
 }

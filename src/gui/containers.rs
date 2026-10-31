@@ -268,10 +268,14 @@ pub fn container_section(
         history.push((*entry_id, utc.clone(), "closed without its file (missing)".into()));
     }
     for (entry_id, utc, paths, faults) in &detail.damaged_closes {
-        let reason = if faults.is_empty() {
-            format!("{} not matching", plural(paths.len(), "file"))
-        } else {
-            plural(faults.len(), "directory fault")
+        let reason = match (paths.len(), faults.len()) {
+            (files, 0) => format!("{} not matching", plural(files, "file")),
+            (0, faults) => plural(faults, "directory fault"),
+            (files, faults) => format!(
+                "{} not matching · {}",
+                plural(files, "file"),
+                plural(faults, "directory fault")
+            ),
         };
         history.push((*entry_id, utc.clone(), format!("closed as damaged · {reason}")));
     }

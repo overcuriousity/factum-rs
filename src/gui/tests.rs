@@ -2968,7 +2968,7 @@ fn damaged_container_opens_the_dialog() {
     let mut harness = fixture.harness();
     close_from_menu(&mut harness, id);
     match harness.state().dialogs.last() {
-        Some(Dialog::Damaged { mismatches, .. }) => assert_eq!(mismatches.len(), 1),
+        Some(Dialog::Damaged { recheck, .. }) => assert_eq!(recheck.mismatches.len(), 1),
         _ => panic!("no damaged dialog"),
     }
     screenshot(&mut harness, "damaged_dialog");

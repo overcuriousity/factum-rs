@@ -1513,7 +1513,7 @@ impl FactumApp {
                 .map_err(|e| e.to_string());
             self.dialogs.push(Dialog::Damaged {
                 container_id: id,
-                mismatches: recheck.mismatches,
+                recheck,
                 add_again,
                 then_archive,
             });
@@ -2111,10 +2111,10 @@ impl FactumApp {
             }
             DialogResult::CloseDamaged {
                 container_id,
-                mismatches,
+                recheck,
                 then_archive,
             } => {
-                let result = self.factum().close_container_damaged(container_id, &mismatches, &[]);
+                let result = self.factum().close_container_damaged(container_id, &recheck);
                 if self.run(result).is_some()
                     && let Some(case_id) = then_archive
                 {
