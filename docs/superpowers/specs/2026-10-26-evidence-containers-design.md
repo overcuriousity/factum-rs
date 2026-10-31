@@ -281,8 +281,8 @@ codes and, on a container factum wrote, factum's verdict without the case log. W
 so every `replacedBy` stays a warning; it has no trust list, so an X.509 root is only checked against `--ca`; and it
 reads only factum's fixed Turtle layout, so valid Turtle in another layout (a comment, a list of objects) fails. It takes
 every file for factum's, so it is stricter on other files: what another tool's container may lack fails or warns where
-factum, which reads those, has nothing to say, and an older AFF4 file fails where factum warns. It never passes what
-factum fails, but for what only the log can tell.
+factum, which reads those, has nothing to say, and an older AFF4 file fails where factum warns. It is not meant to pass
+anything factum fails, but for what only the log can tell.
 
 Whether a container is factum's is decided by its layout (`factum/history/`, `factum/README.txt`, `verify_container.py`
 or root signatures), never by `version.txt`, which is not signed. In a factum container a stored file whose content
