@@ -184,8 +184,9 @@ impl Budget {
     /// The one finding of a check that stopped here.
     fn finding(&self) -> String {
         format!(
-            "The metadata of this container needs more memory than this check sets aside ({} GiB in all, {} GiB for one \
-             member), so the check stopped here and did not finish. That alone does not mean the container was altered.",
+            "The metadata of this container needs more memory than this check sets aside ({} GiB in all, {} GiB for \
+             one member), so the check stopped here and did not finish. That alone does not mean the container was \
+             altered.",
             self.limit >> 30,
             MAX_IN_MEMORY >> 30
         )
