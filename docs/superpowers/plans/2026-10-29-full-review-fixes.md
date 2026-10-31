@@ -468,6 +468,11 @@ verify vs. sign if needed), src/gui/tests.rs.
     CloseWithoutFile (and any other action that changes the container or its path) to the guard.
 15. gui/containers.rs:92 (first round). `recheck_status` builds text by `replacen` on `add_status`'s output. Share a
     formatter that takes the verb.
+16. Carry-over from Task 9: directory faults have no way out in the GUI yet. mod.rs:1522 shows a refusal saying "can
+    only be closed as damaged" with no button, and mod.rs:2117 drops the faults. Wire `Recheck.directory_faults` into
+    `Dialog::Damaged` and pass them as `close_container_damaged`'s third argument (the GUI passes `&[]` today). Offer
+    Close as Damaged when `Volume::open` refuses with `ErrorKind::ContainerCrc`. Close and Archive must take this route
+    too instead of stopping.
 
 ### Task 14: GUI dialogs and widgets
 
