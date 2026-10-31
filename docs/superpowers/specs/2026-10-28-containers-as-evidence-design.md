@@ -172,9 +172,13 @@ to the builder, as long as pyaff4 opens the result and the full original path ca
 With every add, factum records the mount the chosen sources lie on, so the log and the container say which device,
 file system and options the files were read through, and, where it can be found, which image file.
 
-- **Linux**: from `/proc/self/mountinfo`, the mount containing the base path (longest mount point prefix): mount
-  point, source device, file system type, mount options. For a loop device (`/dev/loopN`), the backing file from
-  `/sys/block/loopN/loop/backing_file`. For a device-mapper or NBD device, the device only.
+- **Linux**: from `/proc/self/mountinfo`, the mount containing the base path (longest mount point prefix, among the
+  mounts a path can reach: one with a mount on top of it, or below a folder mounted over later, is left out): mount
+  point, source device, file system type, mount options and superblock options. Read-only when either set says
+  `ro`. A mount point is matched by its bytes; one that is not UTF-8 is recorded as text with U+FFFD and with its
+  bytes in Base64. For a loop device (`/dev/loopN`) or a partition of one (`/dev/loopNpM`), the backing file from
+  `/sys/class/block/<device>/loop/backing_file` of the whole device. For a device-mapper or NBD device, the device
+  only.
   For xmount and similar (image → FUSE mount → loop device → mounted file system), the backing file lies on a FUSE
   mount; that mount is recorded too (its mount point, source and type as `mountinfo` shows them), which usually
   names the tool and often the image. Going further is not required.
@@ -189,9 +193,14 @@ the add proceeds and records that the mount is unknown.
 
 Where it goes:
 - the `container_files_added` payload gets `sources`: a list of
-  `{mount_point, device, fs_type, options, read_only, image, volume_serial, volume_label, volume_guid}` (fields
-  absent where the platform does not give them);
-- the container's Add task (`aff4l:LogicalAcquisitionTask`) gets the same facts as factum properties;
+  `{mount_point, mount_point_raw, device, fs_type, options, super_options, read_only, image, volume_serial,
+  volume_label, volume_guid}` (fields absent where the platform does not give them; `mount_point_raw` only for a
+  mount point `mount_point` cannot hold, `super_options` not in earlier entries);
+- the payload has `base_path_raw` beside `base_path` and each file `source_raw` beside `source` when the text cannot
+  hold the path: Base64 of its bytes, which Add Again uses. Without them (all plain paths, all earlier entries) the
+  text is the path;
+- the container's Add task (`aff4l:LogicalAcquisitionTask`) gets the same facts as factum properties (among them
+  `factum:mountOptions`, `factum:superOptions`, `factum:mountPointRaw`);
 - the log text stays as today; the evidence view shows the source line per add (4.2);
 - reports show it with each add if the existing layout has a place for adds, else with the container.
 

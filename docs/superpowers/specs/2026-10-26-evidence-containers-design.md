@@ -133,6 +133,16 @@ URI left to the builder), which other readers ignore:
   original file) together with `factum:originalSize`. For an excerpt, `aff4:size` and the hashes describe the stored
   bytes; for a metadata-only file the original size is kept and the hashes are of the original content (factum
   reads the file to hash it, but does not store it).
+- on each file: `factum:sourcePath` (the path it was read from) and on each link `factum:symlinkTarget`, as text. A
+  path the text cannot hold (not valid UTF-8, or with control characters) shows U+FFFD in place of what is not
+  Unicode, and has its bytes beside it: `factum:sourcePathRaw`, `factum:symlinkTargetRaw` (Base64,
+  `xsd:base64Binary`). On Windows the bytes of a name are its UTF-16 as WTF-8, also for `aff4l:fileName` and
+  `aff4l:originalPathName` and their `*Raw` forms, so an unpaired surrogate survives.
+
+The file's IRIs follow the Turtle grammar. factum %-encodes what an IRI cannot hold when writing (it only ever writes
+`aff4://` ARNs and fixed namespaces, which are not changed by this), and when reading decodes `\uXXXX` and
+`\UXXXXXXXX` and refuses a space, a control character or any of `<>"{}|^` and backtick and backslash, written
+directly or as such an escape.
 
 How a metadata-only file is represented so that pyaff4 opens the container without errors (e.g. a `FileImage` with
 no storage stream, or a zero-length stream marked by `factum:metadataOnly`) is left to the builder, to be decided
@@ -240,7 +250,11 @@ Findings use the existing pass / warning / fail vocabulary and symbols (✓ ⚠ 
 **X.509 trust**: a chain is trusted only if it ends at a root that gpgsm trusts on this machine (its `trustlist.txt`
 / keybox), never merely because the container carries the root. A valid signature whose root is not trusted is a
 **fail** ("untrusted root"), consistent with how untrusted GPG keys are treated today; the finding names the root's
-subject and fingerprint so the examiner can decide to trust it in gpgsm.
+subject and fingerprint so the examiner can decide to trust it in gpgsm. A certificate that has expired since keeps
+its signature good; what counts is that it was valid when it signed. The certificate that made the signature must be
+the first one of the chain stored in the container (`information.turtle.factum.cer`) and the one the case log records
+for that close, whichever the file and the database know of; anything else is a **fail**, also below a trusted root.
+A container without a stored chain gets no such finding.
 
 **Containers from other tools** get the AFF4-L checks only, and only for AFF4-L v1.0 containers: ZipSegment and
 in-metadata streams, Map and ImageStream streams with stored or deflate compression (factum writes deflate

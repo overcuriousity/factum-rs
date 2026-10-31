@@ -174,7 +174,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Reopened and extended, a container keeps every closed state: its bytes never move, and each close's signed metadata
   stays under `factum/history/<n>/`. A copy handed over after an earlier close still verifies
 - **Verify Container…** checks every stored file against its hashes, the metadata against its hash file, the GPG and
-  X.509 signatures (X.509 only against roots gpgsm trusts on this machine; revocation is not checked offline), every
+  X.509 signatures (X.509 only against roots gpgsm trusts on this machine and only by the certificate the container
+  and the case log name; one that has expired since counts if it was valid when it signed; revocation is not checked
+  offline), every
   closed state, and, for a container of this database, that the file matches the case log. Containers from other
   tools get the AFF4-L v1.0 checks; older AFF4 formats are reported as unsupported
 - Recipients without factum run the script the container carries: extract `verify_container.py` and run
