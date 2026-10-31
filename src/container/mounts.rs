@@ -112,7 +112,9 @@ pub fn mount_line(m: &Mount) -> String {
         (None, Some(false)) => parts.push("rw".into()),
         (None, None) => {}
     }
-    if let Some(options) = &m.super_options {
+    // on one line only what changes the picture; the log has them all
+    let mount_ro = m.options.as_deref().is_some_and(read_only);
+    if let Some(options) = m.super_options.as_ref().filter(|o| read_only(o) && !mount_ro) {
         parts.push(format!("super {options}"));
     }
     if let Some(serial) = &m.volume_serial {
@@ -327,27 +329,32 @@ pub(crate) fn parse_mountinfo(content: impl AsRef<[u8]>) -> Vec<MountEntry> {
 }
 
 /// Without the mounts nothing reaches any more: one with a mount on top of it (which hangs from the one it covers),
-/// and one below a folder that was mounted over later (that mount hangs from one of its ancestors, not below it).
+/// and one below a folder that was mounted over later. Of two mounts on the same parent, the one further down was
+/// there first, or it would hang from the other, and is covered by it; so `other` covers an entry when what the entry
+/// comes through on that parent lies below `other`. If that lies at or above `other`, `other` is what is covered.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn reachable(entries: Vec<MountEntry>) -> Vec<MountEntry> {
-    let parents: HashMap<u64, u64> = entries.iter().map(|e| (e.id, e.parent)).collect();
-    let ancestors = |entry: &MountEntry| {
-        let mut found = vec![entry.parent];
-        while let Some(parent) = parents.get(&found[found.len() - 1]).filter(|p| !found.contains(p)) {
-            found.push(*parent);
+    let by_id: HashMap<u64, &MountEntry> = entries.iter().map(|e| (e.id, e)).collect();
+    let line = |entry: &'_ MountEntry| {
+        let mut found = vec![entry.id];
+        while let Some(parent) = by_id
+            .get(&by_id[&found[found.len() - 1]].parent)
+            .filter(|p| !found.contains(&p.id))
+        {
+            found.push(parent.id);
         }
         found
     };
     let hidden = |entry: &MountEntry| {
-        let ancestors = ancestors(entry);
+        let line = line(entry);
         entries.iter().any(|other| {
             if other.mount_point == entry.mount_point {
-                other.parent == entry.id && other.id != entry.id
-            } else {
-                Path::new(&entry.mount_point).starts_with(&other.mount_point)
-                    && !ancestors.contains(&other.id)
-                    && ancestors.contains(&other.parent)
+                return other.parent == entry.id && other.id != entry.id;
             }
+            let through = line.iter().map(|id| by_id[id]).find(|m| m.parent == other.parent);
+            through.is_some_and(|m| {
+                m.mount_point != other.mount_point && Path::new(&m.mount_point).starts_with(&other.mount_point)
+            })
         })
     };
     let keep: Vec<bool> = entries.iter().map(|e| !hidden(e)).collect();
@@ -374,7 +381,6 @@ pub(crate) fn containing<'a>(entries: &'a [MountEntry], path: &Path) -> Option<&
         })
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn read_only(options: &str) -> bool {
     options.split(',').any(|o| o == "ro")
 }
@@ -639,6 +645,20 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_inside_the_cover_stays_though_a_covered_mount_lies_above_it() {
+        // as a kernel lists it: X on a/b, Y over a, then a/b/c made in Y and Z mounted there
+        let entries = parse_mountinfo(
+            "20 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             21 20 0:40 / /a/b rw - tmpfs X rw\n\
+             22 20 0:41 / /a rw - tmpfs Y rw\n\
+             23 22 0:42 / /a/b/c rw - tmpfs Z rw\n",
+        );
+        assert_eq!(points(&entries), vec![(20, "/"), (22, "/a"), (23, "/a/b/c")]);
+        assert_eq!(containing(&entries, Path::new("/a/b/c/f")).unwrap().device, "Z");
+        assert_eq!(containing(&entries, Path::new("/a/b/f")).unwrap().device, "Y");
+    }
+
+    #[test]
     fn a_parent_id_loop_is_no_hang() {
         let entries = parse_mountinfo("2 3 8:1 / /a rw - ext4 /dev/a rw\n3 2 8:2 / /a/b rw - ext4 /dev/b rw\n");
         assert_eq!(entries.len(), 2);
@@ -688,10 +708,19 @@ mod tests {
         assert_eq!(mount.options.as_deref(), Some("rw,noatime"));
         assert_eq!(mount.super_options.as_deref(), Some("ro,norecovery"));
         assert_eq!(mount.read_only, Some(true));
+        // the line names them only when they change the picture
         assert_eq!(
             mount_line(&mount),
             "/mnt/disk · /dev/sdb1 · ext4 · rw,noatime · super ro,norecovery"
         );
+        for (options, super_options) in [("ro,noatime", "ro,norecovery"), ("rw,noatime", "rw,seclabel")] {
+            let plain = Mount {
+                options: Some(options.into()),
+                super_options: Some(super_options.into()),
+                ..mount.clone()
+            };
+            assert_eq!(mount_line(&plain), format!("/mnt/disk · /dev/sdb1 · ext4 · {options}"));
+        }
         assert_eq!(Mount::from_json(&mount.to_json()), Some(mount));
         let entries = parse_mountinfo("40 22 7:0 / /mnt/disk ro - ext4 /dev/sdb1 rw\n");
         assert_eq!(platform::to_mount(&entries[0]).read_only, Some(true));
