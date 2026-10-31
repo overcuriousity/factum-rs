@@ -2254,6 +2254,9 @@ fn add_again_replaces_and_closes_signed() {
     add_again(&s, id, &recheck);
     let added = s.events("container_files_added");
     assert_eq!(added[1]["replaces"][0]["arn"], recheck.mismatches[0].arn);
+    // plain paths need no raw form: their log payload is what it always was
+    assert!(added[0].get("base_path_raw").is_none());
+    assert!(added[0]["files"][0].get("source_raw").is_none());
     factum.close_container(id).unwrap();
     let report = factum
         .verify_container_file(
@@ -2267,6 +2270,71 @@ fn add_again_replaces_and_closes_signed() {
     assert_eq!(codes.iter().filter(|c| **c == "replaced_copy").count(), 1, "{codes:?}");
     assert!(!codes.contains(&"stream_hash"), "{:?}", report.findings);
     assert!(!codes.contains(&"log_mismatch"), "{:?}", report.findings);
+}
+
+/// Both names show as `a\u{fffd}`, in a folder that is not UTF-8 either.
+#[cfg(target_os = "linux")]
+#[test]
+fn add_again_finds_a_source_that_is_not_unicode() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let s = Setup::new();
+    let base = s.f.path().join(OsStr::from_bytes(b"caf\xe9"));
+    std::fs::create_dir(&base).unwrap();
+    let (first, second) = (
+        base.join(OsStr::from_bytes(b"a\xe9")),
+        base.join(OsStr::from_bytes(b"a\xff")),
+    );
+    std::fs::write(&first, "one").unwrap();
+    std::fs::write(&second, "two").unwrap();
+    let id = s.create();
+    let factum = s.f.factum();
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    let options = AddOptions {
+        base: base.clone(),
+        keep_path: true,
+        ..Default::default()
+    };
+    let staged = volume
+        .stage_add(
+            &[first.clone(), second.clone()],
+            &options,
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    factum.commit_container_add(id, &mut volume, staged).unwrap();
+    drop(volume);
+    let added = &s.events("container_files_added")[0];
+    assert!(added["base_path_raw"].is_string());
+    assert!(added["base_path"].as_str().unwrap().ends_with("caf\u{fffd}"));
+    assert!(added["files"][0]["source_raw"].is_string());
+
+    let arn = first_arn(&s, id);
+    damage_content(&s.container_path(), &arn);
+    let recheck = factum.recheck_container(id).unwrap();
+    assert_eq!(recheck.mismatches.len(), 1);
+    let plan = factum.add_again_plan(id, &recheck.mismatches).unwrap();
+    assert_eq!(plan[0].0, vec![first]);
+    assert_eq!(plan[0].1.base, base);
+    add_again(&s, id, &recheck);
+    let added = s.events("container_files_added");
+    assert_eq!(added[1]["replaces"][0]["arn"], arn.as_str());
+    assert_eq!(added[1]["files"].as_array().unwrap().len(), 1);
+    // the log and the container agree on the raw forms too
+    let report = factum
+        .verify_container_file(
+            &s.container_path(),
+            &factum.gpgsm(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    assert!(
+        !report.findings.iter().any(|f| f.code == "log_mismatch"),
+        "{:?}",
+        report.findings
+    );
 }
 
 #[test]

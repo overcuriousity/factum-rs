@@ -2,7 +2,7 @@
 //! platform shows it, and their names in the AFF4-L encoding (section 5).
 
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -31,6 +31,8 @@ pub struct SourceMeta {
     pub birth: Option<String>,
     /// the Unix file mode
     pub mode: Option<u32>,
+    /// which file this is: device and inode on Unix, volume serial and file index of a regular file on Windows
+    pub id: Option<(u64, u64)>,
 }
 
 /// An xsd:dateTime in UTC; the fraction of a second only as long as it needs to be.
@@ -46,6 +48,12 @@ pub fn xsd_time(time: SystemTime) -> String {
     text + "Z"
 }
 
+/// The time `seconds` and `nanos` after the epoch; a time before 1970 has negative seconds and positive nanoseconds.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn unix_time(seconds: i64, nanos: i64) -> Option<SystemTime> {
+    chrono::DateTime::from_timestamp(seconds, nanos.clamp(0, 999_999_999) as u32).map(SystemTime::from)
+}
+
 pub fn read_meta(path: &Path) -> io::Result<SourceMeta> {
     let metadata = std::fs::symlink_metadata(path)?;
     let file_type = metadata.file_type();
@@ -59,16 +67,22 @@ pub fn read_meta(path: &Path) -> io::Result<SourceMeta> {
         SourceKind::Special
     };
     #[cfg(unix)]
-    let (changed, mode) = {
+    let (changed, mode, id) = {
         use std::os::unix::fs::MetadataExt;
-        let changed = std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(
-            metadata.ctime().max(0) as u64,
-            metadata.ctime_nsec().clamp(0, 999_999_999) as u32,
-        ));
-        (changed.map(xsd_time), Some(metadata.mode()))
+        (
+            unix_time(metadata.ctime(), metadata.ctime_nsec()).map(xsd_time),
+            Some(metadata.mode()),
+            Some((metadata.dev(), metadata.ino())),
+        )
     };
-    #[cfg(not(unix))]
-    let (changed, mode) = (None, None);
+    #[cfg(windows)]
+    let (changed, mode, id) = {
+        // a path's metadata does not hold the file index; the file has to be opened, regular files only
+        let id = (kind == SourceKind::File)
+            .then(|| open_not_following(path).and_then(|file| file_id(&file)).ok())
+            .flatten();
+        (None, None, id)
+    };
     Ok(SourceMeta {
         size: if kind == SourceKind::File { metadata.len() } else { 0 },
         kind,
@@ -77,25 +91,117 @@ pub fn read_meta(path: &Path) -> io::Result<SourceMeta> {
         changed,
         birth: metadata.created().ok().map(xsd_time),
         mode,
+        id,
     })
 }
 
-/// Opens a source read-only; on Linux without updating its access time, where the file's owner allows that.
-pub fn open_source(path: &Path) -> io::Result<File> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOATIME)
-            .open(path)
-        {
-            // O_NOATIME is only allowed to the file's owner
-            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
-            other => return other,
-        }
+/// Whether two ids are the same file; an inode of 0 says nothing.
+fn same_id(a: Option<(u64, u64)>, b: Option<(u64, u64)>) -> Option<bool> {
+    match (a, b) {
+        (Some(a), Some(b)) if a.1 != 0 && b.1 != 0 => Some(a == b),
+        _ => None,
     }
-    File::open(path)
+}
+
+/// Whether a walked item is the file `own` with the real path `own_real`: never a link to it, which is recorded as a
+/// link. The ids decide; where they do not (an inode of 0, a file system that numbers its files anew), the real path
+/// of a file of the same size does.
+pub fn is_same_file(own: &SourceMeta, own_real: &Path, path: &Path, meta: &SourceMeta) -> bool {
+    meta.kind == SourceKind::File
+        && (same_id(own.id, meta.id) == Some(true)
+            || (meta.size == own.size && std::fs::canonicalize(path).is_ok_and(|real| real == own_real)))
+}
+
+/// Opens without following a link and without waiting for the other end of a FIFO. On Linux without updating the
+/// access time, where the file's owner allows that.
+#[cfg(unix)]
+fn open_not_following(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let open = |flags: i32| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | flags)
+            .open(path)
+    };
+    #[cfg(target_os = "linux")]
+    match open(libc::O_NOATIME) {
+        // O_NOATIME is only allowed to the file's owner
+        Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
+        other => return other,
+    }
+    open(0)
+}
+
+/// Opens the link or other reparse point itself (FILE_FLAG_OPEN_REPARSE_POINT), to look at it: no access to its
+/// content is asked for.
+#[cfg(windows)]
+fn open_not_following(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(0x0020_0000)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn file_id(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Volume serial and file index. std has them only on nightly.
+#[cfg(windows)]
+fn file_id(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+    // SAFETY: an all-zero value is valid for this plain struct
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle lives as long as `file`, and `info` is a valid struct to fill
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((u64::from(info.dwVolumeSerialNumber), index))
+}
+
+/// Reads block again: only the open must not wait.
+#[cfg(unix)]
+fn blocking(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: fd is open for as long as `file` lives; these calls touch only its status flags
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Opens a walked file read-only, and only that file: whatever lies at the path by now (a link, a FIFO, another file)
+/// is an error. `SourceMeta::size` is what may be read from it.
+pub fn open_source(path: &Path, meta: &SourceMeta) -> io::Result<File> {
+    let changed = || io::Error::other("changed after it was listed; not added");
+    // a link where a file was walked
+    #[cfg(unix)]
+    let file = open_not_following(path).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            changed()
+        } else {
+            e
+        }
+    })?;
+    // not with FILE_FLAG_OPEN_REPARSE_POINT: that bypasses the filter of a deduplicated or cloud file, which would
+    // read as its stub. A link swapped in leads to another file index, and that is found below.
+    #[cfg(windows)]
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != meta.size || same_id(file_id(&file).ok(), meta.id) == Some(false) {
+        return Err(changed());
+    }
+    #[cfg(unix)]
+    blocking(&file)?;
+    Ok(file)
 }
 
 /// A file or path name as AFF4-L stores it, and its raw bytes when the name cannot be stored as it is.
@@ -131,17 +237,89 @@ pub fn encode_name(bytes: &[u8]) -> EncodedName {
     }
 }
 
-/// The bytes of a name as the operating system gives them (Windows: its UTF-16 converted to UTF-8).
+/// The bytes of a name as the operating system gives them (Windows: its UTF-16 as WTF-8, which is UTF-8 for any name
+/// that is valid Unicode).
 pub fn os_bytes(name: &OsStr) -> Vec<u8> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
         name.as_bytes().to_vec()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        name.to_string_lossy().into_owned().into_bytes()
+        use std::os::windows::ffi::OsStrExt;
+        wtf8(name.encode_wide())
     }
+}
+
+/// A name back from `os_bytes`.
+pub fn os_string(bytes: Vec<u8>) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        OsString::from_wide(&utf16_of_wtf8(&bytes))
+    }
+}
+
+/// UTF-16 as WTF-8: an unpaired surrogate becomes the three bytes UTF-8 would give it. They are not valid UTF-8, so
+/// such a name gets a raw form like any other that is not.
+#[cfg(any(windows, test))]
+fn wtf8(units: impl Iterator<Item = u16>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for unit in char::decode_utf16(units) {
+        match unit {
+            Ok(c) => out.extend(c.encode_utf8(&mut [0; 4]).as_bytes()),
+            Err(e) => {
+                let unit = e.unpaired_surrogate();
+                out.extend([
+                    0xE0 | (unit >> 12) as u8,
+                    0x80 | ((unit >> 6) & 0x3F) as u8,
+                    0x80 | (unit & 0x3F) as u8,
+                ]);
+            }
+        }
+    }
+    out
+}
+
+/// The UTF-16 of `wtf8`'s bytes; bytes it does not write give some other name, never a panic.
+#[cfg(any(windows, test))]
+fn utf16_of_wtf8(bytes: &[u8]) -> Vec<u16> {
+    let mut units = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let (len, first) = match bytes[at] {
+            byte @ 0..=0xBF => (1, u32::from(byte)),
+            byte @ 0xC0..=0xDF => (2, u32::from(byte & 0x1F)),
+            byte @ 0xE0..=0xEF => (3, u32::from(byte & 0x0F)),
+            byte => (4, u32::from(byte & 0x07)),
+        };
+        let rest = &bytes[(at + 1).min(bytes.len())..(at + len).min(bytes.len())];
+        let code = rest.iter().fold(first, |code, byte| code << 6 | u32::from(byte & 0x3F));
+        match code.checked_sub(0x1_0000) {
+            None => units.push(code as u16),
+            Some(code) => units.extend([0xD800 | ((code >> 10) & 0x3FF) as u16, 0xDC00 | (code & 0x3FF) as u16]),
+        }
+        at += len;
+    }
+    units
+}
+
+/// Base64 of a path's bytes, when its text cannot stand in for them.
+pub fn raw_path(path: &Path) -> Option<String> {
+    encode_name(&os_bytes(path.as_os_str())).raw_b64
+}
+
+/// The path a recorded text and raw form (from `raw_path`) stand for; without a raw form, the text.
+pub fn exact_path(text: &str, raw_b64: Option<&str>) -> PathBuf {
+    raw_b64
+        .and_then(|raw| base64::engine::general_purpose::STANDARD.decode(raw).ok())
+        .map_or_else(|| PathBuf::from(text), |bytes| PathBuf::from(os_string(bytes)))
 }
 
 /// The path stored for a source: below `base`, joined with the platform's separator, or only the file name.
@@ -418,8 +596,162 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
         std::fs::write(&path, b"content").unwrap();
+        let meta = read_meta(&path).unwrap();
         let mut text = String::new();
-        open_source(&path).unwrap().read_to_string(&mut text).unwrap();
+        open_source(&path, &meta).unwrap().read_to_string(&mut text).unwrap();
         assert_eq!(text, "content");
+    }
+
+    #[cfg(unix)]
+    fn assert_changed(path: &Path, meta: &SourceMeta) {
+        let error = open_source(path, meta).unwrap_err();
+        assert!(error.to_string().contains("changed after it was listed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_source_refuses_what_was_swapped_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"content").unwrap();
+        let meta = read_meta(&path).unwrap();
+        // a link to a file of the same size
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"CONTENT").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+        assert_changed(&path, &meta);
+        // another file of the same size at the path
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&other, &path).unwrap();
+        assert_changed(&path, &meta);
+        // a FIFO nobody writes to: without O_NONBLOCK this open never returns
+        std::fs::remove_file(&path).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        assert!(made.is_ok_and(|s| s.success()));
+        assert_changed(&path, &meta);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_source_refuses_another_size_and_reads_block_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"content").unwrap();
+        let meta = read_meta(&path).unwrap();
+        let file = open_source(&path, &meta).unwrap();
+        use std::os::fd::AsRawFd;
+        // SAFETY: only reads the flags of an open descriptor
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags & libc::O_NONBLOCK, 0);
+        std::fs::write(&path, b"content and more").unwrap();
+        assert_changed(&path, &meta);
+    }
+
+    #[test]
+    fn the_container_is_found_by_its_id_or_else_by_its_real_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let own_path = dir.path().join("c.aff4l");
+        let same_size = dir.path().join("other");
+        std::fs::write(&own_path, b"container").unwrap();
+        std::fs::write(&same_size, b"same size").unwrap();
+        let own_real = std::fs::canonicalize(&own_path).unwrap();
+        let own = read_meta(&own_real).unwrap();
+        assert!(is_same_file(&own, &own_real, &own_path, &own));
+        // a hard link is the same file; on Windows the index must be readable to know that
+        let hard = dir.path().join("hard");
+        std::fs::hard_link(&own_path, &hard).unwrap();
+        assert!(is_same_file(&own, &own_real, &hard, &read_meta(&hard).unwrap()));
+        assert!(!is_same_file(
+            &own,
+            &own_real,
+            &same_size,
+            &read_meta(&same_size).unwrap()
+        ));
+        // an inode of 0 says nothing, nor do ids that differ on a file system that numbers files anew
+        for (own_id, walked_id) in [((1, 0), (1, 0)), (own.id.unwrap(), (1, 0)), (own.id.unwrap(), (9, 9))] {
+            let own = SourceMeta {
+                id: Some(own_id),
+                ..own.clone()
+            };
+            let walked = SourceMeta {
+                id: Some(walked_id),
+                ..own.clone()
+            };
+            assert!(is_same_file(&own, &own_real, &own_path, &walked));
+            assert!(!is_same_file(&own, &own_real, &same_size, &walked));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_never_the_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let own_path = dir.path().join("c.aff4l");
+        std::fs::write(&own_path, b"container").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&own_path, &link).unwrap();
+        let own_real = std::fs::canonicalize(&own_path).unwrap();
+        let own = read_meta(&own_real).unwrap();
+        assert!(!is_same_file(&own, &own_real, &link, &read_meta(&link).unwrap()));
+    }
+
+    #[test]
+    fn times_before_1970_keep_their_sign() {
+        assert_eq!(xsd_time(unix_time(-1, 500_000_000).unwrap()), "1969-12-31T23:59:59.5Z");
+        assert_eq!(xsd_time(unix_time(-86_400, 0).unwrap()), "1969-12-31T00:00:00Z");
+        assert_eq!(
+            xsd_time(unix_time(1_599_435_382, 100).unwrap()),
+            "2020-09-06T23:36:22.0000001Z"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_modified_time_before_1970_is_read_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        let time = std::time::UNIX_EPOCH - std::time::Duration::new(86_400, 0);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(time).unwrap();
+        assert_eq!(
+            read_meta(&path).unwrap().modified.as_deref(),
+            Some("1969-12-31T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn unpaired_surrogates_keep_a_raw_form() {
+        let name = wtf8([0x61, 0xD83D, 0x62, 0xDC00].into_iter());
+        assert_eq!(name, b"a\xED\xA0\xBDb\xED\xB0\x80");
+        let encoded = encode_name(&name);
+        assert_eq!(encoded.text, "a%ED%A0%BDb%ED%B0%80");
+        assert_eq!(encoded.raw_b64, Some(b64(&name)));
+        assert_eq!(utf16_of_wtf8(&name), vec![0x61, 0xD83D, 0x62, 0xDC00]);
+    }
+
+    #[test]
+    fn valid_utf16_is_plain_utf8_and_comes_back() {
+        let text = "Jürgen ネコ 😀.txt";
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let name = wtf8(units.iter().copied());
+        assert_eq!(name, text.as_bytes());
+        assert_eq!(encode_name(&name).raw_b64, None);
+        assert_eq!(utf16_of_wtf8(&name), units);
+        // what wtf8 never writes is no panic
+        utf16_of_wtf8(b"\xF0\x9F");
+        utf16_of_wtf8(b"\xE0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_comes_back_from_its_raw_form() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(OsStr::from_bytes(b"/mnt/caf\xe9/x"));
+        let raw = raw_path(path).unwrap();
+        assert_eq!(exact_path(&path.display().to_string(), Some(&raw)), path);
+        assert_eq!(raw_path(Path::new("/mnt/plain")), None);
+        assert_eq!(exact_path("/mnt/plain", None), Path::new("/mnt/plain"));
     }
 }

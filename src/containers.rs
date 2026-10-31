@@ -78,6 +78,8 @@ pub struct AddEvent {
     pub mounts: Vec<crate::container::mounts::Mount>,
     /// the base path and path option the files were added with (not recorded before 2.7)
     pub base_path: Option<String>,
+    /// Base64 of the base path's bytes, when `base_path` cannot hold them
+    pub base_path_raw: Option<String>,
     pub keep_path: Option<bool>,
     /// (ARN, ARN of the copy added again in its place)
     pub replaces: Vec<(String, String)>,
@@ -508,6 +510,7 @@ impl Factum<'_> {
                     detail.adds.push(AddEvent {
                         entry_id: event.entry_id,
                         base_path: event.optional("base_path"),
+                        base_path_raw: event.optional("base_path_raw"),
                         keep_path: event.payload.get("keep_path").and_then(Value::as_bool),
                         utc: event.utc,
                         files,
@@ -805,6 +808,9 @@ impl Factum<'_> {
                              "base_path": staged.base().display().to_string(), "keep_path": staged.keep_path,
                              "sources": staged.mounts.iter().map(crate::container::mounts::Mount::to_json).collect::<Vec<_>>()});
         let mut payload = payload;
+        if let Some(raw) = crate::container::source::raw_path(staged.base()) {
+            payload["base_path_raw"] = json!(raw);
+        }
         if !staged.replaced.is_empty() {
             payload["replaces"] = staged
                 .replaced
@@ -1086,10 +1092,10 @@ impl Factum<'_> {
                 .iter()
                 .find(|add| add.files.iter().any(|f| f.arn == record.arn))
                 .ok_or_else(not_recorded)?;
-            let (Some(source), Some(base), Some(keep_path)) = (&record.source, &add.base_path, add.keep_path) else {
+            let (Some(source), Some(base), Some(keep_path)) = (record.source_path(), &add.base_path, add.keep_path)
+            else {
                 return Err(not_recorded());
             };
-            let source = PathBuf::from(source);
             let position = match plan
                 .iter()
                 .position(|(entry, _, o)| *entry == add.entry_id && o.excerpt == record.excerpt)
@@ -1100,7 +1106,7 @@ impl Factum<'_> {
                         add.entry_id,
                         Vec::new(),
                         crate::container::volume::AddOptions {
-                            base: PathBuf::from(base),
+                            base: crate::container::source::exact_path(base, add.base_path_raw.as_deref()),
                             keep_path,
                             excerpt: record.excerpt,
                             ..Default::default()

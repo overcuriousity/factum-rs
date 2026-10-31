@@ -10,7 +10,10 @@ use serde_json::{Value, json};
 use sha2::Digest;
 
 use super::mounts::Mount;
-use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_bytes, read_meta, stored_path};
+use super::source::{
+    self, SourceKind, SourceMeta, encode_name, exact_path, is_same_file, open_source, os_bytes, raw_path, read_meta,
+    stored_path,
+};
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
 use super::zip64::{
@@ -85,16 +88,28 @@ pub struct FileRecord {
     pub link: Option<String>,
     /// the absolute path it was read from (not recorded before 2.7)
     pub source: Option<String>,
+    /// Base64 of that path's bytes, when `source` cannot hold them
+    pub source_raw: Option<String>,
 }
 
 impl FileRecord {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "arn": self.arn, "path": self.path, "size": self.size, "md5": self.md5, "sha1": self.sha1,
             "sha256": self.sha256, "metadata_only": self.metadata_only,
             "excerpt": self.excerpt.map(|(from, to)| json!([from, to])), "link": self.link,
             "source": self.source,
-        })
+        });
+        if let Some(raw) = &self.source_raw {
+            value["source_raw"] = json!(raw);
+        }
+        value
+    }
+
+    /// The exact path it was read from.
+    pub fn source_path(&self) -> Option<PathBuf> {
+        let source = self.source.as_deref()?;
+        Some(exact_path(source, self.source_raw.as_deref()))
     }
 
     pub fn from_json(value: &Value) -> Option<Self> {
@@ -115,6 +130,7 @@ impl FileRecord {
             excerpt,
             link: text("link"),
             source: text("source"),
+            source_raw: text("source_raw"),
         })
     }
 }
@@ -451,6 +467,7 @@ pub fn file_records(graph: &Graph) -> Vec<FileRecord> {
                 excerpt,
                 link: value(factum("symlinkTarget")),
                 source: value(factum("sourcePath")),
+                source_raw: value(factum("sourcePathRaw")),
             }
         })
         .collect()
@@ -534,6 +551,14 @@ fn name_and_meta(graph: &mut Graph, arn: &str, name: &[u8], stored: &[u8], meta:
     }
     if let Some(mode) = meta.mode {
         graph.add(arn, &aff4l("fileMode"), typed(mode, "long"));
+    }
+}
+
+/// A path as a factum property, and its bytes as `<property>Raw` when the text cannot hold them.
+fn path_triples(graph: &mut Graph, arn: &str, property: &str, path: &Path) {
+    graph.add(arn, &factum(property), plain(path.display().to_string()));
+    if let Some(raw) = raw_path(path) {
+        graph.add(arn, &factum(&format!("{property}Raw")), typed(raw, "base64Binary"));
     }
 }
 
@@ -969,11 +994,17 @@ impl Volume {
         }
         let mut errors = Vec::new();
         let mut items = Vec::new();
-        // a container inside the folder being added never adds itself
-        let own = std::fs::canonicalize(&self.path).ok();
+        // a container inside the folder being added never adds itself; a link to it is recorded like any link
+        let own = std::fs::canonicalize(&self.path)
+            .ok()
+            .and_then(|real| Some((read_meta(&real).ok()?, real)));
+        let is_own = |path: &Path, meta: &SourceMeta| {
+            own.as_ref()
+                .is_some_and(|(own, real)| is_same_file(own, real, path, meta))
+        };
         for walked in source::walk(sources) {
             match walked {
-                Ok(item) if own.is_some() && std::fs::canonicalize(&item.0).ok() == own => {}
+                Ok((path, meta)) if is_own(&path, &meta) => {}
                 Ok(item) => items.push(item),
                 Err((path, e)) => errors.push((path.display().to_string(), e.to_string())),
             }
@@ -1054,12 +1085,11 @@ impl Volume {
                 }
                 SourceKind::Link(target) => {
                     let arn = new_arn();
-                    let target = target.display().to_string();
                     graph.add(&arn, &rdf_type(), Term::Iri(aff4("FileImage")));
                     name_and_meta(&mut graph, &arn, &name, stored, meta);
                     graph.add(&arn, &aff4("size"), typed(0, "long"));
-                    graph.add(&arn, &factum("symlinkTarget"), plain(&target));
-                    graph.add(&arn, &factum("sourcePath"), plain(&display));
+                    path_triples(&mut graph, &arn, "symlinkTarget", target);
+                    path_triples(&mut graph, &arn, "sourcePath", path);
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     records.push(FileRecord {
                         arn,
@@ -1070,8 +1100,9 @@ impl Volume {
                         sha256: String::new(),
                         metadata_only: false,
                         excerpt: None,
-                        link: Some(target),
+                        link: Some(target.display().to_string()),
                         source: Some(display.clone()),
+                        source_raw: raw_path(path),
                     });
                     progress.files.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1081,16 +1112,18 @@ impl Volume {
                     let file_start = app.position();
                     let report = |read: u64| progress.bytes.store(done_bytes + read, Ordering::Relaxed);
                     let result = (|| -> io::Result<Content> {
-                        let mut src = open_source(path)?;
-                        if options.metadata_only {
-                            let (size, digests) = stream::hash_only(&mut src, &report, cancel)?;
-                            return Ok(Content::Hashed(size, digests));
-                        }
+                        let mut src = open_source(path, meta)?;
                         if let Some((from, to)) = options.excerpt {
                             src.seek(SeekFrom::Start(from))?;
                             let mut part = src.take(to - from);
                             return stream::store(app, &member, &mut part, to - from, limit, &report, cancel)
                                 .map(Content::Stored);
+                        }
+                        // one byte more than listed is enough to know it changed
+                        let mut src = src.take(meta.size.saturating_add(1));
+                        if options.metadata_only {
+                            let (size, digests) = stream::hash_only(&mut src, &report, cancel)?;
+                            return Ok(Content::Hashed(size, digests));
                         }
                         stream::store(app, &member, &mut src, meta.size, limit, &report, cancel).map(Content::Stored)
                     })();
@@ -1148,7 +1181,7 @@ impl Volume {
                         graph.add(&arn, &factum("excerptEnd"), typed(to, "long"));
                         graph.add(&arn, &factum("originalSize"), typed(meta.size, "long"));
                     }
-                    graph.add(&arn, &factum("sourcePath"), plain(&display));
+                    path_triples(&mut graph, &arn, "sourcePath", path);
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     done_bytes += read_size;
                     progress.bytes.store(done_bytes, Ordering::Relaxed);
@@ -1164,6 +1197,7 @@ impl Volume {
                         excerpt: options.excerpt,
                         link: None,
                         source: Some(display.clone()),
+                        source_raw: raw_path(path),
                     });
                 }
             }
@@ -1174,8 +1208,7 @@ impl Volume {
             .replaces
             .iter()
             .filter_map(|(source, old)| {
-                let source = source.display().to_string();
-                let new = records.iter().find(|r| r.source.as_deref() == Some(source.as_str()))?;
+                let new = records.iter().find(|r| r.source_path().as_ref() == Some(source))?;
                 let old_record = earlier.iter().find(|r| r.arn == *old)?;
                 let same = (&new.md5, &new.sha1, &new.sha256, new.size)
                     == (&old_record.md5, &old_record.sha1, &old_record.sha256, old_record.size);
@@ -2324,11 +2357,166 @@ mod tests {
             excerpt: Some((1, 3)),
             link: None,
             source: Some("/mnt/x".into()),
+            source_raw: None,
         };
         let json = record.to_json();
         assert_eq!(json["excerpt"], serde_json::json!([1, 3]));
         assert_eq!(json["link"], serde_json::Value::Null);
-        assert_eq!(FileRecord::from_json(&json), Some(record));
+        // the payload of a plain path is what it always was
+        assert!(json.get("source_raw").is_none());
+        assert_eq!(FileRecord::from_json(&json), Some(record.clone()));
+        let record = FileRecord {
+            source_raw: Some("L21udC94".into()),
+            ..record
+        };
+        assert_eq!(FileRecord::from_json(&record.to_json()), Some(record));
+    }
+
+    /// The source tree of `Setup` with two more files; the second comes after the first when walked.
+    #[cfg(unix)]
+    fn a_and_b(setup: &Setup) -> (PathBuf, PathBuf) {
+        let (a, b) = (setup.source.join("a"), setup.source.join("b"));
+        std::fs::write(&a, b"first").unwrap();
+        std::fs::write(&b, b"second").unwrap();
+        (a, b)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_after_the_walk_is_an_error_of_that_file() {
+        let setup = Setup::new();
+        let (a, b) = a_and_b(&setup);
+        let mut volume = setup.create();
+        // the walk is over when the first file has been read
+        let staged = volume
+            .stage_add_with(
+                &[a, b.clone()],
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+                &|path| {
+                    if path.ends_with("a") {
+                        std::fs::remove_file(&b).unwrap();
+                        let made = std::process::Command::new("mkfifo").arg(&b).status();
+                        assert!(made.is_ok_and(|s| s.success()));
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(paths(&staged.records), vec!["a"]);
+        assert_eq!(staged.errors.len(), 1);
+        assert!(staged.errors[0].0.ends_with("b"));
+        assert!(
+            staged.errors[0].1.contains("changed after it was listed"),
+            "{}",
+            staged.errors[0].1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_swapped_in_after_the_walk_is_not_followed() {
+        let setup = Setup::new();
+        let (a, b) = a_and_b(&setup);
+        let secret = setup.dir.path().join("secret");
+        std::fs::write(&secret, b"SECOND").unwrap();
+        let mut volume = setup.create();
+        let staged = volume
+            .stage_add_with(
+                &[a, b.clone()],
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+                &|path| {
+                    if path.ends_with("a") {
+                        std::fs::remove_file(&b).unwrap();
+                        std::os::unix::fs::symlink(&secret, &b).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(paths(&staged.records), vec!["a"]);
+        assert!(staged.errors[0].1.contains("changed after it was listed"));
+    }
+
+    /// A regular file of size 0 by its metadata that has content: reading stops one byte after the listed size.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_longer_than_listed_is_not_read_to_its_end() {
+        let status = PathBuf::from("/proc/self/status");
+        if !status.exists() {
+            return;
+        }
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        for metadata_only in [true, false] {
+            let options = AddOptions {
+                base: PathBuf::new(),
+                keep_path: false,
+                metadata_only,
+                ..Default::default()
+            };
+            let progress = AddProgress::default();
+            let staged = volume
+                .stage_add(
+                    std::slice::from_ref(&status),
+                    &options,
+                    &progress,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(staged.records.is_empty());
+            assert!(
+                staged.errors[0].1.contains("changed while it was read"),
+                "{:?}",
+                staged.errors
+            );
+            assert_eq!(progress.bytes.load(Ordering::Relaxed), 1);
+            volume.discard(staged).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_the_container_is_recorded_and_the_container_left_out() {
+        let setup = Setup::new();
+        let inside = setup.source.join("c.aff4l");
+        let mut volume =
+            Volume::create(&inside, "33333333-3333-3333-3333-333333333333", &VolumeInfo::default()).unwrap();
+        std::os::unix::fs::symlink(&inside, setup.source.join("link")).unwrap();
+        let staged = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        assert!(!paths(&staged.records).contains(&"c.aff4l"));
+        let link = staged.records.iter().find(|r| r.path == "link").unwrap();
+        assert_eq!(link.link.as_deref(), Some(inside.display().to_string().as_str()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paths_that_are_not_unicode_keep_their_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let setup = Setup::new();
+        let file = setup.source.join(OsStr::from_bytes(b"caf\xe9.txt"));
+        let target = PathBuf::from(OsStr::from_bytes(b"target\xff"));
+        std::fs::write(&file, b"x").unwrap();
+        let link = setup.source.join(OsStr::from_bytes(b"link\xe9"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut volume = setup.create();
+        let staged = add(&mut volume, &[file.clone(), link.clone()], &setup.options(), 1);
+        // the file as written and read back, with the display text as it always was
+        let graph = read_graph(&setup.path(), None).unwrap();
+        let records = file_records(&graph);
+        assert_eq!(records, staged.records);
+        assert_eq!(records[0].source.as_deref(), Some(file.display().to_string().as_str()));
+        assert_eq!(records[0].source_path(), Some(file));
+        assert_eq!(records[1].source_path(), Some(link));
+        let raw = graph.first_value(&records[1].arn, &factum("symlinkTargetRaw")).unwrap();
+        assert_eq!(exact_path("", Some(raw)), target);
+        // plain paths have no raw form
+        let plain_path = setup.source.join("Users/x/evil.exe");
+        let staged = add(&mut volume, std::slice::from_ref(&plain_path), &setup.options(), 2);
+        assert_eq!(staged.records[0].source_raw, None);
+        assert_eq!(staged.records[0].source_path(), Some(plain_path));
     }
 
     #[test]
