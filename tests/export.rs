@@ -976,7 +976,7 @@ fn report_lists_container_sources_and_damaged_state() {
     let record = staged.records[0].clone();
     factum.commit_container_add(id, &mut volume, staged).unwrap();
     drop(volume);
-    factum.close_container_damaged(id, &[record]).unwrap();
+    factum.close_container_damaged(id, &[record], &[]).unwrap();
     let seal_id = factum.seal(case_id, "export").unwrap();
     let model = build(&factum, case_id, seal_id, None);
     let row = &model.containers[0];

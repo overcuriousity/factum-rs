@@ -1,6 +1,9 @@
 //! Evidence containers in the case log: every creation, addition, close, reopen and late signature is a system
 //! entry, and the container's state is read back from those entries (no tables of its own). The entry is written
 //! first; the container file is written inside the append transaction, so a failure leaves neither.
+//!
+//! A proven fault of a container's directory (a CRC-32 that differs) means no addition and no signature: Close as
+//! Damaged is the way out, and it writes nothing to the file.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -121,8 +124,9 @@ pub struct ContainerDetail {
     /// closes logged while the file was missing (entry id, time): no state was signed or written, so they are not
     /// in `closes`, whose order matches the closed states kept in the file
     pub closed_without_file: Vec<(i64, String)>,
-    /// closes as damaged (entry id, time, the paths that did not match): nothing signed or written either
-    pub damaged_closes: Vec<(i64, String, Vec<String>)>,
+    /// closes as damaged (entry id, time, the paths that did not match, the directory's faults): nothing signed or
+    /// written either; with only faults, no file was found damaged
+    pub damaged_closes: Vec<(i64, String, Vec<String>, Vec<String>)>,
     /// `container_signed` entries: (entry id, turtle_sha256, gpg fingerprint, x509 fingerprint)
     pub late_signatures: Vec<(i64, String, Option<String>, Option<String>)>,
 }
@@ -524,14 +528,17 @@ impl Factum<'_> {
                     detail.closed_without_file.push((event.entry_id, event.utc));
                 }
                 "container_closed" if event.payload.contains_key("damaged") => {
-                    let paths = event
-                        .payload
-                        .get("damaged")
-                        .and_then(Value::as_array)
-                        .map(|paths| paths.iter().filter_map(Value::as_str).map(str::to_string).collect())
-                        .unwrap_or_default();
+                    let list = |key: &str| -> Vec<String> {
+                        event
+                            .payload
+                            .get(key)
+                            .and_then(Value::as_array)
+                            .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                            .unwrap_or_default()
+                    };
+                    let (paths, faults) = (list("damaged"), list("directory_fault"));
                     detail.summary.open = false;
-                    detail.damaged_closes.push((event.entry_id, event.utc, paths));
+                    detail.damaged_closes.push((event.entry_id, event.utc, paths, faults));
                 }
                 "container_closed" => {
                     let (gpg, x509) = event.signatures();
@@ -825,6 +832,15 @@ impl Factum<'_> {
                 let end = cell.borrow_mut().finalize_add(&staged, entry_id)?;
                 store_end(conn, &detail.summary.uuid, end)
             };
+            // read again under the write lock: it may have been closed (without its file) while this was running
+            let still_open = |_: &rusqlite::Connection| -> Result<()> {
+                if self.container(id)?.summary.open {
+                    return Ok(());
+                }
+                Err(FactumError::general(format!(
+                    "Container #{id} was closed meanwhile; nothing was added."
+                )))
+            };
             self.append(
                 detail.summary.case_id,
                 KIND_SYSTEM,
@@ -832,6 +848,7 @@ impl Factum<'_> {
                 Append {
                     payload: Some(payload),
                     on_commit: Some(&finalize),
+                    reserve: Some(&still_open),
                     ..Default::default()
                 },
             )
@@ -962,8 +979,8 @@ impl Factum<'_> {
     }
 
     /// Closes a container: signs its state and logs `container_closed`; the signatures and a copy of the state
-    /// under factum/history/<n>/ are written inside the append.
-    /// Closes and signs the container after `recheck` (of `recheck_input`) found every file intact.
+    /// under factum/history/<n>/ are written inside the append. Only after `recheck` found every file intact and no
+    /// fault of the directory, and only when nothing changed since; the volume is locked before that is compared.
     pub fn close_container_with(&self, id: i64, gpgsm: &Gpgsm, recheck: &Recheck) -> Result<CloseEvent> {
         let detail = self.container(id)?;
         ensure_case_open(&self.db.conn, detail.summary.case_id)?;
@@ -976,9 +993,26 @@ impl Factum<'_> {
                 mismatch_text(recheck.mismatches.len())
             )));
         }
+        if !recheck.directory_faults.is_empty() {
+            return Err(FactumError::container_crc(format!(
+                "Container #{id} was not closed: a fault of its directory, so its state is not signed ({}). Verify \
+                 Container shows whether the content is intact; it can only be closed as damaged.",
+                recheck.directory_faults.join(", ")
+            )));
+        }
         let mut volume = self.open_volume(&detail)?;
+        let detail = self.container(id)?;
+        if !detail.summary.open {
+            return Err(FactumError::general(format!("Container #{id} is already closed.")));
+        }
+        let input = self.recheck_input(id)?;
+        if !recheck.is_of(input.end, &input.records, volume.mark()) {
+            return Err(FactumError::general(format!(
+                "Container #{id} was not closed: the container changed since the re-check; re-check again."
+            )));
+        }
         self.ensure_matches_log(id, &volume)?;
-        let turtle = volume.turtle_bytes();
+        let turtle = volume.member(TURTLE)?;
         let turtle_sha256 = hex::encode(sha2::Sha256::digest(&turtle));
         let SignedState {
             signatures,
@@ -1044,28 +1078,47 @@ impl Factum<'_> {
         })
     }
 
-    /// Closes an open container whose file is missing, so that its case can be archived: `container_closed` with
-    /// `file_missing`, and nothing signed or written, as there is no file. Refused while the file is there.
-    /// Closes a container whose re-check found damaged files, without signing or writing anything (spec 5.2).
-    pub fn close_container_damaged(&self, id: i64, damaged: &[FileRecord]) -> Result<i64> {
-        let detail = self.container(id)?;
+    /// The container as the log has it, with its file locked against other writers as long as the handle lives (no
+    /// handle without a file); for what changes the log alone.
+    fn locked_for_log(&self, id: i64) -> Result<(ContainerDetail, Option<std::fs::File>)> {
+        let path = self.container(id)?.summary.path;
+        let lock = path.map_or(Ok(None), |path| crate::container::volume::lock_file(&path))?;
+        Ok((self.container(id)?, lock))
+    }
+
+    /// Closes a container that cannot be signed, without signing or writing anything (spec 5.2): `damaged`, the files
+    /// its re-check found damaged, or `directory_faults`, what it found wrong with the directory (`Recheck`). The
+    /// container need not open for this: a directory fault is why it does not.
+    pub fn close_container_damaged(&self, id: i64, damaged: &[FileRecord], directory_faults: &[String]) -> Result<i64> {
+        if damaged.is_empty() && directory_faults.is_empty() {
+            return Err(FactumError::general(format!(
+                "Container #{id} is not damaged; close it as usual."
+            )));
+        }
+        let (detail, _lock) = self.locked_for_log(id)?;
         ensure_case_open(&self.db.conn, detail.summary.case_id)?;
         if !detail.summary.open {
             return Err(FactumError::general(format!("Container #{id} is already closed.")));
         }
         let file_count = detail.summary.file_count;
         let paths: Vec<&str> = damaged.iter().map(|r| r.path.as_str()).collect();
+        let reason = match (damaged.len(), directory_faults.len()) {
+            (files, 0) => mismatch_text(files),
+            (0, faults) => format!("{}, no file found damaged", plural(faults, "directory fault")),
+            (files, faults) => format!("{} · {}", mismatch_text(files), plural(faults, "directory fault")),
+        };
+        let mut payload = json!({"event": "container_closed", "case_id": detail.summary.case_id,
+                                 "container_id": detail.summary.uuid, "damaged": paths,
+                                 "file_count": file_count, "closed_utc": utc_now()});
+        if !directory_faults.is_empty() {
+            payload["directory_fault"] = json!(directory_faults);
+        }
         self.append(
             detail.summary.case_id,
             KIND_SYSTEM,
-            &format!(
-                "Container #{id} closed as damaged · {} · not signed",
-                mismatch_text(damaged.len())
-            ),
+            &format!("Container #{id} closed as damaged · {reason} · not signed"),
             Append {
-                payload: Some(json!({"event": "container_closed", "case_id": detail.summary.case_id,
-                                     "container_id": detail.summary.uuid, "damaged": paths,
-                                     "file_count": file_count, "closed_utc": utc_now()})),
+                payload: Some(payload),
                 ..Default::default()
             },
         )
@@ -1124,8 +1177,10 @@ impl Factum<'_> {
             .collect())
     }
 
+    /// Closes an open container whose file is missing, so that its case can be archived: `container_closed` with
+    /// `file_missing`, and nothing signed or written, as there is no file. Refused while the file is there.
     pub fn close_container_without_file(&self, id: i64) -> Result<i64> {
-        let detail = self.container(id)?;
+        let (detail, _lock) = self.locked_for_log(id)?;
         ensure_case_open(&self.db.conn, detail.summary.case_id)?;
         if !detail.summary.open {
             return Err(FactumError::general(format!("Container #{id} is already closed.")));
@@ -1156,9 +1211,10 @@ impl Factum<'_> {
         )
     }
 
-    /// Logs `container_reopened`; Add is possible again. The file is not touched.
+    /// Logs `container_reopened`; Add is possible again. The file is not touched, but it is locked for the moment:
+    /// not while another process still writes to it.
     pub fn reopen_container(&self, id: i64) -> Result<i64> {
-        let detail = self.container(id)?;
+        let (detail, _lock) = self.locked_for_log(id)?;
         if detail.summary.open {
             return Err(FactumError::general(format!("Container #{id} is open.")));
         }

@@ -17,8 +17,8 @@ use super::source::{
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
 use super::zip64::{
-    Appender, Archive, CdEntry, crc_mismatch, find_last_end, find_newest_end, member_bytes, member_reader, member_text,
-    read_archive,
+    Appender, Archive, CdEntry, crc_mismatch, find_last_end, find_newest_end, member_bytes, member_bytes_and_crc,
+    member_reader, member_text, read_archive,
 };
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS, RDF_NS, XSD_NS, ZIP_SEGMENT_LIMIT, member_name};
 use crate::error::{FactumError, Result};
@@ -296,7 +296,7 @@ fn open_error(path: &Path, e: io::Error, other: impl Fn(String) -> FactumError) 
     match crc_mismatch(&e) {
         Some(member) => FactumError::container_crc(format!(
             "The container {} was not opened, nothing in it was changed: {member} differs from the CRC-32 of the \
-             directory. Verify Container shows whether the content is intact.",
+             directory. Verify Container shows whether the content is intact; it can only be closed as damaged.",
             path.display()
         )),
         None if matches!(e.kind(), InvalidData | UnexpectedEof | Unsupported) => other(e.to_string()),
@@ -313,6 +313,26 @@ pub struct Recheck {
     pub uncached: bool,
     /// files whose stored content cannot be read or does not match their hashes
     pub mismatches: Vec<FileRecord>,
+    /// faults of the directory, not of the content: a metadata member, or `path (member)` of a file that matched its
+    /// hashes, that differs from the directory's CRC-32, or a directory that cannot be read. Such a state is not
+    /// signed; it can only be closed as damaged.
+    pub directory_faults: Vec<String>,
+    /// where the log's state ended when the re-check started
+    pub logged_end: Option<u64>,
+    /// the files it read back, in the order of the input
+    pub arns: Vec<String>,
+    /// the end of the state it read
+    pub volume_end: u64,
+}
+
+impl Recheck {
+    /// Whether this re-check read what the log and the locked volume hold now: `mark` is the volume's, its write
+    /// position the end of a state that was set aside, which a re-check before that read.
+    pub fn is_of(&self, logged_end: Option<u64>, records: &[FileRecord], mark: Mark) -> bool {
+        self.logged_end == logged_end
+            && self.arns.iter().eq(records.iter().map(|r| &r.arn))
+            && (self.volume_end == mark.base_end || self.volume_end == mark.write_pos)
+    }
 }
 
 /// Drops the file's cached pages, so the next reads come from the disk; true when that was possible.
@@ -330,8 +350,16 @@ fn drop_cache(file: &File) -> bool {
     }
 }
 
-/// Whether a read error during a re-check means the stored content is damaged (missing, corrupt, cut short), rather
-/// than that the container could not be read right now (a pulled drive, a lock, permissions).
+/// Errors that say a device or share went away, in the numbers of the platform.
+#[cfg(target_os = "linux")]
+const MEDIUM_GONE: [i32; 4] = [libc::ENODEV, libc::ENXIO, libc::ENOMEDIUM, libc::EHOSTDOWN];
+#[cfg(all(unix, not(target_os = "linux")))]
+const MEDIUM_GONE: [i32; 3] = [libc::ENODEV, libc::ENXIO, libc::EHOSTDOWN];
+// ERROR_NOT_READY, _DEV_NOT_EXIST, _NETNAME_DELETED, _MEDIA_CHANGED, _NO_MEDIA_IN_DRIVE, _DEVICE_NOT_CONNECTED
+#[cfg(windows)]
+const MEDIUM_GONE: [i32; 6] = [21, 55, 64, 1110, 1112, 1167];
+
+/// Whether a read error during a re-check means the stored content is damaged (missing, corrupt, cut short).
 fn is_damage(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -342,8 +370,87 @@ fn is_damage(kind: io::ErrorKind) -> bool {
     )
 }
 
+/// Whether a read error only says that the container could not be read right now (permissions, a lock, an
+/// interrupted call, a removed medium, a lost share): retried by the user, never logged as damage.
+fn is_transient(e: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        PermissionDenied
+            | Interrupted
+            | WouldBlock
+            | TimedOut
+            | ResourceBusy
+            | OutOfMemory
+            | NotConnected
+            | ConnectionReset
+            | ConnectionAborted
+            | HostUnreachable
+            | NetworkUnreachable
+            | NetworkDown
+            | StaleNetworkFileHandle
+    ) || e.raw_os_error().is_some_and(|code| MEDIUM_GONE.contains(&code))
+}
+
+/// Whether a read error that stayed on a second attempt counts as damage. Any error but a transient one does (EIO
+/// above all, which a bad sector gives), unless `rest_reads` fails too: a removed drive gives EIO for the whole file.
+fn counts_as_damage(e: &io::Error, rest_reads: impl FnOnce() -> bool) -> bool {
+    is_damage(e.kind()) || (!is_transient(e) && rest_reads())
+}
+
+/// Whether the start of a container file can be read from the disk.
+fn start_reads(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    drop_cache(&file);
+    file.read(&mut [0; 4096]).is_ok_and(|read| read > 0)
+}
+
+/// A state as a re-check finds it.
+struct RecheckState {
+    end: u64,
+    archive: Archive,
+    turtle: Vec<u8>,
+    /// the metadata members that differ from the directory's CRC-32
+    crc: Vec<String>,
+}
+
+/// Reads the directory of the state at `end` (the newest when None) and its metadata; None without a complete one.
+fn read_recheck_state(file: &mut File, end: Option<u64>) -> io::Result<Option<RecheckState>> {
+    let Some(end) = find_last_end(file, end)? else {
+        return Ok(None);
+    };
+    let archive = read_archive(file, end)?;
+    let mut crc = Vec::new();
+    let mut turtle = Vec::new();
+    for name in ["version.txt", "container.description", HASHES, TURTLE] {
+        let Some(entry) = archive.get(name) else { continue };
+        let (data, matches) = member_bytes_and_crc(file, entry)?;
+        if !matches {
+            crc.push(name.to_string());
+        }
+        if name == TURTLE {
+            turtle = data;
+        }
+    }
+    if archive.get(TURTLE).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "information.turtle is missing",
+        ));
+    }
+    Ok(Some(RecheckState {
+        end,
+        archive,
+        turtle,
+        crc,
+    }))
+}
+
 /// Reads the stored content of `records` back from the state that ends at `end` (the newest when None) and
-/// compares it with their hashes.
+/// compares it with their hashes. A read error that stays on a second attempt counts as damage when the file can
+/// otherwise be read (`counts_as_damage`); until then it is an error and nothing is decided.
 pub fn recheck(
     path: &Path,
     end: Option<u64>,
@@ -354,15 +461,39 @@ pub fn recheck(
     let unreadable = |e: String| FactumError::general(format!("The container {} cannot be read: {e}", path.display()));
     let mut file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
     let uncached = drop_cache(&file);
-    let end = find_last_end(&mut file, end)
-        .map_err(|e| unreadable(e.to_string()))?
-        .ok_or_else(|| unreadable("no complete ZIP directory".into()))?;
-    let archive = read_archive(&mut file, end).map_err(|e| unreadable(e.to_string()))?;
-    let entry = archive
-        .get(TURTLE)
-        .ok_or_else(|| unreadable("information.turtle is missing".into()))?;
-    let text = member_text(&mut file, entry).map_err(|e| unreadable(e.to_string()))?;
-    let graph = turtle::parse(&text).map_err(unreadable)?;
+    let mut result = Recheck {
+        uncached,
+        logged_end: end,
+        arns: records.iter().map(|r| r.arn.clone()).collect(),
+        ..Default::default()
+    };
+    let state = match read_recheck_state(&mut file, end) {
+        Err(e) if !is_damage(e.kind()) && !is_transient(&e) => read_recheck_state(&mut file, end),
+        state => state,
+    };
+    let state = match state {
+        Ok(state) => state.ok_or_else(|| unreadable("no complete ZIP directory".into()))?,
+        // the directory itself is what cannot be read: nothing to go through, and nothing to sign
+        Err(e) if !is_damage(e.kind()) && counts_as_damage(&e, || start_reads(path)) => {
+            result
+                .directory_faults
+                .push(format!("the directory cannot be read ({e})"));
+            return Ok(result);
+        }
+        Err(e) => return Err(unreadable(e.to_string())),
+    };
+    result.volume_end = state.end;
+    result.directory_faults = state.crc;
+    let archive = state.archive;
+    let parsed = String::from_utf8(state.turtle)
+        .map_err(|_| "information.turtle is not UTF-8 text".to_string())
+        .and_then(|text| turtle::parse(&text));
+    let graph = match parsed {
+        Ok(graph) => graph,
+        // it differs from its CRC-32 and cannot be read: the listed files cannot be found, whatever they hold
+        Err(_) if result.directory_faults.iter().any(|name| name == TURTLE) => return Ok(result),
+        Err(e) => return Err(unreadable(e)),
+    };
     progress.total_files.store(records.len() as u64, Ordering::Relaxed);
     progress
         .total_bytes
@@ -370,38 +501,45 @@ pub fn recheck(
     progress.files.store(0, Ordering::Relaxed);
     progress.bytes.store(0, Ordering::Relaxed);
     let cancelled = || FactumError::general("Re-check cancelled — the container was not closed.");
-    let mut result = Recheck {
-        uncached,
-        ..Default::default()
-    };
     for record in records {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
         let done = result.bytes;
         let report = |read: u64| progress.bytes.store(done + read, Ordering::Relaxed);
-        let hashed = match content_reader(&mut file, &archive, &graph, &record.arn) {
-            // a differing CRC-32 alone is the directory's, not the content's: the hashes decide
-            Ok(Some(mut reader)) => {
-                stream::hash_stored(&mut reader, &report, cancel).map(|(size, digests, _)| Some((size, digests)))
+        let hash = |file: &mut File| {
+            #[cfg(test)]
+            if let Some(e) = tests::failed_read() {
+                return Err(e);
             }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+            match content_reader(file, &archive, &graph, &record.arn) {
+                Ok(Some(mut reader)) => stream::hash_stored(&mut reader, &report, cancel).map(Some),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            }
         };
-        let matches = match hashed {
+        let hashed = match hash(&mut file) {
+            Err(e) if !is_damage(e.kind()) && !is_transient(&e) => hash(&mut file),
+            hashed => hashed,
+        };
+        let (matches, crc) = match hashed {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(cancelled()),
             // not damage: the check stops, the container stays open and nothing is logged
-            Err(e) if !is_damage(e.kind()) => return Err(unreadable(e.to_string())),
-            Ok(Some((size, digests))) => {
+            Err(e) if !counts_as_damage(&e, || start_reads(path)) => return Err(unreadable(e.to_string())),
+            Ok(Some((size, digests, crc))) => (
                 size == record.size
                     && digests.md5 == record.md5
                     && digests.sha1 == record.sha1
-                    && digests.sha256 == record.sha256
-            }
-            Ok(None) | Err(_) => false,
+                    && digests.sha256 == record.sha256,
+                crc,
+            ),
+            Ok(None) | Err(_) => (false, None),
         };
         if !matches {
             result.mismatches.push(record.clone());
+        } else if let Some(member) = crc {
+            // the hashes matched, so the fault is the directory's; damaged content explains its CRC-32 itself
+            result.directory_faults.push(format!("{} ({member})", record.path));
         }
         result.files += 1;
         result.bytes += record.size;
@@ -697,6 +835,28 @@ fn lock(file: &File) -> Result<()> {
     ))
 }
 
+/// Holds the writer's lock of a container file while the log alone changes (the returned handle keeps it); None when
+/// there is no file to lock. Nothing is written, so a write-protected file is locked as well.
+pub fn lock_file(path: &Path) -> Result<Option<File>> {
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .or_else(|_| File::open(path));
+    let file = match opened {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(FactumError::general(format!(
+                "The container {} cannot be opened: {e}",
+                path.display()
+            )));
+        }
+    };
+    lock(&file)?;
+    Ok(Some(file))
+}
+
 /// The writer of a volume; gone only after a failed rollback left the file in an unknown state.
 fn writer<'a>(app: &'a mut Option<Appender>, path: &Path) -> Result<&'a mut Appender> {
     app.as_mut().ok_or_else(|| {
@@ -887,11 +1047,6 @@ impl Volume {
 
     fn app(&mut self) -> Result<&mut Appender> {
         writer(&mut self.app, &self.path)
-    }
-
-    /// The bytes `information.turtle` has in the current state; what a close signs.
-    pub fn turtle_bytes(&self) -> Vec<u8> {
-        turtle::write(&self.graph, &turtle::factum_prefixes()).into_bytes()
     }
 
     /// How many times the container was closed.
@@ -1318,10 +1473,10 @@ impl Volume {
     }
 
     /// Closes the current state: its signatures at the root, and a copy of the signed state under
-    /// factum/history/<n>/. Returns n.
+    /// factum/history/<n>/, byte for byte the root `information.turtle`. Returns n.
     pub fn close(&mut self, signatures: &Signatures) -> Result<u32> {
         let n = self.history_count() + 1;
-        let turtle = self.turtle_bytes();
+        let turtle = self.member(TURTLE)?;
         let hashes = hashes_bytes(&self.uuid, &turtle);
         let mut members: Vec<(String, Vec<u8>)> =
             vec![(history_member(n, TURTLE), turtle), (history_member(n, HASHES), hashes)];
@@ -1353,7 +1508,7 @@ impl Volume {
     /// while the current state is still that close's. Existing members are never replaced.
     pub fn add_late_signatures(&mut self, n: u32, signatures: &Signatures) -> Result<()> {
         let signed = self.member(&history_member(n, TURTLE))?;
-        let current = n == self.history_count() && signed == self.turtle_bytes();
+        let current = n == self.history_count() && signed == self.member(TURTLE)?;
         let mut members = Vec::new();
         for (name, data) in signatures.members() {
             let history = history_member(n, name);
@@ -1400,6 +1555,118 @@ mod tests {
         assert!(!setup.path().exists());
         // the name can be used again
         setup.create();
+    }
+
+    thread_local! {
+        /// what the next reads of stored content fail with, as (OS error, how many times)
+        pub static FAIL_READ: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    pub fn failed_read() -> Option<io::Error> {
+        let (code, times) = FAIL_READ.get();
+        (times > 0).then(|| {
+            FAIL_READ.set((code, times - 1));
+            io::Error::from_raw_os_error(code)
+        })
+    }
+
+    fn eio() -> io::Error {
+        io::Error::from_raw_os_error(libc::EIO)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_errors_are_sorted_into_damage_and_transient() {
+        let fine = || true;
+        let gone = || false;
+        // what the content itself gives away counts at once
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(counts_as_damage(&kind.into(), gone));
+        }
+        // a read that fails while the file still reads
+        assert!(counts_as_damage(&eio(), fine));
+        assert!(counts_as_damage(&io::Error::other("anything else"), fine));
+        assert!(counts_as_damage(&io::ErrorKind::Unsupported.into(), fine));
+        // a removed drive gives EIO for all of the file
+        assert!(!counts_as_damage(&eio(), gone));
+        // these say nothing about the content, however often they come
+        for code in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EINTR,
+            libc::ENODEV,
+            libc::ENXIO,
+            libc::ETIMEDOUT,
+            libc::ESTALE,
+        ] {
+            assert!(!counts_as_damage(&io::Error::from_raw_os_error(code), fine), "{code}");
+        }
+    }
+
+    /// The result, the files, and how many of the failures were not used up.
+    fn recheck_with_failing_reads(code: i32, times: u32) -> (Result<Recheck>, Vec<FileRecord>, u32) {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let records = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1).records;
+        drop(volume);
+        FAIL_READ.set((code, times));
+        let result = recheck(
+            &setup.path(),
+            None,
+            &records,
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        );
+        (result, records, FAIL_READ.replace((0, 0)).1)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_error_that_repeats_is_damage() {
+        let (result, records, _) = recheck_with_failing_reads(libc::EIO, 2);
+        let result = result.unwrap();
+        assert_eq!(paths(&result.mismatches), [records[0].path.as_str()]);
+        assert_eq!(result.files as usize, records.len());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_error_that_goes_away_is_nothing() {
+        let (result, ..) = recheck_with_failing_reads(libc::EIO, 1);
+        assert!(result.unwrap().mismatches.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_transient_read_error_stops_the_recheck_and_decides_nothing() {
+        for code in [libc::EACCES, libc::ENODEV, libc::ENXIO] {
+            let (result, _, left) = recheck_with_failing_reads(code, 2);
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("cannot be read"), "{error}");
+            assert_eq!(left, 1, "retried: {code}");
+        }
+    }
+
+    #[test]
+    fn a_close_copies_the_stored_turtle_byte_for_byte() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let stored = format!(
+            "# by another version\n{}",
+            String::from_utf8(volume.member(TURTLE).unwrap()).unwrap()
+        );
+        let comment = volume.archive.comment.clone();
+        let app = volume.app().unwrap();
+        app.add_bytes(TURTLE, 8, stored.as_bytes()).unwrap();
+        let end = app.finish(&[], &comment).unwrap();
+        volume.archive = Archive::new(app.entries(), comment, end);
+        volume.close(&Signatures::default()).unwrap();
+        assert_eq!(volume.member(&history_member(1, TURTLE)).unwrap(), stored.as_bytes());
     }
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -1513,7 +1780,7 @@ mod tests {
         let n = volume.close(&Signatures::default()).unwrap();
         assert_eq!(n, 1);
         let history1 = volume.member("factum/history/1/information.turtle").unwrap();
-        assert_eq!(history1, volume.turtle_bytes());
+        assert_eq!(history1, volume.member(TURTLE).unwrap());
         let listed1: Vec<CdEntry> = volume.archive().entries.clone();
         // reopen (nothing in the file changes) and add more
         let second = add(

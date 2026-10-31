@@ -1439,7 +1439,7 @@ mod verify {
             )
             .unwrap();
         volume.finalize_add(&staged, 1).unwrap();
-        let (signature, chain) = sign(&volume.turtle_bytes());
+        let (signature, chain) = sign(&volume.member(TURTLE).unwrap());
         let signatures = Signatures {
             gpg: None,
             x509: Some((signature, chain)),
@@ -2440,7 +2440,7 @@ fn damaged_close_logs_and_writes_nothing() {
     let (id, recheck) = damaged(&s);
     let length = std::fs::metadata(s.container_path()).unwrap().len();
     let factum = s.f.factum();
-    let entry = factum.close_container_damaged(id, &recheck.mismatches).unwrap();
+    let entry = factum.close_container_damaged(id, &recheck.mismatches, &[]).unwrap();
     let event = &s.events("container_closed")[0];
     assert_eq!(event["damaged"], serde_json::json!([recheck.mismatches[0].path]));
     assert!(event.get("signatures").is_none());
@@ -2462,7 +2462,7 @@ fn reopen_after_damaged_close_rechecks_again() {
     let s = Setup::new();
     let (id, recheck) = damaged(&s);
     let factum = s.f.factum();
-    factum.close_container_damaged(id, &recheck.mismatches).unwrap();
+    factum.close_container_damaged(id, &recheck.mismatches, &[]).unwrap();
     factum.reopen_container(id).unwrap();
     let input = factum.recheck_input(id).unwrap();
     assert!(input.records.iter().any(|r| r.arn == recheck.mismatches[0].arn));
@@ -2630,15 +2630,20 @@ fn add_again_needs_a_recorded_source() {
 
 /// Adds `subject predicate <object>` to the container's current state, as a forger with write access would.
 fn add_triple(path: &Path, subject: &str, predicate: &str, object: &str) {
+    use factum::container::turtle::{self, Term};
+    let mut graph = turtle::parse(&String::from_utf8(member(path, TURTLE).unwrap()).unwrap()).unwrap();
+    graph.add(subject, predicate, Term::Iri(object.to_string()));
+    write_turtle(path, &turtle::write(&graph, &turtle::factum_prefixes()));
+}
+
+/// Writes `text` as the container's new root metadata, with matching hashes and no signatures.
+fn write_turtle(path: &Path, text: &str) {
     use factum::container::AFF4_NS;
     use factum::container::turtle::{self, Term};
     use factum::container::zip64::{Appender, read_archive};
     let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
     let len = file.metadata().unwrap().len();
     let archive = read_archive(&mut file, len).unwrap();
-    let mut graph = turtle::parse(&String::from_utf8(member(path, TURTLE).unwrap()).unwrap()).unwrap();
-    graph.add(subject, predicate, Term::Iri(object.to_string()));
-    let text = turtle::write(&graph, &turtle::factum_prefixes());
     let uuid = String::from_utf8(member(path, "container.description").unwrap()).unwrap();
     let mut hashes = turtle::Graph::default();
     for (name, value) in [
@@ -2667,7 +2672,7 @@ fn verify_after_damaged_close_names_it() {
     let s = Setup::new();
     let (id, recheck) = damaged(&s);
     let factum = s.f.factum();
-    let entry = factum.close_container_damaged(id, &recheck.mismatches).unwrap();
+    let entry = factum.close_container_damaged(id, &recheck.mismatches, &[]).unwrap();
     let report = factum
         .verify_container_file(
             &s.container_path(),
@@ -2728,4 +2733,311 @@ fn replacement_with_other_content_fails_verification() {
         "{:?}",
         report.findings
     );
+}
+
+/// Changes the CRC-32 the directory has for one member; its content stays as it was.
+fn flip_directory_crc(path: &Path, entry: &factum::container::zip64::CdEntry) {
+    use std::io::{Seek, SeekFrom, Write};
+    let bytes = std::fs::read(path).unwrap();
+    // the name as the directory has it: followed by the ZIP64 extra
+    let name = [entry.name.as_slice(), &[1, 0, 24, 0]].concat();
+    let at = bytes.windows(name.len()).rposition(|w| w == name).unwrap() as u64;
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(at - 46 + 16)).unwrap();
+    file.write_all(&(entry.crc32 ^ 1).to_le_bytes()).unwrap();
+}
+
+fn directory_entry(
+    path: &Path,
+    find: impl Fn(&factum::container::zip64::Archive) -> Option<&factum::container::zip64::CdEntry>,
+) -> factum::container::zip64::CdEntry {
+    let mut file = std::fs::File::open(path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = factum::container::zip64::read_archive(&mut file, len).unwrap();
+    find(&archive).unwrap().clone()
+}
+
+#[test]
+fn close_refuses_a_recheck_of_another_state() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let recheck = factum.recheck_container(id).unwrap();
+    // another process adds a file after the re-check
+    s.add(id, &[s.file("b.txt")]);
+    let error = factum.close_container_with(id, &factum.gpgsm(), &recheck).unwrap_err();
+    assert!(
+        error.to_string().contains("changed since the re-check; re-check again"),
+        "{error}"
+    );
+    assert!(s.events("container_closed").is_empty());
+    // nothing was re-checked at all
+    let error = factum
+        .close_container_with(id, &factum.gpgsm(), &Default::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("re-check again"), "{error}");
+    // nothing changed: a re-check stays good, however long ago it was
+    let recheck = factum.recheck_container(id).unwrap();
+    factum.close_container_with(id, &factum.gpgsm(), &recheck).unwrap();
+}
+
+#[test]
+fn close_refuses_a_recheck_once_a_late_signature_moved_the_end() {
+    let s = Setup::with_signer(FakeSigner::new(false));
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    factum.close_container(id).unwrap();
+    factum.reopen_container(id).unwrap();
+    let recheck = factum.recheck_container(id).unwrap();
+    s.f.signer.set_active(true);
+    assert_eq!(factum.sign_unsigned_containers(s.case_id).unwrap().0, 1);
+    let error = factum.close_container_with(id, &factum.gpgsm(), &recheck).unwrap_err();
+    assert!(error.to_string().contains("re-check again"), "{error}");
+}
+
+#[test]
+fn a_recheck_before_a_crashed_addition_still_closes() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let recheck = factum.recheck_container(id).unwrap();
+    // written, but the process died before its log entry: the state the re-check read is still what is closed
+    let (mut volume, _) = Volume::open(&s.container_path(), None).unwrap();
+    let staged = volume
+        .stage_add(
+            &[s.file("b.txt")],
+            &s.options(),
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    volume.finalize_add(&staged, 999_999).unwrap();
+    drop(volume);
+    factum.close_container_with(id, &factum.gpgsm(), &recheck).unwrap();
+}
+
+#[test]
+fn an_addition_is_refused_once_the_container_was_closed() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let mut volume = factum.open_container_for_add(id).unwrap();
+    let staged = volume
+        .stage_add(
+            &[s.file("b.txt")],
+            &s.options(),
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    // the file went away while it was being added to, and was closed without it
+    let aside = s.f.path().join("aside");
+    std::fs::rename(s.container_path(), &aside).unwrap();
+    factum.close_container_without_file(id).unwrap();
+    std::fs::rename(&aside, s.container_path()).unwrap();
+    let error = factum.commit_container_add(id, &mut volume, staged).unwrap_err();
+    assert!(error.to_string().contains("closed meanwhile"), "{error}");
+    drop(volume);
+    assert_eq!(s.events("container_files_added").len(), 1);
+    assert_eq!(factum.container(id).unwrap().summary.file_count, 1);
+    assert!(
+        factum
+            .compare_with_log(id, &Volume::open(&s.container_path(), None).unwrap().0)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn log_only_steps_wait_for_no_writer_and_need_no_file() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let record = factum.container(id).unwrap().adds[0].files[0].clone();
+    let writer = Volume::open(&s.container_path(), None).unwrap();
+    let error = factum
+        .close_container_damaged(id, std::slice::from_ref(&record), &[])
+        .unwrap_err();
+    assert!(error.to_string().contains("in use"), "{error}");
+    assert!(s.events("container_closed").is_empty());
+    drop(writer);
+    factum
+        .close_container_damaged(id, std::slice::from_ref(&record), &[])
+        .unwrap();
+
+    let writer = Volume::open(&s.container_path(), None).unwrap();
+    let error = factum.reopen_container(id).unwrap_err();
+    assert!(error.to_string().contains("in use"), "{error}");
+    assert!(s.events("container_reopened").is_empty());
+    drop(writer);
+    // without a file there is nothing to lock
+    let aside = s.f.path().join("aside");
+    std::fs::rename(s.container_path(), &aside).unwrap();
+    factum.reopen_container(id).unwrap();
+    factum.close_container_without_file(id).unwrap();
+}
+
+#[test]
+fn a_close_signs_the_stored_bytes() {
+    use factum::verifier::Level;
+    let s = Setup::with_signer(FakeSigner::new(false));
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let path = s.container_path();
+    // what an older serializer left: the same graph in other bytes
+    let stored = String::from_utf8(member(&path, TURTLE).unwrap()).unwrap();
+    write_turtle(&path, &format!("# written by an older factum\n{stored}"));
+    let stored = member(&path, TURTLE).unwrap();
+    let factum = s.f.factum();
+    let close = factum.close_container(id).unwrap();
+    assert_eq!(member(&path, TURTLE).unwrap(), stored);
+    assert_eq!(member(&path, &history_member(1, TURTLE)).unwrap(), stored);
+    assert_eq!(close.turtle_sha256, hex::encode(sha2::Sha256::digest(&stored)));
+    // the state is the current one, so a late signature goes to the root as well
+    s.f.signer.set_active(true);
+    assert_eq!(factum.sign_unsigned_containers(s.case_id).unwrap().0, 1);
+    assert!(member(&path, SIG_GPG).is_some());
+    let report = factum
+        .verify_container_file(&path, &factum.gpgsm(), &|_, _| {}, &AtomicBool::new(false))
+        .unwrap();
+    assert_eq!(report.states.len(), 1, "{:?}", report.states);
+    assert!(report.states[0].current);
+    assert!(
+        !report.findings.iter().any(|f| f.level == Level::Fail),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn a_directory_fault_of_the_metadata_can_only_be_closed_as_damaged() {
+    for member_name in ["version.txt", "container.description", TURTLE, HASHES] {
+        let s = Setup::new();
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let path = s.container_path();
+        flip_directory_crc(&path, &directory_entry(&path, |archive| archive.get(member_name)));
+        let length = std::fs::metadata(&path).unwrap().len();
+        let factum = s.f.factum();
+
+        // neither appended to
+        if member_name != HASHES {
+            let error = factum.open_container_for_add(id).err().unwrap();
+            assert!(error.is(ErrorKind::ContainerCrc), "{error}");
+        }
+        // nor signed
+        let recheck = factum.recheck_container(id).unwrap();
+        assert_eq!(recheck.directory_faults, [member_name]);
+        assert!(recheck.mismatches.is_empty());
+        let error = factum.close_container_with(id, &factum.gpgsm(), &recheck).unwrap_err();
+        assert!(error.is(ErrorKind::ContainerCrc), "{error}");
+        assert!(error.to_string().contains(member_name), "{error}");
+        assert!(error.to_string().contains("closed as damaged"), "{error}");
+        assert!(s.events("container_closed").is_empty());
+
+        // the way out: nothing written, and the log says what the reason was
+        let entry = factum
+            .close_container_damaged(id, &[], &recheck.directory_faults)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+        let event = &s.events("container_closed")[0];
+        assert_eq!(event["damaged"], serde_json::json!([]));
+        assert_eq!(event["directory_fault"], serde_json::json!([member_name]));
+        let text = s.entry_text(entry);
+        assert!(text.contains("1 directory fault, no file found damaged"), "{text}");
+        assert!(!text.contains("match"), "{text}");
+        let detail = factum.container(id).unwrap();
+        assert!(detail.summary.damaged && !detail.summary.open && !detail.summary.signed);
+        assert_eq!(detail.damaged_closes[0].3, [member_name]);
+        assert_eq!(factum.list_containers(s.case_id).unwrap()[0], detail.summary);
+        // the case can be archived now
+        factum.reopen_container(id).unwrap();
+        factum
+            .close_container_damaged(id, &[], &recheck.directory_faults)
+            .unwrap();
+        factum.archive_case(s.case_id).unwrap();
+    }
+}
+
+#[test]
+fn metadata_that_differs_from_its_crc_and_cannot_be_read_is_a_directory_fault() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let path = s.container_path();
+    write_turtle(&path, "@this is no turtle");
+    flip_directory_crc(&path, &directory_entry(&path, |archive| archive.get(TURTLE)));
+    let recheck = s.f.factum().recheck_container(id).unwrap();
+    assert_eq!(recheck.directory_faults, [TURTLE]);
+    assert_eq!(recheck.files, 0);
+    assert!(
+        s.f.factum()
+            .close_container_damaged(id, &[], &recheck.directory_faults)
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_content_crc_fault_stops_the_signature_and_names_the_member() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt"), s.file("b.txt")]);
+    let arn = first_arn(&s, id);
+    let path = s.container_path();
+    let entry = directory_entry(&path, |archive| archive.get_arn(&arn));
+    flip_directory_crc(&path, &entry);
+    let factum = s.f.factum();
+    // an addition does not read the content, so it does not stop for this
+    drop(factum.open_container_for_add(id).unwrap());
+    let recheck = factum.recheck_container(id).unwrap();
+    assert!(recheck.mismatches.is_empty(), "the hashes matched");
+    assert_eq!(recheck.directory_faults.len(), 1);
+    let member = entry.name_lossy().to_string();
+    assert!(
+        recheck.directory_faults[0].contains(&member),
+        "{:?}",
+        recheck.directory_faults
+    );
+    let error = factum.close_container_with(id, &factum.gpgsm(), &recheck).unwrap_err();
+    assert!(error.is(ErrorKind::ContainerCrc), "{error}");
+    assert!(error.to_string().contains(&member), "{error}");
+    assert!(s.events("container_closed").is_empty());
+    let entry = factum
+        .close_container_damaged(id, &[], &recheck.directory_faults)
+        .unwrap();
+    assert!(
+        s.entry_text(entry).contains("no file found damaged"),
+        "{}",
+        s.entry_text(entry)
+    );
+}
+
+#[test]
+fn content_that_differs_from_its_hashes_is_damage_not_a_directory_fault() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    assert!(recheck.directory_faults.is_empty(), "{:?}", recheck.directory_faults);
+    let entry =
+        s.f.factum()
+            .close_container_damaged(id, &recheck.mismatches, &[])
+            .unwrap();
+    assert!(s.events("container_closed")[0].get("directory_fault").is_none());
+    assert!(
+        s.entry_text(entry).contains("1 file doesn't match"),
+        "{}",
+        s.entry_text(entry)
+    );
+}
+
+#[test]
+fn a_close_as_damaged_needs_a_reason() {
+    let s = Setup::new();
+    let id = s.create();
+    assert!(s.f.factum().close_container_damaged(id, &[], &[]).is_err());
+    assert!(s.events("container_closed").is_empty());
 }
