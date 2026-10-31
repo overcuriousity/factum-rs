@@ -1808,7 +1808,27 @@ mod script {
     }
 
     #[test]
-    fn script_warns_about_a_long_interrupted_tail() {
+    fn script_warns_about_an_interrupted_addition() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        s.interrupted_add();
+        let Some((code, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            output
+                .lines()
+                .any(|l| l.starts_with('\u{26a0}') && l.contains("bytes after the last complete state")),
+            "{output}"
+        );
+        assert!(output.contains("[trailing_data]"), "{output}");
+        assert!(output.contains("1 file(s) checked"), "{output}");
+    }
+
+    #[test]
+    fn script_fails_bytes_no_addition_leaves() {
         let s = Setup::with_signer(FakeSigner::new(false));
         let id = s.create();
         s.add(id, &[s.file("a.txt")]);
@@ -1818,11 +1838,13 @@ mod script {
         let Some((code, output)) = run(&s.container_path(), &[], None) else {
             return;
         };
-        assert_eq!(code, 0, "{output}");
+        assert_eq!(code, 1, "{output}");
         assert!(
-            output.contains("\u{26a0} 100000 bytes after the last complete state"),
+            output.contains("\u{2717} 100000 bytes after the last complete state"),
             "{output}"
         );
+        assert!(output.contains("[trailing_data]"), "{output}");
+        // the last complete state is still checked
         assert!(output.contains("1 file(s) checked"), "{output}");
     }
 
