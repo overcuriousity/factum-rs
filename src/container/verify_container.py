@@ -168,7 +168,7 @@ def parse_turtle(text):
         match = PREFIX.match(line)
         if match:
             prefixes[match.group(1)] = iri_value(match.group(2))
-        elif line.startswith("<") and line.endswith(">"):
+        elif line.startswith("<") and line.endswith(">") and subject is None:
             subject = iri_value(line[1:-1])
             graph.setdefault(subject, [])
         elif line.startswith("    ") and subject is not None and line[-2:] in (" ;", " ."):
@@ -180,8 +180,12 @@ def parse_turtle(text):
                 graph[subject].append((predicate, unescape(literal.group(1)), False, datatype))
             else:
                 graph[subject].append((predicate, expand(obj), True, None))
+            if line.endswith(" ."):
+                subject = None
         else:
             raise ValueError("not factum's Turtle layout: " + line[:60])
+    if subject is not None:
+        raise ValueError("not factum's Turtle layout: the last statement does not end")
     return graph
 
 

@@ -2728,6 +2728,26 @@ mod script {
                 }),
             ),
             (
+                "a statement that does not end",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(|p| {
+                    let text = turtle_text(p);
+                    let last = text.rfind(" .\n").unwrap();
+                    write_turtle(p, &format!("{} ;\n", &text[..last]));
+                }),
+            ),
+            (
+                "a statement that runs into the next subject",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(|p| {
+                    let text = turtle_text(p);
+                    let first = text.find(" .\n\n<").unwrap();
+                    write_turtle(p, &format!("{} ;{}", &text[..first], &text[first + 2..]));
+                }),
+            ),
+            (
                 "a stray bracket in a hashes file",
                 Level::Fail,
                 "turtle_hash",
