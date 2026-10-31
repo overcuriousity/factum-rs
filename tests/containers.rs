@@ -3177,6 +3177,22 @@ mod script {
         assert!(!output.contains("never closed"), "{output}");
     }
 
+    /// Only the subject that names the volume differs: no file, hash or close has any other reason to fail.
+    #[test]
+    fn both_verifiers_fail_metadata_of_another_volume() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let path = s.container_path();
+        let volume = String::from_utf8(member(&path, "container.description").unwrap()).unwrap();
+        let subject = format!("<{volume}>\n");
+        let other = "<aff4://11111111-2222-4333-8444-555555555555>\n";
+        write_turtle(&path, &turtle_text(&path).replacen(&subject, other, 1));
+        let signer = FakeSigner::new(false);
+        let verifiers: (&dyn factum::signer::Signer, &Gpgsm) = (&signer, &Gpgsm::unavailable());
+        assert_verdict("another volume", &path, Level::Fail, "history", verifiers, &[], None);
+    }
+
     #[test]
     fn a_forged_tool_line_changes_nothing() {
         let s = Setup::with_signer(FakeSigner::new(false));
