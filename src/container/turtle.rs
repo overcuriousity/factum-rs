@@ -175,6 +175,29 @@ fn escape(value: &str) -> String {
     out
 }
 
+/// What the Turtle grammar does not allow between `<` and `>`, written or escaped.
+fn not_in_iri(c: char) -> bool {
+    c <= ' ' || "<>\"{}|^`\\".contains(c)
+}
+
+/// `<iri>`. What an IRI cannot hold is %-encoded, so whatever an IRI holds, it stays one term on one line; an IRI
+/// that can be written as it is stays as it is.
+fn iri_ref(iri: &str) -> String {
+    let mut out = String::with_capacity(iri.len() + 2);
+    out.push('<');
+    for c in iri.chars() {
+        if not_in_iri(c) || c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('>');
+    out
+}
+
 /// `prefix:local` when a prefix covers the IRI and the local part is plain, else `<iri>`.
 fn compact(iri: &str, prefixes: &[(&str, &str)]) -> String {
     for (prefix, namespace) in prefixes {
@@ -185,14 +208,14 @@ fn compact(iri: &str, prefixes: &[(&str, &str)]) -> String {
             return format!("{prefix}:{local}");
         }
     }
-    format!("<{iri}>")
+    iri_ref(iri)
 }
 
 /// Writes the graph: the prefixes, then each subject (in the order they first appear) with one triple per line.
 pub fn write(graph: &Graph, prefixes: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (prefix, namespace) in prefixes {
-        let _ = writeln!(out, "@prefix {prefix}: <{namespace}> .");
+        let _ = writeln!(out, "@prefix {prefix}: {} .", iri_ref(namespace));
     }
     let mut order: Vec<&str> = Vec::new();
     let mut by_subject: HashMap<&str, Vec<&Triple>> = HashMap::new();
@@ -205,7 +228,7 @@ pub fn write(graph: &Graph, prefixes: &[(&str, &str)]) -> String {
     }
     for subject in order {
         let triples = &by_subject[subject];
-        let _ = write!(out, "\n<{subject}>\n");
+        let _ = write!(out, "\n{}\n", iri_ref(subject));
         for (index, triple) in triples.iter().enumerate() {
             let predicate = if triple.predicate == RDF_TYPE {
                 "a".to_string()
@@ -240,6 +263,14 @@ enum Token {
     Directive(String),
 }
 
+/// The character of a `\u` or `\U` escape whose digits start at `at`, and where they end.
+fn uchar(chars: &[char], at: usize, escaped: char) -> Result<(char, usize), String> {
+    let len = if escaped == 'u' { 4 } else { 8 };
+    let hex: String = chars.get(at..at + len).ok_or("bad \\u escape")?.iter().collect();
+    let code = u32::from_str_radix(&hex, 16).map_err(|_| "bad \\u escape")?;
+    Ok((char::from_u32(code).ok_or("bad \\u escape")?, at + len))
+}
+
 fn tokenize(text: &str) -> Result<Vec<Token>, String> {
     let chars: Vec<char> = text.chars().collect();
     let mut tokens = Vec::new();
@@ -254,11 +285,25 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                 at += 1;
             }
         } else if c == '<' {
-            let end = (at + 1..chars.len())
-                .find(|&i| chars[i] == '>')
-                .ok_or("unterminated IRI")?;
-            tokens.push(Token::Iri(chars[at + 1..end].iter().collect()));
-            at = end + 1;
+            at += 1;
+            let mut iri = String::new();
+            loop {
+                let mut ch = *chars.get(at).ok_or("unterminated IRI")?;
+                at += 1;
+                if ch == '>' {
+                    break;
+                }
+                if ch == '\\' {
+                    let escaped = chars.get(at).copied().filter(|e| matches!(e, 'u' | 'U'));
+                    let escaped = escaped.ok_or("an IRI allows only \\u and \\U escapes")?;
+                    (ch, at) = uchar(&chars, at + 1, escaped)?;
+                }
+                if not_in_iri(ch) {
+                    return Err(format!("{ch:?} is not allowed in an IRI"));
+                }
+                iri.push(ch);
+            }
+            tokens.push(Token::Iri(iri));
         } else if c == '"' || c == '\'' {
             let long = chars.get(at + 1) == Some(&c) && chars.get(at + 2) == Some(&c);
             at += if long { 3 } else { 1 };
@@ -289,11 +334,9 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                         'f' => value.push('\u{c}'),
                         '"' | '\'' | '\\' => value.push(escaped),
                         'u' | 'U' => {
-                            let len = if escaped == 'u' { 4 } else { 8 };
-                            let hex: String = chars.get(at..at + len).ok_or("bad \\u escape")?.iter().collect();
-                            let code = u32::from_str_radix(&hex, 16).map_err(|_| "bad \\u escape")?;
-                            value.push(char::from_u32(code).ok_or("bad \\u escape")?);
-                            at += len;
+                            let (decoded, end) = uchar(&chars, at, escaped)?;
+                            value.push(decoded);
+                            at = end;
                         }
                         other => return Err(format!("unknown escape \\{other}")),
                     }
@@ -577,6 +620,78 @@ mod tests {
     fn round_trip_preserves_triples() {
         let graph = sample();
         assert_eq!(parse(&write(&graph, &PREFIXES)).unwrap(), graph);
+    }
+
+    #[test]
+    fn the_iris_factum_writes_stay_as_they_are() {
+        let mut graph = sample();
+        let iris = [
+            "aff4://28617d0f-2ca1-47c0-82cb-4a8374029805/information.turtle",
+            "https://www.ietf.org/rfc/rfc1950.txt",
+            "https://factum.invalid/Schema/2026/#sourcePathRaw",
+            "aff4://a/b%20c?d=e&f#g",
+            "aff4://ü/ネコ",
+        ];
+        for iri in iris {
+            graph.add(iri, iri, Term::Iri(iri.into()));
+        }
+        let text = write(&graph, &PREFIXES);
+        for iri in iris {
+            assert!(text.contains(&format!("<{iri}>")), "{text}");
+        }
+        assert_eq!(parse(&text).unwrap(), graph);
+    }
+
+    #[test]
+    fn what_an_iri_cannot_hold_is_encoded() {
+        let mut graph = Graph::default();
+        graph.add(
+            "aff4://s a<b>\"{c}|^`\\\n\u{7f}\u{85}\u{2028}",
+            &format!("{AFF4_NS}p q"),
+            Term::Iri("aff4://o>\n<aff4://forged> a <x".into()),
+        );
+        let text = write(&graph, &PREFIXES);
+        let body: Vec<&str> = text.lines().skip_while(|l| !l.starts_with('<')).collect();
+        assert_eq!(body.len(), 2, "{text}");
+        assert_eq!(
+            body[0],
+            "<aff4://s%20a%3Cb%3E%22%7Bc%7D%7C%5E%60%5C%0A%7F%C2%85%E2%80%A8>"
+        );
+        assert_eq!(
+            body[1],
+            "    <http://aff4.org/Schema#p%20q> <aff4://o%3E%0A%3Caff4://forged%3E%20a%20%3Cx> ."
+        );
+        let graph = parse(&text).unwrap();
+        assert_eq!(graph.triples().len(), 1);
+        assert_eq!(
+            graph.triples()[0].object,
+            Term::Iri("aff4://o%3E%0A%3Caff4://forged%3E%20a%20%3Cx".into())
+        );
+    }
+
+    #[test]
+    fn escapes_in_iris_are_decoded() {
+        let graph = parse("<aff4://\\u0061\\U00000062> <http://p/\\u00FC> <aff4://o> .").unwrap();
+        assert_eq!(graph.triples()[0].subject, "aff4://ab");
+        assert_eq!(graph.triples()[0].predicate, "http://p/ü");
+    }
+
+    #[test]
+    fn what_no_iri_may_hold_is_refused_written_or_escaped() {
+        for iri in [
+            "<aff4://a b>",
+            "<aff4://a\nb>",
+            "<aff4://a{b>",
+            "<aff4://a\\u0020b>",
+            "<aff4://a\\u003Eb>",
+            "<aff4://a\\u005Cb>",
+            "<aff4://a\\nb>",
+            "<aff4://a\\u00>",
+            "<aff4://a\\uD800b>",
+        ] {
+            assert!(parse(&format!("{iri} <http://p> <aff4://o> .")).is_err(), "{iri}");
+        }
+        assert!(parse("<aff4://a").unwrap_err().contains("unterminated"));
     }
 
     #[test]
