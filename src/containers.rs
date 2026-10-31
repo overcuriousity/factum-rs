@@ -1528,11 +1528,61 @@ impl Factum<'_> {
         progress: &dyn Fn(u64, u64),
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::container::verify::ContainerReport> {
-        let mut report = crate::container::verify::verify_file(path, self.signer, gpgsm, progress, cancel)?;
-        let Some(uuid) = report.uuid.clone() else {
-            return Ok(report);
+        self.verify_expected_container(path, None, gpgsm, progress, cancel)
+    }
+
+    /// The containers of this log whose recorded place is this file.
+    fn containers_at(&self, path: &Path) -> Result<Vec<i64>> {
+        let Ok(file) = std::fs::canonicalize(path) else {
+            return Ok(Vec::new());
         };
-        let Some(id) = self.find_container_by_uuid(&uuid)? else {
+        let mut statement = self
+            .db
+            .conn
+            .prepare("SELECT key, value FROM settings WHERE key LIKE 'container_path:%'")?;
+        let places = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut found = Vec::new();
+        for (key, place) in places {
+            if std::fs::canonicalize(&place).is_ok_and(|place| place == file)
+                && let Some(id) = self.find_container_by_uuid(key.trim_start_matches("container_path:"))?
+            {
+                found.push(id);
+            }
+        }
+        Ok(found)
+    }
+
+    /// `verify_container_file` for a file that has to be a container of this log: the one asked for, or the one
+    /// whose place it is. Otherwise what a file says it is decides, and a file could name no container at all, or
+    /// another, to keep the log out of it. A file nothing is expected of may be any container.
+    pub fn verify_expected_container(
+        &self,
+        path: &Path,
+        expected: Option<i64>,
+        gpgsm: &Gpgsm,
+        progress: &dyn Fn(u64, u64),
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<crate::container::verify::ContainerReport> {
+        let mut report = crate::container::verify::verify_file(path, self.signer, gpgsm, progress, cancel)?;
+        let mut expected: Vec<i64> = expected.into_iter().collect();
+        expected.extend(self.containers_at(path)?);
+        let id = match &report.uuid {
+            Some(uuid) => self.find_container_by_uuid(uuid)?,
+            None => None,
+        };
+        if !expected.is_empty() && !id.is_some_and(|id| expected.contains(&id)) {
+            let named = report.uuid.as_deref().unwrap_or("no container");
+            let logged = self.container(expected[0])?.summary.uuid;
+            report.finding(
+                Level::Fail,
+                "log_mismatch",
+                format!("This file should be container {logged} of the case log, but it names {named}."),
+            );
+            return Ok(report);
+        }
+        let (Some(id), Some(uuid)) = (id, report.uuid.clone()) else {
             return Ok(report);
         };
         let Some(graph) = report.graph.clone() else {

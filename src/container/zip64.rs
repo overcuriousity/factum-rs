@@ -740,9 +740,17 @@ impl Read for CrcChecked<'_> {
 /// cannot make factum hold more, whatever its directory claims or its data inflates to.
 pub const MAX_IN_MEMORY: u64 = 1 << 30;
 
-/// The most a verification holds of a container's metadata, all its states and their graphs together: a few MiB of
-/// file can inflate to many members of MAX_IN_MEMORY.
+/// The most a verification holds of a container's metadata, all its states and their graphs together, at least: a few
+/// MiB of file can inflate to many members of MAX_IN_MEMORY.
 pub const MAX_TOTAL_IN_MEMORY: u64 = 4 << 30;
+
+/// ... and at most this much for each byte of metadata the file stores: what a real large container takes, and little
+/// more than nothing to one whose metadata is mostly air.
+pub const MAX_METADATA_PER_STORED_BYTE: u64 = 64;
+
+/// The most of a signature or a certificate chain that is looked at: their size has no reason to be more, and tools
+/// that take them apart make many times their size of it.
+pub const MAX_SIGNATURE_MEMBER: u64 = 4 << 20;
 
 /// A member's content in memory; refused when it is larger than MAX_IN_MEMORY.
 pub fn member_bytes(file: &mut File, entry: &CdEntry) -> io::Result<Vec<u8>> {

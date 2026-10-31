@@ -1140,12 +1140,17 @@ impl FactumApp {
     }
 
     /// Verifies a container file in the background; the result opens in a window.
-    fn verify_container_file(&mut self, path: PathBuf) {
-        self.start_container_verification(path, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    fn verify_container_file(&mut self, path: PathBuf, expected: Option<i64>) {
+        self.start_container_verification(path, expected, Arc::new(std::sync::atomic::AtomicBool::new(false)));
     }
 
-    /// `cancel` stops it (the progress dialog's Cancel sets it).
-    fn start_container_verification(&mut self, path: PathBuf, cancel: Arc<std::sync::atomic::AtomicBool>) {
+    /// `expected` is the container the file has to be; `cancel` stops it (the progress dialog's Cancel sets it).
+    fn start_container_verification(
+        &mut self,
+        path: PathBuf,
+        expected: Option<i64>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) {
         if self
             .container_verify_job
             .as_ref()
@@ -1155,8 +1160,14 @@ impl FactumApp {
             return;
         }
         let ctx = self.egui_ctx.clone();
-        let (worker, progress) =
-            workers::verify_container(&ctx, self.db.path.clone(), self.signer.gpg_home(), path, cancel.clone());
+        let (worker, progress) = workers::verify_container(
+            &ctx,
+            self.db.path.clone(),
+            self.signer.gpg_home(),
+            path,
+            expected,
+            cancel.clone(),
+        );
         self.container_verify_job = Some(ContainerVerifyJob {
             worker,
             progress,
@@ -1469,7 +1480,7 @@ impl FactumApp {
             }
             ContainerAction::Verify(id) => {
                 if let Some(path) = summary(self, id).and_then(|s| s.path) {
-                    self.verify_container_file(path);
+                    self.verify_container_file(path, Some(id));
                 }
             }
         }
@@ -2679,7 +2690,7 @@ impl FactumApp {
                 .add_filter("AFF4-L container", &["aff4l", "aff4"])
                 .pick_file()
         {
-            self.verify_container_file(path);
+            self.verify_container_file(path, None);
         }
         if ui
             .add_enabled(case_id.is_some(), egui::Button::new("Seal Now"))

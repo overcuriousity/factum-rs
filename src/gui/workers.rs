@@ -195,6 +195,7 @@ pub fn verify_container(
     db_path: PathBuf,
     gpg_home: Option<PathBuf>,
     path: PathBuf,
+    expected: Option<i64>,
     cancel: Arc<AtomicBool>,
 ) -> (Worker<ContainerVerifyResult>, Arc<Progress>) {
     let progress = Arc::new(Progress {
@@ -214,7 +215,7 @@ pub fn verify_container(
             repaint.request_repaint();
         };
         factum
-            .verify_container_file(&path, &gpgsm, &report_progress, &cancel)
+            .verify_expected_container(&path, expected, &gpgsm, &report_progress, &cancel)
             .map_err(|e| e.to_string())
     });
     (worker, progress)

@@ -2193,11 +2193,27 @@ fn verify_container_can_be_cancelled() {
     let (fixture, _, path) = Fixture::with_container();
     let mut harness = fixture.harness();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    harness.state_mut().start_container_verification(path, cancel);
+    harness.state_mut().start_container_verification(path, None, cancel);
     run_until(&mut harness, |h| h.state().container_verify_job.is_none());
     harness.run_ok();
     assert!(harness.state().container_verify_windows.is_empty());
     assert!(harness.query_by_label("Verification cancelled.").is_some());
+}
+
+/// The Verify action of a container says which it is: what the file then says of itself decides nothing.
+#[test]
+fn verify_of_a_container_expects_that_container() {
+    let (fixture, id, _) = Fixture::with_container();
+    let other = fixture._dir.path().join("elsewhere.aff4l");
+    std::fs::write(&other, vec![0u8; 5000]).unwrap();
+    let mut harness = fixture.harness();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    harness
+        .state_mut()
+        .start_container_verification(other, Some(id), cancel);
+    run_until(&mut harness, |h| !h.state().container_verify_windows.is_empty());
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("should be container").is_some());
 }
 
 #[test]

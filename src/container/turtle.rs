@@ -276,7 +276,7 @@ fn uchar(text: &str, at: usize, escaped: char) -> Result<(char, usize), String> 
 
 /// What a token costs in memory until the graph is built, the graph's share included, roughly.
 const TOKEN_COST: u64 = 128;
-const TOO_MUCH: &str = "more metadata than fits the memory set aside for it";
+pub const TOO_MUCH: &str = "more metadata than fits the memory set aside for it";
 
 /// `at` walks the text by bytes and stays on character boundaries: what delimits a token is ASCII, which is never a
 /// part of another character.
