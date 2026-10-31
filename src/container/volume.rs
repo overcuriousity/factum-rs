@@ -571,10 +571,14 @@ fn mount_triples(graph: &mut Graph, arn: &str, mount: &Mount) {
     if !mount.mount_point.is_empty() {
         graph.add(arn, &factum("mountPoint"), plain(&mount.mount_point));
     }
+    if let Some(raw) = &mount.mount_point_raw {
+        graph.add(arn, &factum("mountPointRaw"), typed(raw, "base64Binary"));
+    }
     for (property, value) in [
         ("device", &mount.device),
         ("fileSystem", &mount.fs_type),
         ("mountOptions", &mount.options),
+        ("superOptions", &mount.super_options),
         ("image", &mount.image),
         ("volumeSerial", &mount.volume_serial),
         ("volumeLabel", &mount.volume_label),
