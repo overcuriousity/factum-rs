@@ -24,3 +24,8 @@ examiner's public key first (gpg --import). Or add --use-carried-key: the script
 carries (information.turtle.pubkey.asc) in a temporary keyring and prints its fingerprint; compare it with one you
 received separately.
 The script prints one line per check (✓ passed, ⚠ warning, ✗ failed) and exits with 0 only if nothing failed.
+
+The script and this README are not signed: whoever could change the container could change them too, and a script
+changed that way can say anything. Run a copy you trust, such as the one from your own installation of factum, or
+compare the SHA-256 the script prints when it starts with what factum --version prints on a machine you trust, or with
+the release notes of that version. Neither needs a network.

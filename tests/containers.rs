@@ -1205,6 +1205,99 @@ mod verify {
         assert_eq!(report.states.len(), 1);
     }
 
+    fn log_mismatch(report: &ContainerReport) -> bool {
+        report
+            .findings
+            .iter()
+            .any(|f| f.level == Level::Fail && f.code == "log_mismatch")
+    }
+
+    /// What a file says it is cannot keep it from the log at the place the log has for it.
+    #[test]
+    fn at_its_logged_place_a_file_cannot_name_itself_out_of_the_log() {
+        let other: &[u8] = b"aff4://11111111-2222-4333-8444-555555555555";
+        for description in [other, b""] {
+            let s = Setup::new();
+            closed_with_files(&s);
+            let path = s.container_path();
+            rewrite(&path, &[("container.description", description)], &[]);
+            let report = verify(&s, &path);
+            assert!(log_mismatch(&report), "{:?}", report.findings);
+            assert!(report.log.is_none());
+        }
+    }
+
+    /// Swaps a file, gives it matching hashes, and takes the closes, the signatures and the uuid away.
+    fn forged(s: &Setup) -> PathBuf {
+        use factum::container::volume::file_records;
+        let path = s.container_path();
+        let text = String::from_utf8(member(&path, TURTLE).unwrap()).unwrap();
+        let graph = factum::container::turtle::parse(&text).unwrap();
+        let record = file_records(&graph).remove(0);
+        let uuid = String::from_utf8(member(&path, "container.description").unwrap()).unwrap();
+        let name = factum::container::member_name(&record.arn, &uuid);
+        let new = b"z";
+        let other = "aff4://11111111-2222-4333-8444-555555555555";
+        let forged = text
+            .replace(&record.md5, &hex::encode(md5::Md5::digest(new)))
+            .replace(&record.sha1, &hex::encode(sha1::Sha1::digest(new)))
+            .replace(&record.sha256, &hex::encode(sha2::Sha256::digest(new)));
+        rewrite(&path, &[(name.as_str(), new)], &[]);
+        write_turtle(&path, &forged.replace(&uuid, other));
+        rewrite(&path, &[("container.description", other.as_bytes())], &[]);
+        without_layout(&path, &[]);
+        path
+    }
+
+    #[test]
+    fn a_forged_file_at_a_logged_place_fails_and_nowhere_passes_as_good() {
+        let s = Setup::new();
+        closed_with_files(&s);
+        let path = forged(&s);
+        let report = verify(&s, &path);
+        assert!(log_mismatch(&report), "{:?}", report.findings);
+        // elsewhere nothing is expected of it, and it is simply an unsigned file
+        let copy = s.f.path().join("handed-over.aff4l");
+        std::fs::rename(&path, &copy).unwrap();
+        let report = verify(&s, &copy);
+        assert!(!log_mismatch(&report), "{:?}", report.findings);
+        assert_eq!(report.overall(), Level::Warn, "{:?}", report.findings);
+        assert!(
+            codes(&report, Level::Warn).contains(&"not_signed"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_file_asked_for_as_a_container_has_to_be_it() {
+        let s = Setup::new();
+        let id = closed_with_files(&s);
+        let copy = s.f.path().join("elsewhere.aff4l");
+        std::fs::copy(s.container_path(), &copy).unwrap();
+        let expect = |path: &Path, expected| {
+            s.f.factum()
+                .verify_expected_container(
+                    path,
+                    expected,
+                    &Gpgsm::unavailable(),
+                    &|_, _| {},
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+        };
+        // the right file, wherever it is
+        let report = expect(&copy, Some(id));
+        assert!(!log_mismatch(&report) && report.log.is_some(), "{:?}", report.findings);
+        // nothing expected: any container, and any file
+        rewrite(&copy, &[("container.description", b"aff4://other")], &[]);
+        assert!(!log_mismatch(&expect(&copy, None)));
+        // asked for: not this one
+        let report = expect(&copy, Some(id));
+        assert!(log_mismatch(&report), "{:?}", report.findings);
+        assert!(report.log.is_none());
+    }
+
     #[test]
     fn a_signed_file_in_a_format_nobody_reads_fails_with_the_log_too() {
         let s = Setup::new();
@@ -2650,6 +2743,71 @@ mod script {
                 }),
             ),
             (
+                "container.description naming another container",
+                Level::Fail,
+                "history",
+                Box::new(|p| {
+                    let other = b"aff4://11111111-2222-4333-8444-555555555555";
+                    rewrite(p, &[("container.description", other)], &[]);
+                }),
+            ),
+            (
+                "container.description emptied",
+                Level::Fail,
+                "history",
+                Box::new(|p| rewrite(p, &[("container.description", b"")], &[])),
+            ),
+            (
+                "the ZIP comment naming another container",
+                Level::Fail,
+                "history",
+                Box::new(|p| {
+                    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(p).unwrap();
+                    let len = file.metadata().unwrap().len();
+                    let archive = read_archive(&mut file, len).unwrap();
+                    let mut app = Appender::new(file, len, archive.entries).unwrap();
+                    let other = b"aff4://11111111-2222-4333-8444-555555555555";
+                    app.finish(&[], other).unwrap();
+                }),
+            ),
+            (
+                "metadata that describes another volume",
+                Level::Fail,
+                "history",
+                Box::new(|p| {
+                    let volume = String::from_utf8(member(p, "container.description").unwrap()).unwrap();
+                    let other = "aff4://11111111-2222-4333-8444-555555555555";
+                    write_turtle(p, &turtle_text(p).replace(&volume, other));
+                }),
+            ),
+            (
+                "the root hashes file another one",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(|p| rewrite(p, &[(HASHES, b"<a>\n    <b> \"0\"^^<c#SHA256> .\n")], &[])),
+            ),
+            (
+                "the root hashes file removed",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(|p| rewrite(p, &[], &[HASHES])),
+            ),
+            (
+                "a signature far larger than any",
+                Level::Fail,
+                "x509_invalid",
+                Box::new(|p| {
+                    let name = history_member(1, "information.turtle.factum.sig");
+                    rewrite(p, &[(&name, &vec![0x41; 5 << 20])], &[]);
+                }),
+            ),
+            (
+                "records that each claim a long directory",
+                Level::Fail,
+                "not_aff4",
+                Box::new(|p| std::fs::write(p, claimed_directories(40_000, 1_000)).unwrap()),
+            ),
+            (
                 "container.description removed",
                 Level::Fail,
                 "history",
@@ -2719,6 +2877,23 @@ mod script {
                 }),
             ),
             (
+                "a secondary store that is no Turtle",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(|p| {
+                    let volume = String::from_utf8(member(p, "container.description").unwrap()).unwrap();
+                    let store = b"x> .";
+                    let hash = hex::encode(sha2::Sha256::digest(store));
+                    let text = format!(
+                        "{}\n<{volume}/information.turtle.2>\n    aff4:hash \"{hash}\"^^aff4:SHA256 .\n\n<{volume}>\n    \
+                         aff4l:imports <{volume}/information.turtle.2> .\n",
+                        turtle_text(p)
+                    );
+                    write_turtle(p, &text);
+                    rewrite(p, &[("information.turtle.2", store)], &[]);
+                }),
+            ),
+            (
                 "a second type beside FileImage",
                 Level::Fail,
                 "",
@@ -2771,6 +2946,12 @@ mod script {
                 "end records repeated after the end",
                 Level::Fail,
                 "trailing_data",
+                Box::new(|p| append(p, &b"PK\x05\x06".repeat(4_000))),
+            ),
+            (
+                "more end records after the end than a search goes through",
+                Level::Fail,
+                "not_aff4",
                 Box::new(|p| append(p, &b"PK\x05\x06".repeat(1 << 16))),
             ),
             (
@@ -2786,6 +2967,26 @@ mod script {
                 Box::new(|p| std::fs::write(p, vec![0u8; 5000]).unwrap()),
             ),
         ]
+    }
+
+    /// `entries` valid directory entries, then `records` end records that each claim them all.
+    fn claimed_directories(entries: u32, records: u32) -> Vec<u8> {
+        let mut bytes = b"JUNK".to_vec();
+        for _ in 0..entries {
+            bytes.extend(b"PK\x01\x02");
+            bytes.extend([0; 42]);
+        }
+        for _ in 0..records {
+            let size = bytes.len() as u32 - 4;
+            bytes.extend(b"PK\x05\x06");
+            bytes.extend([0; 4]);
+            bytes.extend((entries as u16).to_le_bytes());
+            bytes.extend((entries as u16).to_le_bytes());
+            bytes.extend(size.to_le_bytes());
+            bytes.extend(4u32.to_le_bytes());
+            bytes.extend(0u16.to_le_bytes());
+        }
+        bytes
     }
 
     /// The ARN of the file stored as an ImageStream.
@@ -2846,12 +3047,17 @@ mod script {
         let Some((level, output)) = script else { return };
         assert_eq!(level, Level::Fail, "{output}");
         assert!(output.contains("[unsupported]"), "{output}");
-        // another tool's file: nothing here to fail it, and the script takes it for factum's
+        // another tool's file: unsigned, so neither calls it good
         let foreign = s.f.path().join("foreign.aff4l");
         std::fs::copy(s.container_path(), &foreign).unwrap();
         without_layout(&foreign, &[]);
         let (report, script) = verdicts(&foreign);
-        assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+        assert_eq!(report.overall(), Level::Warn, "{:?}", report.findings);
+        assert!(
+            report.findings.iter().any(|f| f.code == "not_signed"),
+            "{:?}",
+            report.findings
+        );
         assert_eq!(script.unwrap().0, Level::Warn);
         // Turtle that is not factum's layout, though valid: a comment
         let text = format!("# a comment\n{}", turtle_text(&s.container_path()));
@@ -2861,6 +3067,114 @@ mod script {
         let (level, output) = script.unwrap();
         assert_eq!(level, Level::Fail, "{output}");
         assert!(output.contains("[turtle_hash]"), "{output}");
+    }
+
+    /// What ends a name in Turtle ends it for both: on damaged content, a name that hid it from the script left the
+    /// file out of the check.
+    #[test]
+    fn both_verifiers_fail_a_type_a_name_cannot_hold() {
+        for (from, to) in [
+            ("a aff4:FileImage ;", "a aff4:FileImage,aff4:Other ;"),
+            ("a aff4:FileImage ;", "a aff4:FileImage#x ;"),
+            ("a aff4:FileImage ;", "a aff4:FileImage(x) ;"),
+            ("a aff4:FileImage ;", "a aff4:FileImage;x ;"),
+            ("a aff4:FileImage ;", "a aff4:FileImage'x ;"),
+            ("a aff4:FileImage ;", "a aff4:FileImage. ;"),
+            ("a aff4:FileImage ;", "a aff4:FileImage , aff4:Other ;"),
+        ] {
+            let s = Setup::with_signer(FakeSigner::new(false));
+            let id = s.create();
+            s.add(id, &[s.file("a.txt")]);
+            let path = s.container_path();
+            damage_content(&path, &first_arn(&s, id));
+            write_turtle(&path, &turtle_text(&path).replacen(from, to, 1));
+            let signer = FakeSigner::new(false);
+            let verifiers: (&dyn factum::signer::Signer, &Gpgsm) = (&signer, &Gpgsm::unavailable());
+            if !assert_verdict(to, &path, Level::Fail, "", verifiers, &[], None) {
+                return;
+            }
+        }
+    }
+
+    /// The script, with what a check may hold set to `limit`.
+    fn script_within(path: &Path, limit: u64) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("verify_container.py");
+        std::fs::write(&script, VERIFY_CONTAINER_PY).unwrap();
+        let code = format!(
+            "import importlib.util as u, sys\ns = u.spec_from_file_location('v', sys.argv[1])\nv = u.module_from_spec(s)\n\
+             s.loader.exec_module(v)\nv.MAX_TOTAL_IN_MEMORY = {limit}\nv.MAX_METADATA_PER_STORED_BYTE = 0\n\
+             sys.exit(v.main(sys.argv[2:]))\n"
+        );
+        let output = Command::new(which::which("python3").ok()?)
+            .args(["-I", "-X", "utf8", "-c", &code])
+            .arg(&script)
+            .arg(path)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// A check that runs out of what it may hold says that, once, and reads nothing into what it did not get to.
+    #[test]
+    fn the_script_stops_with_one_finding_when_the_metadata_does_not_fit() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        let sizes = member(&path, TURTLE).unwrap().len() as u64;
+        // enough for the first copy only
+        let Some(output) = script_within(&path, sizes + 1000) else {
+            return;
+        };
+        assert!(!output.contains("Traceback"), "{output}");
+        let findings: Vec<&str> = output.lines().filter(|l| l.starts_with('\u{2717}')).collect();
+        assert_eq!(findings.len(), 1, "{output}");
+        assert!(findings[0].ends_with("[too_large]"), "{output}");
+        assert!(findings[0].contains("does not mean"), "{output}");
+        assert!(findings[0].contains("GiB"), "{output}");
+        assert!(
+            !output.contains("not signed") && !output.contains("never closed"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn the_script_prints_its_own_hash_first() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let hash = hex::encode(sha2::Sha256::digest(VERIFY_CONTAINER_PY));
+        let Some((_, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert!(output.lines().next().unwrap().ends_with(&hash), "{output}");
+    }
+
+    #[test]
+    fn an_unreadable_close_is_not_called_an_open_state() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        differ_local_header(&path, &history_member(2, TURTLE));
+        let db = Db::open(&dir.path().join("factum.db")).unwrap();
+        let signer = GnupgSigner::new(&db, Some(home.path()));
+        let report = verify_file(
+            &path,
+            &signer,
+            &Gpgsm::unavailable(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let messages: Vec<&str> = report.findings.iter().map(|f| f.message.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("cannot be read")), "{messages:?}");
+        assert!(!messages.iter().any(|m| m.contains("never closed")), "{messages:?}");
+        let Some((code, output)) = run_script(VERIFY_CONTAINER_PY, &path, &[], Some(&home.path())) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(!output.contains("never closed"), "{output}");
     }
 
     #[test]

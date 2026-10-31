@@ -39,10 +39,10 @@ pub fn readme_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let hash = hex::encode(sha2::Sha256::digest(VERIFY_CONTAINER_PY));
     format!(
-        "{README}\nWritten by factum {version}. verify_container.py in this container:\n  SHA-256 {hash}\n\
-         The same script is published at\n  \
-         https://github.com/overcuriousity/factum-rs/blob/v{version}/src/container/verify_container.py\n\
-         Compare the hash with that copy (sha256sum verify_container.py) before running it.\n"
+        "{README}\nWritten by factum {version}. verify_container.py as it was written into this container, which is \
+         worth no more than this file is:\n  SHA-256 {hash}\n\
+         Where there is a network, the same script is also published at\n  \
+         https://github.com/overcuriousity/factum-rs/blob/v{version}/src/container/verify_container.py\n"
     )
 }
 

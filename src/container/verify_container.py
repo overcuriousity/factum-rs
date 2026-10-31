@@ -41,8 +41,13 @@ MAX_CHUNKS_PER_SEGMENT = 1 << 20
 U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
 MAX_IN_MEMORY = 1 << 30  # of one member
-# of a container's metadata, all its states and their graphs together: a few MiB of file can inflate to many members
+# of a container's metadata, all its states and their graphs together, at least: a few MiB of file can inflate to many
+# members; and at most this much for each byte of it the file stores: what a real large container takes, and little
+# more than nothing to one whose metadata is mostly air
 MAX_TOTAL_IN_MEMORY = 4 << 30
+MAX_METADATA_PER_STORED_BYTE = 64
+# of a signature or a certificate chain: no reason to be more, and openssl makes many times that of it when it prints it
+MAX_SIGNATURE_MEMBER = 4 << 20
 LINE_COST = 384  # what a triple costs in memory, roughly
 FAILS = []
 WARNINGS = []
@@ -72,12 +77,16 @@ def fail(code, message):
 
 
 class Memory(object):
-    left = MAX_TOTAL_IN_MEMORY
+    left = limit = MAX_TOTAL_IN_MEMORY
+
+
+class TooLarge(Exception):
+    """The metadata does not fit: the check stops there, which says nothing about the container."""
 
 
 def take_memory(count):
     if count > Memory.left:
-        raise ValueError("more metadata than fits the memory set aside for it")
+        raise TooLarge()
     Memory.left -= count
 
 
@@ -92,7 +101,9 @@ def decimal(text, limit):
 
 # --- factum's Turtle layout: @prefix lines, then "<subject>" and one "    predicate object ;" line per triple
 
-PREFIX = re.compile(r"^@prefix (\S*): <([^>]*)> \.$")
+# what ends a name in Turtle, so it is none of a name's: in factum, a list or a comment would start here
+NAME_ENDS = r"""\s;,<>"'()\[\]#"""
+PREFIX = re.compile(r"^@prefix ([^" + NAME_ENDS + r"]*): <([^>]*)> \.$")
 LITERAL = re.compile(r'^"((?:[^"\\]|\\.)*)"(?:\^\^(\S+))?$')
 ESCAPES = {"t": "\t", "b": "\b", "n": "\n", "r": "\r", "f": "\f", '"': '"', "'": "'", "\\": "\\"}
 NOT_IN_IRI = '<>"{}|^`\\'
@@ -155,7 +166,7 @@ def parse_turtle(text):
     def expand(name):
         if name.startswith("<") and name.endswith(">"):
             return iri_value(name[1:-1])
-        if re.search(r"\s", name):
+        if re.search("[" + NAME_ENDS + "]", name) or name.endswith("."):
             raise ValueError("not factum's Turtle layout: " + name[:60])
         prefix, _, local = name.partition(":")
         if prefix not in prefixes:
@@ -166,7 +177,7 @@ def parse_turtle(text):
         line = content.group().rstrip("\r")
         take_memory(LINE_COST)
         match = PREFIX.match(line)
-        if match:
+        if match and subject is None:
             prefixes[match.group(1)] = iri_value(match.group(2))
         elif line.startswith("<") and line.endswith(">") and subject is None:
             subject = iri_value(line[1:-1])
@@ -282,6 +293,8 @@ FLAGS_COMPARED = 1 | (1 << 3) | (1 << 11)
 BUFFER = 1 << 20
 CENTRAL_LEN = 46
 DIRECTORY_BLOCK = 1 << 16
+MIN_SEARCH_LIMIT = 16 << 20  # what one search for an end record may spend, at least: see Search
+SEARCH_TRY = 1 << 10  # what it costs to try a record, whatever it turns out to be; directory bytes read count one each
 
 Entry = collections.namedtuple("Entry", "name flags method crc compressed size offset")
 
@@ -396,21 +409,36 @@ def zip64_values(extra, size, compressed, offset):
     return fields
 
 
+class Search(object):
+    """What one search of a file of `length` bytes may spend. Each record costs little, but a crafted file can hold many
+    that each claim the same long directory; a complete state is never that far from the end. Linear in the file, so
+    what a real container costs is not touched, and whatever a file holds a search ends."""
+
+    def __init__(self, length):
+        self.left = max(MIN_SEARCH_LIMIT, length)
+
+
 def read_archive(handle, end):
     """The central directory whose end-of-central-directory record ends exactly at `end`."""
     return read_archive_at(handle, find_end_record(handle, end), end)
 
 
-def read_archive_at(handle, eocd, end):
+def read_archive_at(handle, eocd, end, search=None):
     """read_archive for a record whose start is known. The directory is read as far as it holds up, and only then the
-    comment: a search may try thousands of records, and each of them may claim all that lies before it."""
+    comment: a search may try thousands of records, and each of them may claim all that lies before it. Directory bytes
+    come out of `search`."""
     count, cd_size, cd_offset = read_end_records(handle, eocd, end)
     directory = bytearray()
 
     def read_directory(needed):
         while len(directory) < needed and len(directory) < cd_size:
             held = len(directory)
-            directory.extend(read_at(handle, cd_offset + held, min(cd_size - held, DIRECTORY_BLOCK)))
+            block = min(cd_size - held, DIRECTORY_BLOCK)
+            if search is not None:
+                if block > search.left:
+                    raise Invalid("the search for a complete state went on too long")
+                search.left -= block
+            directory.extend(read_at(handle, cd_offset + held, block))
 
     entries = []
     at = 0
@@ -446,17 +474,17 @@ def is_state(handle, end):
         return False
 
 
-def is_state_at(handle, eocd, end):
+def is_state_at(handle, eocd, end, search):
     try:
-        read_archive_at(handle, eocd, end)
+        read_archive_at(handle, eocd, end, search)
         return True
     except Invalid:
         return False
 
 
-def search_back(handle, start, length, visit):
+def search_back(handle, start, length, search, visit):
     """Offers each end-of-central-directory record in start..length, newest first, as (where it starts, where it ends),
-    to `visit`, until it answers."""
+    to `visit`, until it answers. Stops, as if there were no more, when `search` is spent."""
     # backwards in blocks that overlap by 3 bytes, so a signature across a block boundary is found
     block_end = length
     while block_end >= start + 4:
@@ -466,6 +494,9 @@ def search_back(handle, start, length, visit):
         while at >= 0:
             offset = block_start + at
             if offset + EOCD_LEN <= length:
+                if search.left < SEARCH_TRY:
+                    return None
+                search.left -= SEARCH_TRY
                 candidate = offset + EOCD_LEN + u16_at(read_at(handle, offset + 20, 2), 0)
                 found = visit(offset, candidate) if candidate <= length else None
                 if found is not None:
@@ -482,7 +513,9 @@ def find_last_end(handle, length):
     end-of-central-directory record before the end whose central directory reads (an interrupted addition)."""
     if is_state(handle, length):
         return length
-    return search_back(handle, 0, length, lambda eocd, end: end if is_state_at(handle, eocd, end) else None)
+    search = Search(length)
+    return search_back(handle, 0, length, search,
+                       lambda eocd, end: end if is_state_at(handle, eocd, end, search) else None)
 
 
 def signature_at(handle, pos, length, signatures):
@@ -569,8 +602,10 @@ def state_end(handle, pos, length):
 def search_tail(handle, start, length):
     """Searches the bytes the walk could not pass: the end of the newest state among them, if any; an error when end
     records there fit their place in the file but their directory cannot be read."""
+    search = Search(length)
+
     def visit(eocd, end):
-        if is_state_at(handle, eocd, end):
+        if is_state_at(handle, eocd, end, search):
             return end
         try:
             read_end_records(handle, eocd, end)
@@ -578,7 +613,11 @@ def search_tail(handle, start, length):
             return None  # the end of a file nested in the evidence: its offsets count from its own start
         raise Invalid("the state ending at offset %d is complete but cannot be read" % end)
 
-    return search_back(handle, start, length, visit)
+    found = search_back(handle, start, length, search, visit)
+    # given up, not done: a state may lie further back, so this is not what an interrupted addition leaves
+    if found is None and search.left < SEARCH_TRY:
+        raise Invalid("more end records after the last complete state than can be searched")
+    return found
 
 
 def walk_tail(handle, start, length):
@@ -677,23 +716,45 @@ def member_bytes(archive, entry, limit):
     return b"".join(blocks), not differs
 
 
-def read(archive, name, code):
+def read_limited(archive, name, code, limit):
     """A member's content; None when it is not listed. One that cannot be read is a failure, not an error, and so is
-    a CRC-32 that differs: the content then still counts, and the checks say the rest. What is read is held for the
-    rest of the check, so it comes out of the budget."""
+    a CRC-32 that differs: the content then still counts, and the checks say the rest."""
     entry = archive.get(name)
     if entry is None:
         return None
     try:
-        data, crc_matches = member_bytes(archive, entry, min(MAX_IN_MEMORY, Memory.left))
-    except (Invalid, OSError, zlib.error, NotImplementedError, MemoryError) as e:
-        fail(code, "%s cannot be read (%s)." % (name, str(e) or "out of memory"))
+        data, crc_matches = member_bytes(archive, entry, limit)
+    except (Invalid, OSError, zlib.error, NotImplementedError) as e:
+        fail(code, "%s cannot be read (%s)." % (name, e))
         return None
-    Memory.left -= len(data)
     message = "%s: CRC-32 differs from the central directory." % name
     if not crc_matches and message not in FAILS:
         fail(code, message)
     return data
+
+
+def read(archive, name, code):
+    """read_limited for what is held for the rest of the check, so it comes out of the budget."""
+    entry = archive.get(name)
+    if entry is not None and entry.size > MAX_IN_MEMORY:
+        raise TooLarge()
+    data = read_limited(archive, name, code, MAX_IN_MEMORY)
+    if data is not None:
+        take_memory(len(data))
+    return data
+
+
+def read_signature(archive, name, code):
+    """A signature member: looked at once and let go, so the budget has no part in it, and there is no reason for one to
+    be large. A public key can be, with its certifications."""
+    return read_limited(archive, name, code, MAX_IN_MEMORY if name.endswith(SIGNATURES[1]) else MAX_SIGNATURE_MEMBER)
+
+
+def metadata_budget(archive, length):
+    """For a file of `length` bytes: a directory can claim any compressed size, the file holds no more than it holds."""
+    stored = sum(entry.compressed for entry in archive.entries
+                 if entry.name.rpartition(b"/")[2].startswith(TURTLE.encode()))
+    return max(MAX_TOTAL_IN_MEMORY, min(stored, length) * MAX_METADATA_PER_STORED_BYTE)
 
 
 # --- content
@@ -842,8 +903,8 @@ def check_files(archive, graph):
             # factum stores files in one way, so another is no format it cannot read: the hashes must not be skipped by
             # naming one
             problems = ["%s: not checked (%s)." % (name, e)]
-        except (Invalid, OSError, zlib.error, ValueError, MemoryError) as e:
-            problems = ["%s: its content cannot be read (%s)." % (name, str(e) or "out of memory")]
+        except (Invalid, OSError, zlib.error, ValueError) as e:
+            problems = ["%s: its content cannot be read (%s)." % (name, e)]
         if replacements and problems:
             # a damaged copy that was added again (Add Again) is a known fact: a warning, not a failure, but only when
             # the replacement is a file of this state with the same hashes and size; that explains its CRC-32 as well
@@ -1139,8 +1200,8 @@ def check_hashes(label, turtle, hashes):
         return
     try:
         graph = parse_metadata(hashes)
-    except (ValueError, MemoryError) as e:
-        fail("turtle_hash", "%s: information.turtle.hashes cannot be read (%s)." % (label, str(e) or "out of memory"))
+    except ValueError as e:
+        fail("turtle_hash", "%s: information.turtle.hashes cannot be read (%s)." % (label, e))
         return
     actual = {"SHA256": hashlib.sha256(turtle).hexdigest(), "SHA512": hashlib.sha512(turtle).hexdigest()}
     compared, differ = set(), False
@@ -1161,8 +1222,8 @@ def check_hashes(label, turtle, hashes):
 def check_root_signatures(archive, close):
     """The root signatures of a closed current state are that close's."""
     for name in SIGNATURES:
-        root = read(archive, name, "history")
-        kept = read(archive, history_member(close, name), "history")
+        root = read_signature(archive, name, "history")
+        kept = read_signature(archive, history_member(close, name), "history")
         if root is not None and root != kept:
             fail("history", "%s differs from the one kept for close %d." % (name, close))
 
@@ -1224,9 +1285,9 @@ def resolve_imports(archive, graph, volume, label):
             try:
                 for subject, triples in parse_metadata(data).items():
                     graph.setdefault(subject, []).extend(triples)
-            except (ValueError, MemoryError) as e:
-                warn("not_checked", "%s: %s cannot be read (%s); its files were not checked."
-                     % (label, name, str(e) or "out of memory"))
+            except ValueError as e:
+                # this script reads what factum wrote, and factum writes nothing it cannot read
+                fail("turtle_hash", "%s: %s cannot be read (%s)." % (label, name, e))
 
 
 def check_numbering(closes):
@@ -1262,7 +1323,9 @@ def open_container(path):
         except Invalid as e:
             fail("trailing_data", "%d bytes after the last complete state may be more than an interrupted addition "
                                   "(%s); the last complete state was checked." % (length - end, e))
-    return read_archive(handle, end)
+    archive = read_archive(handle, end)
+    Memory.left = Memory.limit = metadata_budget(archive, length)
+    return archive
 
 
 def version_property(version, key):
@@ -1270,12 +1333,25 @@ def version_property(version, key):
     return match.group(1).strip() if match else None
 
 
+def own_hash():
+    """The SHA-256 of this file: it comes with the container it checks, so nothing vouches for it but a copy to compare
+    with. factum --version and the release notes give the hash."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except (NameError, OSError):
+        return "unknown"
+
+
 def main(argv=None):
     tolerant_output()
     try:
         return check_container(argv)
-    except MemoryError:
-        fail("history", "The check ran out of memory and did not finish.")
+    except (TooLarge, MemoryError):
+        # what is left unread stays unjudged: no rule may read anything into it
+        fail("too_large", "The metadata of this container needs more memory than this check sets aside (%d GiB in all, "
+                          "%d GiB for one member), so the check stopped here and did not finish. That alone does not "
+                          "mean the container was altered." % (Memory.limit >> 30, MAX_IN_MEMORY >> 30))
         print("Result: FAIL — %d failure(s), %d warning(s)" % (len(FAILS), len(WARNINGS)))
         return 1
 
@@ -1288,6 +1364,8 @@ def check_container(argv):
                         help="verify GPG signatures against the public key the container carries, in a temporary "
                              "keyring; compare the printed fingerprint with one you received separately")
     args = parser.parse_args(argv)
+    print("verify_container.py SHA-256 %s" % own_hash())
+    print("Compare it with factum --version or the release notes: this script comes with the container it checks.")
     try:
         archive = open_container(args.container)
     except (OSError, Invalid) as e:
@@ -1312,8 +1390,10 @@ def check_container(argv):
     description = read(archive, "container.description", "history")
     if not archive.has("container.description"):
         fail("history", "container.description is missing, which ties this container to its case log.")
-    uuid = description.decode("utf-8", "replace").strip() if description is not None else archive.volume()
-    volume = "aff4://" + re.sub("^(aff4://)+", "", uuid)
+    named = description.decode("utf-8", "replace").strip() if description is not None else archive.volume()
+    if named != archive.volume():
+        fail("history", "container.description names %s, the ZIP comment %s." % (named[:200], archive.volume()[:200]))
+    volume = "aff4://" + re.sub("^(aff4://)+", "", named)
     current = read(archive, TURTLE, "turtle_hash")
     if current is None:
         if not archive.has(TURTLE):
@@ -1323,10 +1403,12 @@ def check_container(argv):
     check_numbering(closes)
     check_outside_closes(archive, closes)
     states = []  # (label, the close it is, turtle, its hashes file, whether it is the current state)
+    close_unread = False
     for n in sorted(closes):
-        turtle = read(archive, history_member(n, TURTLE), "history") or b""
+        turtle = read(archive, history_member(n, TURTLE), "history")
+        close_unread = close_unread or turtle is None
         hashes = read(archive, history_member(n, HASHES), "turtle_hash")
-        states.append(("close %d" % n, n, turtle, hashes, False))
+        states.append(("close %d" % n, n, turtle or b"", hashes, False))
     if states and states[-1][2] == current:
         label, n, turtle, hashes, _ = states[-1]
         states[-1] = (label + " (current)", n, turtle, hashes, True)
@@ -1341,31 +1423,40 @@ def check_container(argv):
             prefix = "" if close is None else history_member(close, "")
             check_hashes(label, turtle, hashes)
             signed = False
-            signature = read(archive, prefix + SIGNATURES[0], "signature_invalid")
+            signature = read_signature(archive, prefix + SIGNATURES[0], "signature_invalid")
             if signature is not None:
                 signed = True
-                key = read(archive, prefix + SIGNATURES[1], "signature_invalid") if args.use_carried_key else None
+                key = None
+                if args.use_carried_key:
+                    key = read_signature(archive, prefix + SIGNATURES[1], "signature_invalid")
                 gpg.check(label, signature, key, turtle, workdir)
-            x509 = read(archive, prefix + SIGNATURES[2], "x509_invalid")
+            x509 = read_signature(archive, prefix + SIGNATURES[2], "x509_invalid")
             if x509 is not None:
                 signed = True
-                chain = read(archive, prefix + SIGNATURES[3], "x509_invalid")
+                chain = read_signature(archive, prefix + SIGNATURES[3], "x509_invalid")
                 check_x509(label, x509, chain, turtle, args.ca, workdir)
             if close is not None and not signed:
                 fail("unsigned", "%s: not signed." % label)
             if close is not None and is_current:
                 check_root_signatures(archive, close)
+                # what readers of the standard go by; the close's copy above is another member
+                root_hashes = read(archive, HASHES, "turtle_hash")
+                if root_hashes is not None or not archive.has(HASHES):
+                    check_hashes(label + ", at the root", turtle, root_hashes)
             # every state factum writes takes the root signatures away, so an open state has none: one that does is a
             # close that was taken out of the directory
             root_signed = [name for name in SIGNATURES if archive.has(name)]
-            if close is None and root_signed:
+            if close is None and root_signed and not close_unread:
                 fail("history", "%s is at the root of a state that was never closed." % root_signed[0])
             try:
                 graph = parse_metadata(turtle)
-            except (ValueError, MemoryError) as e:
-                fail("turtle_hash", "%s: information.turtle cannot be read (%s)." % (label, str(e) or "out of memory"))
+            except ValueError as e:
+                fail("turtle_hash", "%s: information.turtle cannot be read (%s)." % (label, e))
                 continue
             resolve_imports(archive, graph, volume, label)
+            # the signed metadata says which volume it describes
+            if not has_type(graph, named, "ZipVolume"):
+                fail("history", "%s: information.turtle does not describe the volume %s." % (label, named[:200]))
             graphs.append((label, close, graph))
         if graphs:
             newest_close, newest = graphs[-1][1:]
