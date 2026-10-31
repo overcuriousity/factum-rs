@@ -2883,6 +2883,153 @@ fn log_only_steps_wait_for_no_writer_and_need_no_file() {
 }
 
 #[test]
+fn a_replacement_the_log_does_not_record_fails() {
+    let s = Setup::new();
+    let id = s.create();
+    let twin = s.file("twin.txt");
+    std::fs::write(&twin, "a").unwrap();
+    s.add(id, &[s.file("a.txt"), twin]);
+    let files = s.f.factum().container(id).unwrap().adds[0].files.clone();
+    let path = s.container_path();
+    damage_content(&path, &files[0].arn);
+    add_triple(
+        &path,
+        &files[0].arn,
+        &format!("{}replacedBy", factum::container::FACTUM_NS),
+        &files[1].arn,
+    );
+    // a recipient without the log sees a replaced copy, as before
+    let factum = s.f.factum();
+    let alone = factum::container::verify::verify_file(
+        &path,
+        &FakeSigner::new(false),
+        &factum.gpgsm(),
+        &|_, _| {},
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(
+        alone.findings.iter().any(|f| f.code == "replaced_copy"),
+        "{:?}",
+        alone.findings
+    );
+    assert!(!alone.findings.iter().any(|f| f.code == "log_mismatch"));
+    let report = factum
+        .verify_container_file(&path, &factum.gpgsm(), &|_, _| {}, &AtomicBool::new(false))
+        .unwrap();
+    assert!(
+        report.findings.iter().any(|f| f.code == "log_mismatch"
+            && f.level == factum::verifier::Level::Fail
+            && f.message.contains("marks")),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn a_replacement_is_compared_with_the_log_both_ways() {
+    let s = Setup::new();
+    let (id, recheck) = damaged(&s);
+    add_again(&s, id, &recheck);
+    let factum = s.f.factum();
+    let mut detail = factum.container(id).unwrap();
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
+    assert_eq!(detail.adds[1].replaces.len(), 1);
+    assert!(factum::containers::compare_records(&detail, volume.graph(), i64::MAX).is_empty());
+    // the log records one the container does not list
+    detail.adds[1].replaces.push(("aff4://old".into(), "aff4://new".into()));
+    let findings = factum::containers::compare_records(&detail, volume.graph(), i64::MAX);
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert_eq!(findings[0].entry_id, Some(detail.adds[1].entry_id));
+    // not as of a state before the addition that recorded it
+    assert!(
+        factum::containers::compare_records(&detail, volume.graph(), detail.adds[0].entry_id)
+            .iter()
+            .all(|f| !f.message.contains("aff4://new"))
+    );
+}
+
+#[test]
+fn folders_are_compared_with_the_log_both_ways() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.source.join("Users")]);
+    let factum = s.f.factum();
+    let mut detail = factum.container(id).unwrap();
+    assert_eq!(detail.adds[0].folders.len(), 2);
+    let (volume, _) = Volume::open(&s.container_path(), None).unwrap();
+    assert!(factum::containers::compare_records(&detail, volume.graph(), i64::MAX).is_empty());
+    detail.adds[0].folders[0].path += "x";
+    let messages: Vec<String> = factum::containers::compare_records(&detail, volume.graph(), i64::MAX)
+        .into_iter()
+        .map(|f| f.message)
+        .collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(messages[0].contains("in the case log but not in the container"));
+    assert!(messages[1].contains("in no addition"));
+}
+
+/// Logs a `container_signed` entry, as an older version or another process may have left it.
+fn log_signed(s: &Setup, uuid: &str, close: Option<u32>, sha: Option<&str>) {
+    let mut payload = serde_json::json!({"event": "container_signed", "case_id": s.case_id, "container_id": uuid,
+                                         "signatures": {"gpg": "F00", "x509": null}, "signed_utc": "x"});
+    if let Some(close) = close {
+        payload["close"] = close.into();
+    }
+    if let Some(sha) = sha {
+        payload["turtle_sha256"] = sha.into();
+    }
+    let append = factum::log_service::Append {
+        payload: Some(payload),
+        allow_archived: true,
+        ..Default::default()
+    };
+    s.f.factum().append(s.case_id, "system", "signed", append).unwrap();
+}
+
+#[test]
+fn list_and_detail_agree_on_which_close_is_signed() {
+    let s = Setup::with_signer(FakeSigner::new(false));
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let agree = |signed: bool, damaged: bool| {
+        let detail = factum.container(id).unwrap();
+        assert_eq!(factum.list_containers(s.case_id).unwrap()[0], detail.summary);
+        assert_eq!((detail.summary.signed, detail.summary.damaged), (signed, damaged));
+    };
+    let first = factum.close_container(id).unwrap();
+    let uuid = factum.container(id).unwrap().summary.uuid;
+    factum.reopen_container(id).unwrap();
+    s.add(id, &[s.file("b.txt")]);
+    let second = factum.close_container(id).unwrap();
+    assert_ne!(first.turtle_sha256, second.turtle_sha256);
+    agree(false, false);
+    // an event that does not tell which close it signed proves nothing
+    log_signed(&s, &uuid, None, None);
+    agree(false, false);
+    log_signed(&s, &uuid, Some(2), None);
+    agree(false, false);
+    // late signing signs the older close only: the newest decides
+    log_signed(&s, &uuid, Some(1), Some(&first.turtle_sha256));
+    agree(false, false);
+    // a number that names the wrong close: the hash finds the right one
+    log_signed(&s, &uuid, Some(1), Some(&second.turtle_sha256));
+    agree(true, false);
+    // a close as damaged after it is the newest
+    factum.reopen_container(id).unwrap();
+    agree(true, false);
+    let record = factum.container(id).unwrap().adds[0].files[0].clone();
+    factum.close_container_damaged(id, &[record], &[]).unwrap();
+    agree(false, true);
+    factum.reopen_container(id).unwrap();
+    let aside = s.f.path().join("aside");
+    std::fs::rename(s.container_path(), &aside).unwrap();
+    factum.close_container_without_file(id).unwrap();
+    agree(false, false);
+}
+
+#[test]
 fn a_close_signs_the_stored_bytes() {
     use factum::verifier::Level;
     let s = Setup::with_signer(FakeSigner::new(false));

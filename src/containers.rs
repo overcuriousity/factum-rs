@@ -6,6 +6,7 @@
 //! Damaged is the way out, and it writes nothing to the file.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
@@ -14,8 +15,8 @@ use sha2::Digest;
 
 use crate::canonical::utc_now;
 use crate::container::volume::{
-    FileRecord, FolderRecord, Recheck, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, history_member,
-    task_entries,
+    FileRecord, FolderRecord, Recheck, Signatures, Staged, TURTLE, Volume, VolumeInfo, file_records, folder_records,
+    history_member, replaced_pairs, task_entries,
 };
 use crate::container::x509::{Gpgsm, X509_CERT_SETTING, X509_CHAIN_SETTING};
 use crate::db::ensure_case_open;
@@ -145,6 +146,28 @@ impl ContainerDetail {
     }
 }
 
+/// The close a `container_signed` entry signs, by its place in `closes`. The number it names decides, then the hash:
+/// identical states (close, reopen, close) share one, so it only picks among those that were not signed. An entry
+/// that names neither signs nothing that can be told.
+fn signed_close(closes: &[CloseEvent], named: Option<u64>, sha: &str) -> Option<usize> {
+    let unsigned = |close: &CloseEvent| close.turtle_sha256 == sha && !close.is_signed();
+    named
+        .and_then(|n| (n as usize).checked_sub(1))
+        .filter(|&index| closes.get(index).is_some_and(unsigned))
+        .or_else(|| closes.iter().position(unsigned))
+}
+
+/// (damaged, signed) of a container's summary: the newest close decides; a regular one is signed or not, one
+/// without file or as damaged never is.
+fn newest_close_state(closes: &[CloseEvent], damaged: Option<i64>, without_file: Option<i64>) -> (bool, bool) {
+    let regular = closes.last().map(|c| c.entry_id);
+    let other = without_file.max(damaged);
+    (
+        damaged.is_some() && damaged == other && damaged > regular,
+        regular > other && closes.last().is_some_and(CloseEvent::is_signed),
+    )
+}
+
 /// What a close re-checks, read from the log on the GUI thread and checked on a worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecheckInput {
@@ -237,9 +260,9 @@ pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtl
             },
         ));
     };
-    let in_container: std::collections::HashMap<String, FileRecord> =
+    let in_container: HashMap<String, FileRecord> =
         file_records(graph).into_iter().map(|r| (r.arn.clone(), r)).collect();
-    let mut in_log = std::collections::HashSet::new();
+    let mut in_log = HashSet::new();
     for (add, record) in detail.files().filter(|(add, _)| add.entry_id <= upto) {
         in_log.insert(record.arn.clone());
         match in_container.get(&record.arn) {
@@ -278,15 +301,19 @@ pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtl
             );
         }
     }
-    let logged_folders: Vec<&FolderRecord> = detail
-        .adds
+    let logged_adds = || detail.adds.iter().filter(|add| add.entry_id <= upto);
+    let logged_folders: Vec<&FolderRecord> = logged_adds().flat_map(|add| &add.folders).collect();
+    let stored_folders = folder_records(graph);
+    let logged: HashSet<(&str, &str)> = logged_folders
         .iter()
-        .filter(|add| add.entry_id <= upto)
-        .flat_map(|add| &add.folders)
+        .map(|f| (f.arn.as_str(), f.path.as_str()))
         .collect();
-    let stored_folders = crate::container::volume::folder_records(graph);
+    let stored: HashSet<(&str, &str)> = stored_folders
+        .iter()
+        .map(|f| (f.arn.as_str(), f.path.as_str()))
+        .collect();
     for folder in &logged_folders {
-        if !stored_folders.contains(folder) {
+        if !stored.contains(&(folder.arn.as_str(), folder.path.as_str())) {
             fail(
                 format!(
                     "The folder {} is in the case log but not in the container.",
@@ -297,7 +324,7 @@ pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtl
         }
     }
     for folder in &stored_folders {
-        if !logged_folders.contains(&folder) {
+        if !logged.contains(&(folder.arn.as_str(), folder.path.as_str())) {
             fail(
                 format!(
                     "The folder {} is in the container but in no addition the case log records.",
@@ -307,7 +334,35 @@ pub fn compare_records(detail: &ContainerDetail, graph: &crate::container::turtl
             );
         }
     }
-    let adds: std::collections::HashSet<i64> = detail.adds.iter().map(|a| a.entry_id).collect();
+    // a replacement turns a failed hash into a warning: it counts only as the log recorded it
+    let stored_pairs = replaced_pairs(graph);
+    let logged_pairs: HashSet<(&str, &str)> = logged_adds()
+        .flat_map(|add| add.replaces.iter().map(|(old, new)| (old.as_str(), new.as_str())))
+        .collect();
+    for (old, new) in &stored_pairs {
+        if !logged_pairs.contains(&(old.as_str(), new.as_str())) {
+            let name = in_container.get(old).map_or(old.as_str(), |r| r.path.as_str());
+            fail(
+                format!("The container marks {name} as replaced by {new}, which no addition in the case log records."),
+                None,
+            );
+        }
+    }
+    let stored_pairs: HashSet<(&str, &str)> = stored_pairs.iter().map(|(o, n)| (o.as_str(), n.as_str())).collect();
+    for add in logged_adds() {
+        for (old, new) in &add.replaces {
+            if !stored_pairs.contains(&(old.as_str(), new.as_str())) {
+                fail(
+                    format!(
+                        "The case log (entry #{}) records {old} as replaced by {new}, which the container does not.",
+                        add.entry_id
+                    ),
+                    Some(add.entry_id),
+                );
+            }
+        }
+    }
+    let adds: HashSet<i64> = detail.adds.iter().map(|a| a.entry_id).collect();
     for entry_id in task_entries(graph) {
         if !adds.contains(&entry_id) {
             fail(
@@ -376,9 +431,16 @@ impl Factum<'_> {
              (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.name') END), \
              (CASE WHEN json_valid(payload_json) THEN json_array_length(payload_json, '$.files') END), \
              (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.evidence_id') END), \
-             (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.signatures.gpg') IS NOT NULL \
-                OR json_extract(payload_json, '$.signatures.x509') IS NOT NULL ELSE 0 END), \
-             (CASE WHEN json_valid(payload_json) THEN json_type(payload_json, '$.damaged') IS NOT NULL ELSE 0 END) \
+             (CASE WHEN json_valid(payload_json) AND json_type(payload_json, '$.signatures.gpg') = 'text' \
+                THEN json_extract(payload_json, '$.signatures.gpg') END), \
+             (CASE WHEN json_valid(payload_json) AND json_type(payload_json, '$.signatures.x509') = 'text' \
+                THEN json_extract(payload_json, '$.signatures.x509') END), \
+             (CASE WHEN json_valid(payload_json) THEN json_type(payload_json, '$.damaged') IS NOT NULL ELSE 0 END), \
+             (CASE WHEN json_valid(payload_json) THEN json_type(payload_json, '$.file_missing') IS 'true' ELSE 0 END), \
+             (CASE WHEN json_valid(payload_json) AND json_type(payload_json, '$.turtle_sha256') = 'text' \
+                THEN json_extract(payload_json, '$.turtle_sha256') END), \
+             (CASE WHEN json_valid(payload_json) AND json_type(payload_json, '$.close') = 'integer' \
+                THEN CAST(json_extract(payload_json, '$.close') AS INTEGER) END) \
              FROM entries WHERE case_id = ? AND kind = 'system' \
              AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.event') END) LIKE 'container\\_%' ESCAPE '\\' ORDER BY leaf_index",
         )?;
@@ -390,33 +452,64 @@ impl Factum<'_> {
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<i64>>(5)?,
-                row.get::<_, bool>(6)?,
-                row.get::<_, bool>(7)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, bool>(8)?,
+                row.get::<_, bool>(9)?,
+                row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                row.get::<_, Option<i64>>(11)?,
             ))
         })?;
         // in creation order
         let mut containers: Vec<ContainerSummary> = Vec::new();
+        // by container: the regular closes, the newest close as damaged and the newest one without file
+        let mut closes: Vec<(Vec<CloseEvent>, Option<i64>, Option<i64>)> = Vec::new();
         for row in rows {
-            let (entry_id, event, uuid, name, files, evidence_id, signed, damaged) = row?;
+            let (entry_id, event, uuid, name, files, evidence_id, gpg, x509, damaged, file_missing, sha, close) = row?;
             if event == "container_created" {
                 containers.push(self.summary(entry_id, case_id, uuid, name.unwrap_or_default(), evidence_id));
+                closes.push(Default::default());
                 continue;
             }
-            let Some(container) = containers.iter_mut().find(|c| c.uuid == uuid) else {
+            let Some(index) = containers.iter().position(|c| c.uuid == uuid) else {
                 continue;
             };
+            let container = &mut containers[index];
+            let (regular, newest_damaged, newest_without_file) = &mut closes[index];
             container.last_event = entry_id;
             match event.as_str() {
                 "container_files_added" => container.file_count += files.unwrap_or(0).max(0) as u64,
                 "container_closed" => {
                     container.open = false;
-                    container.signed = signed;
-                    container.damaged = damaged;
+                    if file_missing {
+                        *newest_without_file = Some(entry_id);
+                    } else if damaged {
+                        *newest_damaged = Some(entry_id);
+                    } else {
+                        regular.push(CloseEvent {
+                            entry_id,
+                            utc: String::new(),
+                            turtle_sha256: sha,
+                            file_count: 0,
+                            gpg,
+                            x509,
+                            x509_refused: None,
+                            signed_later: None,
+                        });
+                    }
                 }
-                "container_signed" => container.signed = true,
+                "container_signed" => {
+                    let named = close.and_then(|n| u64::try_from(n).ok());
+                    if let Some(index) = signed_close(regular, named, &sha) {
+                        regular[index].signed_later = Some(entry_id);
+                    }
+                }
                 "container_reopened" => container.open = true,
                 _ => {}
             }
+        }
+        for (container, (regular, damaged, without_file)) in containers.iter_mut().zip(&closes) {
+            (container.damaged, container.signed) = newest_close_state(regular, *damaged, *without_file);
         }
         Ok(containers)
     }
@@ -561,23 +654,9 @@ impl Factum<'_> {
                 "container_signed" => {
                     let (gpg, x509) = event.signatures();
                     let sha = event.text("turtle_sha256");
-                    // the close it names; identical states (close, reopen, close) share a hash, so the hash only
-                    // picks among the closes that were not signed
-                    let named = event
-                        .payload
-                        .get("close")
-                        .and_then(Value::as_u64)
-                        .and_then(|n| detail.closes.get_mut((n as usize).checked_sub(1)?))
-                        .filter(|c| c.turtle_sha256 == sha && !c.is_signed());
-                    let close = match named {
-                        Some(close) => Some(close),
-                        None => detail
-                            .closes
-                            .iter_mut()
-                            .find(|c| c.turtle_sha256 == sha && !c.is_signed()),
-                    };
-                    if let Some(close) = close {
-                        close.signed_later = Some(event.entry_id);
+                    let named = event.payload.get("close").and_then(Value::as_u64);
+                    if let Some(index) = signed_close(&detail.closes, named, &sha) {
+                        detail.closes[index].signed_later = Some(event.entry_id);
                     }
                     detail.late_signatures.push((event.entry_id, sha, gpg, x509));
                 }
@@ -585,19 +664,10 @@ impl Factum<'_> {
             }
         }
         detail.summary.file_count = detail.adds.iter().map(|a| a.files.len() as u64).sum();
-        // the newest close decides: a regular one is signed or not, one without file or as damaged never is
-        let newest_regular = detail.closes.last().map(|c| c.entry_id);
         let newest_damaged = detail.damaged_closes.last().map(|(id, ..)| *id);
-        let newest_other = detail
-            .closed_without_file
-            .iter()
-            .map(|(id, _)| *id)
-            .chain(newest_damaged)
-            .max();
-        detail.summary.damaged =
-            newest_damaged.is_some() && newest_damaged == newest_other && newest_damaged > newest_regular;
-        detail.summary.signed =
-            newest_regular > newest_other && detail.closes.last().is_some_and(CloseEvent::is_signed);
+        let newest_without_file = detail.closed_without_file.iter().map(|(id, _)| *id).max();
+        (detail.summary.damaged, detail.summary.signed) =
+            newest_close_state(&detail.closes, newest_damaged, newest_without_file);
         Ok(detail)
     }
 
@@ -1132,6 +1202,10 @@ impl Factum<'_> {
         mismatches: &[FileRecord],
     ) -> Result<Vec<(Vec<PathBuf>, crate::container::volume::AddOptions)>> {
         let detail = self.container(id)?;
+        let mut add_of: HashMap<&str, &AddEvent> = HashMap::new();
+        for (add, file) in detail.files() {
+            add_of.entry(file.arn.as_str()).or_insert(add);
+        }
         let mut plan: Vec<(i64, Vec<PathBuf>, crate::container::volume::AddOptions)> = Vec::new();
         for record in mismatches {
             let not_recorded = || {
@@ -1140,11 +1214,7 @@ impl Factum<'_> {
                     record.path
                 ))
             };
-            let add = detail
-                .adds
-                .iter()
-                .find(|add| add.files.iter().any(|f| f.arn == record.arn))
-                .ok_or_else(not_recorded)?;
+            let add = *add_of.get(record.arn.as_str()).ok_or_else(not_recorded)?;
             let (Some(source), Some(base), Some(keep_path)) = (record.source_path(), &add.base_path, add.keep_path)
             else {
                 return Err(not_recorded());

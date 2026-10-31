@@ -1,6 +1,7 @@
 //! One container file: created, filled by Add operations, closed (signed state kept under factum/history/<n>/),
 //! reopened, and recovered after an interrupted Add.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -608,6 +609,21 @@ pub fn file_records(graph: &Graph) -> Vec<FileRecord> {
                 source_raw: value(factum("sourcePathRaw")),
             }
         })
+        .collect()
+}
+
+/// The (ARN, ARN of its copy added again) pairs a graph lists; what verification takes a replacement from.
+pub fn replaced_pairs(graph: &Graph) -> Vec<(String, String)> {
+    let predicate = factum("replacedBy");
+    graph
+        .subjects_of_type(&aff4("FileImage"))
+        .flat_map(|arn| {
+            graph
+                .objects(arn, &predicate)
+                .map(move |t| (arn, t))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(arn, t)| Some((arn.to_string(), t.iri()?.to_string())))
         .collect()
 }
 
@@ -1370,13 +1386,22 @@ impl Volume {
             }
         }
         // a copy replaces a damaged one only when it is the same content: a source that changed since is new evidence
-        let earlier = file_records(&self.graph);
+        let earlier: HashMap<String, FileRecord> = file_records(&self.graph)
+            .into_iter()
+            .map(|r| (r.arn.clone(), r))
+            .collect();
+        let mut by_source: HashMap<PathBuf, &FileRecord> = HashMap::new();
+        for record in &records {
+            if let Some(source) = record.source_path() {
+                by_source.entry(source).or_insert(record);
+            }
+        }
         let replaced = options
             .replaces
             .iter()
             .filter_map(|(source, old)| {
-                let new = records.iter().find(|r| r.source_path().as_ref() == Some(source))?;
-                let old_record = earlier.iter().find(|r| r.arn == *old)?;
+                let new = *by_source.get(source)?;
+                let old_record = earlier.get(old)?;
                 let same = (&new.md5, &new.sha1, &new.sha256, new.size)
                     == (&old_record.md5, &old_record.sha1, &old_record.sha256, old_record.size);
                 same.then(|| (old.clone(), new.arn.clone()))
