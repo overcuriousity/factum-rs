@@ -781,6 +781,8 @@ pub struct FakeSigner {
     pub fail_next: Cell<bool>,
     /// detached signatures still made before one fails (once)
     pub fail_detached_after: Cell<Option<u32>>,
+    /// text signatures still made before one fails (once)
+    pub fail_text_after: Cell<Option<u32>>,
     pub last_failed: Cell<bool>,
     /// armor as gpg writes it on Windows
     pub crlf: Cell<bool>,
@@ -803,6 +805,7 @@ impl FakeSigner {
             trust: RefCell::new(trust.to_string()),
             fail_next: Cell::new(false),
             fail_detached_after: Cell::new(None),
+            fail_text_after: Cell::new(None),
             last_failed: Cell::new(false),
             crlf: Cell::new(false),
             before_sign: RefCell::new(None),
@@ -839,6 +842,14 @@ impl Signer for FakeSigner {
             hook();
         }
         self.active_key_id.borrow().as_ref()?;
+        match self.fail_text_after.get() {
+            Some(0) => {
+                self.fail_text_after.set(None);
+                self.fail_next.set(true);
+            }
+            Some(n) => self.fail_text_after.set(Some(n - 1)),
+            None => {}
+        }
         if self.fail_next.replace(false) {
             self.last_failed.set(true);
             return None;

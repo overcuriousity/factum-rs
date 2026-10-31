@@ -56,6 +56,8 @@ pub struct Append<'f> {
     pub allow_archived: bool,
     pub on_commit: Option<OnCommit<'f>>,
     pub reserve: Option<Reserve<'f>>,
+    /// run from the `on_commit` of another append: the entry joins that transaction, and is signed inside it
+    pub in_transaction: bool,
 }
 
 impl Factum<'_> {
@@ -108,7 +110,9 @@ impl Factum<'_> {
                 &entry_signed_payload(&leaf, leaf_index + 1, &root),
                 "GPG signing failed — nothing was saved.",
             )?;
-            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+            if !options.in_transaction
+                && let Err(e) = conn.execute_batch("BEGIN IMMEDIATE")
+            {
                 return Err(FactumError::general(format!(
                     "The database is locked by another factum process ({e}) — nothing was saved. Try again."
                 )));
@@ -171,6 +175,13 @@ impl Factum<'_> {
                 Ok(Some(entry_id))
             })();
             match result {
+                // the outer append ends the transaction, whichever way this went
+                Ok(Some(entry_id)) if options.in_transaction => return Ok(entry_id),
+                Ok(None) | Err(_) if options.in_transaction => {
+                    return result.and(Err(FactumError::log_changed(
+                        "The case log changed while signing, nothing was saved — try again.",
+                    )));
+                }
                 Ok(Some(entry_id)) => {
                     if let Err(e) = conn.execute_batch("COMMIT") {
                         let _ = conn.execute_batch("ROLLBACK");

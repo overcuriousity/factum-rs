@@ -53,6 +53,19 @@ impl Evidence {
 impl Factum<'_> {
     /// `name` is stored in the `description` column; `details` is the free-text description.
     pub fn create_evidence(&self, case_id: i64, name: &str, evidence_hash: &str, details: &str) -> Result<i64> {
+        self.create_evidence_then(case_id, name, evidence_hash, details, &|_| Ok(()))
+    }
+
+    /// `create_evidence`, and `then` (given the new id) inside its append transaction: if `then` fails, there is no
+    /// evidence item and no entry.
+    pub(crate) fn create_evidence_then(
+        &self,
+        case_id: i64,
+        name: &str,
+        evidence_hash: &str,
+        details: &str,
+        then: &dyn Fn(i64) -> Result<()>,
+    ) -> Result<i64> {
         let (description, evidence_hash, details) = (strip(name), strip(evidence_hash), strip(details));
         if description.is_empty() {
             return Err(FactumError::general("An evidence description is required."));
@@ -82,6 +95,7 @@ impl Factum<'_> {
                 )?;
                 Ok(())
             };
+            let on_commit = |_: &rusqlite::Connection, _: i64| then(evidence_id);
             let appended = self.append(
                 case_id,
                 KIND_SYSTEM,
@@ -89,6 +103,7 @@ impl Factum<'_> {
                 Append {
                     payload: Some(payload),
                     reserve: Some(&reserve),
+                    on_commit: Some(&on_commit),
                     ..Default::default()
                 },
             );

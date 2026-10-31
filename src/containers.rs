@@ -5,7 +5,7 @@
 //! A proven fault of a container's directory (a CRC-32 that differs) means no addition and no signature: Close as
 //! Damaged is the way out, and it writes nothing to the file.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -175,6 +175,16 @@ pub struct RecheckInput {
     /// the logged end of the container's state
     pub end: Option<u64>,
     pub records: Vec<FileRecord>,
+}
+
+/// A container that passed the checks, before its file exists.
+struct NewContainer {
+    case_id: i64,
+    case_file: String,
+    name: String,
+    path: PathBuf,
+    file_name: String,
+    base_path: String,
 }
 
 /// The signatures of one state and who made them.
@@ -671,48 +681,52 @@ impl Factum<'_> {
         Ok(detail)
     }
 
-    /// Creates the container file, then logs `container_created`; returns the container's number (its entry id).
-    pub fn create_container(
-        &self,
-        case_id: i64,
-        name: &str,
-        evidence_id: i64,
-        path: &Path,
-        base_path: &str,
-    ) -> Result<i64> {
-        let name = strip(name);
+    /// What every new container is checked for first; the file does not exist yet.
+    fn new_container(&self, case_id: i64, name: &str, path: &Path, base_path: &str) -> Result<NewContainer> {
+        let name = strip(name).to_string();
         if name.is_empty() {
             return Err(FactumError::general("A container name is required."));
         }
         let case = self.require_case(case_id)?;
         ensure_case_open(&self.db.conn, case_id)?;
-        let evidence = match self.get_evidence(evidence_id)? {
-            Some(e) if !e.is_deleted() && e.case_id == case_id => Some((e.id, e.description, e.details)),
-            _ => {
-                return Err(FactumError::general(format!(
-                    "Evidence #{evidence_id} does not exist in this case."
-                )));
-            }
-        };
         let path = std::path::absolute(path)?;
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .ok_or_else(|| FactumError::general("The container needs a file name."))?;
+        Ok(NewContainer {
+            case_id,
+            case_file: case.case_file,
+            name,
+            path,
+            file_name,
+            base_path: base_path.to_string(),
+        })
+    }
+
+    /// Creates the container file, then logs `container_created`; the file goes again when that fails. `evidence`:
+    /// id, name, description. `in_transaction`: the entry joins the transaction of an append that runs this.
+    fn create_logged(&self, new: &NewContainer, evidence: (i64, String, String), in_transaction: bool) -> Result<i64> {
+        let NewContainer {
+            case_id,
+            name,
+            path,
+            file_name,
+            base_path,
+            ..
+        } = new;
         let uuid = uuid::Uuid::new_v4().to_string();
         let created_utc = utc_now();
+        let evidence_id = evidence.0;
         let info = VolumeInfo {
-            name: name.to_string(),
-            case_file: case.case_file.clone(),
-            case_id,
-            evidence: evidence.clone(),
+            name: name.clone(),
+            case_file: new.case_file.clone(),
+            case_id: *case_id,
+            evidence: Some(evidence),
             created_utc: created_utc.clone(),
         };
-        let volume = Volume::create(&path, &uuid, &info)?;
-        let mut text = format!("Container \"{name}\" created");
-        if let Some((evidence_id, _, _)) = &evidence {
-            text += &format!(" (from evidence #{evidence_id})");
-        }
+        let volume = Volume::create(path, &uuid, &info)?;
+        let text = format!("Container \"{name}\" created (from evidence #{evidence_id})");
         let payload = json!({"event": "container_created", "case_id": case_id, "container_id": uuid, "name": name,
                              "evidence_id": evidence_id, "file_name": file_name, "base_path": base_path,
                              "created_utc": created_utc});
@@ -725,29 +739,48 @@ impl Factum<'_> {
             store_end(conn, &uuid, end)
         };
         let appended = self.append(
-            case_id,
+            *case_id,
             KIND_SYSTEM,
             &text,
             Append {
                 payload: Some(payload),
                 on_commit: Some(&remember),
+                in_transaction,
                 ..Default::default()
             },
         );
         drop(volume);
-        let id = match appended {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = std::fs::remove_file(&path);
-                return Err(e);
+        appended.inspect_err(|_| {
+            let _ = std::fs::remove_file(path);
+        })
+    }
+
+    /// Creates the container file, then logs `container_created`; returns the container's number (its entry id).
+    pub fn create_container(
+        &self,
+        case_id: i64,
+        name: &str,
+        evidence_id: i64,
+        path: &Path,
+        base_path: &str,
+    ) -> Result<i64> {
+        let new = self.new_container(case_id, name, path, base_path)?;
+        let evidence = match self.get_evidence(evidence_id)? {
+            Some(e) if !e.is_deleted() && e.case_id == case_id => (e.id, e.description, e.details),
+            _ => {
+                return Err(FactumError::general(format!(
+                    "Evidence #{evidence_id} does not exist in this case."
+                )));
             }
         };
-        log::info!("Container #{id} created: {}", path.display());
+        let id = self.create_logged(&new, evidence, false)?;
+        log::info!("Container #{id} created: {}", new.path.display());
         Ok(id)
     }
 
-    /// A new evidence item and a container for it, named alike: two log entries, as if made one after the other.
-    /// Returns (evidence id, container id); the evidence stays when the container cannot be created.
+    /// A new evidence item and a container for it, named alike: two log entries in one transaction, the evidence's
+    /// first, with the file created between them. Returns (evidence id, container id); a failure leaves neither
+    /// entry nor file, so it can simply be tried again.
     pub fn create_evidence_with_container(
         &self,
         case_id: i64,
@@ -757,15 +790,22 @@ impl Factum<'_> {
         path: &Path,
         base_path: &str,
     ) -> Result<(i64, i64)> {
-        let evidence_id = self.create_evidence(case_id, name, hash, details)?;
-        let container_id = self
-            .create_container(case_id, name, evidence_id, path, base_path)
-            .map_err(|e| {
-                FactumError::general(format!(
-                    "Evidence #{evidence_id} was created, but its container was not: {e}"
-                ))
-            })?;
-        Ok((evidence_id, container_id))
+        let new = self.new_container(case_id, name, path, base_path)?;
+        let container_id = Cell::new(None);
+        let created = self.create_evidence_then(case_id, name, hash, details, &|evidence_id| {
+            let evidence = (evidence_id, strip(name).to_string(), strip(details).to_string());
+            container_id.set(Some(self.create_logged(&new, evidence, true)?));
+            Ok(())
+        });
+        let evidence_id = created.inspect_err(|_| {
+            // a failed commit, after the file was written
+            if container_id.get().is_some() {
+                let _ = std::fs::remove_file(&new.path);
+            }
+        })?;
+        let id = container_id.get().expect("set inside the append");
+        log::info!("Container #{id} created: {}", new.path.display());
+        Ok((evidence_id, id))
     }
 
     /// Opens the container file of a container the log knows, checking that it is that container.

@@ -3030,6 +3030,62 @@ fn list_and_detail_agree_on_which_close_is_signed() {
 }
 
 #[test]
+fn evidence_with_container_leaves_nothing_when_it_fails() {
+    let s = Setup::new();
+    let factum = s.f.factum();
+    let entries = || {
+        s.f.count(&format!("SELECT COUNT(*) FROM entries WHERE case_id = {}", s.case_id))
+    };
+    let evidence = || {
+        s.f.count(&format!("SELECT COUNT(*) FROM evidence WHERE case_id = {}", s.case_id))
+    };
+    let (entries_before, evidence_before) = (entries(), evidence());
+    let unchanged = || assert_eq!((entries(), evidence()), (entries_before, evidence_before));
+    let create = |path: &Path| factum.create_evidence_with_container(s.case_id, "disk 2", "", "seized", path, "");
+
+    // the file cannot be created
+    let existing = s.f.path().join("taken.aff4l");
+    std::fs::write(&existing, "something else").unwrap();
+    assert!(create(&existing).is_err());
+    assert_eq!(std::fs::read(&existing).unwrap(), b"something else");
+    assert!(create(&s.f.path().join("no/such/folder/c.aff4l")).is_err());
+    unchanged();
+    // an evidence name it cannot be created with
+    let path = s.container_path();
+    assert!(
+        factum
+            .create_evidence_with_container(s.case_id, " ", "", "", &path, "")
+            .is_err()
+    );
+    unchanged();
+    // the second of the two entries cannot be signed: the first goes with it, and so does the file
+    s.f.signer.fail_text_after.set(Some(1));
+    assert!(create(&path).is_err());
+    assert!(!path.exists());
+    unchanged();
+    // the name is free again and the retry leaves one of each
+    let (evidence_id, id) = create(&path).unwrap();
+    assert_eq!((entries(), evidence()), (entries_before + 2, evidence_before + 1));
+    let detail = factum.container(id).unwrap();
+    assert_eq!(detail.evidence_id, Some(evidence_id));
+    let (volume, _) = Volume::open(&path, None).unwrap();
+    let arn = volume.arn();
+    assert_eq!(
+        volume
+            .graph()
+            .first_value(&arn, &format!("{}evidenceId", factum::container::FACTUM_NS)),
+        Some(evidence_id.to_string().as_str())
+    );
+    drop(volume);
+    let report = factum.verify_case(s.case_id, None).unwrap();
+    assert!(
+        !report.findings.iter().any(|f| f.level == factum::verifier::Level::Fail),
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
 fn a_close_signs_the_stored_bytes() {
     use factum::verifier::Level;
     let s = Setup::with_signer(FakeSigner::new(false));
