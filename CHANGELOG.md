@@ -102,9 +102,9 @@ All notable changes to this project are documented here. The format follows
   name is shortened, with a short hash keeping it unique
 - A container close signs only the state that was re-checked: it compares under the volume lock, and asks for a new
   re-check when another process changed the container since
-- An addition is refused when the container was closed meanwhile; Close as Damaged, Close Without File and Reopen
-  fail with "in use" while another process holds the file, and go through when it cannot be reached at all (a dead
-  mount)
+- An addition or a close is refused when the container was closed meanwhile; Close as Damaged, Close Without File and
+  Reopen fail with "in use" while another process holds the file, and go through when it cannot be reached at all (a
+  dead mount)
 - Opening a container goes by the log as it is once the lock is held, so a late signature can no longer drop an
   addition that another process committed while it waited
 - A `factum:replacedBy` that no addition in the case log records (or the reverse) fails Verify Container, so a forged

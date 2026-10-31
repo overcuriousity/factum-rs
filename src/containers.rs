@@ -925,6 +925,17 @@ impl Factum<'_> {
         Ok(volume)
     }
 
+    /// For `Append::reserve`: read again under the write lock, as a close without the volume lock (a file that cannot
+    /// be reached) may have landed while the step was running or waiting for a signature.
+    fn ensure_still_open(&self, id: i64, outcome: &str) -> Result<()> {
+        if self.container(id)?.summary.open {
+            return Ok(());
+        }
+        Err(FactumError::general(format!(
+            "Container #{id} was closed meanwhile; {outcome}."
+        )))
+    }
+
     /// Logs a staged Add operation and lists it in the container, both or neither.
     pub fn commit_container_add(&self, id: i64, volume: &mut Volume, staged: Staged) -> Result<i64> {
         let detail = self.container(id)?;
@@ -978,15 +989,7 @@ impl Factum<'_> {
                 let end = cell.borrow_mut().finalize_add(&staged, entry_id)?;
                 store_end(conn, &detail.summary.uuid, end)
             };
-            // read again under the write lock: it may have been closed (without its file) while this was running
-            let still_open = |_: &rusqlite::Connection| -> Result<()> {
-                if self.container(id)?.summary.open {
-                    return Ok(());
-                }
-                Err(FactumError::general(format!(
-                    "Container #{id} was closed meanwhile; nothing was added."
-                )))
-            };
+            let still_open = |_: &rusqlite::Connection| self.ensure_still_open(id, "nothing was added");
             self.append(
                 detail.summary.case_id,
                 KIND_SYSTEM,
@@ -1192,6 +1195,7 @@ impl Factum<'_> {
                 volume.close(&signatures)?;
                 store_end(conn, &uuid, volume.end())
             };
+            let still_open = |_: &rusqlite::Connection| self.ensure_still_open(id, "nothing was signed");
             self.append(
                 detail.summary.case_id,
                 KIND_SYSTEM,
@@ -1199,6 +1203,7 @@ impl Factum<'_> {
                 Append {
                     payload: Some(payload),
                     on_commit: Some(&close),
+                    reserve: Some(&still_open),
                     ..Default::default()
                 },
             )
@@ -1234,7 +1239,7 @@ impl Factum<'_> {
 
     /// Closes a container that cannot be signed, without signing or writing anything (spec 5.2), for what `recheck`
     /// found: damaged files, faults of the directory, or both. The container need not open for this: a directory
-    /// fault is why it does not. The log says what was not checked: an early end proves nothing about the files.
+    /// fault is why it does not. A re-check that ended early proves nothing about the files, and the log says so.
     pub fn close_container_damaged(&self, id: i64, recheck: &Recheck) -> Result<i64> {
         let (damaged, faults) = (&recheck.mismatches, &recheck.directory_faults);
         if damaged.is_empty() && faults.is_empty() {
@@ -1255,10 +1260,10 @@ impl Factum<'_> {
             (0, faults) => plural(faults, "directory fault"),
             (files, faults) => format!("{} · {}", mismatch_text(files), plural(faults, "directory fault")),
         };
-        let reason = match (unchecked, damaged.is_empty()) {
-            (0, true) => format!("{found}, no file found damaged"),
-            (0, false) => found,
-            (_, _) => format!("{found}, files not checked"),
+        let reason = match (recheck.ended_early, damaged.is_empty()) {
+            (true, _) => format!("{found}, files not checked"),
+            (false, true) => format!("{found}, no file found damaged"),
+            (false, false) => found,
         };
         let mut payload = json!({"event": "container_closed", "case_id": detail.summary.case_id,
                                  "container_id": detail.summary.uuid, "damaged": paths,
@@ -1266,7 +1271,7 @@ impl Factum<'_> {
         if !faults.is_empty() {
             payload["directory_fault"] = json!(faults);
         }
-        if unchecked > 0 {
+        if recheck.ended_early {
             payload["unchecked_files"] = json!(unchecked);
         }
         self.append(

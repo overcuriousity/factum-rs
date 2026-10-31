@@ -320,8 +320,10 @@ pub struct Recheck {
     pub directory_faults: Vec<String>,
     /// where the log's state ended when the re-check started
     pub logged_end: Option<u64>,
-    /// the files it read back, in the order of the input
+    /// the files it was to read back, in the order of the input
     pub arns: Vec<String>,
+    /// it stopped at the metadata: nothing is known about the files, listed or not
+    pub ended_early: bool,
     /// the end of the state it read
     pub volume_end: u64,
 }
@@ -359,6 +361,13 @@ const MEDIUM_GONE: [i32; 3] = [libc::ENODEV, libc::ENXIO, libc::EHOSTDOWN];
 // ERROR_NOT_READY, _DEV_NOT_EXIST, _NETNAME_DELETED, _MEDIA_CHANGED, _NO_MEDIA_IN_DRIVE, _DEVICE_NOT_CONNECTED
 #[cfg(windows)]
 const MEDIUM_GONE: [i32; 6] = [21, 55, 64, 1110, 1112, 1167];
+
+/// The platform's number of an input/output error; `io::ErrorKind` has no stable name for it.
+#[cfg(unix)]
+const IO_ERROR: i32 = libc::EIO;
+// ERROR_IO_DEVICE
+#[cfg(windows)]
+const IO_ERROR: i32 = 1117;
 
 /// Whether a read error during a re-check means the stored content is damaged (missing, corrupt, cut short).
 fn is_damage(kind: io::ErrorKind) -> bool {
@@ -489,9 +498,13 @@ pub fn recheck(
     };
     let mut file = match open_for_recheck(path).or_else(|_| open_for_recheck(path)) {
         Ok(file) => file,
-        // it is there, but what it stands on cannot be read: no state to go through
-        Err(e) if !is_damage(e.kind()) && !is_transient(&e) && std::fs::metadata(path).is_ok() => {
-            result.directory_faults.push(format!("the file cannot be opened ({e})"));
+        // it is there, but an I/O error keeps it shut; that may be the disk or the drive going, so no more is said.
+        // Anything else (too many open files, say) is about this process and only stops the check.
+        Err(e) if e.raw_os_error() == Some(IO_ERROR) && std::fs::metadata(path).is_ok() => {
+            result.ended_early = true;
+            result
+                .directory_faults
+                .push(format!("the file could not be opened ({e})"));
             return Ok(result);
         }
         Err(e) => return Err(unreadable(e.to_string())),
@@ -505,6 +518,7 @@ pub fn recheck(
         Ok(state) => state.ok_or_else(|| unreadable("no complete ZIP directory".into()))?,
         // the directory itself is what cannot be read: nothing to go through, and nothing to sign
         Err(e) if !is_damage(e.kind()) && counts_as_damage(&e, || medium_reads(path)) => {
+            result.ended_early = true;
             result
                 .directory_faults
                 .push(format!("the directory cannot be read ({e})"));
@@ -521,7 +535,10 @@ pub fn recheck(
     let graph = match parsed {
         Ok(graph) => graph,
         // it differs from its CRC-32 and cannot be read: the listed files cannot be found, whatever they hold
-        Err(_) if result.directory_faults.iter().any(|name| name == TURTLE) => return Ok(result),
+        Err(_) if result.directory_faults.iter().any(|name| name == TURTLE) => {
+            result.ended_early = true;
+            return Ok(result);
+        }
         Err(e) => return Err(unreadable(e)),
     };
     progress.total_files.store(records.len() as u64, Ordering::Relaxed);
@@ -863,6 +880,10 @@ fn try_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
 /// Locks the file, waiting briefly for a lock held for a moment (a child process between fork and exec still shares
 /// the open file). The last error is what stayed: `WouldBlock`, another process holds the lock.
 fn wait_for_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    #[cfg(test)]
+    if tests::NO_LOCKS.replace(false) {
+        return Err(std::fs::TryLockError::Error(io::Error::other("no locks here (test)")));
+    }
     for _ in 0..19 {
         match try_lock(file) {
             Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(50)),
@@ -1629,6 +1650,8 @@ mod tests {
         /// what the next read of the metadata and the next opens fail with, as for FAIL_READ
         pub static FAIL_METADATA: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
         pub static FAIL_OPEN: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+        /// the next lock fails with an error of its own, not because another process holds it
+        pub static NO_LOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// (head, tail) that a probe of the medium does not get
         pub static DEAD: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
     }
@@ -1788,11 +1811,13 @@ mod tests {
     #[cfg(unix)]
     fn an_open_that_fails_is_a_fault_only_while_the_file_is_there() {
         let result = recheck_set_up(|| FAIL_OPEN.set((libc::EIO, 2))).unwrap();
+        assert_eq!(result.directory_faults.len(), 1);
         assert!(
-            result.directory_faults[0].contains("cannot be opened"),
+            result.directory_faults[0].starts_with("the file could not be opened ("),
             "{:?}",
             result.directory_faults
         );
+        assert!(result.ended_early);
         assert_eq!((result.files, result.arns.is_empty()), (0, false));
         // once is nothing, and a transient error stays one
         assert!(
@@ -1802,6 +1827,11 @@ mod tests {
                 .is_empty()
         );
         assert!(recheck_set_up(|| FAIL_OPEN.set((libc::EACCES, 2))).is_err());
+        // only an I/O error is about the file: running out of descriptors is about this process
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOMEM] {
+            let error = recheck_set_up(|| FAIL_OPEN.set((code, 2))).unwrap_err();
+            assert!(error.to_string().contains("cannot be read"), "{error}");
+        }
         // gone altogether: the stat fails as well
         let missing = recheck(
             &PathBuf::from("/nonexistent/c.aff4l"),
@@ -1811,6 +1841,22 @@ mod tests {
             &AtomicBool::new(false),
         );
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn a_lock_that_fails_for_itself_gives_no_lock_and_no_error() {
+        let setup = Setup::new();
+        drop(setup.create());
+        NO_LOCKS.set(true);
+        assert!(lock_file(&setup.path()).unwrap().is_none());
+        // a writer does need it
+        NO_LOCKS.set(true);
+        let error = Volume::open(&setup.path(), None).err().unwrap();
+        assert!(error.to_string().contains("cannot be locked"), "{error}");
+        // no file, no lock
+        assert!(lock_file(&setup.dir.path().join("gone")).unwrap().is_none());
+        let held = lock_file(&setup.path()).unwrap();
+        assert!(held.is_some());
     }
 
     #[test]

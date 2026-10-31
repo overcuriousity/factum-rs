@@ -3475,3 +3475,62 @@ fn closed_states_a_crafted_number_claims_are_one_finding() {
         ["The closed states of closes 2 to 4294967294 are missing from the container."]
     );
 }
+
+#[test]
+fn a_close_as_damaged_that_lands_during_a_close_stops_it() {
+    use std::cell::Cell;
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let recheck = factum.recheck_container(id).unwrap();
+    let (db_path, path, aside) = (
+        s.f.path().join("factum.db"),
+        s.container_path(),
+        s.f.path().join("aside"),
+    );
+    let once = Cell::new(true);
+    *s.f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        // while this close signs its entry, another process closes the container without its lock: it found no file
+        if once.replace(false) {
+            let db = factum::Db::open(&db_path).unwrap();
+            let signer = FakeSigner::new(true);
+            let other = factum::Factum::with_seal_dir(&db, &signer, None);
+            std::fs::rename(&path, &aside).unwrap();
+            other.close_container_without_file(id).unwrap();
+            std::fs::rename(&aside, &path).unwrap();
+        }
+    }));
+    let length = std::fs::metadata(s.container_path()).unwrap().len();
+    let error = factum.close_container_with(id, &factum.gpgsm(), &recheck).unwrap_err();
+    assert!(
+        error.to_string().contains("closed meanwhile; nothing was signed"),
+        "{error}"
+    );
+    let closes = s.events("container_closed");
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(closes[0]["file_missing"], true);
+    assert_eq!(std::fs::metadata(s.container_path()).unwrap().len(), length);
+    assert!(member(&s.container_path(), &history_member(1, TURTLE)).is_none());
+}
+
+#[test]
+fn a_recheck_that_ended_early_says_so_with_nothing_due_as_well() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    factum.close_container(id).unwrap();
+    factum.reopen_container(id).unwrap();
+    let path = s.container_path();
+    write_turtle(&path, "@this is no turtle");
+    flip_directory_crc(&path, &directory_entry(&path, |archive| archive.get(TURTLE)));
+    let recheck = factum.recheck_container(id).unwrap();
+    assert!(recheck.arns.is_empty(), "nothing was added since the close");
+    assert!(recheck.ended_early);
+    let entry = factum.close_container_damaged(id, &recheck).unwrap();
+    let text = s.entry_text(entry);
+    assert!(text.contains("1 directory fault, files not checked"), "{text}");
+    assert!(!text.contains("no file found damaged"), "{text}");
+    assert_eq!(s.events("container_closed")[1]["unchecked_files"], 0);
+}
