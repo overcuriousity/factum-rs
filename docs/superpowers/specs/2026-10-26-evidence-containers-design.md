@@ -141,8 +141,8 @@ URI left to the builder), which other readers ignore:
 
 The file's IRIs follow the Turtle grammar. factum %-encodes what an IRI cannot hold when writing (it only ever writes
 `aff4://` ARNs and fixed namespaces, which are not changed by this), and when reading decodes `\uXXXX` and
-`\UXXXXXXXX` and refuses a space, a control character or any of `<>"{}|^` and backtick and backslash, written
-directly or as such an escape.
+`\UXXXXXXXX` and refuses U+0000 to U+0020 or any of `<>"{}|^`, backtick and backslash, written directly or as such
+an escape.
 
 How a metadata-only file is represented so that pyaff4 opens the container without errors (e.g. a `FileImage` with
 no storage stream, or a zero-length stream marked by `factum:metadataOnly`) is left to the builder, to be decided
@@ -251,10 +251,14 @@ Findings use the existing pass / warning / fail vocabulary and symbols (✓ ⚠ 
 / keybox), never merely because the container carries the root. A valid signature whose root is not trusted is a
 **fail** ("untrusted root"), consistent with how untrusted GPG keys are treated today; the finding names the root's
 subject and fingerprint so the examiner can decide to trust it in gpgsm. A certificate that has expired since keeps
-its signature good; what counts is that it was valid when it signed. The certificate that made the signature must be
-the first one of the chain stored in the container (`information.turtle.factum.cer`) and the one the case log records
-for that close, whichever the file and the database know of; anything else is a **fail**, also below a trusted root.
-A container without a stored chain gets no such finding.
+its signature good, with a **warning**: every certificate of the chain must have been valid at the time the signature
+states, and that time is what the signer stated, which nothing confirms.
+
+The certificate that made the signature must be the first one of the chain stored in the container
+(`information.turtle.factum.cer`); a difference is a **fail**, also below a trusted root, and a signature with no
+stored chain is a **warning**. This shows a file that is inconsistent, nothing more: whoever replaces the signature
+and the chain together passes it, with any certificate below a trusted root. Only the comparison with the certificate
+the case log records for that close (a **fail** too) defends against that, and only for a container of this database.
 
 **Containers from other tools** get the AFF4-L checks only, and only for AFF4-L v1.0 containers: ZipSegment and
 in-metadata streams, Map and ImageStream streams with stored or deflate compression (factum writes deflate

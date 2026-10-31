@@ -175,7 +175,8 @@ file system and options the files were read through, and, where it can be found,
 - **Linux**: from `/proc/self/mountinfo`, the mount containing the base path (longest mount point prefix, among the
   mounts a path can reach: one with a mount on top of it, or below a folder mounted over later, is left out): mount
   point, source device, file system type, mount options and superblock options. Read-only when either set says
-  `ro`. A mount point is matched by its bytes; one that is not UTF-8 is recorded as text with U+FFFD and with its
+  `ro`; the source line names the superblock options only when they say `ro` and the mount's do not, the log and the
+  container always have them. A mount point is matched by its bytes; one that is not UTF-8 is recorded as text with U+FFFD and with its
   bytes in Base64. For a loop device (`/dev/loopN`) or a partition of one (`/dev/loopNpM`), the backing file from
   `/sys/class/block/<device>/loop/backing_file` of the whole device. For a device-mapper or NBD device, the device
   only.

@@ -35,21 +35,24 @@ All notable changes to this project are documented here. The format follows
 - Containers: a source is opened without following a link or waiting on a FIFO, must still be the regular file of the
   same size that was listed (otherwise it is reported as changed, not added), and is read no further than one byte
   past that size
-- Containers: a link to the container inside an added folder is recorded as a link, not dropped; files are no longer
-  resolved one by one to find the container
+- Containers: a link to the container inside an added folder is recorded as a link, not dropped, and a hard link to it
+  is listed as not added; files are no longer resolved one by one to find the container
 - Containers: paths and link targets that are not valid Unicode keep their bytes beside the text
   (`factum:sourcePathRaw`, `factum:symlinkTargetRaw`, in the log `source_raw`, `base_path_raw`), and Add Again uses
   them, so such sources can be added again; a Windows name with an unpaired surrogate keeps a raw form too; change
   times before 1970 are no longer recorded as 1970
 - Containers: a mount point that is not UTF-8 no longer leaves every mount of the add unknown; it is matched by its
   bytes and recorded with them (`factum:mountPointRaw`). A mount hidden by another is no longer reported
-- Containers: superblock options are recorded beside the mount's own (`factum:superOptions`, in reports `super ...`)
-  and read-only counts if either says so; the image behind a partition of a loop device is recorded
+- Containers: superblock options are recorded beside the mount's own (`factum:superOptions`; the source line shows
+  them when they say `ro` and the mount does not) and read-only counts if either says so; the image behind a partition of a loop device is recorded
 - Containers: on Windows a mount folder among the sources no longer decides the volume of its siblings; adding many
   files no longer reads sysfs once per file
-- Containers: an X.509 signature no longer fails once its certificate has expired; the certificate must have been
-  valid when it signed. A signature by another certificate than the one stored in the container or recorded in the
-  case log is a failure, even when it chains to a trusted root
+- Containers: an X.509 signature no longer fails once its certificate has expired: every certificate of its chain
+  must have been valid at the time the signature states, and verification warns (`x509_expired`) that this rests on
+  the time the signer stated. A signature by another certificate than the first one stored in the container is a
+  failure, even when it chains to a trusted root, and a signature with no stored certificate a warning; this finds an
+  inconsistent file, not someone who replaces both. Only the comparison with the certificate recorded in the case
+  log, a failure too, defends against that
 - Containers: IRIs that do not fit the Turtle grammar are %-encoded when written and refused when read, and `\u`
   escapes in IRIs are decoded
 - Containers: reading a member checks it against the CRC-32 of the central directory. In verification a mismatch is a
