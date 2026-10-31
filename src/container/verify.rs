@@ -719,7 +719,7 @@ pub fn verify_file(
         return Ok(report);
     };
     // every closed state kept, numbered from 1 without gaps: a gap is a closed state that was removed
-    let closes: std::collections::BTreeSet<u32> = archive
+    let mut closes: std::collections::BTreeSet<u32> = archive
         .entries
         .iter()
         .filter_map(|e| {
@@ -730,6 +730,13 @@ pub fn verify_file(
                 .ok()
         })
         .collect();
+    if closes.remove(&0) {
+        report.finding(
+            Level::Fail,
+            "history",
+            "A closed state numbered 0: closes are numbered from 1; it was not checked.",
+        );
+    }
     let count = closes.last().copied().unwrap_or(0);
     for missing in (1..count).filter(|n| !closes.contains(n)) {
         report.finding(

@@ -34,7 +34,6 @@ pub const SIGNATURE_MEMBERS: [&str; 4] = [SIG_GPG, KEY_GPG, SIG_X509, CER_X509];
 const README: &str = include_str!("README.txt");
 pub const VERIFY_CONTAINER_PY: &[u8] = include_bytes!("verify_container.py");
 
-/// The name of a closed state's copy of a member.
 /// The README a container carries: what it is, how to verify it, and which verifier it carries (spec 5.3).
 pub fn readme_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -47,6 +46,7 @@ pub fn readme_text() -> String {
     )
 }
 
+/// The name of a closed state's copy of a member.
 pub fn history_member(n: u32, name: &str) -> String {
     format!("factum/history/{n}/{name}")
 }

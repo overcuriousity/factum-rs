@@ -1461,6 +1461,11 @@ impl Factum<'_> {
     }
 }
 
+/// The close a state number stands for, from 1; a file can claim any number.
+fn nth_close(detail: &ContainerDetail, n: u32) -> Option<&CloseEvent> {
+    detail.closes.get((n as usize).checked_sub(1)?)
+}
+
 impl Factum<'_> {
     /// Verifies a container file (spec 4.6); for a container of this database also against its case log: the
     /// closed states against the logged closes, the files against the logged additions, and what the log
@@ -1494,7 +1499,7 @@ impl Factum<'_> {
         let mut findings = Vec::new();
         for state in &report.states {
             let Some(n) = state.close else { continue };
-            match detail.closes.get(n as usize - 1) {
+            match nth_close(&detail, n) {
                 Some(close) if close.turtle_sha256 == state.turtle_sha256 => {
                     // who signed it: at the close, or later
                     let late = detail
@@ -1538,7 +1543,7 @@ impl Factum<'_> {
             .is_some_and(|p| Some(p) == canonical(path));
         let upto = match matches_close {
             _ if live => i64::MAX,
-            Some(n) => detail.closes.get(n as usize - 1).map_or(i64::MAX, |c| c.entry_id),
+            Some(n) => nth_close(&detail, n).map_or(i64::MAX, |c| c.entry_id),
             None => task_entries(&graph).into_iter().max().unwrap_or(id),
         };
         findings.extend(compare_records(&detail, &graph, upto));

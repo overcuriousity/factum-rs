@@ -3118,6 +3118,35 @@ fn a_close_signs_the_stored_bytes() {
 }
 
 #[test]
+fn a_closed_state_numbered_zero_is_a_failure() {
+    use factum::container::zip64::{Appender, read_archive};
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    factum.close_container(id).unwrap();
+    let path = s.container_path();
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let len = file.metadata().unwrap().len();
+    let archive = read_archive(&mut file, len).unwrap();
+    let mut app = Appender::new(file, len, archive.entries).unwrap();
+    app.add_bytes(&history_member(0, TURTLE), 8, b"# nothing").unwrap();
+    app.finish(&[], &archive.comment).unwrap();
+    drop(app);
+    let report = factum
+        .verify_container_file(&path, &factum.gpgsm(), &|_, _| {}, &AtomicBool::new(false))
+        .unwrap();
+    assert!(
+        report.findings.iter().any(|f| f.code == "history"
+            && f.level == factum::verifier::Level::Fail
+            && f.message.contains("numbered 0")),
+        "{:?}",
+        report.findings
+    );
+    assert!(report.states.iter().all(|state| state.close != Some(0)));
+}
+
+#[test]
 fn a_directory_fault_of_the_metadata_can_only_be_closed_as_damaged() {
     for member_name in ["version.txt", "container.description", TURTLE, HASHES] {
         let s = Setup::new();
