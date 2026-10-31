@@ -285,11 +285,12 @@ factum, which reads those, has nothing to say, and an older AFF4 file fails wher
 factum fails, but for what only the log can tell.
 
 Whether a container is factum's is decided by its layout (`factum/history/`, `factum/README.txt`, `verify_container.py`
-or root signatures), never by `version.txt`, which is not signed. In a factum container "not checked" is a failure, as
-is a `version.txt` or `container.description` that is missing, a member under `factum/history/` outside a close that was
-read, and a root signature on a state that is not closed: from 2.6.0 on every new state takes the root signatures away.
-Other tools' containers keep the warnings above. A check holds at most 4 GiB of metadata, all states and graphs
-together, in either verifier; what needs more fails.
+or root signatures), never by `version.txt`, which is not signed. In a factum container a stored file whose content
+cannot be hashed is a failure, not "not checked", as is a `version.txt` or `container.description` that is missing, a
+member under `factum/history/` outside a close that was read, and a root signature on a state that is not closed: from
+2.6.0 on every new state takes the root signatures away. "Not checked" stays a warning for other tools' containers, and
+in any container for what is no stored file: an `information.hdt`, the other parts of a multi-part file. A check holds
+at most 4 GiB of metadata, all states and graphs together, in either verifier; what needs more fails.
 
 ### 4.7 GUI
 
