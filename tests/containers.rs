@@ -2115,8 +2115,8 @@ mod script {
         assert_eq!(code, 1, "{output}");
     }
 
-    // --- verify_container.py and factum's verifier on the same files. factum's verifier also runs here without the case
-    // log: what only the log can tell is left out, as a recipient of the container does not have it either.
+    // --- verify_container.py and factum's verifier on the same files. factum's verifier also runs here without the
+    // case log: what only the log can tell is left out, as a recipient of the container does not have it either.
 
     /// The verdict of this build's script, run as a recipient runs it; None without python3.
     fn script_verdict(path: &Path, flags: &[&str], gnupg_home: Option<&Path>) -> Option<(Level, String)> {
