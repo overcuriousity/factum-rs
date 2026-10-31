@@ -1529,10 +1529,19 @@ impl Factum<'_> {
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<crate::container::verify::ContainerReport> {
         let mut report = crate::container::verify::verify_file(path, self.signer, gpgsm, progress, cancel)?;
-        let (Some(uuid), Some(graph)) = (report.uuid.clone(), report.graph.clone()) else {
+        let Some(uuid) = report.uuid.clone() else {
             return Ok(report);
         };
         let Some(id) = self.find_container_by_uuid(&uuid)? else {
+            return Ok(report);
+        };
+        let Some(graph) = report.graph.clone() else {
+            // what was found stands, but whatever its verdict, it is not the file the log records
+            report.finding(
+                Level::Fail,
+                "log_mismatch",
+                format!("This file names container {uuid} of the case log, but its metadata could not be compared."),
+            );
             return Ok(report);
         };
         let detail = self.container(id)?;
