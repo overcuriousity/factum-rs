@@ -220,7 +220,7 @@ def hash_value(graph, subject, algorithm):
     return None
 
 
-def fingerprint_of_content(graph, arn):
+def content_identity(graph, arn):
     """What a file and its replacement must share: the hashes and the size."""
     found = {}
     for _, value, _, datatype in values(graph, arn, "hash"):
@@ -648,7 +648,7 @@ def bevy_member(archive, name, differs):
     try:
         data, crc_matches = member_bytes(archive, entry)
     except NotImplementedError as e:
-        raise Invalid(str(e))  # unlike a whole file it is not a stored form factum leaves unchecked
+        raise Invalid(str(e))  # part of a stream: damage, not a file stored in a form not read
     if not crc_matches:
         differs.append(name)
     return data
@@ -766,7 +766,7 @@ def check_files(archive, graph):
             # a damaged copy that was added again (Add Again) is a known fact: a warning, not a failure, but only when
             # the replacement is a file of this state with the same hashes and size; that explains its CRC-32 as well
             by = replacements.pop(0)
-            if by in listed and fingerprint_of_content(graph, by) == fingerprint_of_content(graph, arn):
+            if by in listed and content_identity(graph, by) == content_identity(graph, arn):
                 warn("replaced_copy", "%s: the content does not match its hashes; replaced by a copy added again (%s)."
                      % (name, display(graph, by)))
             else:

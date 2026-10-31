@@ -31,7 +31,19 @@ All notable changes to this project are documented here. The format follows
   `--target` matches nothing. `install.sh` quotes and escapes the install folder in the menu entry's `Exec=` line;
   `install.ps1` keeps `%VAR%` entries of the user PATH unexpanded.
 
+- `verify_container.py` ends each finding with factum's code for it, in square brackets, and reads a signature's
+  certificates as of the signing time it states: a good signature by a certificate that has expired since is a warning
+  (`x509_expired`), a chain not valid at signing fails, and a `.sig` without its `.cer` is a warning. A signature counts
+  by the same rules as in `verify.py` (exactly one good signature, a key expired since is a warning, every trust line
+  counts, the primary key's fingerprint), and it needs gpg 2.1 or newer to check one. Every `replacedBy` is a warning
+  naming the pair: only factum can compare it with the case log
+
 ### Fixed
+- `verify_container.py` reaches the verdicts of factum's own check: it reads the ZIP itself, so bytes after the last
+  complete state are a warning only when they are an interrupted addition and otherwise fail, like a directory that
+  holds more or less than its count or a member whose local header differs; a bad CRC-32 is a finding beside the hashes
+  instead of a traceback or a stop; a closed current state's root signatures are compared with the kept ones; `history/0`
+  fails; a crafted history number no longer exhausts memory; IRIs decode `\u` escapes and refuse what Turtle forbids
 - Containers: a source is opened without following a link or waiting on a FIFO, must still be the regular file of the
   same size that was listed (otherwise it is reported as changed, not added), and is read no further than one byte
   past that size

@@ -186,8 +186,10 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   unsupported
 - Recipients without factum run the script the container carries: extract `verify_container.py` and run
   `python3 verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
-  `gpg` and `openssl` for the signatures). The container's `factum/README.txt` names the script's SHA-256 and the
-  same script on GitHub for that version, to compare before running it
+  `gpg` 2.1 or newer and `openssl` for the signatures). It reaches factum's verdict on the file, except that it has no
+  case log, so each `replacedBy` stays a warning, and that it fails a container it does not support, which factum only
+  warns about. Each finding ends with factum's code for it. The container's `factum/README.txt` names the script's
+  SHA-256 and the same script on GitHub for that version, to compare before running it
 - `samples/container/` holds a signed sample container with throwaway TEST ONLY keys, for checking other AFF4-L
   tools against factum's GPG and X.509 signatures
 - Reports list each container with its files; the verification bundle carries the log entries, not the container

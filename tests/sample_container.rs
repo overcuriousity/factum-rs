@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use factum::container::verify::verify_file;
+use factum::container::volume::VERIFY_CONTAINER_PY;
 use factum::container::x509::Gpgsm;
 use factum::container::zip64::{member_bytes, read_archive};
 use factum::signer::FakeSigner;
@@ -43,6 +44,30 @@ fn sample_verifies() {
     }
     assert_eq!(report.states.iter().filter(|s| s.close.is_some()).count(), 2);
     assert_eq!(report.checked_files, 3);
+}
+
+/// The script of this build, as CI runs the one the sample carries. Signatures that cannot be checked for want of gpg or
+/// openssl are warnings, so it passes without them as well.
+#[test]
+fn this_build_of_the_script_passes_the_sample() {
+    let Ok(python) = which::which("python3") else {
+        eprintln!("skipped: python3 is not installed");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("verify_container.py");
+    std::fs::write(&script, VERIFY_CONTAINER_PY).unwrap();
+    let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/container");
+    let output = std::process::Command::new(python)
+        .args(["-I", "-X", "utf8"])
+        .arg(&script)
+        .arg(samples.join("sample.aff4l"))
+        .arg("--ca")
+        .arg(samples.join("root.pem"))
+        .arg("--use-carried-key")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
 }
 
 /// Every state in the file, not only the newest: its directory reads to its end and its members to theirs.

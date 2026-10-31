@@ -1410,7 +1410,7 @@ mod verify {
     }
 
     /// A container outside any log, closed with an X.509 signature and `chain` beside it.
-    fn loose_container(s: &Setup, gpgsm: &Gpgsm, home: &common::GpgsmHome, chain: Option<&str>) -> PathBuf {
+    pub(super) fn loose_container(s: &Setup, gpgsm: &Gpgsm, home: &common::GpgsmHome, chain: Option<&str>) -> PathBuf {
         home.trusted();
         loose_signed(s, &|turtle| {
             let (signature, own_chain) = gpgsm.sign_with_chain(&home.leaf_fingerprint, turtle, &[]).unwrap();
@@ -1419,7 +1419,7 @@ mod verify {
     }
 
     /// A container outside any log, closed with the (signature, chain) `sign` makes of its metadata.
-    fn loose_signed(s: &Setup, sign: &dyn Fn(&[u8]) -> (String, String)) -> PathBuf {
+    pub(super) fn loose_signed(s: &Setup, sign: &dyn Fn(&[u8]) -> (String, String)) -> PathBuf {
         use factum::container::volume::{Signatures, VolumeInfo};
         let path = s.f.path().join("loose.aff4l");
         let _ = std::fs::remove_file(&path);
@@ -1628,21 +1628,27 @@ mod verify {
 
 mod script {
     use super::*;
+    use factum::container::verify::verify_file;
     use factum::container::volume::VERIFY_CONTAINER_PY;
     use factum::container::x509::{Gpgsm, X509_CERT_SETTING};
     use factum::container::zip64::{Appender, read_archive};
     use factum::signer::{GnupgSigner, Signer as _};
+    use factum::verifier::Level;
     use factum::{Db, Factum};
     use std::process::Command;
 
     /// Extracts verify_container.py from the container and runs it there; None without python3.
     fn run(container: &Path, flags: &[&str], gnupg_home: Option<&Path>) -> Option<(i32, String)> {
+        // from the container, as recipients do; from this build when the ZIP cannot be read (a damaged tail)
+        let carried = member(container, "verify_container.py").unwrap_or_else(|| VERIFY_CONTAINER_PY.to_vec());
+        run_script(&carried, container, flags, gnupg_home)
+    }
+
+    fn run_script(source: &[u8], container: &Path, flags: &[&str], gnupg_home: Option<&Path>) -> Option<(i32, String)> {
         let python = which::which("python3").ok()?;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("verify_container.py");
-        // from the container, as recipients do; from this build when the ZIP cannot be read (a damaged tail)
-        let carried = member(container, "verify_container.py").unwrap_or_else(|| VERIFY_CONTAINER_PY.to_vec());
-        std::fs::write(&script, carried).unwrap();
+        std::fs::write(&script, source).unwrap();
         let mut command = Command::new(python);
         // UTF-8 output whatever the console's code page (Windows pipes default to it), so the ✓ ⚠ ✗ are checked
         command
@@ -1805,6 +1811,19 @@ mod script {
         };
         assert_eq!(code, 0, "{output}");
         assert!(output.contains("1 file(s) checked"), "{output}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn script_reads_the_raw_form_of_paths_that_are_not_unicode() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        added_from_a_path_that_is_not_unicode(&s);
+        assert!(turtle_text(&s.container_path()).contains("sourcePathRaw"));
+        let Some((code, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("2 file(s) checked"), "{output}");
     }
 
     #[test]
@@ -2094,6 +2113,697 @@ mod script {
             return;
         };
         assert_eq!(code, 1, "{output}");
+    }
+
+    // --- verify_container.py and factum's verifier on the same files. factum's verifier also runs here without the case
+    // log: what only the log can tell is left out, as a recipient of the container does not have it either.
+
+    /// The verdict of this build's script, run as a recipient runs it; None without python3.
+    fn script_verdict(path: &Path, flags: &[&str], gnupg_home: Option<&Path>) -> Option<(Level, String)> {
+        let (code, output) = run_script(VERIFY_CONTAINER_PY, path, flags, gnupg_home)?;
+        assert!(!output.contains("Traceback"), "{output}");
+        let level = match code {
+            0 if output.contains(", 0 warning(s)") => Level::Ok,
+            0 => Level::Warn,
+            1 => Level::Fail,
+            other => panic!("exit code {other}: {output}"),
+        };
+        Some((level, output))
+    }
+
+    /// Both verifiers on `path`: the same verdict, the one expected, and `code` (empty: none asked for) among the
+    /// findings of both. Returns false without python3.
+    fn assert_verdict(
+        what: &str,
+        path: &Path,
+        expected: Level,
+        code: &str,
+        verifiers: (&dyn factum::signer::Signer, &Gpgsm),
+        flags: &[&str],
+        gnupg_home: Option<&Path>,
+    ) -> bool {
+        let (signer, gpgsm) = verifiers;
+        let report = verify_file(path, signer, gpgsm, &|_, _| {}, &AtomicBool::new(false)).unwrap();
+        let Some((level, output)) = script_verdict(path, flags, gnupg_home) else {
+            eprintln!("skipped: python3 is not installed");
+            return false;
+        };
+        let findings = &report.findings;
+        assert_eq!(report.overall(), expected, "{what}: factum: {findings:?}");
+        assert_eq!(level, expected, "{what}: the script: {output}\nfactum: {findings:?}");
+        if !code.is_empty() {
+            assert!(findings.iter().any(|f| f.code == code), "{what}: {code}: {findings:?}");
+            assert!(output.contains(&format!("[{code}]")), "{what}: {code}: {output}");
+        }
+        true
+    }
+
+    /// Where the directory of the newest state lists `name`.
+    fn directory_at(bytes: &[u8], name: &str) -> usize {
+        // the name as the directory has it: followed by the ZIP64 extra
+        let listed = [name.as_bytes(), &[1, 0, 24, 0]].concat();
+        let at = bytes
+            .windows(listed.len())
+            .enumerate()
+            .rev()
+            .find(|(at, w)| *w == listed && bytes[at - 46..at - 42] == *b"PK\x01\x02");
+        at.unwrap().0 - 46
+    }
+
+    fn entry_of(path: &Path, name: &str) -> factum::container::zip64::CdEntry {
+        directory_entry(path, |archive| archive.get(name))
+    }
+
+    fn flip_crc(path: &Path, name: &str) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let listed = directory_at(&bytes, name);
+        bytes[listed + 16] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Flips one byte of a member's stored data; the directory stays as it was.
+    fn flip_data(path: &Path, name: &str) {
+        let entry = entry_of(path, name);
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[entry.header_offset as usize + 30 + name.len() + 20 + entry.compressed_size as usize / 2] ^= 0x55;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A compression method nobody reads, in the local header and the directory alike.
+    fn set_method(path: &Path, name: &str) {
+        let entry = entry_of(path, name);
+        let mut bytes = std::fs::read(path).unwrap();
+        let listed = directory_at(&bytes, name);
+        bytes[listed + 10] = 99;
+        bytes[entry.header_offset as usize + 8] = 99;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn differ_local_header(path: &Path, name: &str) {
+        let entry = entry_of(path, name);
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[entry.header_offset as usize + 30] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// The entry count of the end records, moved by `by`: the directory then holds more or less than it says.
+    fn change_count(path: &Path, by: i64) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let record = bytes.windows(4).rposition(|w| w == b"PK\x06\x06").unwrap();
+        let count = u64::from_le_bytes(bytes[record + 32..record + 40].try_into().unwrap());
+        let count = count.checked_add_signed(by).unwrap();
+        bytes[record + 24..record + 32].copy_from_slice(&count.to_le_bytes());
+        bytes[record + 32..record + 40].copy_from_slice(&count.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn append(path: &Path, tail: &[u8]) {
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes.extend(tail);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn cut(path: &Path, count: usize) {
+        let bytes = std::fs::read(path).unwrap();
+        std::fs::write(path, &bytes[..bytes.len() - count]).unwrap();
+    }
+
+    /// Writes members after the newest state and a new directory; `omit` leaves members out of it.
+    fn rewrite(path: &Path, members: &[(&str, &[u8])], omit: &[&str]) {
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let mut app = Appender::new(file, len, archive.entries).unwrap();
+        for (name, data) in members {
+            app.add_bytes(name, 0, data).unwrap();
+        }
+        app.finish(omit, &archive.comment).unwrap();
+    }
+
+    fn turtle_text(path: &Path) -> String {
+        String::from_utf8(member(path, TURTLE).unwrap()).unwrap()
+    }
+
+    /// The ARN and the member of the file stored as a ZipSegment, and the first bevy of the ImageStream.
+    fn stored_names(path: &Path) -> (String, String, String) {
+        let graph = factum::container::turtle::parse(&turtle_text(path)).unwrap();
+        let small = factum::container::volume::file_records(&graph)
+            .into_iter()
+            .find(|r| r.path.ends_with("small.txt"))
+            .unwrap();
+        let uuid = String::from_utf8(member(path, "container.description").unwrap()).unwrap();
+        let small_member = factum::container::member_name(&small.arn, &uuid);
+        let mut file = std::fs::File::open(path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let bevy = read_archive(&mut file, len)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.name_lossy())
+            .find(|n| n.ends_with("/00000000"))
+            .unwrap();
+        (small.arn, small_member, bevy)
+    }
+
+    /// Stands in for an ARN: the same IRI with its last character written as an escape.
+    fn escaped_last_character(arn: &str) -> String {
+        let (start, last) = arn.split_at(arn.len() - 1);
+        format!("{start}\\u{:04X}", last.chars().next().unwrap() as u32)
+    }
+
+    type Tamper = Box<dyn Fn(&Path)>;
+
+    /// (what is done, the verdict, a finding both must name, what does it)
+    fn tamperings(base: &Path, source: &Path) -> Vec<(&'static str, Level, &'static str, Tamper)> {
+        use factum::container::FACTUM_NS;
+        use factum::container::volume::KEY_GPG;
+        let (small, small_member, bevy) = stored_names(base);
+        let close_1_turtle = history_member(1, TURTLE);
+        let close_1_signature = member(base, &history_member(1, SIG_GPG)).unwrap();
+        let source = source.to_path_buf();
+        let big = stored_big_arn(base);
+        let doubled = [close_1_signature.as_slice(), close_1_signature.as_slice()].concat();
+        let on = |tamper: fn(&Path, &str), name: &str| -> Tamper {
+            let name = name.to_string();
+            Box::new(move |p| tamper(p, &name))
+        };
+        let replaced = small.clone();
+        let swapped = small.clone();
+        vec![
+            ("nothing", Level::Ok, "", Box::new(|_| {})),
+            // the end of the file
+            (
+                "a member hidden behind a lowered count",
+                Level::Fail,
+                "trailing_data",
+                Box::new(|p| change_count(p, -1)),
+            ),
+            (
+                "a count above what is listed",
+                Level::Fail,
+                "trailing_data",
+                Box::new(|p| change_count(p, 1)),
+            ),
+            (
+                "a few trailing bytes",
+                Level::Fail,
+                "trailing_data",
+                Box::new(|p| append(p, b"junk")),
+            ),
+            (
+                "many trailing bytes",
+                Level::Fail,
+                "trailing_data",
+                Box::new(|p| append(p, &[7; 100_000])),
+            ),
+            (
+                "the end records cut short",
+                Level::Fail,
+                "trailing_data",
+                Box::new(|p| cut(p, 30)),
+            ),
+            (
+                "the directory cut short",
+                Level::Warn,
+                "trailing_data",
+                Box::new(|p| cut(p, 300)),
+            ),
+            (
+                "an interrupted addition",
+                Level::Warn,
+                "trailing_data",
+                Box::new(move |p| {
+                    let file = source.join("interrupted.bin");
+                    std::fs::write(&file, vec![1u8; 100_000]).unwrap();
+                    let (mut volume, _) = Volume::open(p, None).unwrap();
+                    let options = AddOptions {
+                        base: source.clone(),
+                        keep_path: true,
+                        metadata_only: false,
+                        excerpt: None,
+                        replaces: Vec::new(),
+                    };
+                    let progress = AddProgress::default();
+                    volume
+                        .stage_add(&[file], &options, &progress, &AtomicBool::new(false))
+                        .unwrap();
+                }),
+            ),
+            // the directory
+            (
+                "a duplicate name",
+                Level::Fail,
+                "duplicate_member",
+                Box::new(|p| duplicate_member(p, "version.txt")),
+            ),
+            (
+                "the CRC-32 of a file",
+                Level::Fail,
+                "stream_hash",
+                on(flip_crc, &small_member),
+            ),
+            ("the CRC-32 of a bevy", Level::Fail, "stream_hash", on(flip_crc, &bevy)),
+            (
+                "the CRC-32 of information.turtle",
+                Level::Fail,
+                "turtle_hash",
+                on(flip_crc, TURTLE),
+            ),
+            (
+                "the CRC-32 of a kept information.turtle",
+                Level::Fail,
+                "history",
+                on(flip_crc, &close_1_turtle),
+            ),
+            (
+                "the CRC-32 of a kept hashes file",
+                Level::Fail,
+                "turtle_hash",
+                on(flip_crc, &history_member(1, HASHES)),
+            ),
+            (
+                "the CRC-32 of version.txt",
+                Level::Fail,
+                "history",
+                on(flip_crc, "version.txt"),
+            ),
+            (
+                "the CRC-32 of container.description",
+                Level::Fail,
+                "history",
+                on(flip_crc, "container.description"),
+            ),
+            (
+                "the CRC-32 of the root signature",
+                Level::Fail,
+                "history",
+                on(flip_crc, SIG_GPG),
+            ),
+            (
+                "the CRC-32 of a kept signature",
+                Level::Fail,
+                "signature_invalid",
+                on(flip_crc, &history_member(2, SIG_GPG)),
+            ),
+            (
+                "a local header that differs, of a file",
+                Level::Fail,
+                "stream_hash",
+                on(differ_local_header, &small_member),
+            ),
+            (
+                "a local header that differs, of metadata",
+                Level::Fail,
+                "history",
+                on(differ_local_header, &history_member(2, TURTLE)),
+            ),
+            // the content
+            ("a byte of a bevy", Level::Fail, "stream_hash", on(flip_data, &bevy)),
+            (
+                "a byte of a file",
+                Level::Fail,
+                "stream_hash",
+                on(flip_data, &small_member),
+            ),
+            (
+                "a bevy in a method nobody reads",
+                Level::Fail,
+                "stream_hash",
+                on(set_method, &bevy),
+            ),
+            (
+                "a file in a method nobody reads",
+                Level::Warn,
+                "not_checked",
+                on(set_method, &small_member),
+            ),
+            (
+                "the storage type dropped in a new state",
+                Level::Fail,
+                "history",
+                Box::new(move |p| swap_content_and_drop_storage_type(p, &swapped)),
+            ),
+            // the states
+            (
+                "the root signature swapped for an older one",
+                Level::Fail,
+                "history",
+                Box::new(move |p| rewrite(p, &[(SIG_GPG, &close_1_signature)], &[])),
+            ),
+            (
+                "the root key swapped",
+                Level::Fail,
+                "history",
+                Box::new(|p| rewrite(p, &[(KEY_GPG, b"another key")], &[])),
+            ),
+            (
+                "two signatures in one",
+                Level::Fail,
+                "signature_invalid",
+                Box::new(move |p| rewrite(p, &[(&history_member(1, SIG_GPG), &doubled)], &[])),
+            ),
+            (
+                "a close without its signature",
+                Level::Fail,
+                "unsigned",
+                Box::new(|p| rewrite(p, &[], &[&history_member(1, SIG_GPG)])),
+            ),
+            ("a close removed", Level::Fail, "history", Box::new(drop_history_1)),
+            (
+                "a kept state edited",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(move |p| {
+                    let edited = String::from_utf8(member(p, &close_1_turtle).unwrap()).unwrap();
+                    rewrite(
+                        p,
+                        &[(&close_1_turtle, edited.replace("small", "large").as_bytes())],
+                        &[],
+                    );
+                }),
+            ),
+            (
+                "history/0",
+                Level::Fail,
+                "history",
+                Box::new(|p| rewrite(p, &[(&history_member(0, TURTLE), b"")], &[])),
+            ),
+            (
+                "a huge history number",
+                Level::Fail,
+                "history",
+                Box::new(|p| rewrite(p, &[(&history_member(u32::MAX, TURTLE), b"")], &[])),
+            ),
+            (
+                "a history number that is no close to factum",
+                Level::Ok,
+                "",
+                Box::new(|p| rewrite(p, &[("factum/history/4294967296/information.turtle", b"")], &[])),
+            ),
+            // the metadata
+            (
+                "metadata edited",
+                Level::Fail,
+                "history",
+                Box::new(|p| write_turtle(p, &turtle_text(p).replace("small.txt", "large.txt"))),
+            ),
+            (
+                "a forged replacedBy",
+                Level::Fail,
+                "history",
+                Box::new(move |p| add_triple(p, &replaced, &format!("{FACTUM_NS}replacedBy"), &big)),
+            ),
+            (
+                "an ARN written with an escape",
+                Level::Warn,
+                "not_signed",
+                Box::new(move |p| {
+                    let text = turtle_text(p);
+                    write_turtle(p, &text.replace(&small, &escaped_last_character(&small)));
+                }),
+            ),
+            (
+                "a space in an IRI",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(|p| {
+                    let text = turtle_text(p);
+                    let (arn, _, _) = stored_names(p);
+                    write_turtle(p, &text.replace(&arn, &format!("{arn} x")));
+                }),
+            ),
+            (
+                "an escape in an IRI that stands for a space",
+                Level::Fail,
+                "turtle_hash",
+                Box::new(|p| {
+                    let text = turtle_text(p);
+                    let (arn, _, _) = stored_names(p);
+                    write_turtle(p, &text.replace(&arn, &format!("{arn}\\u0020x")));
+                }),
+            ),
+            (
+                "a store nothing here reads",
+                Level::Warn,
+                "not_checked",
+                Box::new(|p| rewrite(p, &[("information.hdt", b"HDT")], &[])),
+            ),
+            (
+                "no ZIP at all",
+                Level::Fail,
+                "not_aff4",
+                Box::new(|p| std::fs::write(p, vec![0u8; 5000]).unwrap()),
+            ),
+        ]
+    }
+
+    /// The ARN of the file stored as an ImageStream.
+    fn stored_big_arn(path: &Path) -> String {
+        let graph = factum::container::turtle::parse(&turtle_text(path)).unwrap();
+        factum::container::volume::file_records(&graph)
+            .into_iter()
+            .find(|r| r.path.ends_with("big.bin"))
+            .unwrap()
+            .arn
+    }
+
+    #[test]
+    fn both_verifiers_agree_on_tampered_containers() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let base = signed_container(&dir, &home);
+        let db = Db::open(&dir.path().join("factum.db")).unwrap();
+        let signer = GnupgSigner::new(&db, Some(home.path()));
+        let gpgsm = Gpgsm::unavailable();
+        let copy = dir.path().join("tampered.aff4l");
+        for (what, expected, code, tamper) in tamperings(&base, &dir.path().join("mnt")) {
+            std::fs::copy(&base, &copy).unwrap();
+            tamper(&copy);
+            let home = home.path();
+            if !assert_verdict(what, &copy, expected, code, (&signer, &gpgsm), &[], Some(&home)) {
+                return;
+            }
+        }
+    }
+
+    /// The one disagreement, on purpose: factum also opens other tools' containers and warns that it does not support
+    /// this one, while the script checks what factum wrote, so it must not answer OK having checked nothing.
+    #[test]
+    fn the_script_fails_what_factum_only_warns_is_unsupported() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        rewrite(&s.container_path(), &[], &["version.txt"]);
+        let report = verify_file(
+            &s.container_path(),
+            &FakeSigner::new(false),
+            &Gpgsm::unavailable(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.overall(), Level::Warn, "{:?}", report.findings);
+        let Some((level, output)) = script_verdict(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert_eq!(level, Level::Fail, "{output}");
+        assert!(output.contains("[unsupported]"), "{output}");
+    }
+
+    #[test]
+    fn both_verifiers_say_so_when_the_key_is_unknown_or_has_expired() {
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        let db = Db::open(&dir.path().join("factum.db")).unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let signer = GnupgSigner::new(&db, Some(empty.path().to_path_buf()));
+        let verifiers: (&dyn factum::signer::Signer, &Gpgsm) = (&signer, &Gpgsm::unavailable());
+        assert_verdict(
+            "no key",
+            &path,
+            Level::Fail,
+            "key_unknown",
+            verifiers,
+            &[],
+            Some(empty.path()),
+        );
+        let Some(home) = common::GpgHome::at_time(
+            Some("20200101T000000"),
+            "Expired Key <expired@factum.invalid>",
+            "sign",
+            "2020-02-01",
+        ) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        home.set_clock(None);
+        let db = Db::open(&dir.path().join("factum.db")).unwrap();
+        let signer = GnupgSigner::new(&db, Some(home.path()));
+        assert_verdict(
+            "an expired key",
+            &path,
+            Level::Warn,
+            "key_expired",
+            (&signer, &Gpgsm::unavailable()),
+            &[],
+            Some(&home.path()),
+        );
+    }
+
+    #[test]
+    fn both_verifiers_agree_on_replacements() {
+        use factum::container::FACTUM_NS;
+        let replaced_by = format!("{FACTUM_NS}replacedBy");
+        for (what, damage, content, expected, code) in [
+            ("forged, the file is fine", false, "a", Level::Warn, "not_signed"),
+            ("a copy added again", true, "a", Level::Warn, "replaced_copy"),
+            ("a copy with other content", true, "other", Level::Fail, "stream_hash"),
+        ] {
+            let s = Setup::with_signer(FakeSigner::new(false));
+            std::fs::write(s.file("twin.txt"), content).unwrap();
+            let id = s.create();
+            s.add(id, &[s.file("a.txt"), s.file("twin.txt")]);
+            let detail = s.f.factum().container(id).unwrap();
+            let (original, twin) = (&detail.adds[0].files[0].arn, &detail.adds[0].files[1].arn);
+            if damage {
+                damage_content(&s.container_path(), original);
+            }
+            add_triple(&s.container_path(), original, &replaced_by, twin);
+            let signer = FakeSigner::new(false);
+            let verifiers: (&dyn factum::signer::Signer, &Gpgsm) = (&signer, &Gpgsm::unavailable());
+            if !assert_verdict(what, &s.container_path(), expected, code, verifiers, &[], None) {
+                return;
+            }
+            // the script has no log to compare a replacement with: it always names the pair
+            let (_, output) = script_verdict(&s.container_path(), &[], None).unwrap();
+            let named = output.lines().any(|l| l.contains("replaced by"));
+            assert!(named, "{what}: {output}");
+            assert!(
+                output.contains("[replaced_copy]") || code == "stream_hash",
+                "{what}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_verifiers_agree_on_x509_signatures() {
+        use factum::container::volume::CER_X509;
+        let Some(home) = common::GpgsmHome::new() else {
+            eprintln!("skipped: gpgsm or openssl is not installed");
+            return;
+        };
+        home.trusted();
+        let gpgsm = Gpgsm::new(Some(home.path()));
+        let s = Setup::new();
+        let signer = FakeSigner::new(false);
+        let root = home.file("root.pem");
+        let flags = ["--ca", root.to_str().unwrap()];
+        let root_pem = std::fs::read_to_string(&root).unwrap();
+        let verifiers: (&dyn factum::signer::Signer, &Gpgsm) = (&signer, &gpgsm);
+        for (what, chain, expected, code) in [
+            ("its own chain", None, Level::Ok, ""),
+            (
+                "another certificate stored",
+                Some(root_pem.as_str()),
+                Level::Fail,
+                "x509_mismatch",
+            ),
+            (
+                "nothing readable stored",
+                Some("not a certificate"),
+                Level::Fail,
+                "x509_mismatch",
+            ),
+        ] {
+            let path = super::verify::loose_container(&s, &gpgsm, &home, chain);
+            if !assert_verdict(what, &path, expected, code, verifiers, &flags, None) {
+                return;
+            }
+        }
+        // no chain beside the signature: what it carries itself is what can be checked
+        let path = super::verify::loose_container(&s, &gpgsm, &home, None);
+        rewrite(&path, &[], &[CER_X509, &history_member(1, CER_X509)]);
+        assert_verdict(
+            "no stored chain",
+            &path,
+            Level::Warn,
+            "x509_no_certificate",
+            verifiers,
+            &flags,
+            None,
+        );
+        // the same without a root to compare with: the script cannot say more than that it was not compared
+        let (_, output) = script_verdict(&path, &[], None).unwrap();
+        assert!(output.contains("x509_no_certificate"), "{output}");
+        // a root that is not the chain's: neither trusts the signature
+        let untrusted = Gpgsm::new(Some(tempfile::tempdir().unwrap().path().to_path_buf()));
+        let other = tempfile::tempdir().unwrap();
+        let other_root = other.path().join("other.pem");
+        let made = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+            .arg(other.path().join("k"))
+            .arg("-out")
+            .arg(&other_root)
+            .args(["-days", "1", "-subj", "/CN=Other Root"])
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        let path = super::verify::loose_container(&s, &gpgsm, &home, None);
+        assert_verdict(
+            "another root",
+            &path,
+            Level::Fail,
+            "x509_untrusted",
+            (&signer, &untrusted),
+            &["--ca", other_root.to_str().unwrap()],
+            None,
+        );
+    }
+
+    #[test]
+    fn both_verifiers_agree_on_certificates_that_expired() {
+        let Some(home) = common::GpgsmHome::with_expired_leaf() else {
+            eprintln!("skipped: no gpgsm, or an openssl without -not_before");
+            return;
+        };
+        home.trusted();
+        let gpgsm = Gpgsm::new(Some(home.path()));
+        let s = Setup::new();
+        let signer = FakeSigner::new(false);
+        let root = home.file("root.pem");
+        let flags = ["--ca", root.to_str().unwrap()];
+        let verifiers: (&dyn factum::signer::Signer, &Gpgsm) = (&signer, &gpgsm);
+        // expired since: good, as long as it was valid when it signed
+        let chain = gpgsm.chain(&home.leaf_fingerprint, &[]).unwrap();
+        let path = super::verify::loose_signed(&s, &|turtle| (home.sign_while_valid(turtle), chain.clone()));
+        if !assert_verdict(
+            "expired since",
+            &path,
+            Level::Warn,
+            "x509_expired",
+            verifiers,
+            &flags,
+            None,
+        ) {
+            return;
+        }
+        // an intermediate that had expired when it signed: the whole chain counts
+        let path = super::verify::loose_signed(&s, &|turtle| {
+            let signature = home.sign_below_expired_intermediate(turtle);
+            let chain = ["leaf2.pem", "int.pem", "root.pem"].map(|f| std::fs::read_to_string(home.file(f)).unwrap());
+            (signature, chain.concat())
+        });
+        assert_verdict(
+            "expired at signing",
+            &path,
+            Level::Fail,
+            "x509_invalid",
+            verifiers,
+            &flags,
+            None,
+        );
     }
 }
 
