@@ -167,7 +167,12 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - **Closing re-checks first**: everything added since the last close is read back from the container file and
   compared with its hashes (on Linux past the page cache, from the disk). If something does not match, a dialog
   offers **Add Again** (copy the files again from their sources; the damaged copies stay, marked as replaced),
-  **Close as Damaged** (logged with the failed files, not signed) or **Cancel**
+  **Close as Damaged** (logged with the failed files, not signed) or **Cancel**. A read error counts as damage when
+  it repeats while the rest of the file reads; a removed drive or missing permissions only stop the check. A close
+  signs only the state that was re-checked: if the container changed since, re-check again
+- **A fault in a container's ZIP directory** (a CRC-32 that differs from what is stored) stops additions and
+  signatures, even when the hashes match; **Close as Damaged** is the way out, writes nothing to the file and logs the
+  fault, not lost files
 - **Closing signs the container**: a GPG signature over `information.turtle`, which lists every file's hashes, plus an
   X.509 (CMS) signature when **Settings → X.509 Certificate…** names a gpgsm certificate (the setup wizard offers it
   too). Without a key the container can be closed unsigned and signed later (**Sign All Unsigned**)
