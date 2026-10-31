@@ -1411,8 +1411,16 @@ mod verify {
 
     /// A container outside any log, closed with an X.509 signature and `chain` beside it.
     fn loose_container(s: &Setup, gpgsm: &Gpgsm, home: &common::GpgsmHome, chain: Option<&str>) -> PathBuf {
-        use factum::container::volume::{Signatures, VolumeInfo};
         home.trusted();
+        loose_signed(s, &|turtle| {
+            let (signature, own_chain) = gpgsm.sign_with_chain(&home.leaf_fingerprint, turtle, &[]).unwrap();
+            (signature, chain.map_or(own_chain, str::to_string))
+        })
+    }
+
+    /// A container outside any log, closed with the (signature, chain) `sign` makes of its metadata.
+    fn loose_signed(s: &Setup, sign: &dyn Fn(&[u8]) -> (String, String)) -> PathBuf {
+        use factum::container::volume::{Signatures, VolumeInfo};
         let path = s.f.path().join("loose.aff4l");
         let _ = std::fs::remove_file(&path);
         let info = VolumeInfo::default();
@@ -1431,12 +1439,10 @@ mod verify {
             )
             .unwrap();
         volume.finalize_add(&staged, 1).unwrap();
-        let (signature, own_chain) = gpgsm
-            .sign_with_chain(&home.leaf_fingerprint, &volume.turtle_bytes(), &[])
-            .unwrap();
+        let (signature, chain) = sign(&volume.turtle_bytes());
         let signatures = Signatures {
             gpg: None,
-            x509: Some((signature, chain.map_or(own_chain, str::to_string))),
+            x509: Some((signature, chain)),
         };
         volume.close(&signatures).unwrap();
         path
@@ -1482,7 +1488,7 @@ mod verify {
     }
 
     #[test]
-    fn x509_container_without_a_stored_certificate_has_no_new_finding() {
+    fn x509_signature_without_a_stored_certificate_is_a_warning() {
         use factum::container::volume::{CER_X509, SIG_X509};
         let Some(home) = common::GpgsmHome::new() else {
             eprintln!("skipped: gpgsm or openssl is not installed");
@@ -1504,9 +1510,42 @@ mod verify {
             "{:?}",
             report.findings
         );
+        assert!(
+            codes(&report, Level::Warn).contains(&"x509_no_certificate"),
+            "{:?}",
+            report.findings
+        );
         assert_eq!(member(&path, CER_X509), None);
         assert!(member(&path, SIG_X509).is_some());
         assert!(report.states[0].x509.as_ref().is_some_and(|x| x.fingerprint.is_some()));
+    }
+
+    #[test]
+    fn x509_certificate_expired_since_is_a_warning_that_names_what_it_rests_on() {
+        let Some(home) = common::GpgsmHome::with_expired_leaf() else {
+            eprintln!("skipped: no gpgsm, or an openssl without -not_before");
+            return;
+        };
+        home.trusted();
+        let gpgsm = Gpgsm::new(Some(home.path()));
+        let s = Setup::new();
+        let chain = gpgsm.chain(&home.leaf_fingerprint, &[]).unwrap();
+        let path = loose_signed(&s, &|turtle| (home.sign_while_valid(turtle), chain.clone()));
+        let report = verify_with(&s, &path, &gpgsm);
+        assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
+        let warning = report
+            .findings
+            .iter()
+            .find(|f| f.code == "x509_expired")
+            .expect("a warning");
+        assert_eq!(warning.level, Level::Warn);
+        assert!(
+            warning.message.contains("signing time the signer stated"),
+            "{}",
+            warning.message
+        );
+        let check = report.states[0].x509.as_ref().unwrap();
+        assert!(check.status.contains("has expired"), "{}", check.status);
     }
 
     #[test]

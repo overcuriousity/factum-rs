@@ -35,7 +35,10 @@ fn sample_verifies() {
         report.findings
     );
     if gpgsm.available() {
-        let signers = report.states.iter().filter_map(|s| s.x509.as_ref()?.fingerprint.as_ref());
+        let signers = report
+            .states
+            .iter()
+            .filter_map(|s| s.x509.as_ref()?.fingerprint.as_ref());
         assert_eq!(signers.count(), 2);
     }
     assert_eq!(report.states.iter().filter(|s| s.close.is_some()).count(), 2);

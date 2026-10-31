@@ -263,6 +263,102 @@ impl GpgsmHome {
         std::fs::read_to_string(signature).unwrap()
     }
 
+    /// A detached signature, made now by a new leaf below an intermediate of `with_expired_leaf`'s root that expired
+    /// five days ago. The leaf itself is valid; gpgsm would not sign with it, openssl does.
+    pub fn sign_below_expired_intermediate(&self, data: &[u8]) -> String {
+        let stamp = |days: i64| {
+            (chrono::Utc::now() + chrono::Duration::days(days))
+                .format("%Y%m%d%H%M%SZ")
+                .to_string()
+        };
+        let openssl = |args: &[&str]| {
+            let output = Command::new("openssl")
+                .args(args)
+                .current_dir(self.files.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        std::fs::write(
+            self.file("intermediate.ext"),
+            "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n",
+        )
+        .unwrap();
+        std::fs::write(self.file("to-sign"), data).unwrap();
+        let subject = ["-subj", "/CN=Factum Test Intermediate"];
+        openssl(
+            &[
+                &[
+                    "req", "-newkey", "rsa:2048", "-nodes", "-keyout", "int.key", "-out", "int.csr",
+                ],
+                &subject[..],
+            ]
+            .concat(),
+        );
+        let (from, to) = (stamp(-10), stamp(-5));
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "int.csr",
+            "-CA",
+            "root.pem",
+            "-CAkey",
+            "root.key",
+            "-CAcreateserial",
+            "-out",
+            "int.pem",
+            "-not_before",
+            &from,
+            "-not_after",
+            &to,
+            "-extfile",
+            "intermediate.ext",
+        ]);
+        let (from, to) = (stamp(-8), stamp(365));
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "leaf.csr",
+            "-CA",
+            "int.pem",
+            "-CAkey",
+            "int.key",
+            "-CAcreateserial",
+            "-out",
+            "leaf2.pem",
+            "-not_before",
+            &from,
+            "-not_after",
+            &to,
+            "-extfile",
+            "ext",
+        ]);
+        let chain = [self.file("int.pem"), self.file("root.pem")].map(|f| std::fs::read_to_string(f).unwrap());
+        std::fs::write(self.file("certs.pem"), chain.concat()).unwrap();
+        openssl(&[
+            "cms",
+            "-sign",
+            "-binary",
+            "-outform",
+            "PEM",
+            "-md",
+            "sha256",
+            "-signer",
+            "leaf2.pem",
+            "-inkey",
+            "leaf.key",
+            "-certfile",
+            "certs.pem",
+            "-in",
+            "to-sign",
+            "-out",
+            "below.pem",
+        ]);
+        std::fs::read_to_string(self.file("below.pem")).unwrap()
+    }
+
     fn build(expired_leaf: bool) -> Option<Self> {
         which::which("gpgsm").ok()?;
         which::which("openssl").ok()?;

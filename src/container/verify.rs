@@ -221,7 +221,19 @@ fn x509_findings(check: &X509Check, label: &str) -> Vec<Finding> {
         return finding(
             Level::Fail,
             "x509_invalid",
-            format!("{label}: the signing certificate was not valid when the signature was made."),
+            format!(
+                "{label}: the signing certificate or one in its chain was not valid at the time the signature states."
+            ),
+        );
+    }
+    if check.expired {
+        return finding(
+            Level::Warn,
+            "x509_expired",
+            format!(
+                "{label}: the X.509 signature is good, but its certificate or one in its chain has expired since. \
+                 That they were valid at signing rests on the signing time the signer stated; nothing confirms it."
+            ),
         );
     }
     Vec::new()
@@ -819,6 +831,13 @@ pub fn verify_file(
                 result
                     .findings
                     .extend(stored_certificate_findings(&check, &chain, &what));
+            } else if archive.get(&chain_name).is_none() {
+                result.findings.push(Finding::new(
+                    Level::Warn,
+                    "x509_no_certificate",
+                    format!("{what}: an X.509 signature without the certificate chain stored beside it."),
+                    Ref::default(),
+                ));
             }
             result.x509 = Some(check);
         }

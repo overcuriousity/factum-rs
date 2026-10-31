@@ -122,7 +122,11 @@ fn a_signature_by_a_certificate_that_has_expired_since_is_good() {
     let Some((home, gpgsm)) = expired_home() else { return };
     let signature = home.sign_while_valid(b"the turtle");
     let check = gpgsm.verify_detached(&signature, b"the turtle");
-    assert!(check.valid && check.trusted && check.valid_at_signing, "{check:?}");
+    assert!(
+        check.valid && check.trusted && check.valid_at_signing && check.expired,
+        "{check:?}"
+    );
+    assert!(check.status.contains("has expired"), "{}", check.status);
     assert_eq!(check.fingerprint.as_deref(), Some(home.leaf_fingerprint.as_str()));
     assert!(
         check.signer_subject.as_deref().unwrap_or("").contains("Examiner One"),
@@ -148,6 +152,16 @@ fn a_signature_made_after_the_certificate_expired_is_not_valid_at_signing() {
     let signature = std::fs::read_to_string(home.file("late.pem")).unwrap();
     let check = gpgsm.verify_detached(&signature, b"data");
     assert!(check.valid && !check.valid_at_signing, "{check:?}");
+}
+
+#[test]
+fn an_intermediate_that_had_expired_when_it_signed_is_not_valid_at_signing() {
+    let Some((home, gpgsm)) = expired_home() else { return };
+    let signature = home.sign_below_expired_intermediate(b"data");
+    let check = gpgsm.verify_detached(&signature, b"data");
+    assert!(check.valid && check.trusted && check.expired, "{check:?}");
+    assert!(!check.valid_at_signing, "{check:?}");
+    assert_eq!(check.root_fingerprint.as_deref(), Some(home.root_fingerprint.as_str()));
 }
 
 #[test]
