@@ -19,6 +19,10 @@ const FLAGS_COMPARED: u16 = 1 | (1 << 3) | FLAG_UTF8;
 const EOCD_LEN: u64 = 22;
 const CENTRAL_LEN: u64 = 46;
 const DIRECTORY_BLOCK: u64 = 1 << 16;
+/// What one search for an end record may spend, at least: see `search_limit`.
+const MIN_SEARCH_LIMIT: u64 = 16 << 20;
+/// What it costs to try a record, whatever it turns out to be; directory bytes read count one each.
+const SEARCH_TRY: u64 = 1 << 10;
 const LOCATOR_LEN: u64 = 20;
 const EOCD64_LEN: u64 = 56;
 const BUFFER: usize = 1 << 20;
@@ -236,12 +240,14 @@ fn read_end_records(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<E
 /// Reads the central directory whose end-of-central-directory record ends exactly at `end`.
 pub fn read_archive(file: &mut File, end: u64) -> io::Result<Archive> {
     let eocd_offset = find_end_record(file, end)?;
-    read_archive_at(file, eocd_offset, end)
+    let mut unlimited = u64::MAX;
+    read_archive_at(file, eocd_offset, end, &mut unlimited)
 }
 
 /// `read_archive` for a record whose start is known. The directory is read as far as it holds up, and only then the
-/// comment: a search may try thousands of records, and each of them may claim all that lies before it.
-fn read_archive_at(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<Archive> {
+/// comment: a search may try thousands of records, and each of them may claim all that lies before it. Directory
+/// bytes come out of `search`.
+fn read_archive_at(file: &mut File, eocd_offset: u64, end: u64, search: &mut u64) -> io::Result<Archive> {
     let EndRecords {
         comment,
         count,
@@ -252,7 +258,13 @@ fn read_archive_at(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<Ar
     let mut entries = Vec::with_capacity(count.min(1 << 20) as usize);
     let mut at = 0usize;
     for _ in 0..count {
-        read_directory(file, cd_offset, cd_size, at + CENTRAL_LEN as usize, &mut directory)?;
+        read_directory(
+            file,
+            (cd_offset, cd_size),
+            at + CENTRAL_LEN as usize,
+            &mut directory,
+            search,
+        )?;
         if at + CENTRAL_LEN as usize > directory.len() || u32_at(&directory, at) != CENTRAL_SIG {
             return Err(invalid("bad central directory entry"));
         }
@@ -260,7 +272,7 @@ fn read_archive_at(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<Ar
         let extra_len = u16_at(&directory, at + 30) as usize;
         let comment_len = u16_at(&directory, at + 32) as usize;
         let next = at + 46 + name_len + extra_len + comment_len;
-        read_directory(file, cd_offset, cd_size, next, &mut directory)?;
+        read_directory(file, (cd_offset, cd_size), next, &mut directory, search)?;
         if next > directory.len() {
             return Err(invalid("bad central directory entry"));
         }
@@ -290,15 +302,21 @@ fn read_archive_at(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<Ar
     Ok(Archive::new(entries, read_at(file, comment.0, comment.1)?, end))
 }
 
-/// Extends `directory` to hold `needed` bytes, if the directory has that many.
-fn read_directory(file: &mut File, offset: u64, size: u64, needed: usize, directory: &mut Vec<u8>) -> io::Result<()> {
+/// Extends `directory`, at (offset, size) in the file, to hold `needed` bytes, if it has that many.
+fn read_directory(
+    file: &mut File,
+    (offset, size): (u64, u64),
+    needed: usize,
+    directory: &mut Vec<u8>,
+    search: &mut u64,
+) -> io::Result<()> {
     while directory.len() < needed && (directory.len() as u64) < size {
         let held = directory.len() as u64;
-        directory.extend(read_at(
-            file,
-            offset + held,
-            (size - held).min(DIRECTORY_BLOCK) as usize,
-        )?);
+        let block = (size - held).min(DIRECTORY_BLOCK);
+        *search = search
+            .checked_sub(block)
+            .ok_or_else(|| invalid("the search for a complete state went on too long"))?;
+        directory.extend(read_at(file, offset + held, block as usize)?);
     }
     Ok(())
 }
@@ -328,27 +346,38 @@ fn apply_zip64_extra(entry: &mut CdEntry, extra: &[u8]) {
 /// Whether a state ends at `end`. A read error is an error, not a "no".
 fn is_state(file: &mut File, end: u64) -> io::Result<bool> {
     match find_end_record(file, end) {
-        Ok(eocd_offset) => is_state_at(file, eocd_offset, end),
+        Ok(eocd_offset) => {
+            let mut unlimited = u64::MAX;
+            is_state_at(file, eocd_offset, end, &mut unlimited)
+        }
         Err(e) if not_a_state(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
 
-fn is_state_at(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<bool> {
-    match read_archive_at(file, eocd_offset, end) {
+fn is_state_at(file: &mut File, eocd_offset: u64, end: u64, search: &mut u64) -> io::Result<bool> {
+    match read_archive_at(file, eocd_offset, end, search) {
         Ok(_) => Ok(true),
         Err(e) if not_a_state(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
 
+/// What one search of a file of `len` bytes may spend. Each record costs little, but a crafted file can hold many that
+/// each claim the same long directory; a complete state is never that far from the end. Linear in the file, so what a
+/// real container costs is not touched, and whatever a file holds a search ends.
+fn search_limit(len: u64) -> u64 {
+    MIN_SEARCH_LIMIT.max(len)
+}
+
 /// Offers each end-of-central-directory record in `from..len`, newest first, as (where it starts, where it ends), to
-/// `visit`, until it answers.
+/// `visit`, until it answers. Stops, as if there were no more, when `search` is spent.
 fn search_back<T>(
     file: &mut File,
     from: u64,
     len: u64,
-    mut visit: impl FnMut(&mut File, u64, u64) -> io::Result<Option<T>>,
+    search: &mut u64,
+    mut visit: impl FnMut(&mut File, u64, u64, &mut u64) -> io::Result<Option<T>>,
 ) -> io::Result<Option<T>> {
     // backwards in blocks that overlap by 3 bytes, so a signature across a block boundary is found
     let mut block_end = len;
@@ -363,9 +392,13 @@ fn search_back<T>(
             if offset + EOCD_LEN > len {
                 continue;
             }
+            if *search < SEARCH_TRY {
+                return Ok(None);
+            }
+            *search -= SEARCH_TRY;
             let candidate = offset + EOCD_LEN + u16_at(&read_at(file, offset + 20, 2)?, 0) as u64;
             if candidate <= len
-                && let Some(found) = visit(file, offset, candidate)?
+                && let Some(found) = visit(file, offset, candidate, search)?
             {
                 return Ok(Some(found));
             }
@@ -390,8 +423,13 @@ pub fn find_last_end(file: &mut File, hint: Option<u64>) -> io::Result<Option<u6
     {
         return Ok(Some(hint));
     }
-    search_back(file, 0, len, |file, record, end| {
-        Ok(is_state_at(file, record, end)?.then_some(end))
+    let mut search = search_limit(len);
+    search_back_for_state(file, len, &mut search)
+}
+
+fn search_back_for_state(file: &mut File, len: u64, search: &mut u64) -> io::Result<Option<u64>> {
+    search_back(file, 0, len, search, |file, record, end, search| {
+        Ok(is_state_at(file, record, end, search)?.then_some(end))
     })
 }
 
@@ -593,8 +631,9 @@ fn state_end(file: &mut File, pos: u64, len: u64) -> io::Result<Option<u64>> {
 /// records there fit their place in the file but their directory cannot be read: damage to a state, not the end of
 /// a file nested in the evidence, whose offsets count from its own start. Without either, the bytes hold no state.
 fn search_tail(file: &mut File, from: u64, len: u64) -> io::Result<Option<u64>> {
-    search_back(file, from, len, |file, record, end| {
-        if is_state_at(file, record, end)? {
+    let mut search = search_limit(len);
+    let found = search_back(file, from, len, &mut search, |file, record, end, search| {
+        if is_state_at(file, record, end, search)? {
             return Ok(Some(end));
         }
         match read_end_records(file, record, end) {
@@ -604,7 +643,14 @@ fn search_tail(file: &mut File, from: u64, len: u64) -> io::Result<Option<u64>> 
             Err(e) if not_a_state(&e) => Ok(None),
             Err(e) => Err(e),
         }
-    })
+    })?;
+    // given up, not done: a state may lie further back, so this is not what an interrupted addition leaves
+    if found.is_none() && search < SEARCH_TRY {
+        return Err(invalid(
+            "more end records after the last complete state than can be searched",
+        ));
+    }
+    Ok(found)
 }
 
 /// The uncompressed content of a member. Its local header has to agree with the central directory: ZIP readers go
@@ -1001,33 +1047,6 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
 
-    /// End records repeated for 256 KiB, each a candidate that fits its place or not: was minutes in a debug build.
-    #[test]
-    fn a_search_does_not_slow_with_the_records_it_tries() {
-        let dir = tempfile::tempdir().unwrap();
-        for filler in [b"PK\x05\x06".repeat(1 << 16), {
-            // each claims all that lies before it as its directory
-            let mut bytes = vec![0u8; 1 << 16];
-            for _ in 0..1 << 14 {
-                let at = bytes.len() as u32;
-                bytes.extend(EOCD_SIG.to_le_bytes());
-                bytes.extend([0; 6]);
-                bytes.extend(1u16.to_le_bytes());
-                bytes.extend(at.to_le_bytes());
-                bytes.extend(0u32.to_le_bytes());
-                bytes.extend(0u16.to_le_bytes());
-            }
-            bytes
-        }] {
-            let path = dir.path().join("x");
-            std::fs::write(&path, filler).unwrap();
-            let mut file = File::open(&path).unwrap();
-            let started = std::time::Instant::now();
-            assert_eq!(find_last_end(&mut file, None).unwrap(), None);
-            assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
-        }
-    }
-
     fn new_file(dir: &tempfile::TempDir) -> std::fs::File {
         OpenOptions::new()
             .read(true)
@@ -1048,6 +1067,74 @@ mod tests {
             .read_to_end(&mut out)
             .unwrap();
         out
+    }
+
+    /// N valid entries and M end records that each claim them all, as a counter: a clock depends on the machine.
+    #[test]
+    fn a_search_stops_at_its_limit_however_many_records_claim_a_directory() {
+        const ENTRIES: u32 = 40_000;
+        const RECORDS: u64 = 1_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x");
+        let mut bytes = vec![0u8; 4];
+        for _ in 0..ENTRIES {
+            bytes.extend(CENTRAL_SIG.to_le_bytes());
+            bytes.extend([0; 42]);
+        }
+        for _ in 0..RECORDS {
+            let size = bytes.len() as u32 - 4;
+            bytes.extend(EOCD_SIG.to_le_bytes());
+            bytes.extend([0; 4]);
+            bytes.extend((ENTRIES as u16).to_le_bytes());
+            bytes.extend((ENTRIES as u16).to_le_bytes());
+            bytes.extend(size.to_le_bytes());
+            bytes.extend(4u32.to_le_bytes());
+            bytes.extend(0u16.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let len = bytes.len() as u64;
+        // reading each in full would be this much
+        let unbounded = RECORDS * ENTRIES as u64 * 46;
+        assert!(unbounded > 10 * search_limit(len));
+        let mut search = search_limit(len);
+        assert_eq!(search_back_for_state(&mut file, len, &mut search).unwrap(), None);
+        // the limit is what ended it
+        assert!(search < DIRECTORY_BLOCK + SEARCH_TRY, "{search}");
+    }
+
+    #[test]
+    fn a_state_behind_records_that_are_none_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut app = Appender::new(file, 0, Vec::new()).unwrap();
+        app.add_bytes("a", 0, b"a").unwrap();
+        let end = app.finish(&[], b"").unwrap();
+        drop(app);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend(b"PK".repeat(4_000));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(find_last_end(&mut file, None).unwrap(), Some(end));
+    }
+
+    #[test]
+    fn a_search_gives_up_and_says_so_when_a_tail_outruns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x");
+        let bytes = b"PK\x05\x06".repeat(1 << 17);
+        assert!((bytes.len() as u64 / 4) * SEARCH_TRY > search_limit(bytes.len() as u64));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert_eq!(find_last_end(&mut file, None).unwrap(), None);
+        let error = search_tail(&mut file, 0, bytes.len() as u64).unwrap_err();
+        assert!(error.to_string().contains("than can be searched"), "{error}");
     }
 
     #[test]
