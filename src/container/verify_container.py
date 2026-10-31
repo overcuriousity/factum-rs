@@ -14,6 +14,7 @@ import argparse
 import base64
 import calendar
 import collections
+import datetime
 import hashlib
 import os
 import re
@@ -39,6 +40,10 @@ MAX_CHUNK_SIZE = 64 << 20
 MAX_CHUNKS_PER_SEGMENT = 1 << 20
 U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
+MAX_IN_MEMORY = 1 << 30  # of one member
+# of a container's metadata, all its states and their graphs together: a few MiB of file can inflate to many members
+MAX_TOTAL_IN_MEMORY = 4 << 30
+LINE_COST = 384  # what a triple costs in memory, roughly
 FAILS = []
 WARNINGS = []
 
@@ -66,6 +71,16 @@ def fail(code, message):
     print("✗ %s [%s]" % (message, code))
 
 
+class Memory(object):
+    left = MAX_TOTAL_IN_MEMORY
+
+
+def take_memory(count):
+    if count > Memory.left:
+        raise ValueError("more metadata than fits the memory set aside for it")
+    Memory.left -= count
+
+
 def decimal(text, limit):
     """A number as factum reads one: digits only, None when there are others or it is above `limit`."""
     match = re.fullmatch(r"\+?0*([0-9]+)", text)
@@ -81,6 +96,10 @@ PREFIX = re.compile(r"^@prefix (\S*): <([^>]*)> \.$")
 LITERAL = re.compile(r'^"((?:[^"\\]|\\.)*)"(?:\^\^(\S+))?$')
 ESCAPES = {"t": "\t", "b": "\b", "n": "\n", "r": "\r", "f": "\f", '"': '"', "'": "'", "\\": "\\"}
 NOT_IN_IRI = '<>"{}|^`\\'
+LINE = re.compile(r"[^\n]+")
+# only \n ends a line: str.splitlines() would also split at U+2028, U+0085, ... Walked, not split: a list of the lines
+# can be many times the size of the text, and whitespace is passed without a step here for each line of it
+CONTENT_LINE = re.compile(r"^[^\S\n]*\S[^\n]*", re.M)
 
 
 def uchar(text, at, escaped):
@@ -136,16 +155,16 @@ def parse_turtle(text):
     def expand(name):
         if name.startswith("<") and name.endswith(">"):
             return iri_value(name[1:-1])
+        if re.search(r"\s", name):
+            raise ValueError("not factum's Turtle layout: " + name[:60])
         prefix, _, local = name.partition(":")
         if prefix not in prefixes:
             raise ValueError("unknown prefix " + prefix)
         return prefixes[prefix] + local
 
-    # only \n ends a line: str.splitlines() would also split at U+2028, U+0085, ...
-    for line in text.split("\n"):
-        line = line.rstrip("\r")
-        if not line.strip():
-            continue
+    for content in CONTENT_LINE.finditer(text):
+        line = content.group().rstrip("\r")
+        take_memory(LINE_COST)
         match = PREFIX.match(line)
         if match:
             prefixes[match.group(1)] = iri_value(match.group(2))
@@ -164,6 +183,14 @@ def parse_turtle(text):
         else:
             raise ValueError("not factum's Turtle layout: " + line[:60])
     return graph
+
+
+def parse_metadata(data):
+    """The graph of a member's bytes; what they make in memory comes out of the budget. Unreadable bytes are not refused
+    here, as in factum: the hashes and signatures say what they are worth."""
+    text = data.decode("utf-8", "replace")
+    take_memory(sys.getsizeof(text))
+    return parse_turtle(text)
 
 
 def local(iri):
@@ -242,13 +269,15 @@ CENTRAL_SIG = b"PK\x01\x02"
 EOCD_SIG = b"PK\x05\x06"
 EOCD64_SIG = b"PK\x06\x06"
 LOCATOR_SIG = b"PK\x06\x07"
+HISTORY = b"factum/history/"
 EOCD_LEN = 22
 LOCATOR_LEN = 20
 EOCD64_LEN = 56
 # encrypted, sizes in a data descriptor, UTF-8 name: the flags that change how a member is read
 FLAGS_COMPARED = 1 | (1 << 3) | (1 << 11)
 BUFFER = 1 << 20
-MAX_IN_MEMORY = 1 << 30
+CENTRAL_LEN = 46
+DIRECTORY_BLOCK = 1 << 16
 
 Entry = collections.namedtuple("Entry", "name flags method crc compressed size offset")
 
@@ -299,9 +328,8 @@ def u64_at(data, at):
     return struct.unpack_from("<Q", data, at)[0]
 
 
-def read_end_records(handle, end):
-    """What the records that end exactly at `end` say, as far as they agree with where they are in the file:
-    (comment, entry count, directory size, directory offset)."""
+def find_end_record(handle, end):
+    """Where the end-of-central-directory record that ends exactly at `end` starts."""
     if end < EOCD_LEN:
         raise Invalid("not a ZIP file")
     # the record is followed by a comment of up to 65535 bytes
@@ -312,8 +340,16 @@ def read_end_records(handle, end):
         at = tail.rfind(EOCD_SIG, 0, at + 3)
     if at < 0:
         raise Invalid("no end-of-central-directory record")
-    eocd = end - window + at
-    count, cd_size, cd_offset = u16_at(tail, at + 10), u32_at(tail, at + 12), u32_at(tail, at + 16)
+    return end - window + at
+
+
+def read_end_records(handle, eocd, end):
+    """What the records say whose end-of-central-directory record starts at `eocd` and ends at `end`, as far as they
+    agree with where they are in the file: (entry count, directory size, directory offset)."""
+    record = read_at(handle, eocd, EOCD_LEN)
+    if record[:4] != EOCD_SIG or u16_at(record, 20) != end - eocd - EOCD_LEN:
+        raise Invalid("no end-of-central-directory record")
+    count, cd_size, cd_offset = u16_at(record, 10), u32_at(record, 12), u32_at(record, 16)
     # where the central directory has to end: at the ZIP64 record, or at the classic one
     cd_end = eocd
     if eocd >= LOCATOR_LEN:
@@ -334,7 +370,9 @@ def read_end_records(handle, end):
         raise Invalid("the central directory does not end where the end records begin")
     if cd_size > 1 << 32:
         raise Invalid("central directory too large")
-    return tail[at + EOCD_LEN:], count, cd_size, cd_offset
+    if count > cd_size // CENTRAL_LEN:
+        raise Invalid("the central directory holds less than its entry count")
+    return count, cd_size, cd_offset
 
 
 def zip64_values(extra, size, compressed, offset):
@@ -356,29 +394,44 @@ def zip64_values(extra, size, compressed, offset):
 
 def read_archive(handle, end):
     """The central directory whose end-of-central-directory record ends exactly at `end`."""
-    comment, count, cd_size, cd_offset = read_end_records(handle, end)
-    directory = read_at(handle, cd_offset, cd_size)
+    return read_archive_at(handle, find_end_record(handle, end), end)
+
+
+def read_archive_at(handle, eocd, end):
+    """read_archive for a record whose start is known. The directory is read as far as it holds up, and only then the
+    comment: a search may try thousands of records, and each of them may claim all that lies before it."""
+    count, cd_size, cd_offset = read_end_records(handle, eocd, end)
+    directory = bytearray()
+
+    def read_directory(needed):
+        while len(directory) < needed and len(directory) < cd_size:
+            held = len(directory)
+            directory.extend(read_at(handle, cd_offset + held, min(cd_size - held, DIRECTORY_BLOCK)))
+
     entries = []
     at = 0
     for _ in range(count):
-        if at + 46 > len(directory) or directory[at:at + 4] != CENTRAL_SIG:
+        read_directory(at + CENTRAL_LEN)
+        if at + CENTRAL_LEN > len(directory) or directory[at:at + 4] != CENTRAL_SIG:
             raise Invalid("bad central directory entry")
         name_len, extra_len, comment_len = struct.unpack_from("<HHH", directory, at + 28)
-        following = at + 46 + name_len + extra_len + comment_len
+        following = at + CENTRAL_LEN + name_len + extra_len + comment_len
+        read_directory(following)
         if following > len(directory):
             raise Invalid("bad central directory entry")
         flags, method = struct.unpack_from("<HH", directory, at + 8)
         crc, compressed, size = struct.unpack_from("<III", directory, at + 16)
+        name = bytes(directory[at + 46:at + 46 + name_len])
         extra = directory[at + 46 + name_len:at + 46 + name_len + extra_len]
         size, compressed, offset = zip64_values(extra, size, compressed, u32_at(directory, at + 42))
         if offset >= cd_offset:
             raise Invalid("a member lies behind the central directory")
-        entries.append(Entry(directory[at + 46:at + 46 + name_len], flags, method, crc, compressed, size, offset))
+        entries.append(Entry(name, flags, method, crc, compressed, size, offset))
         at = following
     # an entry behind the count is one this check would not see, and other ZIP readers would
-    if at != len(directory):
+    if at != cd_size:
         raise Invalid("the central directory holds more than its entry count")
-    return Archive(handle, entries, comment)
+    return Archive(handle, entries, read_at(handle, eocd + EOCD_LEN, end - eocd - EOCD_LEN))
 
 
 def is_state(handle, end):
@@ -389,9 +442,17 @@ def is_state(handle, end):
         return False
 
 
+def is_state_at(handle, eocd, end):
+    try:
+        read_archive_at(handle, eocd, end)
+        return True
+    except Invalid:
+        return False
+
+
 def search_back(handle, start, length, visit):
-    """Offers where each end-of-central-directory record in start..length ends, newest first, to `visit`, until it
-    answers."""
+    """Offers each end-of-central-directory record in start..length, newest first, as (where it starts, where it ends),
+    to `visit`, until it answers."""
     # backwards in blocks that overlap by 3 bytes, so a signature across a block boundary is found
     block_end = length
     while block_end >= start + 4:
@@ -402,7 +463,7 @@ def search_back(handle, start, length, visit):
             offset = block_start + at
             if offset + EOCD_LEN <= length:
                 candidate = offset + EOCD_LEN + u16_at(read_at(handle, offset + 20, 2), 0)
-                found = visit(candidate) if candidate <= length else None
+                found = visit(offset, candidate) if candidate <= length else None
                 if found is not None:
                     return found
             at = block.rfind(EOCD_SIG, 0, at + 3)
@@ -417,7 +478,7 @@ def find_last_end(handle, length):
     end-of-central-directory record before the end whose central directory reads (an interrupted addition)."""
     if is_state(handle, length):
         return length
-    return search_back(handle, 0, length, lambda end: end if is_state(handle, end) else None)
+    return search_back(handle, 0, length, lambda eocd, end: end if is_state_at(handle, eocd, end) else None)
 
 
 def signature_at(handle, pos, length, signatures):
@@ -504,11 +565,11 @@ def state_end(handle, pos, length):
 def search_tail(handle, start, length):
     """Searches the bytes the walk could not pass: the end of the newest state among them, if any; an error when end
     records there fit their place in the file but their directory cannot be read."""
-    def visit(end):
-        if is_state(handle, end):
+    def visit(eocd, end):
+        if is_state_at(handle, eocd, end):
             return end
         try:
-            read_end_records(handle, end)
+            read_end_records(handle, eocd, end)
         except Invalid:
             return None  # the end of a file nested in the evidence: its offsets count from its own start
         raise Invalid("the state ending at offset %d is complete but cannot be read" % end)
@@ -600,29 +661,31 @@ def member_blocks(handle, entry, differs):
         differs.append(shown)
 
 
-def member_bytes(archive, entry):
-    """A member's content in memory, refused when it is larger than MAX_IN_MEMORY, and whether it has the directory's
+def member_bytes(archive, entry, limit):
+    """A member's content in memory, refused when it is larger than `limit`, and whether it has the directory's
     CRC-32."""
     differs, blocks, held = [], [], 0
     for block in member_blocks(archive.handle, entry, differs):
         held += len(block)
-        if held > MAX_IN_MEMORY:
-            raise Invalid("%s is larger than %d bytes" % (entry.name.decode("utf-8", "replace"), MAX_IN_MEMORY))
+        if held > limit:
+            raise Invalid("%s is larger than %d bytes" % (entry.name.decode("utf-8", "replace"), limit))
         blocks.append(block)
     return b"".join(blocks), not differs
 
 
 def read(archive, name, code):
     """A member's content; None when it is not listed. One that cannot be read is a failure, not an error, and so is
-    a CRC-32 that differs: the content then still counts, and the checks say the rest."""
+    a CRC-32 that differs: the content then still counts, and the checks say the rest. What is read is held for the
+    rest of the check, so it comes out of the budget."""
     entry = archive.get(name)
     if entry is None:
         return None
     try:
-        data, crc_matches = member_bytes(archive, entry)
-    except (Invalid, OSError, zlib.error, NotImplementedError) as e:
-        fail(code, "%s cannot be read (%s)." % (name, e))
+        data, crc_matches = member_bytes(archive, entry, min(MAX_IN_MEMORY, Memory.left))
+    except (Invalid, OSError, zlib.error, NotImplementedError, MemoryError) as e:
+        fail(code, "%s cannot be read (%s)." % (name, str(e) or "out of memory"))
         return None
+    Memory.left -= len(data)
     message = "%s: CRC-32 differs from the central directory." % name
     if not crc_matches and message not in FAILS:
         fail(code, message)
@@ -646,12 +709,23 @@ def bevy_member(archive, name, differs):
     if entry is None:
         raise Invalid("member %s is missing" % name)
     try:
-        data, crc_matches = member_bytes(archive, entry)
+        data, crc_matches = member_bytes(archive, entry, MAX_IN_MEMORY)
     except NotImplementedError as e:
         raise Invalid(str(e))  # part of a stream: damage, not a file stored in a form not read
     if not crc_matches:
         differs.append(name)
     return data
+
+
+def chunks_follow_each_other(index):
+    """Whether each chunk starts where the one before it ended or after that, as every writer stores them. An index that
+    repeats a chunk would have a few stored bytes stand for terabytes to hash."""
+    end = 0
+    for offset, length in struct.iter_unpack("<QI", index[:len(index) // 12 * 12]):
+        if offset < end:
+            return False
+        end = offset + length
+    return True
 
 
 def image_stream(archive, graph, arn, differs):
@@ -678,6 +752,8 @@ def image_stream(archive, graph, arn, differs):
         if bevy != loaded:
             data = bevy_member(archive, "%s/%08d" % (member, bevy), differs)
             index = bevy_member(archive, "%s/%08d.index" % (member, bevy), differs)
+            if not chunks_follow_each_other(index):
+                raise ValueError("bevy %d of %s is damaged: its chunks overlap" % (bevy, arn))
             loaded = bevy
         at = (chunk_number % per_bevy) * 12
         if at + 12 > len(index):
@@ -759,9 +835,11 @@ def check_files(archive, graph):
                     and first_factum(graph, arn, "symlinkTarget") is None:
                 problems = ["%s: no stored content, though it is neither metadata only nor a link." % name]
         except NotImplementedError as e:
-            warn("not_checked", "%s: not checked (%s)." % (name, e))
-        except (Invalid, OSError, zlib.error, ValueError) as e:
-            problems = ["%s: its content cannot be read (%s)." % (name, e)]
+            # factum stores files in one way, so another is no format it cannot read: the hashes must not be skipped by
+            # naming one
+            problems = ["%s: not checked (%s)." % (name, e)]
+        except (Invalid, OSError, zlib.error, ValueError, MemoryError) as e:
+            problems = ["%s: its content cannot be read (%s)." % (name, str(e) or "out of memory")]
         if replacements and problems:
             # a damaged copy that was added again (Add Again) is a known fact: a warning, not a failure, but only when
             # the replacement is a file of this state with the same hashes and size; that explains its CRC-32 as well
@@ -898,24 +976,33 @@ class Gpg(object):
 
 
 def pem_certificates(text):
-    return re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----\s*", text, re.S)
+    """The certificate blocks, line by line: a BEGIN line starts over, so one that never ends costs nothing more."""
+    blocks, start = [], None
+    for match in LINE.finditer(text):
+        line = match.group()
+        if line.startswith("-----BEGIN CERTIFICATE-----"):
+            start = match.start()
+        if line.startswith("-----END CERTIFICATE-----") and start is not None:
+            blocks.append(text[start:match.end()] + "\n")
+            start = None
+    return blocks
 
 
 def armored_der(text):
     """The DER of a PEM block of any label (gpgsm writes CMS as BEGIN SIGNED MESSAGE)."""
-    lines = [l.strip() for l in text.splitlines()]
-    body = []
+    body = bytearray()
     inside = False
-    for line in lines:
+    for match in LINE.finditer(text):
+        line = match.group().strip()
         if line.startswith("-----BEGIN "):
             inside = True
         elif line.startswith("-----END "):
             break
         elif inside and line and ":" not in line:
-            body.append(line)
+            body += line.encode("ascii")
     if not inside:
         raise ValueError("no PEM block")
-    return base64.b64decode("".join(body), validate=True)
+    return base64.b64decode(bytes(body), validate=True)
 
 
 def signing_time(path):
@@ -938,7 +1025,11 @@ def signing_time(path):
         stamp = ("19" if stamp[:2] >= "50" else "20") + stamp
     if len(stamp) != 14:
         return None
-    return calendar.timegm([int(stamp[:4])] + [int(stamp[i:i + 2]) for i in range(4, 14, 2)])
+    try:
+        fields = [int(stamp[:4])] + [int(stamp[i:i + 2]) for i in range(4, 14, 2)]
+        return calendar.timegm(datetime.datetime(*fields).timetuple())
+    except (ValueError, OverflowError):  # what it states is no date: the bytes come from the container
+        return None
 
 
 def der_fingerprint(pem):
@@ -1006,7 +1097,7 @@ def check_x509(label, signature, chain, data, ca, workdir):
         with open(paths["signer"], "rb") as handle:
             signers = pem_certificates(handle.read().decode("utf-8", "replace"))
         still_valid, errors = cms_verify(ca or paths["root.pem"])
-    except OSError as e:
+    except (OSError, ValueError) as e:
         fail("x509_invalid", "%s: the X.509 signature could not be checked (%s)." % (label, e))
         return
     if not still_valid and "expired" not in errors:
@@ -1043,9 +1134,9 @@ def check_hashes(label, turtle, hashes):
         fail("turtle_hash", "%s: information.turtle.hashes is missing." % label)
         return
     try:
-        graph = parse_turtle(hashes.decode("utf-8", "replace"))
-    except ValueError as e:
-        fail("turtle_hash", "%s: information.turtle.hashes cannot be read (%s)." % (label, e))
+        graph = parse_metadata(hashes)
+    except (ValueError, MemoryError) as e:
+        fail("turtle_hash", "%s: information.turtle.hashes cannot be read (%s)." % (label, str(e) or "out of memory"))
         return
     actual = {"SHA256": hashlib.sha256(turtle).hexdigest(), "SHA512": hashlib.sha512(turtle).hexdigest()}
     compared, differ = set(), False
@@ -1087,6 +1178,53 @@ def close_numbers(archive):
     return closes
 
 
+def check_outside_closes(archive, closes):
+    """A close that cannot be read is no close: what it held must not pass for something else, or for nothing."""
+    kept = set(str(close).encode() for close in closes)
+    outside = []
+    for entry in archive.entries:
+        if entry.name.startswith(HISTORY):
+            number, slash, _ = entry.name[len(HISTORY):].partition(b"/")
+            if not slash or number not in kept:
+                outside.append(entry.name.decode("utf-8", "replace"))
+    if outside:
+        fail("history", "%d member(s) under factum/history/ belong to no closed state (%s)."
+             % (len(outside), outside[0]))
+
+
+def resolve_imports(archive, graph, volume, label):
+    """Joins the secondary information stores (aff4l:imports, AFF4-L v1.0 section 9) into the graph, each checked
+    against the hash the primary store gives for it (section 10.2)."""
+    done = set()
+    for _ in range(16):
+        imports = [t[1] for t in values(graph, volume, "imports") if t[2] and t[1] not in done]
+        if not imports:
+            return
+        for store in imports:
+            done.add(store)
+            name = member_name(store, volume)
+            if not archive.has(name):
+                fail("turtle_hash", "%s: the secondary store %s is missing." % (label, name))
+                continue
+            data = read(archive, name, "turtle_hash")
+            if data is None:
+                continue
+            expected = [(a, hash_value(graph, store, a)) for a in ("SHA512", "SHA256")]
+            expected = [(algorithm, value) for algorithm, value in expected if value is not None]
+            if not expected:
+                fail("turtle_hash", "%s: the primary store gives no hash for %s." % (label, name))
+            for algorithm, value in expected:
+                actual = hashlib.sha512(data) if algorithm == "SHA512" else hashlib.sha256(data)
+                if actual.hexdigest() != value:
+                    fail("turtle_hash", "%s: %s does not match its %s." % (label, name, algorithm))
+            try:
+                for subject, triples in parse_metadata(data).items():
+                    graph.setdefault(subject, []).extend(triples)
+            except (ValueError, MemoryError) as e:
+                warn("not_checked", "%s: %s cannot be read (%s); its files were not checked."
+                     % (label, name, str(e) or "out of memory"))
+
+
 def check_numbering(closes):
     """Closes are numbered from 1 without gaps: a gap is a closed state that was removed. One finding per gap, from
     one kept state to the next: a crafted number must not make this count up to it."""
@@ -1124,14 +1262,21 @@ def open_container(path):
 
 
 def version_property(version, key):
-    for line in version.split("\n"):
-        if line.startswith(key + "="):
-            return line[len(key) + 1:].strip()
-    return None
+    match = re.search("^%s=(.*)$" % key, version, re.M)
+    return match.group(1).strip() if match else None
 
 
 def main(argv=None):
     tolerant_output()
+    try:
+        return check_container(argv)
+    except MemoryError:
+        fail("history", "The check ran out of memory and did not finish.")
+        print("Result: FAIL — %d failure(s), %d warning(s)" % (len(FAILS), len(WARNINGS)))
+        return 1
+
+
+def check_container(argv):
     parser = argparse.ArgumentParser(description="Verify an evidence container written by factum.")
     parser.add_argument("container", help="the .aff4l file")
     parser.add_argument("--ca", help="the root certificate (PEM) the X.509 chain must end at")
@@ -1153,14 +1298,18 @@ def main(argv=None):
     # this script checks what factum wrote: anything else fails, where factum, which reads other tools' containers too,
     # warns that it is not supported
     if (version_property(version, "major"), version_property(version, "minor")) != ("2", "1"):
-        fail("unsupported", "Not an AFF4-L v1.0 container (version.txt: %r)." % version.strip())
+        fail("unsupported", "Not an AFF4-L v1.0 container (version.txt: %r)." % version.strip()[:200])
         return 1
     if archive.has("information.hdt"):
         warn("not_checked", "information.hdt (an AFF4/HDT store) was not read; the Turtle metadata was checked.")
     if os.path.exists(args.container + ".1"):
         warn("not_checked", "This is one part of a multi-part container (%s.1 exists); only this part was checked."
              % args.container)
-    read(archive, "container.description", "history")
+    description = read(archive, "container.description", "history")
+    if not archive.has("container.description"):
+        fail("history", "container.description is missing, which ties this container to its case log.")
+    uuid = description.decode("utf-8", "replace").strip() if description is not None else archive.volume()
+    volume = "aff4://" + re.sub("^(aff4://)+", "", uuid)
     current = read(archive, TURTLE, "turtle_hash")
     if current is None:
         if not archive.has(TURTLE):
@@ -1168,6 +1317,7 @@ def main(argv=None):
         return 1
     closes = close_numbers(archive)
     check_numbering(closes)
+    check_outside_closes(archive, closes)
     states = []  # (label, the close it is, turtle, its hashes file, whether it is the current state)
     for n in sorted(closes):
         turtle = read(archive, history_member(n, TURTLE), "history") or b""
@@ -1201,10 +1351,18 @@ def main(argv=None):
                 fail("unsigned", "%s: not signed." % label)
             if close is not None and is_current:
                 check_root_signatures(archive, close)
+            # every state factum writes takes the root signatures away, so an open state has none: one that does is a
+            # close that was taken out of the directory
+            root_signed = [name for name in SIGNATURES if archive.has(name)]
+            if close is None and root_signed:
+                fail("history", "%s is at the root of a state that was never closed." % root_signed[0])
             try:
-                graphs.append((label, close, parse_turtle(turtle.decode("utf-8", "replace"))))
-            except ValueError as e:
-                fail("turtle_hash", "%s: information.turtle cannot be read (%s)." % (label, e))
+                graph = parse_metadata(turtle)
+            except (ValueError, MemoryError) as e:
+                fail("turtle_hash", "%s: information.turtle cannot be read (%s)." % (label, str(e) or "out of memory"))
+                continue
+            resolve_imports(archive, graph, volume, label)
+            graphs.append((label, close, graph))
         if graphs:
             newest_close, newest = graphs[-1][1:]
             listed = set(file_images(newest))
