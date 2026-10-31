@@ -44,6 +44,17 @@ All notable changes to this project are documented here. The format follows
   holds more or less than its count or a member whose local header differs; a bad CRC-32 is a finding beside the hashes
   instead of a traceback or a stop; a closed current state's root signatures are compared with the kept ones; `history/0`
   fails; a crafted history number no longer exhausts memory; IRIs decode `\u` escapes and refuse what Turtle forbids
+- Containers: a stored file in a compression method nobody reads fails verification instead of "not checked", which
+  had let a swapped file in a signed container pass with a warning; `not_checked` stays for other tools' containers
+- Containers: whether a container is factum's is told by its layout, not by `version.txt`, which is not signed: a
+  missing or other `version.txt` or a missing `container.description` fails, the file is still checked, also against
+  the case log, and naming another tool no longer turns off the signature checks. A file that names a container of
+  the log but cannot be compared with it fails
+- Containers: members under `factum/history/` outside a close that was read fail, as does a signature at the root of an
+  open state, so a close can no longer be hidden behind a number or left out of the directory
+- Containers: crafted files can no longer stop verification: a stray `>` in Turtle hung the parser, a search through
+  repeated end records took minutes, metadata that inflates has a limit of 4 GiB per check in factum and in
+  `verify_container.py`, and an ImageStream index that repeats a chunk is damage
 - Containers: a source is opened without following a link or waiting on a FIFO, must still be the regular file of the
   same size that was listed (otherwise it is reported as changed, not added), and is read no further than one byte
   past that size
