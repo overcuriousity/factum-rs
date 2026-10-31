@@ -48,7 +48,9 @@ MAX_TOTAL_IN_MEMORY = 4 << 30
 MAX_METADATA_PER_STORED_BYTE = 64
 # of a signature or a certificate chain: no reason to be more, and openssl makes many times that of it when it prints it
 MAX_SIGNATURE_MEMBER = 4 << 20
-LINE_COST = 384  # what a triple costs in memory, roughly
+# what a parsed line holds in memory (a triple, a subject, a prefix), as measured on 200,000 files; factum charges the
+# same, so that neither fails a file the other takes
+LINE_COST = 300
 FAILS = []
 WARNINGS = []
 
@@ -204,8 +206,11 @@ def parse_metadata(data):
     """The graph of a member's bytes; what they make in memory comes out of the budget. Unreadable bytes are not refused
     here, as in factum: the hashes and signatures say what they are worth."""
     text = data.decode("utf-8", "replace")
-    take_memory(sys.getsizeof(text))
-    return parse_turtle(text)
+    size = sys.getsizeof(text)
+    take_memory(size)  # only while it is parsed
+    graph = parse_turtle(text)
+    Memory.left += size
+    return graph
 
 
 def local(iri):

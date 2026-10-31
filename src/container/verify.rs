@@ -1160,8 +1160,8 @@ fn check_file(
     }
 
     // the states whose metadata could be read; the others failed above
-    let newest_readable = states.last().is_some_and(|s| s.graph.is_some());
-    let states: Vec<(&Parsed, &Graph)> = states.iter().filter_map(|s| s.graph.as_ref().map(|g| (s, g))).collect();
+    let mut parsed = states;
+    let states: Vec<(&Parsed, &Graph)> = parsed.iter().filter_map(|s| s.graph.as_ref().map(|g| (s, g))).collect();
     // a closed state's files are the same files, described alike (storage included), in every later state
     if let Some(&(newest, newest_graph)) = states.last() {
         let listed: HashMap<String, FileRecord> = file_records(newest_graph)
@@ -1372,10 +1372,9 @@ fn check_file(
             }
         }
         progress(total, total);
-        if newest_readable {
-            report.graph = Some(graph.clone());
-        }
     }
+    // the newest state's metadata goes on to the log checks; a clone of it would be the peak of the whole check
+    report.graph = parsed.pop().and_then(|state| state.graph);
     Ok(())
 }
 

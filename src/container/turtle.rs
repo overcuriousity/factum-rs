@@ -274,8 +274,11 @@ fn uchar(text: &str, at: usize, escaped: char) -> Result<(char, usize), String> 
     Ok((char::from_u32(code).ok_or("bad \\u escape")?, at + len))
 }
 
-/// What a token costs in memory until the graph is built, the graph's share included, roughly.
-const TOKEN_COST: u64 = 128;
+/// What a token holds in memory while the graph is built from it, with its share of the graph: only while it is.
+const TOKEN_COST: u64 = 96;
+/// What a parsed line of factum's layout holds in memory (a triple, a subject, a prefix), as measured on 200,000 files.
+/// `verify_container.py` charges the same, so that neither fails a file the other takes.
+const LINE_COST: u64 = 300;
 pub const TOO_MUCH: &str = "more metadata than fits the memory set aside for it";
 
 /// `at` walks the text by bytes and stays on character boundaries: what delimits a token is ASCII, which is never a
@@ -566,21 +569,25 @@ pub fn parse(text: &str) -> Result<Graph, String> {
     parse_within(text, &mut unlimited)
 }
 
-/// Like `parse`, for what a container claims: takes what the text and its graph hold in memory from `budget`, and
-/// refuses what does not fit, as a short text can make many tokens.
+/// Like `parse`, for what a container claims: takes what its graph holds in memory from `budget`, and refuses what does
+/// not fit, as a short text can make many lines.
 pub fn parse_within(text: &str, budget: &mut u64) -> Result<Graph, String> {
-    let left = budget.checked_sub(text.len() as u64).ok_or(TOO_MUCH)?;
-    let tokens = tokenize(text, left / TOKEN_COST)?;
-    *budget = left.saturating_sub(tokens.len() as u64 * TOKEN_COST);
     let mut parser = Parser {
-        tokens,
+        tokens: tokenize(text, *budget / TOKEN_COST)?,
         at: 0,
         prefixes: HashMap::new(),
         graph: Graph::default(),
     };
+    let mut held = 0;
     while parser.peek().is_some() {
         parser.statement()?;
+        let lines = parser.graph.triples.len() + parser.graph.by_subject.len() + parser.prefixes.len();
+        held = lines as u64 * LINE_COST;
+        if held > *budget {
+            return Err(TOO_MUCH.into());
+        }
     }
+    *budget -= held;
     Ok(parser.graph)
 }
 
@@ -611,10 +618,11 @@ mod tests {
     #[test]
     fn what_is_refused_in_a_budget_is_refused_before_it_is_held() {
         let text = "<a> <b> <c> .\n";
-        let mut budget = text.len() as u64 + 4 * TOKEN_COST;
+        // a triple and its subject, the two lines factum writes for it
+        let mut budget = 2 * LINE_COST;
         parse_within(text, &mut budget).unwrap();
         assert_eq!(budget, 0);
-        let mut budget = text.len() as u64 - 1;
+        let mut budget = 2 * LINE_COST - 1;
         assert_eq!(parse_within(text, &mut budget).unwrap_err(), TOO_MUCH);
         // a few bytes make a token each
         let mut budget = 1 << 20;

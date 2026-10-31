@@ -52,9 +52,16 @@ All notable changes to this project are documented here. The format follows
   the log but cannot be compared with it fails
 - Containers: members under `factum/history/` outside a close that was read fail, as does a signature at the root of an
   open state, so a close can no longer be hidden behind a number or left out of the directory
+- Containers: a file is checked as what the log expects of it: Verify on a container, or a file at a place the log
+  records, must be that container, whatever uuid it names or none; `container.description` must agree with the ZIP
+  comment and the signed metadata; `not_signed` is a warning in every format, so an unsigned file is never called good;
+  the root `information.turtle.hashes` of a closed state is checked; a secondary store that cannot be read fails
 - Containers: crafted files can no longer stop verification: a stray `>` in Turtle hung the parser, a search through
-  repeated end records took minutes, metadata that inflates has a limit of 4 GiB per check in factum and in
-  `verify_container.py`, and an ImageStream index that repeats a chunk is damage
+  end records has a limit linear in the file, an ImageStream index that repeats a chunk is damage, a signature or
+  chain is at most 4 MiB, and metadata has a limit of 4 GiB or 64 times what the file stores of it, in factum and in
+  `verify_container.py`. A check that runs out stops with one `too_large` finding, which does not mean alteration
+- `verify_container.py` prints its own SHA-256 when it starts, and the container's README says to run a trusted copy or
+  to compare that hash with `factum --version` or the release notes; neither is signed
 - Containers: a source is opened without following a link or waiting on a FIFO, must still be the regular file of the
   same size that was listed (otherwise it is reported as changed, not added), and is read no further than one byte
   past that size

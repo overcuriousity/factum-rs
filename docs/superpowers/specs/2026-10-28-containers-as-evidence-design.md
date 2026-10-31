@@ -259,8 +259,10 @@ logged.
 `factum/README.txt` inside each container is written at creation (and rewritten at each close) with two added
 lines: the factum version that wrote the container, and the SHA-256 of the `verify_container.py` it carries, with
 the address of the same script on GitHub for that version
-(`https://github.com/overcuriousity/factum-rs/blob/v<version>/src/container/verify_container.py`). It tells the
-recipient to compare the hash before running the script. Whether the README is rewritten at close or only written at
+(`https://github.com/overcuriousity/factum-rs/blob/v<version>/src/container/verify_container.py`). Neither the README
+nor the script is signed, so the hash it names is worth no more than the README: it tells the recipient to run a copy
+they trust, or to compare the hash the script prints when it starts with `factum --version` or the release notes, which
+works without a network. Whether the README is rewritten at close or only written at
 creation is up to the builder, given the append-only container layout; it must name the script actually in the
 container.
 

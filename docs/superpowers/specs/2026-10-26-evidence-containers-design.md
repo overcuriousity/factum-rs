@@ -279,18 +279,36 @@ signature against the carried chain and says explicitly that the root was not ch
 chain is checked at the signing time the signature states. The script reads the ZIP itself and gives factum's finding
 codes and, on a container factum wrote, factum's verdict without the case log. What remains different: it has no log,
 so every `replacedBy` stays a warning; it has no trust list, so an X.509 root is only checked against `--ca`; and it
-reads only factum's fixed Turtle layout, so valid Turtle in another layout (a comment, a list of objects) fails. It takes
+reads only factum's fixed Turtle layout, so valid Turtle in another layout (a comment, a list of objects, single quotes)
+fails; what ends a name in Turtle (whitespace, `;,<>"'()[]#`) is refused in one, so it never reads a line otherwise than
+factum does. It takes
 every file for factum's, so it is stricter on other files: what another tool's container may lack fails or warns where
-factum, which reads those, has nothing to say, and an older AFF4 file fails where factum warns. It is not meant to pass
-anything factum fails, but for what only the log can tell.
+factum, which reads those, warns, and an older AFF4 file fails where factum warns. It is not meant to pass anything
+factum fails, but for what only the log can tell. Neither calls an unsigned file good: `not_signed` is a warning in any
+format.
 
 Whether a container is factum's is decided by its layout (`factum/history/`, `factum/README.txt`, `verify_container.py`
 or root signatures), never by `version.txt`, which is not signed. In a factum container a stored file whose content
 cannot be hashed is a failure, not "not checked", as is a `version.txt` or `container.description` that is missing, a
-member under `factum/history/` outside a close that was read, and a root signature on a state that is not closed: from
-2.6.0 on every new state takes the root signatures away. "Not checked" stays a warning for other tools' containers, and
-in any container for what is no stored file: an `information.hdt`, the other parts of a multi-part file. A check holds
-at most 4 GiB of metadata, all states and graphs together, in either verifier; what needs more fails.
+`container.description` that differs from the ZIP comment or from the `ZipVolume` the signed metadata describes, a
+member under `factum/history/` outside a close that was read, a root signature on a state that is not closed (from
+2.6.0 on every new state takes the root signatures away), a root `information.turtle.hashes` that does not match, and a
+secondary store that cannot be read. "Not checked" stays a warning for other tools' containers, and in any container
+for what is no stored file: an `information.hdt`, the other parts of a multi-part file.
+
+Against the case log, what a file says it is decides only when nothing is expected of it. A container verified from
+the case tree must be that container, and a file at a place the log records must be the container recorded there;
+otherwise it is a `log_mismatch`, whatever uuid it names, or none. A file at no logged place, picked by hand, may be any
+container.
+
+A check holds up to `max(4 GiB, 64 × the compressed size of the metadata members)` of metadata, all states and graphs
+together, in either verifier: what stored bytes can inflate to gains an attacker almost nothing, and a real large
+container scales. It counts the bytes of members held and 300 bytes for each line parsed, alike in both verifiers. A
+check that runs out stops with one `too_large` finding, which says the limit and that it does not mean alteration: a
+failure on a factum layout, a warning on another tool's file. A signature or certificate chain is at most 4 MiB.
+
+The script and `factum/README.txt` are not signed, so nothing in a container vouches for them: `verify_container.py`
+prints its own SHA-256 when it starts, to compare with `factum --version` or the release notes.
 
 ### 4.7 GUI
 
