@@ -348,6 +348,14 @@ pub struct ImageStreamReader<'f> {
     crc_mismatch: Option<String>,
 }
 
+/// Whether each chunk starts where the one before it ended or after that, as every writer stores them. An index that
+/// repeats a chunk would have a few stored bytes stand for terabytes to hash.
+fn chunks_follow_each_other(index: &[(u64, u32)]) -> bool {
+    index
+        .windows(2)
+        .all(|pair| pair[0].0.saturating_add(pair[0].1 as u64) <= pair[1].0)
+}
+
 impl ImageStreamReader<'_> {
     /// The first member read so far that differs from the directory's CRC-32, for what does not read to the end.
     pub fn crc_mismatch(&self) -> Option<&str> {
@@ -372,7 +380,7 @@ impl ImageStreamReader<'_> {
         if self.bevy.as_ref().is_none_or(|(n, _, _)| *n != bevy_number) {
             let data = self.member(&format!("{}/{bevy_number:08}", self.member))?;
             let raw_index = self.member(&format!("{}/{bevy_number:08}.index", self.member))?;
-            let index = raw_index
+            let index: Vec<(u64, u32)> = raw_index
                 .as_chunks::<12>()
                 .0
                 .iter()
@@ -383,6 +391,12 @@ impl ImageStreamReader<'_> {
                     )
                 })
                 .collect();
+            if !chunks_follow_each_other(&index) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bevy {bevy_number} of {} is damaged: its chunks overlap", self.arn),
+                ));
+            }
             self.bevy = Some((bevy_number, data, index));
         }
         let (_, data, index) = self.bevy.as_ref().unwrap();
@@ -479,6 +493,14 @@ mod tests {
             .open(dir.path().join("c.aff4l"))
             .unwrap();
         Appender::new(file, 0, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn an_index_that_repeats_a_chunk_is_damaged() {
+        assert!(chunks_follow_each_other(&[(0, 10), (10, 5), (20, 1)]));
+        assert!(chunks_follow_each_other(&[]));
+        assert!(!chunks_follow_each_other(&[(0, 10), (0, 10)]));
+        assert!(!chunks_follow_each_other(&[(0, 10), (9, 10)]));
     }
 
     fn sample() -> Vec<u8> {

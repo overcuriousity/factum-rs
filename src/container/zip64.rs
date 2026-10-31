@@ -17,6 +17,8 @@ const FLAG_UTF8: u16 = 1 << 11;
 /// the others (compression options) say nothing a reader acts on.
 const FLAGS_COMPARED: u16 = 1 | (1 << 3) | FLAG_UTF8;
 const EOCD_LEN: u64 = 22;
+const CENTRAL_LEN: u64 = 46;
+const DIRECTORY_BLOCK: u64 = 1 << 16;
 const LOCATOR_LEN: u64 = 20;
 const EOCD64_LEN: u64 = 56;
 const BUFFER: usize = 1 << 20;
@@ -144,14 +146,15 @@ fn read_at(file: &mut File, offset: u64, len: usize) -> io::Result<Vec<u8>> {
 
 /// What the end records of a central directory say.
 struct EndRecords {
-    comment: Vec<u8>,
+    /// where the comment is and how long: read last, as a search tries many records that are none
+    comment: (u64, usize),
     count: u64,
     cd_size: u64,
     cd_offset: u64,
 }
 
-/// The records that end exactly at `end`, as far as they agree with where they are in the file.
-fn read_end_records(file: &mut File, end: u64) -> io::Result<EndRecords> {
+/// Where the end-of-central-directory record that ends exactly at `end` starts.
+fn find_end_record(file: &mut File, end: u64) -> io::Result<u64> {
     if end < EOCD_LEN {
         return Err(invalid("not a ZIP file"));
     }
@@ -166,12 +169,21 @@ fn read_end_records(file: &mut File, end: u64) -> io::Result<EndRecords> {
         }
     }
     let at = found.ok_or_else(|| invalid("no end-of-central-directory record"))?;
-    let eocd_offset = end - window + at as u64;
-    let comment = tail[at + EOCD_LEN as usize..].to_vec();
+    Ok(end - window + at as u64)
+}
+
+/// The records whose end-of-central-directory record starts at `eocd_offset` and ends at `end`, as far as they agree
+/// with where they are in the file.
+fn read_end_records(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<EndRecords> {
+    let record = read_at(file, eocd_offset, EOCD_LEN as usize)?;
+    let comment_len = end - eocd_offset - EOCD_LEN;
+    if u32_at(&record, 0) != EOCD_SIG || u16_at(&record, 20) as u64 != comment_len {
+        return Err(invalid("no end-of-central-directory record"));
+    }
     let (mut count, mut cd_size, mut cd_offset) = (
-        u16_at(&tail, at + 10) as u64,
-        u32_at(&tail, at + 12) as u64,
-        u32_at(&tail, at + 16) as u64,
+        u16_at(&record, 10) as u64,
+        u32_at(&record, 12) as u64,
+        u32_at(&record, 16) as u64,
     );
     // where the central directory has to end: at the ZIP64 record, or at the classic one
     let mut cd_end = eocd_offset;
@@ -210,8 +222,11 @@ fn read_end_records(file: &mut File, end: u64) -> io::Result<EndRecords> {
     if cd_size > 1 << 32 {
         return Err(invalid("central directory too large"));
     }
+    if count > cd_size / CENTRAL_LEN {
+        return Err(invalid("the central directory holds less than its entry count"));
+    }
     Ok(EndRecords {
-        comment,
+        comment: (eocd_offset + EOCD_LEN, comment_len as usize),
         count,
         cd_size,
         cd_offset,
@@ -220,23 +235,32 @@ fn read_end_records(file: &mut File, end: u64) -> io::Result<EndRecords> {
 
 /// Reads the central directory whose end-of-central-directory record ends exactly at `end`.
 pub fn read_archive(file: &mut File, end: u64) -> io::Result<Archive> {
+    let eocd_offset = find_end_record(file, end)?;
+    read_archive_at(file, eocd_offset, end)
+}
+
+/// `read_archive` for a record whose start is known. The directory is read as far as it holds up, and only then the
+/// comment: a search may try thousands of records, and each of them may claim all that lies before it.
+fn read_archive_at(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<Archive> {
     let EndRecords {
         comment,
         count,
         cd_size,
         cd_offset,
-    } = read_end_records(file, end)?;
-    let directory = read_at(file, cd_offset, cd_size as usize)?;
+    } = read_end_records(file, eocd_offset, end)?;
+    let mut directory = Vec::new();
     let mut entries = Vec::with_capacity(count.min(1 << 20) as usize);
     let mut at = 0usize;
     for _ in 0..count {
-        if at + 46 > directory.len() || u32_at(&directory, at) != CENTRAL_SIG {
+        read_directory(file, cd_offset, cd_size, at + CENTRAL_LEN as usize, &mut directory)?;
+        if at + CENTRAL_LEN as usize > directory.len() || u32_at(&directory, at) != CENTRAL_SIG {
             return Err(invalid("bad central directory entry"));
         }
         let name_len = u16_at(&directory, at + 28) as usize;
         let extra_len = u16_at(&directory, at + 30) as usize;
         let comment_len = u16_at(&directory, at + 32) as usize;
         let next = at + 46 + name_len + extra_len + comment_len;
+        read_directory(file, cd_offset, cd_size, next, &mut directory)?;
         if next > directory.len() {
             return Err(invalid("bad central directory entry"));
         }
@@ -260,10 +284,23 @@ pub fn read_archive(file: &mut File, end: u64) -> io::Result<Archive> {
         at = next;
     }
     // an entry behind the count is one factum would not see, and other ZIP readers would
-    if at != directory.len() {
+    if at as u64 != cd_size {
         return Err(invalid("the central directory holds more than its entry count"));
     }
-    Ok(Archive::new(entries, comment, end))
+    Ok(Archive::new(entries, read_at(file, comment.0, comment.1)?, end))
+}
+
+/// Extends `directory` to hold `needed` bytes, if the directory has that many.
+fn read_directory(file: &mut File, offset: u64, size: u64, needed: usize, directory: &mut Vec<u8>) -> io::Result<()> {
+    while directory.len() < needed && (directory.len() as u64) < size {
+        let held = directory.len() as u64;
+        directory.extend(read_at(
+            file,
+            offset + held,
+            (size - held).min(DIRECTORY_BLOCK) as usize,
+        )?);
+    }
+    Ok(())
 }
 
 /// Replaces the 0xFFFFFFFF fields of a central directory entry with the values of its ZIP64 extra field.
@@ -290,19 +327,28 @@ fn apply_zip64_extra(entry: &mut CdEntry, extra: &[u8]) {
 
 /// Whether a state ends at `end`. A read error is an error, not a "no".
 fn is_state(file: &mut File, end: u64) -> io::Result<bool> {
-    match read_archive(file, end) {
+    match find_end_record(file, end) {
+        Ok(eocd_offset) => is_state_at(file, eocd_offset, end),
+        Err(e) if not_a_state(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_state_at(file: &mut File, eocd_offset: u64, end: u64) -> io::Result<bool> {
+    match read_archive_at(file, eocd_offset, end) {
         Ok(_) => Ok(true),
         Err(e) if not_a_state(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
 
-/// Offers where each end-of-central-directory record in `from..len` ends, newest first, to `visit`, until it answers.
+/// Offers each end-of-central-directory record in `from..len`, newest first, as (where it starts, where it ends), to
+/// `visit`, until it answers.
 fn search_back<T>(
     file: &mut File,
     from: u64,
     len: u64,
-    mut visit: impl FnMut(&mut File, u64) -> io::Result<Option<T>>,
+    mut visit: impl FnMut(&mut File, u64, u64) -> io::Result<Option<T>>,
 ) -> io::Result<Option<T>> {
     // backwards in blocks that overlap by 3 bytes, so a signature across a block boundary is found
     let mut block_end = len;
@@ -319,7 +365,7 @@ fn search_back<T>(
             }
             let candidate = offset + EOCD_LEN + u16_at(&read_at(file, offset + 20, 2)?, 0) as u64;
             if candidate <= len
-                && let Some(found) = visit(file, candidate)?
+                && let Some(found) = visit(file, offset, candidate)?
             {
                 return Ok(Some(found));
             }
@@ -344,7 +390,9 @@ pub fn find_last_end(file: &mut File, hint: Option<u64>) -> io::Result<Option<u6
     {
         return Ok(Some(hint));
     }
-    search_back(file, 0, len, |file, end| Ok(is_state(file, end)?.then_some(end)))
+    search_back(file, 0, len, |file, record, end| {
+        Ok(is_state_at(file, record, end)?.then_some(end))
+    })
 }
 
 /// The end of the newest complete state, to continue from: the file's length if it ends with one, else the newest
@@ -545,11 +593,11 @@ fn state_end(file: &mut File, pos: u64, len: u64) -> io::Result<Option<u64>> {
 /// records there fit their place in the file but their directory cannot be read: damage to a state, not the end of
 /// a file nested in the evidence, whose offsets count from its own start. Without either, the bytes hold no state.
 fn search_tail(file: &mut File, from: u64, len: u64) -> io::Result<Option<u64>> {
-    search_back(file, from, len, |file, end| {
-        if is_state(file, end)? {
+    search_back(file, from, len, |file, record, end| {
+        if is_state_at(file, record, end)? {
             return Ok(Some(end));
         }
-        match read_end_records(file, end) {
+        match read_end_records(file, record, end) {
             Ok(_) => Err(invalid(format!(
                 "the state ending at offset {end} is complete but cannot be read"
             ))),
@@ -646,6 +694,10 @@ impl Read for CrcChecked<'_> {
 /// cannot make factum hold more, whatever its directory claims or its data inflates to.
 pub const MAX_IN_MEMORY: u64 = 1 << 30;
 
+/// The most a verification holds of a container's metadata, all its states and their graphs together: a few MiB of
+/// file can inflate to many members of MAX_IN_MEMORY.
+pub const MAX_TOTAL_IN_MEMORY: u64 = 4 << 30;
+
 /// A member's content in memory; refused when it is larger than MAX_IN_MEMORY.
 pub fn member_bytes(file: &mut File, entry: &CdEntry) -> io::Result<Vec<u8>> {
     match member_bytes_and_crc(file, entry)? {
@@ -659,7 +711,8 @@ pub fn member_bytes_and_crc(file: &mut File, entry: &CdEntry) -> io::Result<(Vec
     member_bytes_up_to(file, entry, MAX_IN_MEMORY)
 }
 
-fn member_bytes_up_to(file: &mut File, entry: &CdEntry, limit: u64) -> io::Result<(Vec<u8>, bool)> {
+/// `member_bytes_and_crc` with no more than `limit`, which also stops the read there.
+pub fn member_bytes_up_to(file: &mut File, entry: &CdEntry, limit: u64) -> io::Result<(Vec<u8>, bool)> {
     let mut data = Vec::with_capacity(entry.size.min(limit).min(1 << 24) as usize);
     let read = member_reader(file, entry)?.take(limit + 1).read_to_end(&mut data);
     let crc_matches = match read {
@@ -947,6 +1000,33 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom};
+
+    /// End records repeated for 256 KiB, each a candidate that fits its place or not: was minutes in a debug build.
+    #[test]
+    fn a_search_does_not_slow_with_the_records_it_tries() {
+        let dir = tempfile::tempdir().unwrap();
+        for filler in [b"PK\x05\x06".repeat(1 << 16), {
+            // each claims all that lies before it as its directory
+            let mut bytes = vec![0u8; 1 << 16];
+            for _ in 0..1 << 14 {
+                let at = bytes.len() as u32;
+                bytes.extend(EOCD_SIG.to_le_bytes());
+                bytes.extend([0; 6]);
+                bytes.extend(1u16.to_le_bytes());
+                bytes.extend(at.to_le_bytes());
+                bytes.extend(0u32.to_le_bytes());
+                bytes.extend(0u16.to_le_bytes());
+            }
+            bytes
+        }] {
+            let path = dir.path().join("x");
+            std::fs::write(&path, filler).unwrap();
+            let mut file = File::open(&path).unwrap();
+            let started = std::time::Instant::now();
+            assert_eq!(find_last_end(&mut file, None).unwrap(), None);
+            assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+        }
+    }
 
     fn new_file(dir: &tempfile::TempDir) -> std::fs::File {
         OpenOptions::new()

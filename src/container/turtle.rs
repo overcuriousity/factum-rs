@@ -264,39 +264,49 @@ enum Token {
 }
 
 /// The character of a `\u` or `\U` escape whose digits start at `at`, and where they end.
-fn uchar(chars: &[char], at: usize, escaped: char) -> Result<(char, usize), String> {
+fn uchar(text: &str, at: usize, escaped: char) -> Result<(char, usize), String> {
     let len = if escaped == 'u' { 4 } else { 8 };
-    let hex: String = chars.get(at..at + len).ok_or("bad \\u escape")?.iter().collect();
-    let code = u32::from_str_radix(&hex, 16).map_err(|_| "bad \\u escape")?;
+    let hex = text.get(at..at + len).ok_or("bad \\u escape")?;
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("bad \\u escape".into());
+    }
+    let code = u32::from_str_radix(hex, 16).map_err(|_| "bad \\u escape")?;
     Ok((char::from_u32(code).ok_or("bad \\u escape")?, at + len))
 }
 
-fn tokenize(text: &str) -> Result<Vec<Token>, String> {
-    let chars: Vec<char> = text.chars().collect();
+/// What a token costs in memory until the graph is built, the graph's share included, roughly.
+const TOKEN_COST: u64 = 128;
+const TOO_MUCH: &str = "more metadata than fits the memory set aside for it";
+
+/// `at` walks the text by bytes and stays on character boundaries: what delimits a token is ASCII, which is never a
+/// part of another character.
+fn tokenize(text: &str, max_tokens: u64) -> Result<Vec<Token>, String> {
+    let bytes = text.as_bytes();
+    let char_at = |at: usize| text[at..].chars().next();
     let mut tokens = Vec::new();
     let mut at = 0;
     let delimiter = |c: char| c.is_whitespace() || ";,<>\"'()[]#".contains(c);
-    while at < chars.len() {
-        let c = chars[at];
+    while let Some(c) = char_at(at) {
+        if tokens.len() as u64 > max_tokens {
+            return Err(TOO_MUCH.into());
+        }
         if c.is_whitespace() {
-            at += 1;
+            at += c.len_utf8();
         } else if c == '#' {
-            while at < chars.len() && chars[at] != '\n' {
-                at += 1;
-            }
+            at = text[at..].find('\n').map_or(text.len(), |n| at + n);
         } else if c == '<' {
             at += 1;
             let mut iri = String::new();
             loop {
-                let mut ch = *chars.get(at).ok_or("unterminated IRI")?;
-                at += 1;
+                let mut ch = char_at(at).ok_or("unterminated IRI")?;
+                at += ch.len_utf8();
                 if ch == '>' {
                     break;
                 }
                 if ch == '\\' {
-                    let escaped = chars.get(at).copied().filter(|e| matches!(e, 'u' | 'U'));
+                    let escaped = char_at(at).filter(|e| matches!(e, 'u' | 'U'));
                     let escaped = escaped.ok_or("an IRI allows only \\u and \\U escapes")?;
-                    (ch, at) = uchar(&chars, at + 1, escaped)?;
+                    (ch, at) = uchar(text, at + 1, escaped)?;
                 }
                 if not_in_iri(ch) {
                     return Err(format!("{ch:?} is not allowed in an IRI"));
@@ -305,14 +315,15 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             }
             tokens.push(Token::Iri(iri));
         } else if c == '"' || c == '\'' {
-            let long = chars.get(at + 1) == Some(&c) && chars.get(at + 2) == Some(&c);
+            let quote = c as u8;
+            let long = bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote);
             at += if long { 3 } else { 1 };
             let mut value = String::new();
             loop {
-                let Some(&ch) = chars.get(at) else {
+                let Some(ch) = char_at(at) else {
                     return Err("unterminated string".into());
                 };
-                if long && ch == c && chars.get(at + 1) == Some(&c) && chars.get(at + 2) == Some(&c) {
+                if long && ch == c && bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote) {
                     at += 3;
                     break;
                 }
@@ -324,8 +335,8 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                     return Err("line break in a short string".into());
                 }
                 if ch == '\\' {
-                    let escaped = *chars.get(at + 1).ok_or("unterminated string")?;
-                    at += 2;
+                    let escaped = char_at(at + 1).ok_or("unterminated string")?;
+                    at += 1 + escaped.len_utf8();
                     match escaped {
                         't' => value.push('\t'),
                         'b' => value.push('\u{8}'),
@@ -334,7 +345,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                         'f' => value.push('\u{c}'),
                         '"' | '\'' | '\\' => value.push(escaped),
                         'u' | 'U' => {
-                            let (decoded, end) = uchar(&chars, at, escaped)?;
+                            let (decoded, end) = uchar(text, at, escaped)?;
                             value.push(decoded);
                             at = end;
                         }
@@ -343,23 +354,23 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                     continue;
                 }
                 value.push(ch);
-                at += 1;
+                at += ch.len_utf8();
             }
             tokens.push(Token::Str(value));
         } else if c == '@' {
             let start = at + 1;
             at = start;
-            while at < chars.len() && (chars[at].is_ascii_alphanumeric() || chars[at] == '-') {
+            while bytes.get(at).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'-') {
                 at += 1;
             }
-            let word: String = chars[start..at].iter().collect();
+            let word = &text[start..at];
             // after a string it is a language tag, otherwise a directive
             if matches!(tokens.last(), Some(Token::Str(_))) {
                 tokens.push(Token::LangTag);
             } else {
                 tokens.push(Token::Directive(word.to_ascii_lowercase()));
             }
-        } else if c == '^' && chars.get(at + 1) == Some(&'^') {
+        } else if c == '^' && bytes.get(at + 1) == Some(&b'^') {
             tokens.push(Token::Carets);
             at += 2;
         } else if c == ';' {
@@ -368,7 +379,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
         } else if c == ',' {
             tokens.push(Token::Comma);
             at += 1;
-        } else if c == '.' && chars.get(at + 1).is_none_or(|n| delimiter(*n)) {
+        } else if c == '.' && char_at(at + 1).is_none_or(delimiter) {
             tokens.push(Token::Dot);
             at += 1;
         } else if "()[]".contains(c) {
@@ -376,10 +387,14 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             at += 1;
         } else {
             let start = at;
-            while at < chars.len() && !delimiter(chars[at]) {
-                at += 1;
+            while let Some(ch) = char_at(at).filter(|ch| !delimiter(*ch)) {
+                at += ch.len_utf8();
             }
-            let mut word: String = chars[start..at].iter().collect();
+            // a delimiter nothing above takes: left where it is, this would never end
+            if at == start {
+                return Err(format!("unexpected {c:?}"));
+            }
+            let mut word = text[start..at].to_string();
             // a name never ends with a dot: that one ends the statement
             let mut dots = 0;
             while word.ends_with('.') {
@@ -547,8 +562,18 @@ impl Parser {
 
 /// Parses the Turtle subset AFF4 containers use; anything else is an error naming it.
 pub fn parse(text: &str) -> Result<Graph, String> {
+    let mut unlimited = u64::MAX;
+    parse_within(text, &mut unlimited)
+}
+
+/// Like `parse`, for what a container claims: takes what the text and its graph hold in memory from `budget`, and
+/// refuses what does not fit, as a short text can make many tokens.
+pub fn parse_within(text: &str, budget: &mut u64) -> Result<Graph, String> {
+    let left = budget.checked_sub(text.len() as u64).ok_or(TOO_MUCH)?;
+    let tokens = tokenize(text, left / TOKEN_COST)?;
+    *budget = left.saturating_sub(tokens.len() as u64 * TOKEN_COST);
     let mut parser = Parser {
-        tokens: tokenize(text)?,
+        tokens,
         at: 0,
         prefixes: HashMap::new(),
         graph: Graph::default(),
@@ -576,6 +601,40 @@ mod tests {
     use crate::container::{AFF4_NS, AFF4L_NS, RDF_NS, XSD_NS};
 
     const PREFIXES: [(&str, &str); 4] = [("aff4", AFF4_NS), ("aff4l", AFF4L_NS), ("rdf", RDF_NS), ("xsd", XSD_NS)];
+
+    #[test]
+    fn a_stray_closing_bracket_is_an_error_not_a_hang() {
+        assert_eq!(parse("x> .").unwrap_err(), "unexpected '>'");
+        assert_eq!(parse("<a> <b> > .").unwrap_err(), "unexpected '>'");
+    }
+
+    #[test]
+    fn what_is_refused_in_a_budget_is_refused_before_it_is_held() {
+        let text = "<a> <b> <c> .\n";
+        let mut budget = text.len() as u64 + 4 * TOKEN_COST;
+        parse_within(text, &mut budget).unwrap();
+        assert_eq!(budget, 0);
+        let mut budget = text.len() as u64 - 1;
+        assert_eq!(parse_within(text, &mut budget).unwrap_err(), TOO_MUCH);
+        // a few bytes make a token each
+        let mut budget = 1 << 20;
+        assert_eq!(parse_within(&";".repeat(1 << 19), &mut budget).unwrap_err(), TOO_MUCH);
+    }
+
+    #[test]
+    fn characters_of_more_than_one_byte_are_read_whole() {
+        let graph = parse("<aff4://ä> <p:ü> \"🦀\\u00e4\" . # kömment\n<b>\u{a0}<c> '''é'''.").unwrap();
+        assert_eq!(graph.triples()[0].subject, "aff4://ä");
+        assert_eq!(graph.triples()[0].object.value(), Some("🦀ä"));
+        assert_eq!(graph.triples()[1].object.value(), Some("é"));
+    }
+
+    #[test]
+    fn an_escape_is_hex_digits_only() {
+        assert!(parse("<a\\u+041> <b> <c> .").is_err());
+        assert!(parse("<a> <b> \"\\u+041\" .").is_err());
+        assert!(parse("<a\\uä000> <b> <c> .").is_err());
+    }
 
     fn typed(value: &str, datatype: &str) -> Term {
         Term::Literal {
