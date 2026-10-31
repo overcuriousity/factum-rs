@@ -997,8 +997,9 @@ impl Volume {
             ));
         }
         let mut errors = Vec::new();
+        let mut skipped = Vec::new();
         let mut items = Vec::new();
-        // a container inside the folder being added never adds itself; a link to it is recorded like any link
+        // a container inside the folder being added never adds itself; a symbolic link to it is recorded like any link
         let own = std::fs::canonicalize(&self.path)
             .ok()
             .and_then(|real| Some((read_meta(&real).ok()?, real)));
@@ -1008,7 +1009,15 @@ impl Volume {
         };
         for walked in source::walk(sources) {
             match walked {
-                Ok((path, meta)) if is_own(&path, &meta) => {}
+                Ok((path, meta)) if is_own(&path, &meta) => {
+                    // the same file under another name (a hard link): left out, and the log says so
+                    if own.as_ref().map(|(_, real)| real) != std::fs::canonicalize(&path).ok().as_ref() {
+                        skipped.push((
+                            path.display().to_string(),
+                            "the container itself; not added".to_string(),
+                        ));
+                    }
+                }
                 Ok(item) => items.push(item),
                 Err((path, e)) => errors.push((path.display().to_string(), e.to_string())),
             }
@@ -1058,7 +1067,6 @@ impl Volume {
         let mut graph = Graph::default();
         let mut records = Vec::new();
         let mut folders = Vec::new();
-        let mut skipped = Vec::new();
         let mut done_bytes = 0u64;
         let app = self.app()?;
         let cancelled = |app: &mut Appender| -> Result<Staged> {
@@ -2492,6 +2500,26 @@ mod tests {
         assert!(!paths(&staged.records).contains(&"c.aff4l"));
         let link = staged.records.iter().find(|r| r.path == "link").unwrap();
         assert_eq!(link.link.as_deref(), Some(inside.display().to_string().as_str()));
+    }
+
+    #[test]
+    fn a_hard_link_to_the_container_is_left_out_with_a_trace() {
+        let setup = Setup::new();
+        let inside = setup.source.join("c.aff4l");
+        let mut volume =
+            Volume::create(&inside, "33333333-3333-3333-3333-333333333333", &VolumeInfo::default()).unwrap();
+        let hard = setup.source.join("hard");
+        std::fs::hard_link(&inside, &hard).unwrap();
+        let staged = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        assert!(staged.records.iter().all(|r| r.path != "hard" && r.path != "c.aff4l"));
+        // the container under its own name needs no mention
+        assert_eq!(
+            staged.skipped,
+            vec![(
+                hard.display().to_string(),
+                "the container itself; not added".to_string()
+            )]
+        );
     }
 
     #[cfg(target_os = "linux")]

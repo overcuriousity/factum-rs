@@ -2498,13 +2498,12 @@ fn add_again_replaces_and_closes_signed() {
     assert!(!codes.contains(&"log_mismatch"), "{:?}", report.findings);
 }
 
-/// Both names show as `a\u{fffd}`, in a folder that is not UTF-8 either.
+/// A container with two files whose names both show as `a\u{fffd}`, in a folder that is not UTF-8 either: its id, the
+/// folder and the two paths.
 #[cfg(target_os = "linux")]
-#[test]
-fn add_again_finds_a_source_that_is_not_unicode() {
+fn added_from_a_path_that_is_not_unicode(s: &Setup) -> (i64, PathBuf, PathBuf, PathBuf) {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
-    let s = Setup::new();
     let base = s.f.path().join(OsStr::from_bytes(b"caf\xe9"));
     std::fs::create_dir(&base).unwrap();
     let (first, second) = (
@@ -2530,7 +2529,15 @@ fn add_again_finds_a_source_that_is_not_unicode() {
         )
         .unwrap();
     factum.commit_container_add(id, &mut volume, staged).unwrap();
-    drop(volume);
+    (id, base, first, second)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn add_again_finds_a_source_that_is_not_unicode() {
+    let s = Setup::new();
+    let (id, base, first, _) = added_from_a_path_that_is_not_unicode(&s);
+    let factum = s.f.factum();
     let added = &s.events("container_files_added")[0];
     assert!(added["base_path_raw"].is_string());
     assert!(added["base_path"].as_str().unwrap().ends_with("caf\u{fffd}"));
@@ -2561,6 +2568,52 @@ fn add_again_finds_a_source_that_is_not_unicode() {
         "{:?}",
         report.findings
     );
+}
+
+/// A log entry whose raw form names the other file, though both show alike as text.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tampered_source_raw_is_refused() {
+    let s = Setup::new();
+    let (id, _, _, second) = added_from_a_path_that_is_not_unicode(&s);
+    let factum = s.f.factum();
+    let added = &s.events("container_files_added")[0];
+    let raw = |n: usize| added["files"][n]["source_raw"].as_str().unwrap().to_string();
+    s.f.exec(&format!(
+        "UPDATE entries SET payload_json = replace(payload_json, '{}', '{}')",
+        raw(0),
+        raw(1)
+    ));
+    // verifying finds the log and the container apart
+    let report = factum
+        .verify_container_file(
+            &s.container_path(),
+            &factum.gpgsm(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+    let mismatch = report
+        .findings
+        .iter()
+        .find(|f| f.code == "log_mismatch")
+        .expect("a mismatch");
+    assert!(
+        mismatch
+            .message
+            .contains("differs between the container and the case log"),
+        "{}",
+        mismatch.message
+    );
+    // Add Again would read what the log names; nothing is added to a container that differs from its log
+    let arn = first_arn(&s, id);
+    damage_content(&s.container_path(), &arn);
+    let recheck = factum.recheck_container(id).unwrap();
+    let plan = factum.add_again_plan(id, &recheck.mismatches).unwrap();
+    assert_eq!(plan[0].0, vec![second]);
+    let error = factum.open_container_for_add(id).err().expect("refused");
+    assert!(error.to_string().contains("differs from the case log"), "{error}");
+    assert_eq!(s.events("container_files_added").len(), 1);
 }
 
 #[test]

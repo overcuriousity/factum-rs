@@ -103,13 +103,13 @@ fn same_id(a: Option<(u64, u64)>, b: Option<(u64, u64)>) -> Option<bool> {
     }
 }
 
-/// Whether a walked item is the file `own` with the real path `own_real`: never a link to it, which is recorded as a
-/// link. The ids decide; where they do not (an inode of 0, a file system that numbers its files anew), the real path
-/// of a file of the same size does.
+/// Whether a walked item is the file `own` with the real path `own_real`: never a symbolic link to it, which is
+/// recorded as a link, and only a file of its size. The ids decide; where they do not (an inode of 0, a file system
+/// that numbers its files anew), the real path does.
 pub fn is_same_file(own: &SourceMeta, own_real: &Path, path: &Path, meta: &SourceMeta) -> bool {
     meta.kind == SourceKind::File
-        && (same_id(own.id, meta.id) == Some(true)
-            || (meta.size == own.size && std::fs::canonicalize(path).is_ok_and(|real| real == own_real)))
+        && meta.size == own.size
+        && (same_id(own.id, meta.id) == Some(true) || std::fs::canonicalize(path).is_ok_and(|real| real == own_real))
 }
 
 /// Opens without following a link and without waiting for the other end of a FIFO. On Linux without updating the
@@ -196,6 +196,8 @@ pub fn open_source(path: &Path, meta: &SourceMeta) -> io::Result<File> {
     #[cfg(windows)]
     let file = File::open(path)?;
     let metadata = file.metadata()?;
+    // vfat, exfat, CIFS with noserverino and FUSE without use_ino may number a file anew between walk and open: that
+    // too reads as changed. Left so on purpose: a failure that says so, never a file taken on trust.
     if !metadata.is_file() || metadata.len() != meta.size || same_id(file_id(&file).ok(), meta.id) == Some(false) {
         return Err(changed());
     }
@@ -668,6 +670,12 @@ mod tests {
             &same_size,
             &read_meta(&same_size).unwrap()
         ));
+        // the same id with another size: not the file that was measured
+        let other_size = SourceMeta {
+            size: own.size + 1,
+            ..own.clone()
+        };
+        assert!(!is_same_file(&own, &own_real, &own_path, &other_size));
         // an inode of 0 says nothing, nor do ids that differ on a file system that numbers files anew
         for (own_id, walked_id) in [((1, 0), (1, 0)), (own.id.unwrap(), (1, 0)), (own.id.unwrap(), (9, 9))] {
             let own = SourceMeta {
