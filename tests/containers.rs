@@ -2818,8 +2818,8 @@ mod script {
     }
 
     /// What stays different, on purpose, and README and spec say so: the script checks what factum wrote and has no
-    /// reader for anything else, so where factum, which also opens other tools' containers, warns or has nothing to say,
-    /// it fails. Never the other way round.
+    /// reader for anything else, so where factum, which also opens other tools' containers, warns or has nothing to
+    /// say, it warns or fails. Not the other way round.
     #[test]
     fn the_script_fails_what_is_not_factums_where_factum_does_not() {
         let verdicts = |path: &Path| {
