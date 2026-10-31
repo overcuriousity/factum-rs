@@ -354,6 +354,13 @@ otherwise, following existing patterns).
    `trailing_data`; Python must match (this replaces the WARN in item 2 for those cases; an interrupted addition stays
    a WARN). Python's zipfile raises on a CRC mismatch: separate it like Rust, so hashes still finish and "CRC-32
    differs" is a finding beside them, and metadata checks continue. Mirror Task 7's end-of-directory checks.
+9. Carry-over from Task 8: decode UCHAR escapes in IRIs and refuse raw characters U+0000 to U+0020 and `<>"{}|^\``
+   the way src/container/turtle.rs does. X.509: `openssl cms -verify` fails on an expired certificate, so a good
+   signature by a certificate expired since must give the WARN `x509_expired` as in Rust; every certificate in the chain
+   must have been valid at signing; compare the CMS signer with the first `.cer` certificate; `.sig` without `.cer` is
+   a WARN `x509_no_certificate` (Python FAILs today). Read any new Turtle properties Task 8 added (see the spec).
+10. Carry-over from Task 9: `history/0/` is a FAIL. verify_container.py:511 enumerates `range(1, max(closes))`, so a
+    crafted huge number exhausts memory; walk neighbouring keys and give one finding per gap, as verify.rs does.
 
 ### Task 11: Export and bundles
 
