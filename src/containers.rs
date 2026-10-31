@@ -1329,7 +1329,27 @@ impl Factum<'_> {
         for state in &report.states {
             let Some(n) = state.close else { continue };
             match detail.closes.get(n as usize - 1) {
-                Some(close) if close.turtle_sha256 == state.turtle_sha256 => {}
+                Some(close) if close.turtle_sha256 == state.turtle_sha256 => {
+                    // who signed it: at the close, or later
+                    let late = detail
+                        .late_signatures
+                        .iter()
+                        .find(|(e, ..)| Some(*e) == close.signed_later);
+                    let logged = close.x509.as_ref().or(late.and_then(|(.., x509)| x509.as_ref()));
+                    let signer = state.x509.as_ref().and_then(|check| check.fingerprint.as_ref());
+                    if let (Some(logged), Some(signer)) = (logged, signer)
+                        && !logged.eq_ignore_ascii_case(signer)
+                    {
+                        findings.push(fail(
+                            format!(
+                                "Closed state {n} was signed by X.509 certificate {signer}, not by {logged}, which \
+                                 the case log records (entry #{}).",
+                                close.entry_id
+                            ),
+                            Some(close.entry_id),
+                        ));
+                    }
+                }
                 Some(close) => findings.push(fail(
                     format!(
                         "Closed state {n} differs from the close the case log records (entry #{}).",

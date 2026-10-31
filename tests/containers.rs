@@ -1396,6 +1396,193 @@ mod verify {
             .expect("untrusted root");
         assert!(fail.message.contains(&home.root_fingerprint), "{}", fail.message);
     }
+
+    /// Closes a container of this case with the test certificate.
+    fn x509_closed(s: &Setup, home: &common::GpgsmHome, gpgsm: &Gpgsm) -> i64 {
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        home.trusted();
+        s.f.db.set_setting(X509_CERT_SETTING, &home.leaf_fingerprint).unwrap();
+        let recheck = s.f.factum().recheck_container(id).unwrap();
+        let close = s.f.factum().close_container_with(id, gpgsm, &recheck).unwrap();
+        assert!(close.x509.is_some(), "{:?}", close.x509_refused);
+        id
+    }
+
+    /// A container outside any log, closed with an X.509 signature and `chain` beside it.
+    fn loose_container(s: &Setup, gpgsm: &Gpgsm, home: &common::GpgsmHome, chain: Option<&str>) -> PathBuf {
+        use factum::container::volume::{Signatures, VolumeInfo};
+        home.trusted();
+        let path = s.f.path().join("loose.aff4l");
+        let _ = std::fs::remove_file(&path);
+        let info = VolumeInfo::default();
+        let mut volume = Volume::create(&path, "44444444-4444-4444-4444-444444444444", &info).unwrap();
+        let options = AddOptions {
+            base: s.source.clone(),
+            keep_path: true,
+            ..Default::default()
+        };
+        let staged = volume
+            .stage_add(
+                &[s.file("a.txt")],
+                &options,
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        volume.finalize_add(&staged, 1).unwrap();
+        let (signature, own_chain) = gpgsm
+            .sign_with_chain(&home.leaf_fingerprint, &volume.turtle_bytes(), &[])
+            .unwrap();
+        let signatures = Signatures {
+            gpg: None,
+            x509: Some((signature, chain.map_or(own_chain, str::to_string))),
+        };
+        volume.close(&signatures).unwrap();
+        path
+    }
+
+    fn verify_with(s: &Setup, path: &Path, gpgsm: &Gpgsm) -> ContainerReport {
+        s.f.factum()
+            .verify_container_file(path, gpgsm, &|_, _| {}, &AtomicBool::new(false))
+            .unwrap()
+    }
+
+    #[test]
+    fn x509_signature_by_another_certificate_than_the_stored_one_fails() {
+        let Some(home) = common::GpgsmHome::new() else {
+            eprintln!("skipped: gpgsm or openssl is not installed");
+            return;
+        };
+        let gpgsm = Gpgsm::new(Some(home.path()));
+        let s = Setup::new();
+        let path = loose_container(&s, &gpgsm, &home, None);
+        let report = verify_with(&s, &path, &gpgsm);
+        assert!(
+            !codes(&report, Level::Fail).contains(&"x509_mismatch"),
+            "{:?}",
+            report.findings
+        );
+        // the signature chains to the trusted root all the same: only the comparison finds this
+        let root = std::fs::read_to_string(home.file("root.pem")).unwrap();
+        let path = loose_container(&s, &gpgsm, &home, Some(&root));
+        let report = verify_with(&s, &path, &gpgsm);
+        let fail = report
+            .findings
+            .iter()
+            .find(|f| f.code == "x509_mismatch")
+            .expect("a mismatch");
+        assert_eq!(fail.level, Level::Fail);
+        assert!(fail.message.contains(&home.leaf_fingerprint), "{}", fail.message);
+        assert!(fail.message.contains(&home.root_fingerprint), "{}", fail.message);
+        assert!(report.states[0].x509.as_ref().is_some_and(|x| x.valid && x.trusted));
+        // a chain nothing can be read from says no more than a wrong one
+        let path = loose_container(&s, &gpgsm, &home, Some("not a certificate"));
+        assert!(codes(&verify_with(&s, &path, &gpgsm), Level::Fail).contains(&"x509_mismatch"));
+    }
+
+    #[test]
+    fn x509_container_without_a_stored_certificate_has_no_new_finding() {
+        use factum::container::volume::{CER_X509, SIG_X509};
+        let Some(home) = common::GpgsmHome::new() else {
+            eprintln!("skipped: gpgsm or openssl is not installed");
+            return;
+        };
+        let gpgsm = Gpgsm::new(Some(home.path()));
+        let s = Setup::new();
+        let path = loose_container(&s, &gpgsm, &home, None);
+        // as a container with the certificates left out of the directory reads
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let archive = read_archive(&mut file, len).unwrap();
+        let history_chain = history_member(1, CER_X509);
+        let app = &mut Appender::new(file, len, archive.entries.clone()).unwrap();
+        app.finish(&[CER_X509, &history_chain], &archive.comment).unwrap();
+        let report = verify_with(&s, &path, &gpgsm);
+        assert!(
+            !codes(&report, Level::Fail).contains(&"x509_mismatch"),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(member(&path, CER_X509), None);
+        assert!(member(&path, SIG_X509).is_some());
+        assert!(report.states[0].x509.as_ref().is_some_and(|x| x.fingerprint.is_some()));
+    }
+
+    #[test]
+    fn x509_certificate_other_than_the_logged_one_fails() {
+        let Some(home) = common::GpgsmHome::new() else {
+            eprintln!("skipped: gpgsm or openssl is not installed");
+            return;
+        };
+        let gpgsm = Gpgsm::new(Some(home.path()));
+        let s = Setup::new();
+        let _id = x509_closed(&s, &home, &gpgsm);
+        let path = s.container_path();
+        assert_eq!(verify_with(&s, &path, &gpgsm).overall(), Level::Ok);
+        s.f.exec(&format!(
+            "UPDATE entries SET payload_json = replace(payload_json, '{}', '{}')",
+            home.leaf_fingerprint, home.root_fingerprint
+        ));
+        let report = verify_with(&s, &path, &gpgsm);
+        let fail = report
+            .findings
+            .iter()
+            .find(|f| f.code == "log_mismatch")
+            .expect("a mismatch");
+        assert_eq!(fail.level, Level::Fail);
+        assert!(fail.message.contains(&home.leaf_fingerprint), "{}", fail.message);
+        assert!(fail.message.contains(&home.root_fingerprint), "{}", fail.message);
+        assert!(!codes(&report, Level::Fail).contains(&"x509_mismatch"));
+    }
+
+    #[test]
+    fn x509_certificate_of_a_late_signature_is_compared_with_the_log_too() {
+        let Some(home) = common::GpgsmHome::new() else {
+            eprintln!("skipped: gpgsm or openssl is not installed");
+            return;
+        };
+        let gpgsm = Gpgsm::new(Some(home.path()));
+        let s = Setup::new();
+        let id = x509_closed(&s, &home, &gpgsm);
+        let detail = s.f.factum().container(id).unwrap();
+        // the log as a close without signatures, signed later by what `logged` names
+        s.f.exec(&format!(
+            "UPDATE entries SET payload_json = replace(payload_json, '\"gpg\":\"{0}\"', '\"gpg\":null') \
+             WHERE payload_json LIKE '%container_closed%'",
+            detail.closes[0].gpg.as_deref().unwrap_or_default()
+        ));
+        s.f.exec(&format!(
+            "UPDATE entries SET payload_json = replace(payload_json, '\"x509\":\"{}\"', '\"x509\":null') \
+             WHERE payload_json LIKE '%container_closed%'",
+            home.leaf_fingerprint
+        ));
+        let sign_later = |logged: &str| {
+            let payload = serde_json::json!({"event": "container_signed", "case_id": s.case_id,
+                                             "container_id": detail.summary.uuid, "close": 1,
+                                             "turtle_sha256": detail.closes[0].turtle_sha256,
+                                             "signatures": {"gpg": null, "x509": logged}, "signed_utc": "x"});
+            let append = Append {
+                payload: Some(payload),
+                ..Default::default()
+            };
+            s.f.factum().append(s.case_id, "system", "signed", append).unwrap();
+        };
+        sign_later(&home.root_fingerprint);
+        assert!(s.f.factum().container(id).unwrap().closes[0].signed_later.is_some());
+        let path = s.container_path();
+        let report = verify_with(&s, &path, &gpgsm);
+        let mismatch = report
+            .findings
+            .iter()
+            .find(|f| f.code == "log_mismatch")
+            .expect("a mismatch");
+        assert!(
+            mismatch.message.contains(&home.root_fingerprint),
+            "{}",
+            mismatch.message
+        );
+    }
 }
 
 // --- verify_container.py, as a recipient runs it

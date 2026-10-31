@@ -225,6 +225,45 @@ pub struct GpgsmHome {
 
 impl GpgsmHome {
     pub fn new() -> Option<Self> {
+        Self::build(false)
+    }
+
+    /// With a leaf that expired yesterday, under a root that was valid before it; `sign_while_valid` signs with it.
+    /// None also where openssl has no `-not_before` (before 3.4).
+    pub fn with_expired_leaf() -> Option<Self> {
+        Self::build(true)
+    }
+
+    /// A detached signature over `data` made while the expired leaf was still valid: at a faked time, the day before.
+    pub fn sign_while_valid(&self, data: &[u8]) -> String {
+        let at = chrono::Utc::now() - chrono::Duration::hours(36);
+        let at = at.format("%Y%m%dT%H%M%S").to_string();
+        let (data_file, signature) = (self.file("to-sign"), self.file("signature.pem"));
+        std::fs::write(&data_file, data).unwrap();
+        let output = self
+            .gpgsm(
+                &[
+                    "--faked-system-time",
+                    &at,
+                    "--disable-crl-checks",
+                    "--disable-ocsp",
+                    "--detach-sign",
+                    "--armor",
+                    "--include-certs",
+                    "-1",
+                    "--local-user",
+                    &self.leaf_fingerprint,
+                    "--output",
+                    signature.to_str().unwrap(),
+                ],
+                &[&data_file],
+            )
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        std::fs::read_to_string(signature).unwrap()
+    }
+
+    fn build(expired_leaf: bool) -> Option<Self> {
         which::which("gpgsm").ok()?;
         which::which("openssl").ok()?;
         let dir = tempfile::Builder::new()
@@ -251,25 +290,36 @@ impl GpgsmHome {
             }
             Some(())
         };
-        openssl(&[
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            "root.key",
-            "-out",
-            "root.pem",
-            "-days",
-            "3650",
-            "-subj",
-            "/CN=Factum Test Root",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
-        ])?;
+        let stamp = |days: i64| (chrono::Utc::now() + chrono::Duration::days(days)).format("%Y%m%d%H%M%SZ");
+        let (not_before, not_after) = (stamp(-2).to_string(), stamp(-1).to_string());
+        let (root_before, root_after) = (stamp(-10).to_string(), stamp(3000).to_string());
+        let root_validity: &[&str] = if expired_leaf {
+            &["-not_before", &root_before, "-not_after", &root_after]
+        } else {
+            &["-days", "3650"]
+        };
+        let leaf_validity: &[&str] = if expired_leaf {
+            &["-not_before", &not_before, "-not_after", &not_after]
+        } else {
+            &["-days", "365"]
+        };
+        openssl(
+            &[
+                &[
+                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "root.key", "-out", "root.pem",
+                ][..],
+                root_validity,
+                &[
+                    "-subj",
+                    "/CN=Factum Test Root",
+                    "-addext",
+                    "basicConstraints=critical,CA:TRUE",
+                    "-addext",
+                    "keyUsage=critical,keyCertSign,cRLSign",
+                ][..],
+            ]
+            .concat(),
+        )?;
         openssl(&[
             "req",
             "-newkey",
@@ -287,23 +337,27 @@ impl GpgsmHome {
             "basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,nonRepudiation\n",
         )
         .ok()?;
-        openssl(&[
-            "x509",
-            "-req",
-            "-in",
-            "leaf.csr",
-            "-CA",
-            "root.pem",
-            "-CAkey",
-            "root.key",
-            "-CAcreateserial",
-            "-out",
-            "leaf.pem",
-            "-days",
-            "365",
-            "-extfile",
-            "ext",
-        ])?;
+        openssl(
+            &[
+                &[
+                    "x509",
+                    "-req",
+                    "-in",
+                    "leaf.csr",
+                    "-CA",
+                    "root.pem",
+                    "-CAkey",
+                    "root.key",
+                    "-CAcreateserial",
+                    "-out",
+                    "leaf.pem",
+                    "-extfile",
+                    "ext",
+                ][..],
+                leaf_validity,
+            ]
+            .concat(),
+        )?;
         openssl(&[
             "pkcs12",
             "-export",

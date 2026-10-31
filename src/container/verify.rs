@@ -15,7 +15,7 @@ use super::turtle::{self, Graph, Term};
 use super::volume::{
     CER_X509, FileRecord, HASHES, KEY_GPG, SIG_GPG, SIG_X509, TURTLE, content_reader, file_records, history_member,
 };
-use super::x509::{Gpgsm, X509Check};
+use super::x509::{Gpgsm, X509Check, first_fingerprint};
 use super::zip64::{Archive, find_last_end, find_newest_end, member_bytes_and_crc, read_archive};
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS};
 use crate::error::{FactumError, Result};
@@ -227,11 +227,40 @@ fn x509_findings(check: &X509Check, label: &str) -> Vec<Finding> {
     Vec::new()
 }
 
-/// The signature members of a state: (gpg signature, x509 signature).
-fn signature_names(close: Option<u32>) -> (String, String) {
+/// The certificate that made a signature against the first of the chain stored beside it: any certificate below a
+/// trusted root makes a good signature, so a signature alone does not say it is the examiner's.
+fn stored_certificate_findings(check: &X509Check, chain: &[u8], label: &str) -> Vec<Finding> {
+    let Some(signer) = &check.fingerprint else {
+        return Vec::new();
+    };
+    let stored = first_fingerprint(&String::from_utf8_lossy(chain));
+    if stored
+        .as_ref()
+        .is_some_and(|stored| stored.eq_ignore_ascii_case(signer))
+    {
+        return Vec::new();
+    }
+    vec![Finding::new(
+        Level::Fail,
+        "x509_mismatch",
+        format!(
+            "{label}: the X.509 signature was made by certificate {signer}, not by the one stored in the container \
+             ({}).",
+            stored.as_deref().unwrap_or("none readable")
+        ),
+        Ref::default(),
+    )]
+}
+
+/// The signature members of a state: (gpg signature, x509 signature, x509 certificate chain).
+fn signature_names(close: Option<u32>) -> (String, String, String) {
     match close {
-        Some(n) => (history_member(n, SIG_GPG), history_member(n, SIG_X509)),
-        None => (SIG_GPG.to_string(), SIG_X509.to_string()),
+        Some(n) => (
+            history_member(n, SIG_GPG),
+            history_member(n, SIG_X509),
+            history_member(n, CER_X509),
+        ),
+        None => (SIG_GPG.to_string(), SIG_X509.to_string(), CER_X509.to_string()),
     }
 }
 
@@ -766,7 +795,7 @@ pub fn verify_file(
             x509: None,
             findings: check_turtle_hashes(&state.turtle, state.hashes.as_deref(), &label),
         };
-        let (gpg_name, x509_name) = signature_names(state.close);
+        let (gpg_name, x509_name, chain_name) = signature_names(state.close);
         if let Some(signature) = read_checked(
             &mut file,
             &archive,
@@ -784,9 +813,13 @@ pub fn verify_file(
         }
         if let Some(signature) = read_checked(&mut file, &archive, &x509_name, "x509_invalid", &mut result.findings) {
             let check = gpgsm.verify_detached(&String::from_utf8_lossy(&signature), &state.turtle);
-            result
-                .findings
-                .extend(x509_findings(&check, &format!("Container state '{label}'")));
+            let what = format!("Container state '{label}'");
+            result.findings.extend(x509_findings(&check, &what));
+            if let Some(chain) = read_checked(&mut file, &archive, &chain_name, "x509_invalid", &mut result.findings) {
+                result
+                    .findings
+                    .extend(stored_certificate_findings(&check, &chain, &what));
+            }
             result.x509 = Some(check);
         }
         if state.close.is_some()
