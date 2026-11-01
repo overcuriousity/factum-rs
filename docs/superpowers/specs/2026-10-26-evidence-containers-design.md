@@ -301,19 +301,25 @@ the case tree must be that container, and a file at a place the log records must
 otherwise it is a `log_mismatch`, whatever uuid it names, or none. A file at no logged place, picked by hand, may be any
 container.
 
-A check holds up to `clamp(128 × compressed size, 4 GiB, 16 GiB)` of metadata, all states and graphs together, in
-either verifier. The size counted is that of exactly the members it reads: the root `information.turtle` and
+A check holds up to `clamp(128 × compressed size, 4 GiB, 16 GiB)` of metadata, all states and graphs together, in either
+verifier. The size counted is that of exactly the members it reads: the root `information.turtle` and
 `information.turtle.hashes`, and those of each `factum/history/<n>/`. So stored bytes nothing reads buy nothing, the
 factor leaves room for near-identical files, which compress to about 11:1 with factum's writer, and the ceiling caps a
-crafted file whichever way it is built: such a file can take the verifier up to that ceiling, not beyond it.
+crafted file whichever way it is built. The limit is on what is charged, and a verifier can pass it by the text of one
+member, which exists before it can be charged. Measured on crafted files: 5.0 GiB at a limit of 4.0 GiB in either
+verifier; at a limit of 9.1 GiB, 10.1 GiB in factum and 11.1 GiB in the script, whose decoded copy of 1 GiB of invalid
+bytes takes 2 GiB. A member is at most 1 GiB, so this should not grow with the limit; it was not measured at the
+ceiling.
 
-Each verifier counts the bytes of the members it holds and, for what it parses, 200 bytes a line plus the text the
-line holds. They measure the same thing but not the same way: factum also limits its tokens while it parses (96 bytes
-each, with their text), and copies a subject into each of its triples, while the script charges the decoded text during
-the parse and holds a subject once. So on one file they arrive at somewhat different totals, most on repeated subjects,
-and close to the limit one can stop where the other does not. A check that runs out stops with one `too_large` finding,
-which says the limit and that it does not mean alteration: a failure on a factum layout, a warning on another tool's file,
-and it is no `log_mismatch` either. A signature or certificate chain is at most 4 MiB.
+Each verifier counts the bytes of the members it holds and, for what it parses, 200 bytes for a triple, a subject or a
+prefix plus the text that one holds, expanded, and before it is held, so a parse stops at the limit whatever the shape
+of a statement. They measure the same thing but not the same way: factum also limits its tokens while it parses (96
+bytes each, with their text), and copies a subject into each of its triples, while the script charges the decoded text
+during the parse and what a str holds around its text, and holds a subject once. So on one file they arrive at somewhat
+different totals, most on repeated subjects, and close to the limit one can stop where the other does not. A check that
+runs out stops with one `too_large` finding, which says the limit and that it does not mean alteration: a failure on a
+factum layout, a warning on another tool's file, and it is no `log_mismatch` either. A signature or certificate chain is
+at most 4 MiB.
 
 The script and `factum/README.txt` are not signed, so nothing in a container vouches for them: `verify_container.py`
 prints its own SHA-256 when it starts, to compare with `factum --version` or the release notes.

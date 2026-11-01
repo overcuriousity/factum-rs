@@ -192,12 +192,14 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   only that root counts; and it reads only factum's Turtle layout, so valid Turtle in another layout, such as a comment,
   or a line over 1 MiB, fails where factum reads it. On a file that is not factum's it is stricter: it takes every file
   for factum's, so what another tool's container may lack (signatures, Maps, metadata streams) fails or warns, and an
-  older AFF4 file fails where factum warns that it does not support it. Neither calls an unsigned file good: factum
-  warns, and the script exits 0, as nothing failed, with `Result: NOT SIGNED`. Both hold 128 times what the file stores
-  of the metadata they read, at least 4 GiB and at most 16 GiB, and stop with `too_large` beyond that, which does not
-  mean the container was altered; a file close to that limit can get different verdicts. The script and the
-  container's `factum/README.txt` are not signed: whoever could change the container could change them. So run a copy
-  of the script you trust, or compare the SHA-256 it prints when it starts with `factum --version` or the release notes
+  older AFF4 file fails where factum warns that it does not support it. Neither calls an unsigned file good: a closed
+  state without a signature fails (`unsigned`) in both, and an open state, which has none yet, is a warning
+  (`not_signed`) in both; with nothing else wrong, the script then exits 0 with `Result: NOT SIGNED`. Both hold 128
+  times what the file stores of the metadata they read, at least 4 GiB and at most 16 GiB, and stop with `too_large`
+  beyond that, which does not mean the container was altered; a file close to that limit can get different verdicts.
+  The script and the container's `factum/README.txt` are not signed: whoever could change the container could change
+  them. So run a copy of the script you trust, or compare the SHA-256 it prints when it starts with `factum --version`
+  or the release notes
 - `samples/container/` holds a signed sample container with throwaway TEST ONLY keys, for checking other AFF4-L
   tools against factum's GPG and X.509 signatures
 - Reports list each container with its files; the verification bundle carries the log entries, not the container

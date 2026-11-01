@@ -750,7 +750,7 @@ impl Read for CrcChecked<'_> {
 pub const MAX_IN_MEMORY: u64 = 1 << 30;
 
 /// What a verification may hold of a container's metadata, all its states and their graphs together: this much for
-/// each byte the file stores of the members it reads, as near-identical files compress to about 11.5:1 with factum's
+/// each byte the file stores of the members it reads, as near-identical files compress to about 11:1 with factum's
 /// writer ...
 pub const METADATA_BUDGET_PER_STORED_BYTE: u64 = 128;
 
