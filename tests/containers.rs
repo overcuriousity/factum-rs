@@ -4130,6 +4130,77 @@ fn a_crc_field_on_a_replaced_copy_is_reported_as_what_it_is() {
 }
 
 #[test]
+fn a_recheck_of_another_state_or_container_is_not_logged_as_damage() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    let record = factum.container(id).unwrap().adds[0].files[0].clone();
+    let damage = factum::container::volume::Recheck {
+        mismatches: vec![record.clone()],
+        ..factum.recheck_container(id).unwrap()
+    };
+    let refused = |recheck: &factum::container::volume::Recheck| {
+        let error = factum.close_container_damaged(id, recheck).unwrap_err();
+        assert!(error.to_string().contains("changed since the re-check"), "{error}");
+        assert!(s.events("container_closed").is_empty());
+    };
+    // the same state, as a re-check of something else says it
+    refused(&factum::container::volume::Recheck {
+        logged_end: Some(1),
+        ..damage.clone()
+    });
+    refused(&factum::container::volume::Recheck {
+        arns: Vec::new(),
+        ..damage.clone()
+    });
+    // an older state of this container
+    s.add(id, &[s.file("b.txt")]);
+    refused(&damage);
+    // another container
+    let path = s.f.path().join("other.aff4l");
+    let other = factum
+        .create_container(s.case_id, "other", s.evidence_id, &path, "")
+        .unwrap();
+    s.add(other, &[s.file("c.txt")]);
+    let other_damage = factum::container::volume::Recheck {
+        mismatches: vec![record],
+        ..factum.recheck_container(other).unwrap()
+    };
+    refused(&other_damage);
+    assert!(factum.container(id).unwrap().summary.open);
+    // of this state: it goes through
+    let current = damage_of(&factum, id, &damage.mismatches[0]);
+    factum.close_container_damaged(id, &current).unwrap();
+}
+
+#[test]
+fn a_file_without_the_logged_state_says_what_to_do() {
+    let s = Setup::new();
+    let id = s.create();
+    let factum = s.f.factum();
+    let first = factum.recheck_input(id).unwrap().end.unwrap();
+    s.add(id, &[s.file("a.txt")]);
+    let path = s.container_path();
+    // the newest state is gone, and what an Add leaves follows the one before it
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.set_len(first).unwrap();
+    drop(file);
+    s.interrupted_add();
+    let error = factum.open_container_for_add(id).err().unwrap();
+    assert!(error.to_string().contains("was not opened"), "{error}");
+    assert!(
+        error
+            .to_string()
+            .ends_with("Locate… the file to continue from the state it holds, or Close as Damaged."),
+        "{error}"
+    );
+    // the way out it names, without opening the file
+    let recheck = factum.recheck_container(id).unwrap();
+    factum.close_container_damaged(id, &recheck).unwrap();
+}
+
+#[test]
 fn damaged_close_logs_and_writes_nothing() {
     let s = Setup::new();
     let (id, recheck) = damaged(&s);
@@ -4464,10 +4535,17 @@ fn replacement_with_other_content_fails_verification() {
     );
 }
 
-/// A re-check that found `record` damaged.
-fn damage_of(record: &factum::container::volume::FileRecord) -> factum::container::volume::Recheck {
+/// A re-check of container `id`'s state that found `record` damaged.
+fn damage_of(
+    factum: &factum::Factum,
+    id: i64,
+    record: &factum::container::volume::FileRecord,
+) -> factum::container::volume::Recheck {
+    let input = factum.recheck_input(id).unwrap();
     factum::container::volume::Recheck {
         mismatches: vec![record.clone()],
+        logged_end: input.end,
+        arns: input.records.iter().map(|r| r.arn.clone()).collect(),
         ..Default::default()
     }
 }
@@ -4597,11 +4675,15 @@ fn log_only_steps_wait_for_no_writer_and_need_no_file() {
     let factum = s.f.factum();
     let record = factum.container(id).unwrap().adds[0].files[0].clone();
     let writer = Volume::open(&s.container_path(), None).unwrap();
-    let error = factum.close_container_damaged(id, &damage_of(&record)).unwrap_err();
+    let error = factum
+        .close_container_damaged(id, &damage_of(&factum, id, &record))
+        .unwrap_err();
     assert!(error.to_string().contains("in use"), "{error}");
     assert!(s.events("container_closed").is_empty());
     drop(writer);
-    factum.close_container_damaged(id, &damage_of(&record)).unwrap();
+    factum
+        .close_container_damaged(id, &damage_of(&factum, id, &record))
+        .unwrap();
 
     let writer = Volume::open(&s.container_path(), None).unwrap();
     let error = factum.reopen_container(id).unwrap_err();
@@ -4753,7 +4835,9 @@ fn list_and_detail_agree_on_which_close_is_signed() {
     factum.reopen_container(id).unwrap();
     agree(true, false);
     let record = factum.container(id).unwrap().adds[0].files[0].clone();
-    factum.close_container_damaged(id, &damage_of(&record)).unwrap();
+    factum
+        .close_container_damaged(id, &damage_of(&factum, id, &record))
+        .unwrap();
     agree(false, true);
     factum.reopen_container(id).unwrap();
     let aside = s.f.path().join("aside");
@@ -5131,7 +5215,7 @@ fn a_file_that_cannot_be_reached_does_not_stop_the_log_only_steps() {
         source_raw: None,
     };
     mode(&path, 0o000);
-    let closed = factum.close_container_damaged(id, &damage_of(&record));
+    let closed = factum.close_container_damaged(id, &damage_of(&factum, id, &record));
     mode(&path, 0o644);
     closed.unwrap();
 }

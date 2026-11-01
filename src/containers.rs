@@ -1102,6 +1102,12 @@ impl Factum<'_> {
             .clone()
             .filter(|_| !detail.summary.missing)
             .ok_or_else(|| FactumError::general(format!("The file of container #{id} is missing.")))?;
+        let (end, records) = self.logged_state(&detail);
+        Ok(RecheckInput { path, end, records })
+    }
+
+    /// Where the log's state ends and the files a close re-checks of it.
+    fn logged_state(&self, detail: &ContainerDetail) -> (Option<u64>, Vec<FileRecord>) {
         let end = self
             .db
             .get_setting(&end_setting(&detail.summary.uuid))
@@ -1121,7 +1127,7 @@ impl Factum<'_> {
             .filter(|r| !r.metadata_only && r.link.is_none() && !replaced.contains(r.arn.as_str()))
             .cloned()
             .collect();
-        Ok(RecheckInput { path, end, records })
+        (end, records)
     }
 
     /// The re-check of `recheck_input`, here and now (no progress, not cancellable).
@@ -1260,6 +1266,13 @@ impl Factum<'_> {
         ensure_case_open(&self.db.conn, detail.summary.case_id)?;
         if !detail.summary.open {
             return Err(FactumError::general(format!("Container #{id} is already closed.")));
+        }
+        // the file may not be there to compare with: what the log holds is enough to tell what this re-check was of
+        let (end, records) = self.logged_state(&detail);
+        if !recheck.is_of_log(end, &records) {
+            return Err(FactumError::general(format!(
+                "Container #{id} was not closed: the container changed since the re-check; re-check again."
+            )));
         }
         let file_count = detail.summary.file_count;
         let paths: Vec<&str> = damaged.iter().map(|r| r.path.as_str()).collect();

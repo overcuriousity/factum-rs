@@ -1183,8 +1183,11 @@ fn report_lists_container_sources_and_damaged_state() {
     let record = staged.records[0].clone();
     factum.commit_container_add(id, &mut volume, staged).unwrap();
     drop(volume);
+    let input = factum.recheck_input(id).unwrap();
     let recheck = factum::container::volume::Recheck {
         mismatches: vec![record],
+        logged_end: input.end,
+        arns: input.records.iter().map(|r| r.arn.clone()).collect(),
         ..Default::default()
     };
     factum.close_container_damaged(id, &recheck).unwrap();

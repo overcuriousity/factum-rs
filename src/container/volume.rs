@@ -335,12 +335,15 @@ impl Recheck {
         self.ended_early || (self.files == 0 && self.mismatches.is_empty())
     }
 
+    /// Whether this re-check was of the state the log holds now.
+    pub fn is_of_log(&self, logged_end: Option<u64>, records: &[FileRecord]) -> bool {
+        self.logged_end == logged_end && self.arns.iter().eq(records.iter().map(|r| &r.arn))
+    }
+
     /// Whether this re-check read what the log and the locked volume hold now: `mark` is the volume's, its write
     /// position the end of a state that was set aside, which a re-check before that read.
     pub fn is_of(&self, logged_end: Option<u64>, records: &[FileRecord], mark: Mark) -> bool {
-        self.logged_end == logged_end
-            && self.arns.iter().eq(records.iter().map(|r| &r.arn))
-            && (self.volume_end == mark.base_end || self.volume_end == mark.write_pos)
+        self.is_of_log(logged_end, records) && (self.volume_end == mark.base_end || self.volume_end == mark.write_pos)
     }
 }
 
@@ -1032,9 +1035,21 @@ impl Volume {
                 path.display()
             ))
         };
-        let end = find_newest_end(&mut file, known)
-            .map_err(refused)?
-            .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
+        let end = match find_newest_end(&mut file, known) {
+            // the log's state is gone from the file, and what is left can be continued from
+            Err(e)
+                if e.kind() == io::ErrorKind::InvalidData
+                    && matches!(find_newest_end(&mut file, None), Ok(Some(end)) if known.is_some_and(|k| end < k)) =>
+            {
+                let refusal = refused(e);
+                return Err(FactumError::general(format!(
+                    "{refusal} Locate… the file to continue from the state it holds, or Close as Damaged."
+                )));
+            }
+            end => end,
+        }
+        .map_err(refused)?
+        .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
         let archive = read_archive(&mut file, end).map_err(|e| open_error(path, e, not_container))?;
         let read = |file: &mut File, name: &str| -> Result<Vec<u8>> {
             let entry = archive
