@@ -180,6 +180,11 @@ All notable changes to this project are documented here. The format follows
   at the end, so reports no longer stay behind when the bundle fails
 - Export file names are shortened: 80 CJK characters in a case file number failed with "file name too long"
 - Export builds only the requested formats, so PDF or Markdown alone no longer build the HTML with its embedded images
+- Companion: selecting a case sends none of its content during the 30 seconds it can be opted out in; its history is
+  enriched only after its first successful pass
+- Companion: switching it off for a case, deleting the case, changing the settings and closing the program take effect
+  after the model call in hand instead of after the whole pass or backlog batch; a pass ends at once when the endpoint
+  stopped answering during its enrichment, instead of waiting out two more timeouts
 - Companion: related older entries are found when the newest entries are the best matches
 - Companion: token estimates follow the server's counts more carefully, so an identifier-heavy prompt no longer overflows
   the window after a prose-heavy one

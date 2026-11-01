@@ -85,6 +85,8 @@ pub enum PassError {
     Db(FactumError),
     Archived,
     NothingNew,
+    /// opt-out, delete, a settings change or shutdown ended the pass
+    Cancelled,
 }
 
 impl PassError {
@@ -108,13 +110,17 @@ impl fmt::Display for PassError {
             PassError::Db(e) => f.write_str(&e.message),
             PassError::Archived => f.write_str("case is archived"),
             PassError::NothingNew => f.write_str("nothing new"),
+            PassError::Cancelled => f.write_str("cancelled"),
         }
     }
 }
 
 impl From<LlmError> for PassError {
     fn from(e: LlmError) -> Self {
-        PassError::Llm(e)
+        match e {
+            LlmError::Cancelled => PassError::Cancelled,
+            e => PassError::Llm(e),
+        }
     }
 }
 
@@ -176,8 +182,8 @@ pub(super) fn load_case(case_db: &Db, case_id: i64) -> Result<CaseData> {
     })
 }
 
-/// Runs one pass over the case. On any error the pass row is closed as failed (skipped for an archived case or
-/// nothing new) and the ledger is left as it was.
+/// Runs one pass over the case. On any error the pass row is closed as failed (skipped for an archived case, nothing
+/// new or a cancelled pass) and the ledger is left as it was.
 pub fn run_pass(
     case_db: &Db,
     cdb: &CompanionDb,
@@ -190,7 +196,7 @@ pub fn run_pass(
     let result = reflect(case_db, cdb, client, case_id, kind, pass_id, &mut log);
     if let Err(e) = &result {
         let status = match e {
-            PassError::Archived | PassError::NothingNew => "skipped",
+            PassError::Archived | PassError::NothingNew | PassError::Cancelled => "skipped",
             _ => {
                 log::warn!("companion pass {pass_id} on case {case_id} failed: {}", e.detail());
                 "failed"
@@ -248,6 +254,10 @@ fn reflect(
     if !unenriched.is_empty()
         && let Err(e) = enrich(case_db, cdb, client, case_id, &unenriched)
     {
+        // a dead endpoint would only be waited for twice more
+        if matches!(e, LlmError::Unreachable(_) | LlmError::Timeout | LlmError::Cancelled) {
+            return Err(e.into());
+        }
         log::warn!("companion enrichment failed, the pass goes on without it: {e}");
     }
 
@@ -319,6 +329,9 @@ fn reflect(
         other => other?,
     };
 
+    if client.stopped() {
+        return Err(PassError::Cancelled);
+    }
     let resolved = cdb.resolved_questions(case_id)?;
     let minus = cdb.minus_examples()?;
     let existing: HashSet<i64> = data.created.keys().copied().collect();

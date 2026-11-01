@@ -2,11 +2,12 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::Fixture;
 use common::fake_llm::{FakeLlm, openai_chat};
-use factum::companion::llm::Client;
+use factum::companion::llm::{Client, Epochs, LlmError};
 use factum::companion::reflect::{PassError, choose_kind, run_pass};
 use factum::companion::{Archetype, CompanionDb, NewQuestion, PassKind, Protocol, QuestionState, Rating, Settings};
 use serde_json::json;
@@ -212,6 +213,73 @@ fn diff_pass_cut_new_entries_are_covered_next_time() {
         newest(&e)
     );
     assert!(e.fake.requests().last().unwrap().body.contains("Fragment 6:"));
+}
+
+#[test]
+fn a_dead_endpoint_ends_the_pass_at_its_enrichment() {
+    let e = env();
+    e.fake.push_hangup();
+    e.fake.push_hangup();
+    let err = pass(&e, PassKind::Full).unwrap_err();
+    assert!(
+        matches!(err, PassError::Llm(LlmError::Unreachable(_) | LlmError::Timeout)),
+        "{err:?}"
+    );
+    // enrichment and its one retry, not the two calls of the pass on top
+    assert_eq!(e.fake.requests().len(), 2);
+    assert_eq!(last_status(&e), "failed");
+}
+
+#[test]
+fn a_bad_enrichment_reply_does_not_end_the_pass() {
+    let e = env();
+    e.fake.push(404, "{}");
+    e.fake.push(200, &ok("Nothing stands out."));
+    e.fake.push(200, &ok(r#"{"questions":[]}"#));
+    assert!(pass(&e, PassKind::Full).is_ok());
+}
+
+/// Runs a pass on `e.client` and stops it as soon as the endpoint has seen `calls` requests.
+fn pass_stopped_at(e: &Env, calls: usize) -> Result<factum::companion::reflect::PassSummary, PassError> {
+    let epochs = Arc::new(Epochs::default());
+    e.client.set_stop(epochs.stop(e.case, epochs.global()));
+    let case = e.case;
+    let fake = &e.fake;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            while fake.requests().len() < calls {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            epochs.bump_case(case);
+        });
+        pass(e, PassKind::Full)
+    })
+}
+
+#[test]
+fn a_stopped_pass_sends_nothing_more_and_changes_nothing() {
+    let e = env();
+    let q = question(&e, "Where did the uploaded webshell come from?");
+    e.fake.push_delayed(200, &ok("[]"), Duration::from_millis(300));
+    e.fake.push(200, &ok("The reasoning that must not be asked for."));
+    assert!(matches!(pass_stopped_at(&e, 1), Err(PassError::Cancelled)));
+    assert_eq!(e.fake.requests().len(), 1);
+    assert_eq!(last_status(&e), "skipped");
+    assert_eq!(open_ids(&e), vec![q]);
+    assert_eq!(e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id, 0);
+}
+
+#[test]
+fn an_answer_that_comes_after_the_stop_is_not_applied() {
+    let e = env();
+    e.fake.push(200, &ok("[]"));
+    e.fake.push(200, &ok("Reasoning about #1."));
+    let output = json!({"questions": [{"text": "Which tool imaged the disk?", "rests_on": [e.notes[0]]}]});
+    e.fake
+        .push_delayed(200, &ok(&output.to_string()), Duration::from_millis(300));
+    assert!(matches!(pass_stopped_at(&e, 3), Err(PassError::Cancelled)));
+    assert!(open_ids(&e).is_empty());
+    assert_eq!(e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id, 0);
 }
 
 #[test]

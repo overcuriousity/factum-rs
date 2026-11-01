@@ -11,8 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::enrich::{enrich, index_unindexed};
-use super::llm::LlmError;
-use super::llm::{Client, probe};
+use super::llm::{Client, Epochs, LlmError, Stop, probe};
 use super::reflect::{PassError, choose_kind, run_pass};
 use super::schedule::Scheduler;
 use super::store::{CompanionDb, Protocol, Settings};
@@ -91,6 +90,7 @@ impl Status {
 pub struct CompanionHandle {
     sender: Sender<Command>,
     status: Arc<Mutex<Status>>,
+    epochs: Arc<Epochs>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -99,13 +99,16 @@ impl CompanionHandle {
         let (sender, receiver) = mpsc::channel();
         let status = Arc::new(Mutex::new(Status::default()));
         let shared = status.clone();
+        let epochs = Arc::new(Epochs::default());
+        let stops = epochs.clone();
         let thread = std::thread::Builder::new()
             .name("companion".into())
-            .spawn(move || run(ctx, receiver, shared, case_db, companion_db))
+            .spawn(move || run(ctx, receiver, shared, stops, case_db, companion_db))
             .expect("spawn the companion thread");
         CompanionHandle {
             sender,
             status,
+            epochs,
             thread: Some(thread),
         }
     }
@@ -117,12 +120,19 @@ impl CompanionHandle {
         let handle = CompanionHandle {
             sender,
             status: Arc::default(),
+            epochs: Arc::default(),
             thread: None,
         };
         (handle, receiver)
     }
 
     pub fn send(&self, cmd: Command) {
+        // the command waits behind the work in hand; the epochs tell that work at once
+        match cmd {
+            Command::CaseToggled(case_id) | Command::CaseDeleted(case_id) => self.epochs.bump_case(case_id),
+            Command::SettingsChanged | Command::Shutdown => self.epochs.bump_all(),
+            _ => {}
+        }
         // a finished thread has nobody to tell
         let _ = self.sender.send(cmd);
     }
@@ -131,7 +141,7 @@ impl CompanionHandle {
         lock(&self.status).clone()
     }
 
-    /// Waits for a running pass to end.
+    /// Waits for a running pass to end, which it does after the model call in hand.
     pub fn shutdown(mut self) {
         self.send(Command::Shutdown);
         if let Some(thread) = self.thread.take() {
@@ -139,7 +149,7 @@ impl CompanionHandle {
         }
     }
 
-    /// Stops the thread without waiting for it: it ends after the work in hand.
+    /// Stops the thread without waiting for it: it ends after the model call in hand.
     pub fn detach(self) {
         self.send(Command::Shutdown);
     }
@@ -180,6 +190,7 @@ fn run(
     ctx: egui::Context,
     receiver: Receiver<Command>,
     status: Arc<Mutex<Status>>,
+    epochs: Arc<Epochs>,
     case_db: PathBuf,
     companion_db: PathBuf,
 ) {
@@ -199,6 +210,8 @@ fn run(
     let mut companion = Companion {
         ctx,
         status,
+        epochs,
+        global_epoch: 0,
         db,
         cdb,
         settings: Settings::default(),
@@ -234,6 +247,9 @@ fn run(
 struct Companion {
     ctx: egui::Context,
     status: Arc<Mutex<Status>>,
+    epochs: Arc<Epochs>,
+    /// the global epoch as of the last settings change handled: anything newer stops work at once, its command waits
+    global_epoch: u64,
     db: Db,
     cdb: CompanionDb,
     settings: Settings,
@@ -270,6 +286,12 @@ impl Companion {
             log::error!("companion: internal error");
             self.set_state(State::Failed("internal error".into()));
         }
+    }
+
+    /// What ends work on the case. Taken before the case is checked: the GUI saves first and bumps after, so a
+    /// switch-off the check missed still sets it.
+    fn stop(&self, case_id: i64) -> Stop {
+        self.epochs.stop(case_id, self.global_epoch)
     }
 
     fn end_indexing(&self) {
@@ -352,7 +374,10 @@ impl Companion {
                     log::warn!("companion: case {case_id} settings cannot be read: {e}");
                 }
             }
-            Command::SettingsChanged => self.reload_settings(),
+            Command::SettingsChanged => {
+                self.global_epoch = self.epochs.global();
+                self.reload_settings();
+            }
             Command::Probe => self.probe(),
             Command::Shutdown => {}
         }
@@ -422,6 +447,14 @@ impl Companion {
         Ok(ids)
     }
 
+    /// The rest of a case's history goes out only after its first pass, so never in the quiet period that lets it be
+    /// opted out (spec 4.2).
+    fn backlog_may_run(&self, case_id: i64) -> Result<bool> {
+        Ok(self.runnable(case_id)?
+            && !self.scheduler.first_seen_pending(case_id)
+            && self.cdb.last_ok_pass(case_id)?.is_some())
+    }
+
     /// The case exists, is not archived and has the companion switched on.
     fn runnable(&self, case_id: i64) -> Result<bool> {
         let signer = GnupgSigner::without_key(None);
@@ -439,11 +472,12 @@ impl Companion {
             return;
         }
         while let Some((case_id, forced)) = self.scheduler.next_due(Instant::now()) {
+            let stop = self.stop(case_id);
             // a panic here would otherwise come back every tick
             let runnable = catch_unwind(AssertUnwindSafe(|| self.runnable(case_id)))
                 .unwrap_or_else(|_| Err(FactumError::general("internal error")));
             match runnable {
-                Ok(true) => return self.reflect(case_id, forced),
+                Ok(true) => return self.reflect(case_id, forced, stop),
                 // picked up again on the next change once the condition clears
                 Ok(false) => self.scheduler.clear(case_id),
                 Err(e) => {
@@ -455,8 +489,9 @@ impl Companion {
         self.backlog();
     }
 
-    fn reflect(&mut self, case_id: i64, forced: bool) {
+    fn reflect(&mut self, case_id: i64, forced: bool, stop: Stop) {
         let Some(client) = &self.client else { return };
+        client.set_stop(stop);
         let before = self.state();
         self.set_state(State::Reflecting(case_id));
         let full = forced || self.full_next.contains(&case_id);
@@ -495,6 +530,11 @@ impl Companion {
             }
             // nothing ran: whatever was shown before stays
             Ok(Err(PassError::NothingNew | PassError::Archived)) => self.set_state(before),
+            // still owed; the command that ended it clears this if the case is gone or switched off
+            Ok(Err(PassError::Cancelled)) => {
+                self.scheduler.changed(case_id, Instant::now());
+                self.set_state(before);
+            }
             Ok(Err(e)) => {
                 // the endpoint may recover: one more try after the spacing, not a loop
                 if matches!(e, PassError::Llm(_)) && self.retried.insert(case_id) {
@@ -523,8 +563,9 @@ impl Companion {
             return;
         }
         let Some(client) = &self.client else { return };
+        let stop = self.stop(case_id);
         let read = || -> Result<(Vec<i64>, usize)> {
-            let ids = if self.runnable(case_id)? {
+            let ids = if self.backlog_may_run(case_id)? {
                 self.entry_ids(case_id)?
             } else {
                 Vec::new()
@@ -557,6 +598,7 @@ impl Companion {
         }
         self.set_state(State::Indexing { done, total });
         let batch = &pending[..pending.len().min(BACKLOG_BATCH)];
+        client.set_stop(stop.clone());
         let result = catch_unwind(AssertUnwindSafe(|| {
             index_unindexed(&self.db, &self.cdb, case_id).map_err(|e| e.to_string())?;
             enrich(&self.db, &self.cdb, client, case_id, batch).map_err(|e| e.to_string())
@@ -574,6 +616,8 @@ impl Companion {
                     self.end_indexing();
                 }
             }
+            // not given up on: the next tick looks at the case again
+            Ok(Err(_)) if stop.is_set() => self.end_indexing(),
             Ok(Err(e)) => {
                 log::warn!("companion: backlog enrichment of case {case_id} failed: {e}");
                 // until the next successful probe or pass, so a dead endpoint is not asked again and again

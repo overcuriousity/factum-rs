@@ -10,6 +10,9 @@ use std::time::Duration;
 
 use serde_json::json;
 
+/// The status of a queued answer that is no answer.
+const HANGUP: u16 = 0;
+
 /// One request as the fake endpoint saw it.
 #[derive(Clone, Debug)]
 pub struct FakeRequest {
@@ -77,6 +80,11 @@ impl FakeLlm {
             .push_back((status, body.to_string(), delay));
     }
 
+    /// The next request is read and its connection closed without an answer, like a server that went away.
+    pub fn push_hangup(&self) {
+        self.push(HANGUP, "");
+    }
+
     pub fn requests(&self) -> Vec<FakeRequest> {
         self.shared.requests.lock().unwrap().clone()
     }
@@ -134,6 +142,9 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
         }
     });
     std::thread::sleep(delay);
+    if status == HANGUP {
+        return Ok(());
+    }
     write!(
         stream,
         "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

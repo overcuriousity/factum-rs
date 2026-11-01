@@ -148,7 +148,8 @@ passes for it. Case menu → "Case goal…" opens a multi-line text dialog that 
 First configuration, and cases without a `case_settings` row: no model work happens for a case until it is selected
 in the tree. Selecting a case that has entries but no companion state runs one full pass (4.7) with the compact
 timeline, so the first questions appear within one pass; the newest 20 entries are enriched before it, the rest of
-the history is enriched afterwards in batches of 50, newest first, only while the thread has nothing else to do.
+the history is enriched after a successful pass in batches of 50, newest first, only while the thread has nothing
+else to do.
 Retrieval over not-yet-enriched entries works on their raw text. The status item shows "indexing n of m" during
 backlog enrichment. While the endpoint is unreachable the companion thread re-probes every 60 s on its own; after a
 pass fails with a model-call error the case is retried once after the minimum spacing. The companion thread serves

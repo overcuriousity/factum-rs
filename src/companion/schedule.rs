@@ -70,6 +70,11 @@ impl Scheduler {
             .is_some_and(|p| p.forced || p.last_change.is_some())
     }
 
+    /// A first pass is waiting out its quiet period, in which the case can still be opted out.
+    pub fn first_seen_pending(&self, case_id: i64) -> bool {
+        self.cases.get(&case_id).is_some_and(|p| p.full)
+    }
+
     /// Forgets the case, pending changes included.
     pub fn clear(&mut self, case_id: i64) {
         self.cases.remove(&case_id);
@@ -147,6 +152,21 @@ mod tests {
         s.first_seen(1, now);
         assert_eq!(s.next_due(now + secs(29)), None);
         assert_eq!(s.next_due(now + QUIET_PERIOD), Some((1, true)));
+    }
+
+    #[test]
+    fn first_seen_is_pending_until_it_passed_or_was_cleared() {
+        let now = Instant::now();
+        let mut s = Scheduler::new();
+        s.changed(1, now);
+        assert!(!s.first_seen_pending(1));
+        s.first_seen(1, now);
+        assert!(s.first_seen_pending(1));
+        s.passed(1, now);
+        assert!(!s.first_seen_pending(1));
+        s.first_seen(1, now);
+        s.clear(1);
+        assert!(!s.first_seen_pending(1));
     }
 
     #[test]
