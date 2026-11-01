@@ -181,13 +181,22 @@ impl Factum<'_> {
 
     pub fn sign_all_checked(&self, report: &CaseReport) -> Result<(usize, Option<FactumError>)> {
         ensure_signable(report)?;
-        let entries: Vec<&EntryResult> = report.entries.iter().filter(|r| !r.signature.present).collect();
-        let heads: Vec<i64> = report
-            .tree_heads
-            .iter()
-            .filter(|head| head.source == SealSource::Database && !head.signature.present)
-            .map(|head| head.tree_head_id.expect("database seals have an id"))
-            .collect();
+        // the report may be minutes old: what was signed elsewhere since is done
+        let mut entries: Vec<&EntryResult> = Vec::new();
+        for result in report.entries.iter().filter(|r| !r.signature.present) {
+            if !self.is_signed("entry", result.entry.id, None)? {
+                entries.push(result);
+            }
+        }
+        let mut heads: Vec<i64> = Vec::new();
+        for head in &report.tree_heads {
+            if head.source == SealSource::Database && !head.signature.present {
+                let id = head.tree_head_id.expect("database seals have an id");
+                if !self.is_signed("tree_head", id, None)? {
+                    heads.push(id);
+                }
+            }
+        }
         let sign_head = |id: i64| {
             let row = self
                 .get_tree_head(id)?

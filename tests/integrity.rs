@@ -1077,6 +1077,18 @@ fn a_run_that_stops_says_how_far_it_got() {
 }
 
 #[test]
+fn a_run_on_a_report_skips_what_was_signed_since() {
+    let f = Fixture::new();
+    let (case_id, note, tree_head_id) = unsigned_case(&f);
+    let factum = f.factum();
+    let report = factum.verify_case(case_id, None).unwrap();
+    factum.sign_entry(note).unwrap();
+    factum.sign_tree_head(tree_head_id).unwrap();
+    assert_eq!(factum.sign_all_checked(&report).unwrap(), (1, None)); // the case created entry
+    assert_eq!(factum.sign_all_checked(&report).unwrap(), (0, None));
+}
+
+#[test]
 fn signing_on_a_report_refuses_what_it_refuses_without_one() {
     let f = Fixture::new();
     let (case_id, note, tree_head_id) = unsigned_case(&f);
