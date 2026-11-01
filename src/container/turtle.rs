@@ -21,6 +21,13 @@ pub enum Term {
 }
 
 impl Term {
+    fn text_len(&self) -> u64 {
+        match self {
+            Term::Iri(iri) => iri.len() as u64,
+            Term::Literal { value, datatype } => (value.len() + datatype.as_ref().map_or(0, String::len)) as u64,
+        }
+    }
+
     pub fn iri(&self) -> Option<&str> {
         match self {
             Term::Iri(iri) => Some(iri),
@@ -49,6 +56,12 @@ pub struct Triple {
     pub subject: String,
     pub predicate: String,
     pub object: Term,
+}
+
+impl Triple {
+    fn text_len(&self) -> u64 {
+        (self.subject.len() + self.predicate.len()) as u64 + self.object.text_len()
+    }
 }
 
 /// Triples in the order they were added, with an index by subject (lookups stay fast in graphs of many files).
@@ -263,6 +276,15 @@ enum Token {
     Directive(String),
 }
 
+impl Token {
+    fn text_len(&self) -> u64 {
+        match self {
+            Token::Iri(text) | Token::Name(text) | Token::Str(text) => text.len() as u64,
+            _ => 0,
+        }
+    }
+}
+
 /// The character of a `\u` or `\U` escape whose digits start at `at`, and where they end.
 fn uchar(text: &str, at: usize, escaped: char) -> Result<(char, usize), String> {
     let len = if escaped == 'u' { 4 } else { 8 };
@@ -274,24 +296,30 @@ fn uchar(text: &str, at: usize, escaped: char) -> Result<(char, usize), String> 
     Ok((char::from_u32(code).ok_or("bad \\u escape")?, at + len))
 }
 
-/// What a token holds in memory while the graph is built from it, with its share of the graph: only while it is.
+/// What a token holds in memory, its text apart, while the graph is built from it: only while it is.
 const TOKEN_COST: u64 = 96;
-/// What a parsed line of factum's layout holds in memory (a triple, a subject, a prefix), as measured on 200,000 files.
-/// `verify_container.py` charges the same, so that neither fails a file the other takes.
-const LINE_COST: u64 = 300;
+/// What a parsed line of factum's layout holds in memory, its text apart (a triple, a subject, a prefix), as measured on
+/// large containers. `verify_container.py` charges the same.
+const LINE_COST: u64 = 200;
 pub const TOO_MUCH: &str = "more metadata than fits the memory set aside for it";
 
 /// `at` walks the text by bytes and stays on character boundaries: what delimits a token is ASCII, which is never a
 /// part of another character.
-fn tokenize(text: &str, max_tokens: u64) -> Result<Vec<Token>, String> {
+fn tokenize(text: &str, budget: u64) -> Result<Vec<Token>, String> {
     let bytes = text.as_bytes();
     let char_at = |at: usize| text[at..].chars().next();
-    let mut tokens = Vec::new();
+    let mut tokens: Vec<Token> = Vec::new();
     let mut at = 0;
     let delimiter = |c: char| c.is_whitespace() || ";,<>\"'()[]#".contains(c);
+    // what the tokens so far hold: each owns its text
+    let (mut counted, mut held) = (0, 0);
     while let Some(c) = char_at(at) {
-        if tokens.len() as u64 > max_tokens {
-            return Err(TOO_MUCH.into());
+        if tokens.len() != counted {
+            counted = tokens.len();
+            held += TOKEN_COST + tokens.last().map_or(0, Token::text_len);
+            if held > budget {
+                return Err(TOO_MUCH.into());
+            }
         }
         if c.is_whitespace() {
             at += c.len_utf8();
@@ -570,19 +598,22 @@ pub fn parse(text: &str) -> Result<Graph, String> {
 }
 
 /// Like `parse`, for what a container claims: takes what its graph holds in memory from `budget`, and refuses what does
-/// not fit, as a short text can make many lines.
+/// not fit: a short text can make many lines, and each triple has a copy of the text of its subject and predicate.
 pub fn parse_within(text: &str, budget: &mut u64) -> Result<Graph, String> {
     let mut parser = Parser {
-        tokens: tokenize(text, *budget / TOKEN_COST)?,
+        tokens: tokenize(text, *budget)?,
         at: 0,
         prefixes: HashMap::new(),
         graph: Graph::default(),
     };
-    let mut held = 0;
+    let (mut counted, mut triples, mut held) = (0, 0, 0);
     while parser.peek().is_some() {
         parser.statement()?;
-        let lines = parser.graph.triples.len() + parser.graph.by_subject.len() + parser.prefixes.len();
-        held = lines as u64 * LINE_COST;
+        for triple in &parser.graph.triples[counted..] {
+            triples += LINE_COST + triple.text_len();
+        }
+        counted = parser.graph.triples.len();
+        held = triples + (parser.graph.by_subject.len() + parser.prefixes.len()) as u64 * LINE_COST;
         if held > *budget {
             return Err(TOO_MUCH.into());
         }
@@ -618,15 +649,32 @@ mod tests {
     #[test]
     fn what_is_refused_in_a_budget_is_refused_before_it_is_held() {
         let text = "<a> <b> <c> .\n";
-        // a triple and its subject, the two lines factum writes for it
-        let mut budget = 2 * LINE_COST;
+        // a triple and its subject, the two lines factum writes for it, and the text of the triple
+        let mut budget = 2 * LINE_COST + 3;
         parse_within(text, &mut budget).unwrap();
         assert_eq!(budget, 0);
-        let mut budget = 2 * LINE_COST - 1;
+        let mut budget = 2 * LINE_COST + 2;
         assert_eq!(parse_within(text, &mut budget).unwrap_err(), TOO_MUCH);
         // a few bytes make a token each
         let mut budget = 1 << 20;
         assert_eq!(parse_within(&";".repeat(1 << 19), &mut budget).unwrap_err(), TOO_MUCH);
+    }
+
+    #[test]
+    fn text_counts_for_what_it_holds() {
+        // a long literal
+        let long = format!("<a> <b> \"{}\" .\n", "x".repeat(1 << 20));
+        let mut budget = 1 << 20;
+        assert_eq!(parse_within(&long, &mut budget).unwrap_err(), TOO_MUCH);
+        let mut budget = 3 << 20;
+        parse_within(&long, &mut budget).unwrap();
+        assert!(budget <= 2 << 20, "{budget}");
+        // a long subject, which every triple of a statement holds a copy of
+        let subject = "s".repeat(1 << 16);
+        let triples = "<b> <c> ; ".repeat(1 << 10);
+        let repeated = format!("<{subject}> {triples} <b> <c> .\n");
+        let mut budget = 16 << 20;
+        assert_eq!(parse_within(&repeated, &mut budget).unwrap_err(), TOO_MUCH);
     }
 
     #[test]

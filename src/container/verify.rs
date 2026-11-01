@@ -18,8 +18,9 @@ use super::volume::{
 };
 use super::x509::{Gpgsm, X509Check, first_fingerprint};
 use super::zip64::{
-    Archive, MAX_IN_MEMORY, MAX_METADATA_PER_STORED_BYTE, MAX_SIGNATURE_MEMBER, MAX_TOTAL_IN_MEMORY, find_last_end,
-    find_newest_end, member_bytes_and_crc, member_bytes_up_to, read_archive,
+    Archive, MAX_IN_MEMORY, MAX_METADATA_BUDGET, MAX_SIGNATURE_MEMBER, METADATA_BUDGET_PER_STORED_BYTE,
+    MIN_METADATA_BUDGET, find_last_end, find_newest_end, member_bytes_and_crc, member_bytes_up_to, read_archive,
+    search_gave_up,
 };
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS};
 use crate::error::{FactumError, Result};
@@ -87,12 +88,37 @@ impl ContainerReport {
         worst(&self.findings)
     }
 
+    /// Whether the check stopped because a container's metadata did not fit: nothing past that point was judged.
+    pub(crate) fn stopped_on_budget(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| f.code == "too_large" && f.level == Level::Fail)
+    }
+
     pub(crate) fn finding(&mut self, level: Level, code: &'static str, message: impl Into<String>) {
         self.findings.push(Finding::new(level, code, message, Ref::default()));
     }
 }
 
 const HISTORY: &[u8] = b"factum/history/";
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// Whether the check reads a member of this name as a state's metadata: the root's, or that of a close.
+fn is_read_metadata(name: &[u8]) -> bool {
+    let leaf = |name: &[u8]| name == TURTLE.as_bytes() || name == HASHES.as_bytes();
+    if leaf(name) {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix(HISTORY) else {
+        return false;
+    };
+    let mut parts = rest.splitn(2, |byte| *byte == b'/');
+    let number = parts.next().and_then(|n| std::str::from_utf8(n).ok());
+    number
+        .and_then(|text| text.parse::<u32>().ok().filter(|n| *n > 0 && n.to_string() == text))
+        .is_some()
+        && parts.next().is_some_and(leaf)
+}
 
 /// Whether factum wrote this container, by what only its files hold. The tool named in version.txt says nothing: that
 /// file is not signed, and what it would decide is whether a missing signature counts.
@@ -143,19 +169,19 @@ impl Budget {
     }
 
     /// For a file of `len` bytes: a directory can claim any compressed size, the file cannot hold more than it holds.
+    /// What counts is what the check reads, so stored bytes that nothing reads buy nothing.
     fn for_archive(archive: &Archive, len: u64) -> Self {
         let stored = archive
             .entries
             .iter()
-            .filter(|e| {
-                e.name
-                    .rsplit(|byte| *byte == b'/')
-                    .next()
-                    .is_some_and(|name| name.starts_with(TURTLE.as_bytes()))
-            })
+            .filter(|e| is_read_metadata(&e.name))
             .fold(0u64, |sum, e| sum.saturating_add(e.compressed_size))
             .min(len);
-        Self::new(MAX_TOTAL_IN_MEMORY.max(stored.saturating_mul(MAX_METADATA_PER_STORED_BYTE)))
+        Self::new(
+            stored
+                .saturating_mul(METADATA_BUDGET_PER_STORED_BYTE)
+                .clamp(MIN_METADATA_BUDGET, MAX_METADATA_BUDGET),
+        )
     }
 
     fn stop(&mut self) -> FactumError {
@@ -173,9 +199,13 @@ impl Budget {
         }
     }
 
-    /// The graph of a text, or why it is none; an error only when the budget is spent.
-    fn parse(&mut self, text: &str) -> Result<std::result::Result<Graph, String>> {
-        match turtle::parse_within(text, &mut self.left) {
+    /// The graph of a member's bytes, or why it is none; an error only when the budget is spent. Bytes that are not
+    /// UTF-8 are not refused here: the hashes and signatures say what they are worth. Each may become three.
+    fn parse(&mut self, bytes: &[u8]) -> Result<std::result::Result<Graph, String>> {
+        if std::str::from_utf8(bytes).is_err() {
+            self.take(bytes.len() as u64 * 3)?;
+        }
+        match turtle::parse_within(&String::from_utf8_lossy(bytes), &mut self.left) {
             Err(e) if e == turtle::TOO_MUCH => Err(self.stop()),
             parsed => Ok(parsed),
         }
@@ -184,11 +214,11 @@ impl Budget {
     /// The one finding of a check that stopped here.
     fn finding(&self) -> String {
         format!(
-            "The metadata of this container needs more memory than this check sets aside ({} GiB in all, {} GiB for \
-             one member), so the check stopped here and did not finish. That alone does not mean the container was \
+            "The metadata of this container needs more memory than this check sets aside ({:.1} GiB in all, {:.1} GiB \
+             for one member), so the check stopped here and did not finish. That alone does not mean the container was \
              altered.",
-            self.limit >> 30,
-            MAX_IN_MEMORY >> 30
+            self.limit as f64 / GIB,
+            MAX_IN_MEMORY as f64 / GIB
         )
     }
 }
@@ -282,7 +312,7 @@ fn check_turtle_hashes(turtle: &[u8], hashes: Option<&[u8]>, label: &str, budget
     let Some(hashes) = hashes else {
         return Ok(fail(format!("{label}: information.turtle.hashes is missing.")));
     };
-    let graph = match budget.parse(&String::from_utf8_lossy(hashes))? {
+    let graph = match budget.parse(hashes)? {
         Ok(graph) => graph,
         Err(e) => {
             return Ok(fail(format!(
@@ -706,7 +736,7 @@ fn resolve_imports(
                     findings.push(fail(format!("{label}: {name} does not match its {algorithm}.")));
                 }
             }
-            match budget.parse(&String::from_utf8_lossy(&data))? {
+            match budget.parse(&data)? {
                 Ok(secondary) => graph.extend(secondary),
                 // what another tool wrote may just be beyond this reader; factum writes nothing it cannot read
                 Err(e) if layout => findings.push(fail(format!("{label}: {name} cannot be read ({e})."))),
@@ -754,7 +784,7 @@ pub fn verify_file(
         checked_files: 0,
         graph: None,
     };
-    let mut budget = Budget::new(MAX_TOTAL_IN_MEMORY);
+    let mut budget = Budget::new(MIN_METADATA_BUDGET);
     match check_file(&mut report, &mut budget, path, signer, gpgsm, progress, cancel) {
         // what is left unread stays unjudged: no rule may read anything into it
         Err(_) if budget.exhausted => {
@@ -786,11 +816,16 @@ fn check_file(
     let end = match find_last_end(&mut file, None) {
         Ok(Some(end)) => end,
         Ok(None) => {
-            report.finding(
-                Level::Fail,
-                "not_aff4",
-                format!("{} is not a ZIP (AFF4) container.", path.display()),
-            );
+            let message = if search_gave_up(&mut file)? {
+                format!(
+                    "No complete state was found in {}: the search through its end records stopped at its limit, so \
+                     this does not say what the file is.",
+                    path.display()
+                )
+            } else {
+                format!("{} is not a ZIP (AFF4) container.", path.display())
+            };
+            report.finding(Level::Fail, "not_aff4", message);
             return Ok(());
         }
         Err(e) => return Err(FactumError::general(format!("{} cannot be read: {e}", path.display()))),
@@ -1018,7 +1053,7 @@ fn check_file(
     for (close, current, turtle, hashes) in parsed {
         let label = close.map_or("current".to_string(), |n| format!("close {n}"));
         // metadata that cannot be parsed is a failure; the state's hashes and signatures are still checked below
-        let graph = match budget.parse(&String::from_utf8_lossy(&turtle))? {
+        let graph = match budget.parse(&turtle)? {
             Ok(mut graph) => {
                 let uuid = report.uuid.clone().unwrap_or_default();
                 let findings = resolve_imports(&mut file, &archive, &mut graph, &uuid, &label, layout, budget)?;
@@ -1773,21 +1808,88 @@ mod crafted {
         let archive = |entries| Archive::new(entries, Vec::new(), 0);
         // a few MiB of it, however far they inflate: the floor
         let small = archive(vec![entry(TURTLE, 3 << 20)]);
-        assert_eq!(Budget::for_archive(&small, 3 << 20).limit, MAX_TOTAL_IN_MEMORY);
-        // a real large one: every copy of it counts, what is no metadata does not
+        assert_eq!(Budget::for_archive(&small, 3 << 20).limit, MIN_METADATA_BUDGET);
+        // a real large one: every copy it reads counts, what is no metadata does not
         let large = archive(vec![
-            entry(TURTLE, 400 << 20),
-            entry("factum/history/1/information.turtle", 400 << 20),
+            entry(TURTLE, 40 << 20),
+            entry("factum/history/1/information.turtle", 40 << 20),
             entry("factum/history/1/information.turtle.hashes", 1 << 10),
             entry("evidence", 1 << 40),
         ]);
         assert_eq!(
             Budget::for_archive(&large, 2 << 40).limit,
-            ((800 << 20) + (1 << 10)) * MAX_METADATA_PER_STORED_BYTE
+            ((80 << 20) + (1 << 10)) * METADATA_BUDGET_PER_STORED_BYTE
         );
+        // stored bytes that nothing reads buy nothing, whatever they are called
+        for pad in [
+            "evidence/information.turtle.pad",
+            "information.turtle.2",
+            "factum/history/x/information.turtle",
+            "factum/history/01/information.turtle",
+            "factum/history/0/information.turtle",
+            "factum/history/1/x/information.turtle",
+            "factum/history/1/information.turtle.asc",
+        ] {
+            let padded = archive(vec![entry(TURTLE, 3 << 20), entry(pad, 1 << 30)]);
+            assert_eq!(
+                Budget::for_archive(&padded, 2 << 30).limit,
+                MIN_METADATA_BUDGET,
+                "{pad}"
+            );
+        }
+        // however much is stored, a ceiling
+        let huge = archive(vec![entry(TURTLE, 1 << 40)]);
+        assert_eq!(Budget::for_archive(&huge, 2 << 40).limit, MAX_METADATA_BUDGET);
         // a directory that claims it: the file holds no more than it holds
         let claimed = archive(vec![entry(TURTLE, 1 << 50)]);
-        assert_eq!(Budget::for_archive(&claimed, 1 << 20).limit, MAX_TOTAL_IN_MEMORY);
+        assert_eq!(Budget::for_archive(&claimed, 1 << 20).limit, MIN_METADATA_BUDGET);
+    }
+
+    /// A genuine container that hits the limit, on the only path factum verifies by: the log has nothing to add.
+    #[test]
+    fn a_stop_at_the_limit_is_no_finding_of_the_log() {
+        use crate::db::Db;
+        use crate::services::Factum;
+        use crate::signer::FakeSigner;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("f.db")).unwrap();
+        let signer = FakeSigner::new(true);
+        let factum = Factum::with_seal_dir(&db, &signer, Some(dir.path().to_path_buf()));
+        let case_id = factum.create_case("C-1", "Case", "").unwrap();
+        let evidence = factum.create_evidence(case_id, "disk", "", "").unwrap();
+        let path = dir.path().join("c.aff4l");
+        let id = factum.create_container(case_id, "C", evidence, &path, "/mnt").unwrap();
+        factum.close_container(id).unwrap();
+        let verify = |expected, budget| {
+            BUDGET.with(|cell| cell.set(budget));
+            factum
+                .verify_expected_container(
+                    &path,
+                    expected,
+                    &Gpgsm::unavailable(),
+                    &|_, _| {},
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+        };
+        let report = verify(None, None);
+        assert!(report.log.is_some(), "{:?}", report.findings);
+        for expected in [Some(id), None] {
+            let report = verify(expected, Some(1_000));
+            assert_eq!(codes(&report, Level::Fail), vec!["too_large"], "{:?}", report.findings);
+            assert!(report.log.is_none());
+        }
+    }
+
+    /// The same stop on a file that shows no sign of factum is no failure of its own, so the log still has its say.
+    #[test]
+    fn a_stop_at_the_limit_keeps_a_stripped_file_from_the_log_no_longer_than_it_stops() {
+        let graph = Graph::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = foreign(&dir, &graph, &mut |_| {}, V21);
+        BUDGET.with(|budget| budget.set(Some(10)));
+        let report = check(&path);
+        assert!(!report.stopped_on_budget(), "{:?}", report.findings);
     }
 
     /// Two closes, each with its signature, and the last one out of reach of a budget that fits the first.
@@ -1831,10 +1933,24 @@ mod crafted {
         assert_eq!(budget.left, 6);
         assert!(budget.take(7).is_err() && budget.exhausted);
         let mut budget = Budget::new(5);
-        assert!(budget.parse("<a> <b> <c> .").is_err() && budget.exhausted);
+        assert!(budget.parse(b"<a> <b> <c> .").is_err() && budget.exhausted);
         let mut budget = Budget::new(1 << 20);
-        assert!(budget.parse("x> .").unwrap().is_err() && !budget.exhausted);
-        assert!(Budget::new(1 << 30).finding().contains("does not mean"));
+        assert!(budget.parse(b"x> .").unwrap().is_err() && !budget.exhausted);
+        let finding = Budget::new((14 << 30) / 3).finding();
+        assert!(
+            finding.contains("does not mean") && finding.contains("4.7 GiB in all"),
+            "{finding}"
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_count_for_what_they_become() {
+        let text = [b"<a> <b> \"".as_slice(), &[0xFF; 1 << 12], b"\" .\n"].concat();
+        // the text itself would fit, what it is read as does not
+        let mut budget = Budget::new(2 << 12);
+        assert!(budget.parse(&text).is_err() && budget.exhausted);
+        let mut budget = Budget::new(16 << 12);
+        assert!(budget.parse(&text).unwrap().is_ok());
     }
 
     #[test]

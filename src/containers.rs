@@ -1573,19 +1573,27 @@ impl Factum<'_> {
             None => None,
         };
         if !expected.is_empty() && !id.is_some_and(|id| expected.contains(&id)) {
-            let named = report.uuid.as_deref().unwrap_or("no container");
             let logged = self.container(expected[0])?.summary.uuid;
+            let found = match &report.uuid {
+                Some(uuid) => format!("it names {uuid}"),
+                None if report.states.is_empty() => "nothing could be read of it".to_string(),
+                None => "it names no container".to_string(),
+            };
             report.finding(
                 Level::Fail,
                 "log_mismatch",
-                format!("This file should be container {logged} of the case log, but it names {named}."),
+                format!("This file should be container {logged} of the case log, but {found}."),
             );
             return Ok(report);
         }
         let (Some(id), Some(uuid)) = (id, report.uuid.clone()) else {
             return Ok(report);
         };
-        let Some(graph) = report.graph.clone() else {
+        let Some(graph) = report.graph.as_ref() else {
+            // the check stopped short of the metadata: that says nothing about the file, and neither does the log
+            if report.stopped_on_budget() {
+                return Ok(report);
+            }
             // what was found stands, but whatever its verdict, it is not the file the log records
             report.finding(
                 Level::Fail,
@@ -1654,9 +1662,9 @@ impl Factum<'_> {
         let upto = match matches_close {
             _ if live => i64::MAX,
             Some(n) => nth_close(&detail, n).map_or(i64::MAX, |c| c.entry_id),
-            None => task_entries(&graph).into_iter().max().unwrap_or(id),
+            None => task_entries(graph).into_iter().max().unwrap_or(id),
         };
-        findings.extend(compare_records(&detail, &graph, upto));
+        findings.extend(compare_records(&detail, graph, upto));
         let mut after: Vec<(i64, String)> = Vec::new();
         for add in detail.adds.iter().filter(|a| a.entry_id > upto) {
             after.push((add.entry_id, format!("{} added", plural(add.files.len(), "file"))));

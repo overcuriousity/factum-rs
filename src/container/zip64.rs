@@ -427,6 +427,15 @@ pub fn find_last_end(file: &mut File, hint: Option<u64>) -> io::Result<Option<u6
     search_back_for_state(file, len, &mut search)
 }
 
+/// Whether a search through this file that found no state stopped at its limit, not at the start of the file: then
+/// that it found none says nothing about what the file is.
+pub fn search_gave_up(file: &mut File) -> io::Result<bool> {
+    let len = file.seek(SeekFrom::End(0))?;
+    let mut search = search_limit(len);
+    search_back_for_state(file, len, &mut search)?;
+    Ok(search < SEARCH_TRY)
+}
+
 fn search_back_for_state(file: &mut File, len: u64, search: &mut u64) -> io::Result<Option<u64>> {
     search_back(file, 0, len, search, |file, record, end, search| {
         Ok(is_state_at(file, record, end, search)?.then_some(end))
@@ -740,13 +749,16 @@ impl Read for CrcChecked<'_> {
 /// cannot make factum hold more, whatever its directory claims or its data inflates to.
 pub const MAX_IN_MEMORY: u64 = 1 << 30;
 
-/// The most a verification holds of a container's metadata, all its states and their graphs together, at least: a few
-/// MiB of file can inflate to many members of MAX_IN_MEMORY.
-pub const MAX_TOTAL_IN_MEMORY: u64 = 4 << 30;
+/// What a verification may hold of a container's metadata, all its states and their graphs together: this much for
+/// each byte the file stores of the members it reads, as near-identical files compress to about 11.5:1 with factum's
+/// writer ...
+pub const METADATA_BUDGET_PER_STORED_BYTE: u64 = 128;
 
-/// ... and at most this much for each byte of metadata the file stores: what a real large container takes, and little
-/// more than nothing to one whose metadata is mostly air.
-pub const MAX_METADATA_PER_STORED_BYTE: u64 = 64;
+/// ... and never less than this, as what is small always fits ...
+pub const MIN_METADATA_BUDGET: u64 = 4 << 30;
+
+/// ... nor more than this, which caps a crafted file whichever way it is built.
+pub const MAX_METADATA_BUDGET: u64 = 16 << 30;
 
 /// The most of a signature or a certificate chain that is looked at: their size has no reason to be more, and tools
 /// that take them apart make many times their size of it.
@@ -1109,6 +1121,16 @@ mod tests {
         assert_eq!(search_back_for_state(&mut file, len, &mut search).unwrap(), None);
         // the limit is what ended it
         assert!(search < DIRECTORY_BLOCK + SEARCH_TRY, "{search}");
+    }
+
+    #[test]
+    fn a_search_says_when_it_gave_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x");
+        std::fs::write(&path, b"PK\x05\x06".repeat(1 << 17)).unwrap();
+        assert!(search_gave_up(&mut File::open(&path).unwrap()).unwrap());
+        std::fs::write(&path, vec![0u8; 5000]).unwrap();
+        assert!(!search_gave_up(&mut File::open(&path).unwrap()).unwrap());
     }
 
     #[test]
