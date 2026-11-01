@@ -191,8 +191,8 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   unsupported
 - Recipients without factum run the script the container carries: extract `verify_container.py` and run
   `python3 -I verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
-  `gpg` 2.1 or newer and `openssl` for the signatures, installed: one in the current folder, the container's or among
-  the files extracted with the script is refused). Each finding ends with factum's code for it. On a container
+  `gpg` 2.1 or newer and `openssl` for the signatures, installed: one in the current folder, the container's or the
+  script's is refused). Each finding ends with factum's code for it. On a container
   written by factum it reaches factum's verdict without the case log, but for these differences: it has no case log, so
   each `replacedBy` stays a warning; it has no trust list, so without `--ca` an X.509 root stays a warning, and with it
   only that root counts; and it reads only factum's Turtle layout, so valid Turtle in another layout, such as a comment,

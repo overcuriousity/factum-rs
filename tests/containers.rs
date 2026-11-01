@@ -1998,8 +1998,6 @@ mod script {
             for (folder, path) in [
                 (beside.clone(), beside.clone()),
                 (extracted.clone(), extracted.clone()),
-                // among what was extracted with the script
-                (extracted.join("sub"), extracted.join("sub")),
                 // the current folder: what Windows looks in first, here through the PATH
                 (current.clone(), PathBuf::from(".")),
             ] {
@@ -2015,13 +2013,31 @@ mod script {
                 let text = String::from_utf8_lossy(&output.stdout);
                 assert_eq!(output.status.code(), Some(1), "{tool}: {text}");
                 assert!(
-                    text.contains(&format!("a {tool} in the current folder")) && text.contains("Nothing was checked."),
+                    text.contains(&format!(": {tool} in the current folder")) && text.contains("Nothing was checked."),
                     "{tool}: {text}"
                 );
                 assert!(!text.contains("Result:"), "{tool}: {text}");
-                assert!(!ran.exists(), "{tool}: {text}");
+                // this container has no X.509 signature: nothing would start an openssl
+                if tool == "gpg" {
+                    assert!(!ran.exists(), "{text}");
+                }
                 std::fs::remove_file(folder.join(tool)).unwrap();
             }
+            // a folder under the script's is no folder of its own: the tool is taken
+            let sub = extracted.join("sub");
+            planted(&sub, tool, &ran);
+            let output = Command::new(&python)
+                .args(["-I", "-X", "utf8"])
+                .arg(&script)
+                .arg(&container)
+                .env("PATH", &sub)
+                .current_dir(&current)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(output.status.code(), Some(0), "{tool}: {text}");
+            assert!(!text.contains("Refusing") && text.contains("Result:"), "{tool}: {text}");
+            std::fs::remove_file(sub.join(tool)).unwrap();
         }
     }
 

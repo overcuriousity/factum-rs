@@ -997,15 +997,10 @@ def same_folder(one, other):
     return os.path.normcase(os.path.realpath(one)) == os.path.normcase(os.path.realpath(other))
 
 
-def inside_folder(path, folder):
-    path, folder = (os.path.normcase(os.path.realpath(item)) for item in (path, folder))
-    return path == folder or path.startswith(os.path.join(folder, ""))
-
-
 def find_tool(name, container):
     """A program as an absolute path, None when it is not installed, or None with the reason it is not run. Windows
     looks in the current folder before the PATH, for a bare name and in shutil.which, and what lies beside a container
-    or among what was extracted from it comes from whoever made it: a program there is not run."""
+    or this script comes from whoever made it: a program there is not run."""
     found = shutil.which(name)
     if found is None:
         return None, None
@@ -1015,9 +1010,9 @@ def find_tool(name, container):
         script = os.path.dirname(os.path.abspath(__file__))
     except NameError:
         script = os.getcwd()
-    if (inside_folder(folder, script) or same_folder(folder, os.path.dirname(os.path.abspath(container)))
+    if (same_folder(folder, script) or same_folder(folder, os.path.dirname(os.path.abspath(container)))
             or same_folder(folder, os.getcwd())):
-        return None, ("Refusing %s: a %s in the current folder, the container's or this script's is not run. "
+        return None, ("Refusing %s: %s in the current folder, the container's or this script's is not run. "
                       "Nothing was checked." % (found, name))
     return found, None
 
