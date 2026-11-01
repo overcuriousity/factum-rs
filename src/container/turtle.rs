@@ -273,7 +273,7 @@ enum Token {
 impl Token {
     fn text_len(&self) -> u64 {
         match self {
-            Token::Iri(text) | Token::Name(text) | Token::Str(text) => text.len() as u64,
+            Token::Iri(text) | Token::Name(text) | Token::Str(text) | Token::Directive(text) => text.len() as u64,
             _ => 0,
         }
     }
@@ -674,6 +674,9 @@ mod tests {
         // one step of the text can make two tokens, and the last step counts too
         assert_eq!(tokenize("xxx.", 2 * TOKEN_COST + 3).unwrap().1, 2 * TOKEN_COST + 3);
         assert_eq!(tokenize("xxx.", 2 * TOKEN_COST + 2).unwrap_err(), TOO_MUCH);
+        // a directive keeps its word
+        assert_eq!(tokenize("@xxx", TOKEN_COST + 3).unwrap().1, TOKEN_COST + 3);
+        assert_eq!(tokenize("@xxx", TOKEN_COST + 2).unwrap_err(), TOO_MUCH);
     }
 
     #[test]

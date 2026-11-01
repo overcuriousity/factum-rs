@@ -224,7 +224,7 @@ def parse_metadata(data):
     here, as in factum: the hashes and signatures say what they are worth."""
     text = data.decode("utf-8", "replace")
     size = sys.getsizeof(text)
-    take_memory(size)  # only while it is parsed; what the graph keeps of it is charged by the line
+    take_memory(size)  # only while it is parsed; what the graph keeps of it is charged as it keeps it
     graph = parse_turtle(text)
     Memory.left += size
     return graph
