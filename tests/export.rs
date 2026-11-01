@@ -884,13 +884,12 @@ with open(sys.argv[3], encoding="utf-8") as handle:
 for shape in shapes:
     verify.load_bundle = lambda path: (dict(files, **{"case.json": shape.encode("utf-8")}), listed)
     del verify.FAILS[:]
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            code = verify.main(["bundle"])
-    except Exception as e:
-        print("raised %r: %s" % (e, shape[:300]))
-        continue
-    if code != 1 or not verify.FAILS:
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = verify.main(["bundle"])
+    if "did not finish" in output.getvalue():
+        print("raised: %s: %s" % (verify.FAILS[-1], shape[:300]))
+    elif code != 1 or not verify.FAILS:
         print("passed: %s" % shape[:300])
 print("%d shapes" % len(shapes))
 "#;
@@ -949,6 +948,148 @@ fn wrong_shapes(clean: &serde_json::Value) -> Vec<String> {
         shapes.push(marked.to_string().replace("\"NESTED\"", &nested));
     }
     shapes
+}
+
+/// Where `name` stands in the ZIP: its local header, its data, the size of that.
+fn member_at(path: &Path, name: &str) -> (u64, u64, u64) {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let member = archive.by_name(name).unwrap();
+    (
+        member.header_start(),
+        member.data_start().unwrap(),
+        member.compressed_size(),
+    )
+}
+
+/// verify.py on `path` ends in FAIL lines and a verdict; its output, None where it cannot run at all.
+fn failed_with(path: &Path, expected: &str) -> Option<String> {
+    let (code, output) = run_verify(path, None, &[])?;
+    if output.contains("Nothing was checked.") {
+        return None; // no gpg to go on with
+    }
+    assert!(!output.contains("Traceback"), "{output}");
+    assert_eq!(code, 1, "{output}");
+    assert!(output.contains(&format!("  FAIL  {expected}")), "{expected}: {output}");
+    assert!(output.contains("Result: FAIL"), "{output}");
+    Some(output)
+}
+
+#[test]
+fn verify_py_fails_a_file_that_is_no_zip() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let clean = std::fs::read(&bundle).unwrap();
+    std::fs::write(&bundle, b"not a zip").unwrap();
+    failed_with(&bundle, "The bundle cannot be read as a ZIP");
+    std::fs::write(&bundle, &clean[..clean.len() / 2]).unwrap();
+    failed_with(&bundle, "The bundle cannot be read as a ZIP");
+    std::fs::remove_file(&bundle).unwrap();
+    failed_with(&bundle, "The bundle cannot be read as a ZIP");
+}
+
+#[test]
+fn verify_py_names_a_member_with_a_flipped_byte_and_checks_the_rest() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let clean = std::fs::read(&bundle).unwrap();
+    let name = REPORTS[0].0;
+    let (header, data, size) = member_at(&bundle, name);
+    // the header, what zlib refuses, what only the CRC-32 tells; not the last byte, padding that changes no content
+    for at in [header, data, data + size / 2] {
+        let mut bytes = clean.clone();
+        bytes[at as usize] ^= 0xFF;
+        std::fs::write(&bundle, bytes).unwrap();
+        let Some(output) = failed_with(&bundle, &format!("{name} cannot be read from the bundle")) else {
+            return;
+        };
+        assert!(
+            output.contains("Case log") && !output.contains(", 0 entries"),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn verify_py_fails_a_manifest_that_is_no_text() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    rewrite_zip(&bundle, &[("MANIFEST.sha256", b"\xff\xfe  x\n".to_vec())]);
+    failed_with(&bundle, "MANIFEST.sha256 is not UTF-8 text.");
+}
+
+#[test]
+fn verify_py_fails_a_signature_that_is_no_text() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let files = read_zip(&bundle);
+    let name = files.keys().find(|name| name.starts_with("signatures/")).unwrap();
+    rewrite_zip(&bundle, &[(name.as_str(), b"\xff\xfe".to_vec())]);
+    failed_with(&bundle, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_py_fails_a_file_in_a_folder_it_cannot_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("link")).unwrap();
+    failed_with(dir.path(), "link cannot be read");
+}
+
+/// verify.py's `main` on `bundle` with `change` applied to it as `verify`.
+fn verify_py_changed(change: &str, bundle: &Path) -> Option<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let code = format!(
+        "import importlib.util, sys\nspec = importlib.util.spec_from_file_location('verify', sys.argv[1])\n\
+         verify = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(verify)\n\
+         verify.find_gpg = lambda bundle: ('gpg', None)\nverify.old_gpg = lambda program: None\n{change}\n\
+         sys.exit(verify.main([sys.argv[2]]))\n"
+    );
+    let output = Command::new(which::which("python3").ok()?)
+        .args(["-I", "-X", "utf8", "-c", &code])
+        .arg(&script)
+        .arg(bundle)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(!text.contains("Traceback") && text.contains("Result: FAIL"), "{text}");
+    Some(text)
+}
+
+#[test]
+fn verify_py_fails_what_gpg_says_was_signed_when_it_is_no_text() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let Some(output) = verify_py_changed(
+        "good = [('GOODSIG', ['KEY', 'user']), ('VALIDSIG', ['KEY']), ('TRUST_ULTIMATE', [])]\n\
+         verify.Gpg.run = lambda self, args: (b'\\xff', good, 0)",
+        &bundle,
+    ) else {
+        return;
+    };
+    assert!(
+        output.contains("the signature was made over different data."),
+        "{output}"
+    );
+}
+
+#[test]
+fn verify_py_says_when_a_check_did_not_finish() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let Some(output) = verify_py_changed(
+        "def broken(files):\n    raise KeyError('a bug')\nverify.check_manifest = broken",
+        &bundle,
+    ) else {
+        return;
+    };
+    assert!(output.contains("  FAIL  The check did not finish"), "{output}");
 }
 
 #[test]

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 
 TRUSTED = ("TRUST_FULLY", "TRUST_ULTIMATE")
 FAILS = []
@@ -92,8 +93,13 @@ def seal_payload(case, head):
     })
 
 
+# what zipfile raises on bytes that are not as written: RuntimeError for a method or encryption it does not read
+ZIP_ERRORS = (zipfile.BadZipFile, zlib.error, EOFError, OSError, ValueError, RuntimeError)
+
+
 def load_bundle(path):
-    """The files by name, and every name as it stands in the bundle, repeated ones and folders too."""
+    """The files by name, and every name as it stands in the bundle, repeated ones and folders too. What cannot be read
+    is a failure and is left out, so the rest is still checked."""
     files = {}
     listed = []
     if os.path.isdir(path):
@@ -102,15 +108,24 @@ def load_bundle(path):
                 full = os.path.join(folder, name)
                 name = os.path.relpath(full, path).replace(os.sep, "/")
                 listed.append(name)
-                with open(full, "rb") as handle:
-                    files[name] = handle.read()
+                try:
+                    with open(full, "rb") as handle:
+                        files[name] = handle.read()
+                except OSError as e:
+                    fail("%s cannot be read (%s)." % (name, e))
     else:
-        with zipfile.ZipFile(path) as bundle:
-            for info in bundle.infolist():
-                # orig_filename: filename has lost what follows a NUL, and on Windows its backslashes
-                listed.append(info.orig_filename)
-                if not info.filename.endswith("/"):
-                    files[info.filename] = bundle.read(info)
+        try:
+            with zipfile.ZipFile(path) as bundle:
+                for info in bundle.infolist():
+                    # orig_filename: filename has lost what follows a NUL, and on Windows its backslashes
+                    listed.append(info.orig_filename)
+                    if not info.filename.endswith("/"):
+                        try:
+                            files[info.filename] = bundle.read(info)
+                        except ZIP_ERRORS as e:
+                            fail("%s cannot be read from the bundle (%s)." % (info.filename, e))
+        except ZIP_ERRORS as e:
+            fail("The bundle cannot be read as a ZIP (%s)." % e)
     return files, listed
 
 
@@ -239,9 +254,14 @@ class Gpg(object):
         if reason:
             fail("%s: signature invalid (%s)." % (what, reason))
             return False
-        if expected_text is not None and output.decode("utf-8").strip() != expected_text:
-            fail("%s: the signature was made over different data." % what)
-            return False
+        if expected_text is not None:
+            try:
+                same = output.decode("utf-8").strip() == expected_text
+            except ValueError:
+                same = False
+            if not same:
+                fail("%s: the signature was made over different data." % what)
+                return False
         values = dict(status)
         validsig = values["VALIDSIG"]
         # the primary key, as factum reports it; field 0 may be a subkey
@@ -280,8 +300,13 @@ def check_manifest(files):
     if manifest is None:
         fail("MANIFEST.sha256 is missing.")
         return
+    try:
+        text = manifest.decode("utf-8")
+    except ValueError:
+        fail("MANIFEST.sha256 is not UTF-8 text.")
+        text = manifest.decode("utf-8", "replace")
     listed = {}
-    for line in manifest.decode("utf-8").splitlines():
+    for line in text.splitlines():
         digest, _, name = line.partition("  ")
         listed[name] = digest
     for name, digest in sorted(listed.items()):
@@ -484,6 +509,15 @@ def tolerant_output():
 
 def main(argv=None):
     tolerant_output()
+    try:
+        return check_bundle(argv)
+    except Exception as e:  # nothing the checks expect: it must not read as a pass, or as anything but unfinished
+        fail("The check did not finish (%s: %s)." % (type(e).__name__, e))
+        print("Result: FAIL — the check did not finish, %d failure(s)" % len(FAILS))
+        return 1
+
+
+def check_bundle(argv):
     parser = argparse.ArgumentParser(description="Verify a factum case bundle.")
     parser.add_argument("bundle", help="the bundle ZIP or a folder it was extracted to")
     parser.add_argument("--use-bundled-keys", action="store_true",
