@@ -110,9 +110,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Case report as **HTML** (integrity details in collapsible sections, no JavaScript), **PDF** (A4, rendered by factum
   itself — no browser or Qt needed) and **Markdown** (short integrity line per entry plus an integrity appendix)
 - **Verification bundle** (ZIP): `case.json`, all signatures, signers' public keys, the three reports, a signed
-  `MANIFEST.sha256` and a dependency-free `verify.py`: `python3 verify.py bundle.zip`. The script comes with the
-  bundle it checks: run a copy you trust, or compare the SHA-256 it prints when it starts with `factum --version` or
-  the release notes
+  `MANIFEST.sha256` and a dependency-free `verify.py`: `python3 -I verify.py bundle.zip` (`-I` keeps Python from
+  loading modules from the script's folder). The script comes with the bundle it checks: run a copy you trust, or
+  compare the SHA-256 it prints when it starts with `factum --version` or the release notes
 - Exporting seals the case first; a case that fails verification is still exported, with the failures on top
 - All files of an export appear together when the last one is complete; a failed export leaves none
 - The PDF embeds its own fonts, which have no CJK, Arabic, emoji and the like: such characters are drawn as `�`, copy
@@ -190,7 +190,7 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   matches the case log. Containers from other tools get the AFF4-L v1.0 checks; older AFF4 formats are reported as
   unsupported
 - Recipients without factum run the script the container carries: extract `verify_container.py` and run
-  `python3 verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
+  `python3 -I verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
   `gpg` 2.1 or newer and `openssl` for the signatures). Each finding ends with factum's code for it. On a container
   written by factum it reaches factum's verdict without the case log, but for these differences: it has no case log, so
   each `replacedBy` stays a warning; it has no trust list, so without `--ca` an X.509 root stays a warning, and with it

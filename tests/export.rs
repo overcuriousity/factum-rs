@@ -1973,6 +1973,50 @@ fn only_the_reports_the_formats_need_are_built() {
     assert_eq!(built(&["bundle"]), (true, true));
 }
 
+/// What a planted `hashlib.py` beside the script does, with and without `-I`.
+fn planted_module_runs(python: &Path, name: &str, script: &[u8], flags: &[&str]) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    let ran = dir.path().join("ran");
+    std::fs::write(&path, script).unwrap();
+    std::fs::write(
+        dir.path().join("hashlib.py"),
+        format!("open({:?}, 'w').close()\n", ran.to_str().unwrap()),
+    )
+    .unwrap();
+    let output = Command::new(python)
+        .args(flags)
+        .arg(&path)
+        .arg(dir.path().join("missing"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    // with -I the script itself ran, up to its own hash
+    if !ran.exists() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.starts_with(&format!("{name} SHA-256 ")), "{text}");
+    }
+    ran.exists()
+}
+
+#[test]
+fn isolated_mode_keeps_a_module_planted_beside_the_script_from_running() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    for (name, script) in [
+        ("verify.py", factum::export::bundle::VERIFY_PY),
+        ("verify_container.py", factum::container::volume::VERIFY_CONTAINER_PY),
+    ] {
+        assert!(planted_module_runs(&python, name, script, &[]), "{name}");
+        assert!(!planted_module_runs(&python, name, script, &["-I"]), "{name}");
+    }
+    // the command the READMEs give is the isolated one
+    assert!(factum::export::bundle::BUNDLE_README.contains("python3 -I verify.py <this-bundle>.zip"));
+    assert!(factum::export::bundle::BUNDLE_README.contains("py -I verify.py"));
+    assert!(!factum::export::bundle::BUNDLE_README.contains("python3 verify.py"));
+}
+
 #[test]
 fn the_timeline_flags_a_note_when_an_earlier_version_failed() {
     let f = Fixture::new();

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Verify a factum case bundle without factum.
 
-    python3 verify.py CASE_BUNDLE.zip [--use-bundled-keys]
-    python3 verify.py EXTRACTED_FOLDER [--use-bundled-keys]
+    python3 -I verify.py CASE_BUNDLE.zip [--use-bundled-keys]
+    python3 -I verify.py EXTRACTED_FOLDER [--use-bundled-keys]
 
 On Windows, use "py" instead of "python3".
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify an evidence container (AFF4-L v1.0) written by factum, without factum.
 
-    python3 verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]
+    python3 -I verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]
 
 Checks every stored file against its MD5, SHA-1 and SHA-256, information.turtle against
 information.turtle.hashes, the GPG signature (with the system's gpg) and the X.509 signature (with openssl) of

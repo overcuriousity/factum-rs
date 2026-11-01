@@ -11,6 +11,8 @@ All notable changes to this project are documented here. The format follows
   trusted copy or compare the hash
 - `verify.py` runs gpg by its absolute path and refuses one in the current folder or the bundle's, which Windows would
   otherwise run before the one on the `PATH`
+- The bundle and container READMEs, `README.md` and `docs/AIRGAP.md` give the scripts' command as `python3 -I`, which
+  keeps Python from loading a module planted beside the script
 - CLI: a case or evidence item is found by `#<id>`, then an exact file number, then an exact name; a plain number is an
   id only when nothing matches, several matches are an error that lists them, `_` is no longer dropped from numbers.
   Exit codes: 0 done, 1 verification failed (also `--export` of a failing case, which warns and still writes the
