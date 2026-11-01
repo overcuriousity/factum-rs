@@ -3313,16 +3313,56 @@ fn a_broken_log_stops_signing_after_the_worker() {
 }
 
 #[test]
-fn a_seal_is_signed_after_the_worker_too() {
+fn a_seal_is_signed_from_the_report_window_after_the_worker() {
     let fixture = Fixture::new();
     let mut harness = fixture.harness();
     let (case_id, _) = unsigned_ids(&harness);
-    let head = harness.state().factum().seal(case_id, REASON_CHECKPOINT).unwrap();
-    let report = harness.state().factum().verify_case(case_id, None).unwrap();
-    harness
-        .state_mut()
-        .after_verification(AfterVerify::SignSeal(head), report);
+    harness.state().factum().seal(case_id, REASON_CHECKPOINT).unwrap();
+    harness.state_mut().verify_case(case_id);
+    run_until(&mut harness, |h| !h.state().verify_windows.is_empty());
+    assert!(harness.state().verify_job.is_none());
+    // shown under the pointer, on the seal's rows
+    harness.query_all_by_label_contains("Seal #").next().unwrap().hover();
+    harness.run_ok();
+    harness.query_all_by_label("Sign seal").next().unwrap().click();
+    harness.step();
+    harness.step();
+    assert!(
+        harness.state().verify_job.is_some() && harness.state().dialogs.is_empty(),
+        "the worker verifies first"
+    );
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
     assert!(message_text(&harness).contains("No GPG key is active"));
+}
+
+#[test]
+fn an_export_whose_verification_fails_leaves_only_its_seal() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, _) = unsigned_ids(&harness);
+    let folder = fixture.path.with_file_name("out");
+    let seals = |h: &Harness<'_, FactumApp>| h.state().factum().list_tree_heads(case_id).unwrap().len();
+    let before = seals(&harness);
+    let plan = harness
+        .state()
+        .factum()
+        .begin_export(case_id, &["html"], &folder)
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1, "the staging folder");
+    let ctx = harness.ctx.clone();
+    harness.state_mut().verify_job = Some(VerifyJob {
+        worker: workers::Worker::spawn(&ctx, || Err("no database".to_string())),
+        progress: Arc::new(workers::Progress {
+            done: Default::default(),
+            total: Default::default(),
+        }),
+        started: Instant::now(),
+        then: AfterVerify::Export(plan, folder.display().to_string()),
+    });
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert_eq!(message_text(&harness), "Verification failed: no database");
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "nothing stays");
+    assert_eq!(seals(&harness), before + 1);
 }
 
 #[test]
