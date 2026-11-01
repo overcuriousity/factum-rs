@@ -1113,6 +1113,59 @@ fn signing_on_a_report_refuses_what_it_refuses_without_one() {
     }
 }
 
+/// What a row can change into after the verification, for each value a seal's signature covers.
+const SEAL_CHANGES: [&str; 6] = [
+    "tree_size = tree_size + 1",
+    "root_hash = 'ab'",
+    "created_utc = '2020-01-01T00:00:00.000Z'",
+    "reason = 'archive'",
+    "case_file = 'C-2'",
+    "case_id = case_id + 1",
+];
+
+#[test]
+fn a_seal_changed_after_the_verification_is_not_signed() {
+    for change in SEAL_CHANGES {
+        let f = Fixture::new();
+        let (case_id, _, tree_head_id) = unsigned_case(&f);
+        let factum = f.factum();
+        let report = factum.verify_case(case_id, None).unwrap();
+        f.exec("PRAGMA foreign_keys = OFF");
+        f.exec(&format!("UPDATE tree_heads SET {change} WHERE id = {tree_head_id}"));
+        let error = factum.sign_tree_head_checked(&report, tree_head_id).unwrap_err();
+        assert!(
+            error.message.contains("the seal changed since the verification; verify again"),
+            "{change}: {error}"
+        );
+        assert_eq!(f.count("SELECT COUNT(*) FROM late_signatures"), 0, "{change}");
+    }
+}
+
+#[test]
+fn a_run_on_a_report_stops_at_a_seal_changed_after_the_verification() {
+    for change in SEAL_CHANGES {
+        let f = Fixture::new();
+        let (case_id, _, tree_head_id) = unsigned_case(&f);
+        let factum = f.factum();
+        let report = factum.verify_case(case_id, None).unwrap();
+        f.exec("PRAGMA foreign_keys = OFF");
+        f.exec(&format!("UPDATE tree_heads SET {change} WHERE id = {tree_head_id}"));
+        // the entries are signed on the report's values; the seal is not
+        let (signed, stopped) = factum.sign_all_checked(&report).unwrap();
+        assert_eq!(signed, 2, "{change}");
+        let stopped = stopped.unwrap().message;
+        assert!(
+            stopped.contains("the seal changed since the verification; verify again"),
+            "{change}: {stopped}"
+        );
+        assert_eq!(
+            f.count("SELECT COUNT(*) FROM late_signatures WHERE target = 'tree_head'"),
+            0,
+            "{change}"
+        );
+    }
+}
+
 #[test]
 fn broken_log_is_not_signed() {
     let f = Fixture::new();

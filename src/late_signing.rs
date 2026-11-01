@@ -33,6 +33,28 @@ fn ensure_signable(report: &CaseReport) -> Result<()> {
     }
 }
 
+/// Refuses a seal row that is not what `report` verified: the signature is made over the row, read at signing time.
+fn ensure_seal_as_verified(report: &CaseReport, row: &TreeHead) -> Result<()> {
+    let id = row.id;
+    let verified = report
+        .tree_heads
+        .iter()
+        .find(|h| h.tree_head_id == Some(id))
+        .ok_or_else(|| FactumError::general(format!("Seal #{id} was not verified.")))?;
+    if row.case_id != report.case.id
+        || verified.case_file.as_ref() != Some(&row.case_file)
+        || verified.tree_size != row.tree_size
+        || verified.root_hash != row.root_hash
+        || verified.created_utc.as_ref() != Some(&row.created_utc)
+        || verified.reason.as_ref() != Some(&row.reason)
+    {
+        return Err(FactumError::general(format!(
+            "Seal #{id} was not signed: the seal changed since the verification; verify again."
+        )));
+    }
+    Ok(())
+}
+
 // The verification signing rests on can run elsewhere (the GUI: on a worker thread, gpg per signature): the `_checked`
 // calls sign on the strength of the report it gave.
 impl Factum<'_> {
@@ -142,9 +164,7 @@ impl Factum<'_> {
     pub fn sign_tree_head_checked(&self, report: &CaseReport, tree_head_id: i64) -> Result<()> {
         let head = self.unsigned_tree_head(tree_head_id)?;
         ensure_signable(report)?;
-        if !report.tree_heads.iter().any(|h| h.tree_head_id == Some(tree_head_id)) {
-            return Err(FactumError::general(format!("Seal #{tree_head_id} was not verified.")));
-        }
+        ensure_seal_as_verified(report, &head)?;
         self.sign_tree_head_row(&head)
     }
 
@@ -201,6 +221,7 @@ impl Factum<'_> {
             let row = self
                 .get_tree_head(id)?
                 .ok_or_else(|| FactumError::general(format!("Seal #{id} does not exist.")))?;
+            ensure_seal_as_verified(report, &row)?;
             self.sign_tree_head_row(&row)
         };
         let signed = entries

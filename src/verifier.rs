@@ -134,6 +134,7 @@ pub enum SealSource {
 pub struct TreeHeadResult {
     pub source: SealSource,
     pub label: String,
+    pub case_file: Option<String>,
     pub tree_size: i64,
     pub root_hash: String,
     pub created_utc: Option<String>,
@@ -654,6 +655,7 @@ impl Factum<'_> {
             heads.push(TreeHeadResult {
                 source: SealSource::Database,
                 label: what,
+                case_file: Some(head.case_file.clone()),
                 tree_size: head.tree_size,
                 root_hash: head.root_hash.clone(),
                 created_utc: Some(head.created_utc.clone()),
@@ -711,6 +713,7 @@ impl Factum<'_> {
             heads.push(TreeHeadResult {
                 source: SealSource::File,
                 label: what,
+                case_file: seal_file.text_field("case_file"),
                 tree_size: seal_file.tree_size(),
                 root_hash: seal_file.root_hash().to_string(),
                 created_utc: seal_file.text_field("created_utc"),

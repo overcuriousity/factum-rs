@@ -211,6 +211,8 @@ All notable changes to this project are documented here. The format follows
 - GUI: a background task that dies no longer leaves its job hanging (the verify progress forever, additions blocked for
   the session): it is reported as a failure and the job ends
 - GUI: a non-ASCII hash in a tampered log no longer panics the container view on every frame
+- A seal that changed after the verification is no longer signed: signing on a verification's report compares the
+  seal with what was verified and asks to verify again
 - GUI: Sign, Sign All Unsigned, Sign Seal and Export verify the case on a worker with the progress dialog, instead of
   freezing the window for a gpg run per signature; signing follows on the GUI thread when the verification passed
 - Sign All Unsigned that stops part way says so ("Signed 5 of 20; stopped: ..."), in the GUI and the CLI, instead of
