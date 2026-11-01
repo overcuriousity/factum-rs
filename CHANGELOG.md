@@ -21,6 +21,8 @@ All notable changes to this project are documented here. The format follows
   trusted copy or compare the hash
 - `verify.py` runs gpg by its absolute path and refuses one in the current folder or the bundle's, which Windows would
   otherwise run before the one on the `PATH`
+- `verify_container.py` runs gpg and openssl by their absolute paths, gpgconf from gpg's folder, and refuses a gpg or
+  openssl in the current folder, the container's or among the files extracted with the script
 - The bundle and container READMEs, `README.md` and `docs/AIRGAP.md` give the scripts' command as `python3 -I`, which
   keeps Python from loading a module planted beside the script
 - CLI: a case or evidence item is found by `#<id>`, then an exact file number, then an exact name; a plain number is an

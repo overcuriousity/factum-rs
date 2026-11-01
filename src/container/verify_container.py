@@ -993,9 +993,38 @@ def signature_problem(status, exit_code):
     return None
 
 
-def old_gpg():
+def same_folder(one, other):
+    return os.path.normcase(os.path.realpath(one)) == os.path.normcase(os.path.realpath(other))
+
+
+def inside_folder(path, folder):
+    path, folder = (os.path.normcase(os.path.realpath(item)) for item in (path, folder))
+    return path == folder or path.startswith(os.path.join(folder, ""))
+
+
+def find_tool(name, container):
+    """A program as an absolute path, None when it is not installed, or None with the reason it is not run. Windows
+    looks in the current folder before the PATH, for a bare name and in shutil.which, and what lies beside a container
+    or among what was extracted from it comes from whoever made it: a program there is not run."""
+    found = shutil.which(name)
+    if found is None:
+        return None, None
+    found = os.path.abspath(found)
+    folder = os.path.dirname(found)
+    try:
+        script = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        script = os.getcwd()
+    if (inside_folder(folder, script) or same_folder(folder, os.path.dirname(os.path.abspath(container)))
+            or same_folder(folder, os.getcwd())):
+        return None, ("Refusing %s: a %s in the current folder, the container's or this script's is not run. "
+                      "Nothing was checked." % (found, name))
+    return found, None
+
+
+def old_gpg(program):
     """The version of gpg when it is older than 2.1, which has no --pinentry-mode; None otherwise."""
-    result = subprocess.run(["gpg", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run([program, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     lines = result.stdout.decode("utf-8", "replace").splitlines()
     match = re.search(r"(\d+)\.(\d+)\S*", lines[0]) if lines else None
     if match and (int(match.group(1)), int(match.group(2))) < (2, 1):
@@ -1004,9 +1033,10 @@ def old_gpg():
 
 
 class Gpg(object):
-    def __init__(self, carried_key):
-        self.missing = None if shutil.which("gpg") else "gpg is not installed"
-        if not self.missing and old_gpg():
+    def __init__(self, program, carried_key):
+        self.program = program
+        self.missing = None if program else "gpg is not installed"
+        if not self.missing and old_gpg(program):
             self.missing = "it needs gpg 2.1 or newer"
         self.home = tempfile.mkdtemp(prefix="fc-") if carried_key else None
         self.carried_key = carried_key
@@ -1014,7 +1044,7 @@ class Gpg(object):
 
     def run(self, args, data=None):
         # what is checked comes from the container: gpg must never ask for anything
-        command = ["gpg", "--batch", "--pinentry-mode", "error", "--status-fd", "2"]
+        command = [self.program, "--batch", "--pinentry-mode", "error", "--status-fd", "2"]
         if self.home:
             command += ["--homedir", self.home]
         result = subprocess.run(command + args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1073,8 +1103,14 @@ class Gpg(object):
 
     def cleanup(self):
         if self.home:
-            subprocess.run(["gpgconf", "--homedir", self.home, "--kill", "gpg-agent"],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if self.program:
+                # beside gpg, for the reason gpg is found the way it is
+                gpgconf = os.path.join(os.path.dirname(self.program), "gpgconf")
+                try:
+                    subprocess.run([gpgconf, "--homedir", self.home, "--kill", "gpg-agent"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except OSError:
+                    pass
             shutil.rmtree(self.home, ignore_errors=True)
 
 
@@ -1108,11 +1144,11 @@ def armored_der(text):
     return base64.b64decode(bytes(body), validate=True)
 
 
-def signing_time(path):
+def signing_time(openssl, path):
     """The time a CMS signature states, as Unix time; None without one. asn1parse, as gpgsm writes BER of indefinite
     length. Only the signed attributes count (depth 5, [0] of a SignerInfo): a certificate in the signature, or the
     unsigned attributes, could hold the same object."""
-    result = subprocess.run(["openssl", "asn1parse", "-inform", "DER", "-in", path],
+    result = subprocess.run([openssl, "asn1parse", "-inform", "DER", "-in", path],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     lines = result.stdout.decode("utf-8", "replace").splitlines()
     signed_attributes, stated = False, None
@@ -1143,11 +1179,11 @@ def der_fingerprint(pem):
         return None
 
 
-def check_x509(label, signature, chain, data, ca, workdir):
+def check_x509(openssl, label, signature, chain, data, ca, workdir):
     """`chain` is the certificate chain stored beside the signature; None without one: the signature's own certificates
     are then what it can be checked with. Trust cannot be decided here as in factum, which has gpgsm's trust list: a
     root passed with --ca is the only one that counts."""
-    if shutil.which("openssl") is None:
+    if openssl is None:
         warn("not_checked", "%s: X.509 signature not checked (openssl is not installed)." % label)
         return
     try:
@@ -1163,7 +1199,7 @@ def check_x509(label, signature, chain, data, ca, workdir):
             handle.write(content)
 
     def cms_verify(root, at=None):
-        command = ["openssl", "cms", "-verify", "-binary", "-inform", "DER", "-in", paths["sig.der"], "-content",
+        command = [openssl, "cms", "-verify", "-binary", "-inform", "DER", "-in", paths["sig.der"], "-content",
                    paths["data"], "-CAfile", root, "-certfile", paths["chain.pem"], "-purpose", "any",
                    "-signer", paths["signer"], "-out", os.devnull]
         result = subprocess.run(command + (["-attime", str(at)] if at is not None else []),
@@ -1175,7 +1211,7 @@ def check_x509(label, signature, chain, data, ca, workdir):
         write("data", data)
         certificates = stored
         if not certificates:
-            carried = subprocess.run(["openssl", "pkcs7", "-inform", "DER", "-in", paths["sig.der"], "-print_certs"],
+            carried = subprocess.run([openssl, "pkcs7", "-inform", "DER", "-in", paths["sig.der"], "-print_certs"],
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             certificates = pem_certificates(carried.stdout.decode("utf-8", "replace"))
         if not certificates:
@@ -1183,7 +1219,7 @@ def check_x509(label, signature, chain, data, ca, workdir):
             return
         write("chain.pem", "".join(certificates).encode())
         write("root.pem", (stored[-1] if stored else "".join(certificates)).encode())
-        signed = signing_time(paths["sig.der"])
+        signed = signing_time(openssl, paths["sig.der"])
         if signed is None:
             fail("x509_invalid", "%s: the X.509 signature states no signing time." % label)
             return
@@ -1409,6 +1445,11 @@ def check_container(argv):
     args = parser.parse_args(argv)
     print("verify_container.py SHA-256 %s" % own_hash())
     print("Compare it with factum --version or the release notes: this script comes with the container it checks.")
+    gpg_program, problem = find_tool("gpg", args.container)
+    openssl, openssl_problem = find_tool("openssl", args.container)
+    if problem or openssl_problem:
+        print(problem or openssl_problem)
+        return 1
     try:
         archive = open_container(args.container)
     except (OSError, Invalid) as e:
@@ -1457,7 +1498,7 @@ def check_container(argv):
         states[-1] = (label + " (current)", n, turtle, hashes, True)
     else:
         states.append(("current (open)", None, current, read(archive, HASHES, "turtle_hash"), True))
-    gpg = Gpg(args.use_carried_key)
+    gpg = Gpg(gpg_program, args.use_carried_key)
     workdir = tempfile.mkdtemp(prefix="fc-")
     unsigned = False
     try:
@@ -1478,7 +1519,7 @@ def check_container(argv):
             if x509 is not None:
                 signed = True
                 chain = read_signature(archive, prefix + SIGNATURES[3], "x509_invalid")
-                check_x509(label, x509, chain, turtle, args.ca, workdir)
+                check_x509(openssl, label, x509, chain, turtle, args.ca, workdir)
             if close is not None and not signed:
                 fail("unsigned", "%s: not signed." % label)
             if close is not None and is_current:

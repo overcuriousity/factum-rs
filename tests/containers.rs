@@ -1963,6 +1963,111 @@ mod script {
         };
     }
 
+    /// A program that leaves `ran` behind if it is ever started. The PATH it runs with may hold nothing else, so it
+    /// does that without `touch`. It answers everything as a gpg new enough.
+    #[cfg(unix)]
+    fn planted(folder: &Path, name: &str, ran: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(folder).unwrap();
+        let program = folder.join(name);
+        let text = format!("#!/bin/sh\n: > '{}'\necho 'gpg (GnuPG) 2.4.0'\n", ran.display());
+        std::fs::write(&program, text).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn script_refuses_a_tool_beside_the_container_or_itself_or_in_the_current_folder() {
+        let Ok(python) = which::which("python3") else {
+            return;
+        };
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let dir = tempfile::tempdir().unwrap();
+        let (beside, extracted, current) = (dir.path().join("b"), dir.path().join("e"), dir.path().join("c"));
+        for folder in [&beside, &extracted, &current] {
+            std::fs::create_dir(folder).unwrap();
+        }
+        let container = beside.join("c.aff4l");
+        std::fs::copy(s.container_path(), &container).unwrap();
+        let script = extracted.join("verify_container.py");
+        std::fs::write(&script, VERIFY_CONTAINER_PY).unwrap();
+        let ran = dir.path().join("ran");
+        for tool in ["gpg", "openssl"] {
+            for (folder, path) in [
+                (beside.clone(), beside.clone()),
+                (extracted.clone(), extracted.clone()),
+                // among what was extracted with the script
+                (extracted.join("sub"), extracted.join("sub")),
+                // the current folder: what Windows looks in first, here through the PATH
+                (current.clone(), PathBuf::from(".")),
+            ] {
+                planted(&folder, tool, &ran);
+                let output = Command::new(&python)
+                    .args(["-I", "-X", "utf8"])
+                    .arg(&script)
+                    .arg(&container)
+                    .env("PATH", path)
+                    .current_dir(&current)
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&output.stdout);
+                assert_eq!(output.status.code(), Some(1), "{tool}: {text}");
+                assert!(
+                    text.contains(&format!("a {tool} in the current folder")) && text.contains("Nothing was checked."),
+                    "{tool}: {text}"
+                );
+                assert!(!text.contains("Result:"), "{tool}: {text}");
+                assert!(!ran.exists(), "{tool}: {text}");
+                std::fs::remove_file(folder.join(tool)).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn script_runs_gpgconf_from_the_folder_of_gpg() {
+        let Ok(python) = which::which("python3") else {
+            return;
+        };
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, current) = (dir.path().join("bin"), dir.path().join("current"));
+        let (ran_current, ran_bin) = (dir.path().join("ran-current"), dir.path().join("ran-bin"));
+        planted(&bin, "gpg", &dir.path().join("ran-gpg"));
+        planted(&current, "gpgconf", &ran_current);
+        let extracted = tempfile::tempdir().unwrap();
+        let script = extracted.path().join("verify_container.py");
+        std::fs::write(&script, VERIFY_CONTAINER_PY).unwrap();
+        let path = std::env::join_paths([bin.clone(), PathBuf::from(".")]).unwrap();
+        let verify = || {
+            let output = Command::new(&python)
+                .args(["-I", "-X", "utf8"])
+                .arg(&script)
+                .arg(s.container_path())
+                .arg("--use-carried-key")
+                .env("PATH", &path)
+                .current_dir(&current)
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(text.contains("Result:") && !text.contains("Traceback"), "{text}");
+        };
+        // none beside gpg: none is run, and the check still ends
+        verify();
+        assert!(!ran_current.exists());
+        planted(&bin, "gpgconf", &ran_bin);
+        verify();
+        assert!(ran_bin.exists() && !ran_current.exists());
+    }
+
     #[test]
     fn script_runs_from_the_container() {
         let s = Setup::with_signer(FakeSigner::new(false));

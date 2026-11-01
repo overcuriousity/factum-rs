@@ -275,7 +275,10 @@ written by factum: stream hashes, metadata hash, GPG signature via the system `g
 own Turtle output, which factum writes in a fixed, simple layout for this purpose; it need not parse arbitrary
 Turtle. It checks the current state and every `factum/history/<n>/` state. X.509 checking in the script uses
 `openssl` with a root certificate the recipient passes (`--ca ROOT.pem`); without it, the script verifies the
-signature against the carried chain and says explicitly that the root was not checked against a trusted one. The
+signature against the carried chain and says explicitly that the root was not checked against a trusted one. `gpg`
+and `openssl` run by absolute path, `gpgconf` from `gpg`'s folder; one found in the current folder, the container's or
+among the files extracted with the script is refused and nothing is checked, as Windows looks in the current folder
+first and what lies there comes from whoever made the container. The
 chain is checked at the signing time the signature states. The script reads the ZIP itself and gives factum's finding
 codes and, on a container factum wrote, factum's verdict without the case log. What remains different: it has no log,
 so every `replacedBy` stays a warning; it has no trust list, so an X.509 root is only checked against `--ca`; and it
