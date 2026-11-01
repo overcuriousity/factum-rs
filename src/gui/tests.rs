@@ -136,7 +136,7 @@ fn case_view_shows_system_rows_and_newest_versions() {
         .items
         .iter()
         .filter_map(|i| match i {
-            Item::Note(c) => Some(c),
+            Item::Note(c) => Some(&**c),
             _ => None,
         })
         .collect();
@@ -186,7 +186,7 @@ fn evidence_view_and_deletable_evidence() {
         .items
         .iter()
         .filter_map(|i| match i {
-            Item::Note(c) => Some(c),
+            Item::Note(c) => Some(&**c),
             _ => None,
         })
         .collect();
@@ -2413,6 +2413,7 @@ fn images_that_cannot_be_shown_say_so() {
         if let Item::Note(card) = item
             && card.entry.id == note
         {
+            let card = Rc::make_mut(card);
             card.images = card
                 .images
                 .iter()
@@ -2453,7 +2454,7 @@ fn an_image_of_another_type_counts_as_missing() {
         {
             let mut images = card.images.to_vec();
             images[0].mime = "image/svg+xml".into();
-            card.images = images.into();
+            Rc::make_mut(card).images = images.into();
         }
     }
     harness.run_ok();
@@ -3406,7 +3407,7 @@ fn a_directory_fault_can_be_closed_as_damaged_from_the_dialog() {
 
 #[test]
 fn close_and_archive_goes_through_a_directory_fault() {
-    let (fixture, id, path) = Fixture::with_container();
+    let (fixture, _, path) = Fixture::with_container();
     flip_directory_crc(&path, "version.txt");
     let mut harness = fixture.harness();
     let case_id = harness.state().factum().list_cases(false).unwrap()[0];
@@ -3466,4 +3467,103 @@ fn a_refused_open_the_recheck_does_not_see_is_not_a_close() {
     };
     assert_eq!(recheck.directory_faults, ["refused when opened"]);
     assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+/// Types into the search field the way the user does.
+fn type_search(harness: &mut Harness<'_, FactumApp>, text: &str) {
+    harness.state_mut().focus_search = true;
+    harness.run_ok();
+    harness.event(egui::Event::Text(text.to_string()));
+}
+
+fn first_card(harness: &Harness<'_, FactumApp>) -> Rc<Card> {
+    let cards = harness.state().view.items.iter().find_map(|item| match item {
+        Item::Note(card) => Some(card.clone()),
+        Item::System(_) => None,
+    });
+    cards.unwrap()
+}
+
+#[test]
+fn a_search_waits_for_the_field_to_rest_and_rebuilds_no_card() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let tree = harness.state().view.tree.clone();
+    let card = first_card(&harness);
+    type_search(&mut harness, "corrected");
+    harness.step();
+    assert!(harness.state().search_edited.is_some(), "not searched at once");
+    assert!(harness.state().view.items.len() > 1);
+    harness.run_ok();
+    assert!(harness.state().search_edited.is_none());
+    assert_eq!(harness.state().view.items.len(), 1);
+    assert!(Rc::ptr_eq(&harness.state().view.tree, &tree), "the tree stays");
+    assert!(Rc::ptr_eq(&first_card(&harness), &card), "the card stays");
+}
+
+#[test]
+fn what_changes_a_card_also_rebuilds_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let note = first_card(&harness).entry.id;
+    crate::tags::add_label(&fixture.db(), note, "reviewed").unwrap();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(first_card(&harness).tags.iter().any(|(tag, _)| tag == "reviewed"));
+    // a label and a pin the window makes itself, with a search waiting
+    type_search(&mut harness, "corrected");
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::TogglePin(note), &ctx);
+    harness.run_ok();
+    assert_eq!(harness.state().view.items.len(), 1);
+    assert!(first_card(&harness).entry.is_pinned);
+}
+
+#[test]
+fn a_container_event_that_cannot_be_read_leaves_the_rest_of_the_view() {
+    let (fixture, _, _) = Fixture::with_container();
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE entries SET payload_json = json_set(payload_json, '$.evidence_id', 'x') \
+             WHERE json_extract(payload_json, '$.event') = 'container_created'",
+            [],
+        )
+        .unwrap();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    assert!(harness.state().factum().list_containers(case_id).is_err());
+    harness.state_mut().select(Some(case_id), None);
+    harness.run_ok();
+    assert_eq!(harness.state().view.tree.len(), 1);
+    assert_eq!(harness.state().view.case.as_ref().map(|c| c.id), Some(case_id));
+    assert!(!harness.state().view.items.is_empty());
+    assert!(harness.state().view.tree[0].containers.is_empty());
+}
+
+#[test]
+fn the_view_takes_the_containers_from_the_tree() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let evidence = container_evidence(&fixture, id);
+    harness.state_mut().select(None, Some(evidence));
+    harness.run_ok();
+    assert_eq!(harness.state().view.containers.len(), 1);
+    // archived and hidden, the tree has no node for it
+    let case_id = harness.state().view.case.as_ref().unwrap().id;
+    close_container(&fixture, id);
+    {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        Factum::with_seal_dir(&db, &signer, None).archive_case(case_id).unwrap();
+    }
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(harness.state().view.tree.is_empty());
+    assert_eq!(harness.state().view.containers.len(), 1);
 }

@@ -207,6 +207,10 @@ All notable changes to this project are documented here. The format follows
 - GUI: a container with a directory fault offers Close as Damaged, also when an addition is refused for it and on the
   way of Close and Archive, which no longer stops there; the faults go into the log. A damaged close with no file to
   read back says the files were not checked
+- GUI: searching waits until the field rests for 200 ms and reuses the case tree and the built cards, so a long log no
+  longer re-reads and re-parses everything on every keystroke
+- GUI: a container event that cannot be read no longer stops the whole window from filling; it is logged and the
+  case shows without those containers
 
 ## [2.7.1] - 2026-10-29
 

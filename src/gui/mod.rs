@@ -18,6 +18,7 @@ mod workers;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -64,6 +65,8 @@ const DEFAULT_SIDE_PANEL_WIDTH: f32 = 340.0;
 const DEFAULT_TREE_WIDTH: f32 = 240.0;
 const DEFAULT_COMPOSER_HEIGHT: f32 = 170.0;
 const MIN_COMPOSER_HEIGHT: f32 = 150.0;
+/// how long the search field has to rest before the log is searched
+const SEARCH_DEBOUNCE: f64 = 0.2;
 const NOTE_PLACEHOLDER: &str = "Write a note. It is time-stamped when added; #tags categorize it.";
 const ICON: &[u8] = include_bytes!("../../assets/icon.png");
 
@@ -123,9 +126,11 @@ struct CaseNode {
     containers: Vec<crate::containers::ContainerSummary>,
 }
 
+/// Shared with the cache of built items: a card is costly (its parsed Markdown, its history).
+#[derive(Clone)]
 enum Item {
-    Note(Card),
-    System(Entry),
+    Note(Rc<Card>),
+    System(Rc<Entry>),
 }
 
 impl Item {
@@ -158,7 +163,7 @@ struct Verified {
 /// Everything the window shows, read from the database in one go.
 #[derive(Default)]
 struct View {
-    tree: Vec<CaseNode>,
+    tree: Rc<Vec<CaseNode>>,
     /// archived cases, shown or not
     archived_cases: usize,
     /// the case of the selection, and the evidence if evidence is selected
@@ -168,7 +173,7 @@ struct View {
     items: Vec<Item>,
     empty_text: Option<String>,
     note_count: String,
-    pinned: Vec<Card>,
+    pinned: Vec<Rc<Card>>,
     pinned_empty_text: Option<String>,
     iocs: BTreeMap<String, Vec<String>>,
     cli_active: String,
@@ -269,6 +274,13 @@ struct FactumApp {
     tag_completion: tag_completion::TagCompletion,
     view: View,
     dirty: bool,
+    /// when the search field was last edited (egui's clock): the search runs once it rests
+    search_edited: Option<f64>,
+    /// the next rebuild is for the search alone: the tree and the built items stay
+    search_only: bool,
+    /// the items built since the last rebuild that was not for the search, by entry id; what changes a card (a label,
+    /// a pin, a correction, the selection, another connection's commit) goes through such a rebuild
+    built_items: std::cell::RefCell<HashMap<i64, Item>>,
     focused_card: Option<i64>,
     history_open: HashSet<i64>,
     /// the image shown full size: its entry and the image; one at a time
@@ -395,6 +407,9 @@ impl FactumApp {
             tag_completion: Default::default(),
             view: View::default(),
             dirty: true,
+            search_edited: None,
+            search_only: false,
+            built_items: Default::default(),
             focused_card: None,
             history_open: HashSet::new(),
             image_viewer: None,
@@ -643,7 +658,12 @@ impl FactumApp {
 
     fn rebuild(&mut self, ctx: &egui::Context) {
         self.dirty = false;
-        match self.read_view() {
+        self.search_edited = None; // it reads the field as it is now
+        let search_only = std::mem::take(&mut self.search_only);
+        if !search_only {
+            self.built_items.borrow_mut().clear();
+        }
+        match self.read_view(search_only) {
             Ok(view) => self.view = view,
             Err(e) => log::error!("Failed to populate the window: {e}"),
         }
@@ -742,12 +762,38 @@ impl FactumApp {
         })
     }
 
-    fn read_view(&self) -> Result<View> {
-        let factum = self.factum();
-        let mut view = View {
-            archived_cases: factum.list_cases(true)?.len() - factum.list_cases(false)?.len(),
-            ..Default::default()
+    /// The search field rests: time to search. A change that is due anyway takes the search along.
+    fn search_when_rested(&mut self, ctx: &egui::Context) {
+        let Some(edited) = self.search_edited else { return };
+        let waited = ctx.input(|i| i.time) - edited;
+        if waited < SEARCH_DEBOUNCE {
+            ctx.request_repaint_after_secs((SEARCH_DEBOUNCE - waited) as f32);
+            return;
+        }
+        self.search_only = !self.dirty;
+        self.dirty = true;
+    }
+
+    /// The item of an entry, built once until something changes; None for an entry that is gone.
+    fn item(&self, factum: &Factum, entry_id: i64, case: &Case) -> Result<Option<Item>> {
+        if let Some(item) = self.built_items.borrow().get(&entry_id) {
+            return Ok(Some(item.clone()));
+        }
+        let Some(entry) = factum.get_entry_without_payload(entry_id)? else {
+            return Ok(None);
         };
+        let item = if entry.is_note() {
+            Item::Note(Rc::new(self.card(factum, entry, case)?))
+        } else {
+            Item::System(Rc::new(entry))
+        };
+        self.built_items.borrow_mut().insert(entry_id, item.clone());
+        Ok(Some(item))
+    }
+
+    /// The case tree, and how many cases are archived.
+    fn read_tree(&self, factum: &Factum) -> Result<(Vec<CaseNode>, usize)> {
+        let mut tree = Vec::new();
         for case_id in factum.list_cases(self.show_archived)? {
             let Some(case) = factum.get_case(case_id)? else {
                 continue;
@@ -763,13 +809,35 @@ impl FactumApp {
                     evidence.push((item, factum.list_entries(case_id, &filter)?.len()));
                 }
             }
-            let containers = factum.list_containers(case_id)?;
-            view.tree.push(CaseNode {
+            tree.push(CaseNode {
                 case,
                 notes,
                 evidence,
-                containers,
+                containers: Self::containers_of(factum, case_id),
             });
+        }
+        Ok((tree, factum.list_cases(true)?.len() - factum.list_cases(false)?.len()))
+    }
+
+    /// A log the containers cannot be read from still shows the rest of the case.
+    fn containers_of(factum: &Factum, case_id: i64) -> Vec<crate::containers::ContainerSummary> {
+        factum
+            .list_containers(case_id)
+            .inspect_err(|e| log::error!("The containers of case #{case_id} cannot be read: {e}"))
+            .unwrap_or_default()
+    }
+
+    /// `search_only`: the search changed and nothing else, so the tree stays and the items built last time are reused.
+    fn read_view(&self, search_only: bool) -> Result<View> {
+        let factum = self.factum();
+        let mut view = View::default();
+        if search_only {
+            view.tree = self.view.tree.clone();
+            view.archived_cases = self.view.archived_cases;
+        } else {
+            let (tree, archived_cases) = self.read_tree(&factum)?;
+            view.tree = Rc::new(tree);
+            view.archived_cases = archived_cases;
         }
         let case_id = self.current_case_id();
         view.case = match case_id {
@@ -810,14 +878,7 @@ impl FactumApp {
             }
             for entry_id in entry_ids.iter().rev() {
                 // newest first
-                let Some(entry) = factum.get_entry_without_payload(*entry_id)? else {
-                    continue;
-                };
-                view.items.push(if entry.is_note() {
-                    Item::Note(self.card(&factum, entry, &case)?)
-                } else {
-                    Item::System(entry)
-                });
+                view.items.extend(self.item(&factum, *entry_id, &case)?);
             }
             let notes = view.items.iter().filter(|item| matches!(item, Item::Note(_))).count();
             let mut text = format!("{notes} note{}", if notes == 1 { "" } else { "s" });
@@ -850,8 +911,12 @@ impl FactumApp {
                 },
             )?;
             for entry_id in pinned_ids.iter().rev() {
-                if let Some(entry) = factum.get_entry_without_payload(*entry_id)? {
-                    view.pinned.push(self.card(&factum, entry, &case)?);
+                match self.item(&factum, *entry_id, &case)? {
+                    Some(Item::Note(card)) => view.pinned.push(card),
+                    Some(Item::System(entry)) => {
+                        view.pinned.push(Rc::new(self.card(&factum, (*entry).clone(), &case)?))
+                    }
+                    None => {}
                 }
             }
             if view.pinned.is_empty() {
@@ -901,9 +966,12 @@ impl FactumApp {
                 None => case.case_name,
             };
         }
-        let selected_case = view.case.as_ref().map(|c| c.id);
-        let summaries = match selected_case {
-            Some(case_id) => factum.list_containers(case_id)?,
+        // an archived case can be selected while the tree hides it
+        let summaries = match &view.case {
+            Some(case) => match view.tree.iter().find(|node| node.case.id == case.id) {
+                Some(node) => node.containers.clone(),
+                None => Self::containers_of(&factum, case.id),
+            },
             None => Vec::new(),
         };
         let shown: Vec<&crate::containers::ContainerSummary> = summaries
@@ -2953,7 +3021,7 @@ impl FactumApp {
             let mut clicked_container: Option<i64> = None;
             let mut menu_action: Option<TreeAction> = None;
             let new_evidence = ctx.format_shortcut(&NEW_EVIDENCE);
-            for node in &self.view.tree {
+            for node in self.view.tree.iter() {
                 let case = &node.case;
                 let selected = self.case_id == Some(case.id) && self.container_id.is_none();
                 let (name, color) = if case.is_archived() {
@@ -3366,11 +3434,11 @@ impl FactumApp {
                         search.request_focus();
                     }
                     if search.changed() {
-                        self.dirty = true;
+                        self.search_edited = Some(ctx.input(|i| i.time));
                     }
                     if clear && IconButton::new(icons::CLOSE, "Clear search").show(ui).clicked() {
                         self.filter.clear();
-                        self.dirty = true;
+                        self.search_edited = Some(f64::NEG_INFINITY); // nothing to wait for
                     }
                 });
             });
@@ -3933,6 +4001,7 @@ impl eframe::App for FactumApp {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         self.shortcuts(&ctx);
+        self.search_when_rested(&ctx);
         if self.dirty {
             self.rebuild(&ctx);
         }
