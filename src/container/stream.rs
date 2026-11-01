@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::Digest;
 
 use super::AFF4_NS;
-use super::zip64::{Appender, Archive, member_bytes};
+use super::zip64::{Appender, Archive, crc_error, crc_mismatch, member_bytes_and_crc};
 
 pub const CHUNK_SIZE: u64 = 32 * 1024;
 pub const CHUNKS_PER_SEGMENT: u64 = 2048;
@@ -225,8 +225,19 @@ pub fn store_image_stream(
     })
 }
 
-/// Hashes without storing (metadata-only files).
+/// Hashes without storing (metadata-only files). For source files only: a differing CRC-32 of a member would go
+/// unnoticed, so content read from a container goes through `hash_stored`.
 pub fn hash_only(src: &mut dyn Read, progress: &dyn Fn(u64), cancel: &AtomicBool) -> io::Result<(u64, Digests)> {
+    hash_stored(src, progress, cancel).map(|(size, digests, _)| (size, digests))
+}
+
+/// Hashes content read from a container. The member whose CRC-32 differs, if any, comes with the digests: only the
+/// directory may be what is wrong, and the digests say whether the content is.
+pub fn hash_stored(
+    src: &mut dyn Read,
+    progress: &dyn Fn(u64),
+    cancel: &AtomicBool,
+) -> io::Result<(u64, Digests, Option<String>)> {
     let mut watched = Watched {
         inner: src,
         total: 0,
@@ -236,9 +247,15 @@ pub fn hash_only(src: &mut dyn Read, progress: &dyn Fn(u64), cancel: &AtomicBool
     let mut hasher = Hasher::new();
     let mut buffer = vec![0; BUFFER];
     loop {
-        let read = watched.read(&mut buffer)?;
+        let read = match watched.read(&mut buffer) {
+            Ok(read) => read,
+            Err(e) => match crc_mismatch(&e) {
+                Some(member) => return Ok((watched.total, hasher.finish(), Some(member.to_string()))),
+                None => return Err(e),
+            },
+        };
         if read == 0 {
-            return Ok((watched.total, hasher.finish()));
+            return Ok((watched.total, hasher.finish(), None));
         }
         hasher.update(&buffer[..read]);
     }
@@ -305,6 +322,7 @@ pub fn open_image_stream<'f>(
         bevy: None,
         chunk: Vec::new(),
         chunk_at: 0,
+        crc_mismatch: None,
     })
 }
 
@@ -326,16 +344,35 @@ pub struct ImageStreamReader<'f> {
     bevy: Option<Bevy>,
     chunk: Vec<u8>,
     chunk_at: usize,
+    /// the first member read that differs from the directory's CRC-32: an error at the end of the stream
+    crc_mismatch: Option<String>,
+}
+
+/// Whether each chunk starts where the one before it ended or after that, as every writer stores them. An index that
+/// repeats a chunk would have a few stored bytes stand for terabytes to hash.
+fn chunks_follow_each_other(index: &[(u64, u32)]) -> bool {
+    index
+        .windows(2)
+        .all(|pair| pair[0].0.saturating_add(pair[0].1 as u64) <= pair[1].0)
 }
 
 impl ImageStreamReader<'_> {
+    /// The first member read so far that differs from the directory's CRC-32, for what does not read to the end.
+    pub fn crc_mismatch(&self) -> Option<&str> {
+        self.crc_mismatch.as_deref()
+    }
+
     fn member(&mut self, name: &str) -> io::Result<Vec<u8>> {
         let entry = self
             .archive
             .get(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("member {name} is missing")))?
             .clone();
-        member_bytes(self.file, &entry)
+        let (data, crc_matches) = member_bytes_and_crc(self.file, &entry)?;
+        if !crc_matches {
+            self.crc_mismatch.get_or_insert_with(|| name.to_string());
+        }
+        Ok(data)
     }
 
     fn load_chunk(&mut self, number: u64) -> io::Result<()> {
@@ -343,7 +380,7 @@ impl ImageStreamReader<'_> {
         if self.bevy.as_ref().is_none_or(|(n, _, _)| *n != bevy_number) {
             let data = self.member(&format!("{}/{bevy_number:08}", self.member))?;
             let raw_index = self.member(&format!("{}/{bevy_number:08}.index", self.member))?;
-            let index = raw_index
+            let index: Vec<(u64, u32)> = raw_index
                 .as_chunks::<12>()
                 .0
                 .iter()
@@ -354,6 +391,12 @@ impl ImageStreamReader<'_> {
                     )
                 })
                 .collect();
+            if !chunks_follow_each_other(&index) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("bevy {bevy_number} of {} is damaged: its chunks overlap", self.arn),
+                ));
+            }
             self.bevy = Some((bevy_number, data, index));
         }
         let (_, data, index) = self.bevy.as_ref().unwrap();
@@ -409,8 +452,11 @@ impl io::Seek for ImageStreamReader<'_> {
 
 impl Read for ImageStreamReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.position >= self.size || buf.is_empty() {
+        if buf.is_empty() {
             return Ok(0);
+        }
+        if self.position >= self.size {
+            return self.crc_mismatch.as_deref().map_or(Ok(0), |name| Err(crc_error(name)));
         }
         if self.chunk_at >= self.chunk.len() {
             self.load_chunk(self.position / self.chunk_size)?;
@@ -447,6 +493,14 @@ mod tests {
             .open(dir.path().join("c.aff4l"))
             .unwrap();
         Appender::new(file, 0, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn an_index_that_repeats_a_chunk_is_damaged() {
+        assert!(chunks_follow_each_other(&[(0, 10), (10, 5), (20, 1)]));
+        assert!(chunks_follow_each_other(&[]));
+        assert!(!chunks_follow_each_other(&[(0, 10), (0, 10)]));
+        assert!(!chunks_follow_each_other(&[(0, 10), (9, 10)]));
     }
 
     fn sample() -> Vec<u8> {

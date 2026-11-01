@@ -1,7 +1,10 @@
 //! A blocking HTTP client for OpenAI-compatible and Anthropic-compatible chat endpoints.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -22,8 +25,13 @@ const THINKING_ONLY: &str = "the model spent its whole output allowance on think
 pub enum LlmError {
     Unreachable(String),
     Timeout,
-    Http { status: u16, body: String },
+    Http {
+        status: u16,
+        body: String,
+    },
     BadResponse(String),
+    /// the work was stopped before this call went out
+    Cancelled,
 }
 
 impl LlmError {
@@ -32,7 +40,7 @@ impl LlmError {
         match self {
             LlmError::Unreachable(_) | LlmError::Timeout => true,
             LlmError::Http { status, .. } => matches!(status, 408 | 409 | 429 | 500..=599),
-            LlmError::BadResponse(_) => false,
+            LlmError::BadResponse(_) | LlmError::Cancelled => false,
         }
     }
 }
@@ -47,6 +55,7 @@ impl fmt::Display for LlmError {
                 write!(f, "HTTP {status}: {body}")
             }
             LlmError::BadResponse(reason) => write!(f, "Bad response: {reason}"),
+            LlmError::Cancelled => write!(f, "Cancelled"),
         }
     }
 }
@@ -269,6 +278,68 @@ fn parse_chat(protocol: Protocol, text: &str) -> Result<ChatResponse, LlmError> 
     }
 }
 
+/// Moved on by the GUI side to end the work in hand: a case's on opt-out and delete, the global one on a settings
+/// change and at shutdown. The thread's commands wait behind that work, this does not.
+#[derive(Default)]
+pub struct Epochs {
+    global: AtomicU64,
+    cases: Mutex<HashMap<i64, u64>>,
+}
+
+impl Epochs {
+    pub fn bump_all(&self) {
+        self.global.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn bump_case(&self, case_id: i64) {
+        *self.lock_cases().entry(case_id).or_default() += 1;
+    }
+
+    pub fn global(&self) -> u64 {
+        self.global.load(Ordering::SeqCst)
+    }
+
+    fn case(&self, case_id: i64) -> u64 {
+        self.lock_cases().get(&case_id).copied().unwrap_or(0)
+    }
+
+    fn lock_cases(&self) -> std::sync::MutexGuard<'_, HashMap<i64, u64>> {
+        self.cases.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A `Stop` for work on the case that has seen the global epoch `global`.
+    pub fn stop(self: &Arc<Self>, case_id: i64, global: u64) -> Stop {
+        Stop {
+            epochs: self.clone(),
+            case_id,
+            global,
+            case: self.case(case_id),
+        }
+    }
+}
+
+/// Set once the epochs have moved on from where they were when it was taken.
+#[derive(Clone)]
+pub struct Stop {
+    epochs: Arc<Epochs>,
+    case_id: i64,
+    global: u64,
+    case: u64,
+}
+
+impl Stop {
+    pub fn is_set(&self) -> bool {
+        self.epochs.global() != self.global || self.epochs.case(self.case_id) != self.case
+    }
+}
+
+/// What a client has found out about the model, for another client of the same endpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Learned {
+    pub context_window: Option<u32>,
+    pub calibration: Calibration,
+}
+
 /// Used from one thread at a time.
 pub struct Client {
     settings: Settings,
@@ -280,6 +351,8 @@ pub struct Client {
     context_window: Cell<Option<u32>>,
     /// the model has returned thinking: its calls get the thinking allowance from the start
     thinks: Cell<bool>,
+    /// once set, no further request goes out
+    stop: RefCell<Option<Stop>>,
 }
 
 impl Client {
@@ -296,6 +369,7 @@ impl Client {
             completion_param: Cell::new(false),
             context_window: Cell::new(None),
             thinks: Cell::new(false),
+            stop: RefCell::new(None),
         }
     }
 
@@ -305,6 +379,33 @@ impl Client {
 
     pub fn calibration(&self) -> Calibration {
         self.calibration.get()
+    }
+
+    /// The model has returned thinking.
+    pub fn thinks(&self) -> bool {
+        self.thinks.get()
+    }
+
+    pub fn learned(&self) -> Learned {
+        Learned {
+            context_window: self.context_window.get(),
+            calibration: self.calibration.get(),
+        }
+    }
+
+    /// Starts from what another client found out.
+    pub fn learn(&self, learned: Learned) {
+        self.context_window.set(learned.context_window);
+        self.calibration.set(learned.calibration);
+    }
+
+    /// From now on no request goes out once `stop` is set.
+    pub fn set_stop(&self, stop: Stop) {
+        *self.stop.borrow_mut() = Some(stop);
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stop.borrow().as_ref().is_some_and(Stop::is_set)
     }
 
     /// Remembers the model's input window, e.g. Anthropic's `max_input_tokens` from the probe listing.
@@ -344,6 +445,9 @@ impl Client {
     pub fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         match self.chat_once(req) {
             Err(e) if e.is_retryable() => {
+                if self.stopped() {
+                    return Err(LlmError::Cancelled);
+                }
                 log::warn!("companion request failed, retrying once: {e}");
                 std::thread::sleep(self.retry_delay);
                 self.chat_once(req)
@@ -421,6 +525,9 @@ impl Client {
         json_mode: bool,
         completion_param: bool,
     ) -> Result<ChatResponse, LlmError> {
+        if self.stopped() {
+            return Err(LlmError::Cancelled);
+        }
         let role = |r: Role| if r == Role::User { "user" } else { "assistant" };
         let turns = req
             .turns
@@ -686,6 +793,47 @@ mod tests {
             client(openai(&fake)).chat(&req(&turns, false)),
             Err(LlmError::Http { status: 401, .. })
         ));
+        assert_eq!(fake.requests().len(), 1);
+    }
+
+    #[test]
+    fn a_stopped_client_sends_nothing_more() {
+        let fake = FakeLlm::start();
+        fake.push(200, &openai_chat("ok", "stop", 1));
+        let c = client(openai(&fake));
+        let epochs = Arc::new(Epochs::default());
+        c.set_stop(epochs.stop(7, epochs.global()));
+        let turns = [(Role::User, "hi")];
+        assert_eq!(c.chat(&req(&turns, false)).unwrap().text, "ok");
+        // another case's opt-out is not this work's
+        epochs.bump_case(8);
+        fake.push(200, &openai_chat("ok", "stop", 1));
+        assert!(c.chat(&req(&turns, false)).is_ok());
+        epochs.bump_case(7);
+        assert!(matches!(c.chat(&req(&turns, false)), Err(LlmError::Cancelled)));
+        c.set_stop(epochs.stop(7, epochs.global()));
+        epochs.bump_all();
+        assert!(matches!(c.chat(&req(&turns, false)), Err(LlmError::Cancelled)));
+        assert_eq!(fake.requests().len(), 2);
+    }
+
+    #[test]
+    fn a_retry_is_not_sent_once_stopped() {
+        let fake = FakeLlm::start();
+        fake.push_delayed(503, "busy", Duration::from_millis(300));
+        let c = client(openai(&fake));
+        let epochs = Arc::new(Epochs::default());
+        c.set_stop(epochs.stop(7, epochs.global()));
+        let stopper = {
+            let epochs = epochs.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                epochs.bump_case(7);
+            })
+        };
+        let turns = [(Role::User, "hi")];
+        assert!(matches!(c.chat(&req(&turns, false)), Err(LlmError::Cancelled)));
+        stopper.join().unwrap();
         assert_eq!(fake.requests().len(), 1);
     }
 

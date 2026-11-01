@@ -6,6 +6,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::canonical::utc_now;
 use crate::error::{FactumError, Result};
+use crate::files::write_atomically;
 use crate::log_service::entry_signed_payload;
 use crate::seals::{TreeHead, seal_payload};
 use crate::services::Factum;
@@ -15,21 +16,51 @@ use crate::verifier::{CaseReport, EntryResult, Level, SealSource};
 /// tampered data
 pub const SIGNABLE: [&str; 1] = ["unsigned"];
 
+/// Refuses a report with a failure that signing later does not fix.
+fn ensure_signable(report: &CaseReport) -> Result<()> {
+    let blocking: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.level == Level::Fail && !SIGNABLE.contains(&f.code))
+        .collect();
+    match blocking.first() {
+        Some(first) => Err(FactumError::log_broken(format!(
+            "Nothing was signed: the case log has {} failure(s), e.g. {}",
+            blocking.len(),
+            first.message
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a seal row that is not what `report` verified: the signature is made over the row, read at signing time.
+fn ensure_seal_as_verified(report: &CaseReport, row: &TreeHead) -> Result<()> {
+    let id = row.id;
+    let verified = report
+        .tree_heads
+        .iter()
+        .find(|h| h.tree_head_id == Some(id))
+        .ok_or_else(|| FactumError::general(format!("Seal #{id} was not verified.")))?;
+    if row.case_id != report.case.id
+        || verified.case_file.as_ref() != Some(&row.case_file)
+        || verified.tree_size != row.tree_size
+        || verified.root_hash != row.root_hash
+        || verified.created_utc.as_ref() != Some(&row.created_utc)
+        || verified.reason.as_ref() != Some(&row.reason)
+    {
+        return Err(FactumError::general(format!(
+            "Seal #{id} was not signed: the seal changed since the verification; verify again."
+        )));
+    }
+    Ok(())
+}
+
+// The verification signing rests on can run elsewhere (the GUI: on a worker thread, gpg per signature): the `_checked`
+// calls sign on the strength of the report it gave.
 impl Factum<'_> {
     pub fn ensure_log_intact(&self, case_id: i64) -> Result<CaseReport> {
         let report = self.verify_case(case_id, None)?;
-        let blocking: Vec<_> = report
-            .findings
-            .iter()
-            .filter(|f| f.level == Level::Fail && !SIGNABLE.contains(&f.code))
-            .collect();
-        if let Some(first) = blocking.first() {
-            return Err(FactumError::log_broken(format!(
-                "Nothing was signed: the case log has {} failure(s), e.g. {}",
-                blocking.len(),
-                first.message
-            )));
-        }
+        ensure_signable(&report)?;
         Ok(report)
     }
 
@@ -41,7 +72,7 @@ impl Factum<'_> {
         }
         self.signer
             .sign_text(payload)
-            .ok_or_else(|| FactumError::signing("GPG signing failed — nothing was signed."))
+            .ok_or_else(|| FactumError::signing("GPG signing failed."))
     }
 
     fn store_late_signature(&self, target: &str, target_id: i64, signature: &str) -> Result<()> {
@@ -70,7 +101,8 @@ impl Factum<'_> {
             .is_some())
     }
 
-    pub fn sign_entry(&self, entry_id: i64) -> Result<()> {
+    /// The case of an entry that can be signed later: it exists and is not signed.
+    pub fn case_of_unsigned_entry(&self, entry_id: i64) -> Result<i64> {
         let row: Option<(i64, Option<String>)> = self
             .db
             .conn
@@ -85,8 +117,20 @@ impl Factum<'_> {
         if self.is_signed("entry", entry_id, signature.as_deref())? {
             return Err(FactumError::general(format!("Entry #{entry_id} is already signed.")));
         }
-        let report = self.ensure_log_intact(case_id)?;
-        let result = report.entry_result(entry_id).expect("the entry is in its case log");
+        Ok(case_id)
+    }
+
+    pub fn sign_entry(&self, entry_id: i64) -> Result<()> {
+        let case_id = self.case_of_unsigned_entry(entry_id)?;
+        self.sign_entry_checked(&self.ensure_log_intact(case_id)?, entry_id)
+    }
+
+    pub fn sign_entry_checked(&self, report: &CaseReport, entry_id: i64) -> Result<()> {
+        self.case_of_unsigned_entry(entry_id)?;
+        ensure_signable(report)?;
+        let result = report
+            .entry_result(entry_id)
+            .ok_or_else(|| FactumError::general(format!("Entry #{entry_id} was not verified.")))?;
         self.sign_entry_result(result)
     }
 
@@ -101,14 +145,26 @@ impl Factum<'_> {
         Ok(())
     }
 
-    pub fn sign_tree_head(&self, tree_head_id: i64) -> Result<()> {
+    /// A seal that can be signed later: it exists and is not signed.
+    pub fn unsigned_tree_head(&self, tree_head_id: i64) -> Result<TreeHead> {
         let head = self
             .get_tree_head(tree_head_id)?
             .ok_or_else(|| FactumError::general(format!("Seal #{tree_head_id} does not exist.")))?;
         if self.is_signed("tree_head", tree_head_id, head.signature.as_deref())? {
             return Err(FactumError::general(format!("Seal #{tree_head_id} is already signed.")));
         }
-        self.ensure_log_intact(head.case_id)?;
+        Ok(head)
+    }
+
+    pub fn sign_tree_head(&self, tree_head_id: i64) -> Result<()> {
+        let case_id = self.unsigned_tree_head(tree_head_id)?.case_id;
+        self.sign_tree_head_checked(&self.ensure_log_intact(case_id)?, tree_head_id)
+    }
+
+    pub fn sign_tree_head_checked(&self, report: &CaseReport, tree_head_id: i64) -> Result<()> {
+        let head = self.unsigned_tree_head(tree_head_id)?;
+        ensure_signable(report)?;
+        ensure_seal_as_verified(report, &head)?;
         self.sign_tree_head_row(&head)
     }
 
@@ -125,7 +181,7 @@ impl Factum<'_> {
         if let Some(file_path) = head.file_path.as_deref().filter(|p| !p.is_empty()) {
             let signed_copy = PathBuf::from(file_path).with_extension("asc");
             // written as gpg wrote it, see seal()
-            std::fs::write(&signed_copy, signature.as_bytes()).map_err(|e| {
+            write_atomically(&signed_copy, signature.as_bytes()).map_err(|e| {
                 FactumError::general(format!(
                     "Seal #{} was signed, but the signed copy could not be written to {}: {e}",
                     head.id,
@@ -136,26 +192,52 @@ impl Factum<'_> {
         Ok(())
     }
 
-    /// Signs every unsigned entry and database seal of a case; returns how many were signed.
-    pub fn sign_all_unsigned(&self, case_id: i64) -> Result<usize> {
-        let report = self.ensure_log_intact(case_id)?;
-        let mut count = 0;
-        for result in &report.entries {
-            if !result.signature.present {
-                self.sign_entry_result(result)?;
-                count += 1;
+    /// Signs every unsigned entry and database seal of a case; returns how many were signed and, when that was not
+    /// all of them, what stopped the run (what was signed stays signed; the text says how far it got). A failed
+    /// verification signs nothing.
+    pub fn sign_all_unsigned(&self, case_id: i64) -> Result<(usize, Option<FactumError>)> {
+        self.sign_all_checked(&self.ensure_log_intact(case_id)?)
+    }
+
+    pub fn sign_all_checked(&self, report: &CaseReport) -> Result<(usize, Option<FactumError>)> {
+        ensure_signable(report)?;
+        // the report may be minutes old: what was signed elsewhere since is done
+        let mut entries: Vec<&EntryResult> = Vec::new();
+        for result in report.entries.iter().filter(|r| !r.signature.present) {
+            if !self.is_signed("entry", result.entry.id, None)? {
+                entries.push(result);
             }
         }
+        let mut heads: Vec<i64> = Vec::new();
         for head in &report.tree_heads {
             if head.source == SealSource::Database && !head.signature.present {
                 let id = head.tree_head_id.expect("database seals have an id");
-                let row = self
-                    .get_tree_head(id)?
-                    .ok_or_else(|| FactumError::general(format!("Seal #{id} does not exist.")))?;
-                self.sign_tree_head_row(&row)?;
-                count += 1;
+                if !self.is_signed("tree_head", id, None)? {
+                    heads.push(id);
+                }
             }
         }
-        Ok(count)
+        let sign_head = |id: i64| {
+            let row = self
+                .get_tree_head(id)?
+                .ok_or_else(|| FactumError::general(format!("Seal #{id} does not exist.")))?;
+            ensure_seal_as_verified(report, &row)?;
+            self.sign_tree_head_row(&row)
+        };
+        let signed = entries
+            .iter()
+            .map(|result| self.sign_entry_result(result))
+            .chain(heads.iter().map(|id| sign_head(*id)));
+        let mut count = 0;
+        for result in signed {
+            if let Err(mut e) = result {
+                if count > 0 {
+                    e.message = format!("Signed {count} of {}; stopped: {e}", entries.len() + heads.len());
+                }
+                return Ok((count, Some(e)));
+            }
+            count += 1;
+        }
+        Ok((count, None))
     }
 }

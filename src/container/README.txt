@@ -16,11 +16,17 @@ What makes it trustworthy
 
 Verifying without factum (Python 3, no other packages)
   unzip -j <container>.aff4l verify_container.py      (or extract it with any ZIP tool)
-  python3 verify_container.py <container>.aff4l
-  python3 verify_container.py <container>.aff4l --ca ROOT.pem   (checks the X.509 chain against your root)
+  python3 -I verify_container.py <container>.aff4l
+  python3 -I verify_container.py <container>.aff4l --ca ROOT.pem   (checks the X.509 chain against your root)
+-I keeps Python from loading modules from the folder the script lies in, where a file planted beside it would run first.
 
 GPG signatures are checked with the system's gpg when it is installed, against your keyring: import the
 examiner's public key first (gpg --import). Or add --use-carried-key: the script then uses the key the container
 carries (information.turtle.pubkey.asc) in a temporary keyring and prints its fingerprint; compare it with one you
 received separately.
 The script prints one line per check (✓ passed, ⚠ warning, ✗ failed) and exits with 0 only if nothing failed.
+
+The script and this README are not signed: whoever could change the container could change them too, and a script
+changed that way can say anything. Run a copy you trust, such as the one from your own installation of factum, or
+compare the SHA-256 the script prints when it starts with what factum --version prints on a machine you trust, or with
+the release notes of that version (on an air-gapped machine, a copy brought in beforehand).

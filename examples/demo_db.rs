@@ -1,11 +1,20 @@
 //! Fills a database with a demo case, e.g. for screenshots: `FACTUM_DB=/tmp/demo.db cargo run --example demo_db`
-//! Signs with the active GPG key of that database, if one is set.
+//! Signs with the active GPG key of that database, if one is set. The database is named by FACTUM_DB or by the first
+//! argument; without either the example refuses, so it never writes into the real database.
 
 use factum::signer::GnupgSigner;
 use factum::{Db, Factum};
 
 fn main() -> factum::Result<()> {
-    let db = Db::open_default()?;
+    let db = match std::env::args_os().nth(1) {
+        Some(path) => Db::open(std::path::Path::new(&path))?,
+        None if factum::config::settings().db_from_env => Db::open_default()?,
+        None => {
+            return Err(factum::FactumError::general(
+                "Set FACTUM_DB or pass a database path: the demo case must not go into your real database.",
+            ));
+        }
+    };
     let signer = GnupgSigner::new(&db, None);
     let factum = Factum::new(&db, &signer);
     let case_id = factum.create_case(

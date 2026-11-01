@@ -22,7 +22,7 @@ else. The private keys were deleted after signing.
 
   ```
   unzip -j sample.aff4l verify_container.py
-  python3 verify_container.py sample.aff4l --ca root.pem --use-carried-key
+  python3 -I verify_container.py sample.aff4l --ca root.pem --use-carried-key
   ```
 
 - In another tool: open `sample.aff4l` and check that it lists the three files and accepts the signatures. The

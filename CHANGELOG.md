@@ -5,6 +5,244 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- GUI: once text is typed into a dialog (Correct, case goal, new case or evidence, companion settings, setup), Escape
+  and a click outside no longer close it, and the field keeps its focus; Cancel closes it
+- GUI: the Correct dialog's text field scrolls, so its buttons stay in view, and each Correct dialog has its own undo
+  history
+- GUI: the Seal Folder dialog and the setup refuse a folder that is not an existing absolute path
+- GUI: a container's file name may not hold a path, a drive or `..`, and gets `.aff4l` when it lacks it
+- GUI: Add Label is off for a label that is only `#` and blanks
+- GUI: a key missing or not trusted shows as failed (✗), as the verifier rates it, and the signature line says "key not
+  trusted"
+- GUI: the verify window lays out only the OK entries in view
+- `verify.py` prints its own SHA-256 when it starts; `factum --version` prints the SHA-256 of the embedded `verify.py`
+  and `verify_container.py` (`-V` stays one line), the release notes list both, and the bundle README says to run a
+  trusted copy or compare the hash
+- `verify.py` runs gpg by its absolute path and refuses one in the current folder or the bundle's, which Windows would
+  otherwise run before the one on the `PATH`
+- `verify_container.py` runs gpg and openssl by their absolute paths, gpgconf from gpg's folder, and refuses a gpg or
+  openssl in the current folder, the container's or the script's
+- The bundle and container READMEs, `README.md` and `docs/AIRGAP.md` give the scripts' command as `python3 -I`, which
+  keeps Python from loading a module planted beside the script
+- CLI: a case or evidence item is found by `#<id>`, then an exact file number, then an exact name; a plain number is an
+  id only when nothing matches, several matches are an error that lists them, `_` is no longer dropped from numbers.
+  Exit codes: 0 done, 1 verification failed (also `--export` of a failing case, which warns and still writes the
+  files), 2 any error (no case found, bad arguments, I/O; was 1). A note together with an option is refused. With
+  `FACTUM_DB` set the CLI prints `Database: <path>` on stderr. `--list-gpg` names an expired or revoked active key.
+  The demo example refuses without `FACTUM_DB` or a path.
+- The seal folder setting is stored as `FACTUM_SEAL_DIR` in the user config `.env`, no longer in the database: the
+  verifier no longer takes the folder it checks from the database it verifies, which a tamperer could point at an
+  empty folder. A folder set in the GUI of an earlier version is moved there on the first start (with a warning), and no
+  database is read for it afterwards. Verify reports (CLI, GUI, HTML, Markdown, PDF) name the seal folder they
+  checked; a change of the seal folder is written to the application log. A folder still named in the database but
+  not in use is mentioned in a warning and not checked; choosing a seal folder in the GUI removes it
+- A `.env` in the current directory is no longer read, only the one in the user config directory
+- Verifying a case again in the same session reuses good signature results as long as the keyring is unchanged (for at
+  most 10 minutes, never on disk), so late signing and repeated checks no longer run gpg for every signature
+- Reports and `verify.py` name the primary key's fingerprint of a signature made with a subkey (a primary key's
+  fingerprint is unchanged); the entry's integrity lines also name the subkey
+- A signature counts only as exactly one good signature with a clean gpg exit code, in factum and in `verify.py`
+- `verify.py` needs gpg 2.1 or newer and says so on an older one
+- Installers and `scripts/airgap-download.sh` check the signature on `SHA256SUMS` with `gpg` when `SHA256SUMS.asc` is
+  there: a bad signature stops the install; a missing `gpg`, `.asc` or release key (never fetched), or a signing key that has expired since, only warns that
+  integrity, not authenticity, was checked. The download script fails when a file is not listed in `SHA256SUMS` or a
+  `--target` matches nothing. `install.sh` quotes and escapes the install folder in the menu entry's `Exec=` line;
+  `install.ps1` keeps `%VAR%` entries of the user PATH unexpanded.
+
+- `verify_container.py` ends each finding with factum's code for it, in square brackets, and reads a signature's
+  certificates as of the signing time it states: a good signature by a certificate that has expired since is a warning
+  (`x509_expired`), a chain not valid at signing fails, and a `.sig` without its `.cer` is a warning. A signature counts
+  by the same rules as in `verify.py` (exactly one good signature, a key expired since is a warning, every trust line
+  counts, the primary key's fingerprint), and it needs gpg 2.1 or newer to check one. Every `replacedBy` is a warning
+  naming the pair: only factum can compare it with the case log
+
+### Fixed
+- `verify_container.py` reaches the verdicts of factum's own check: it reads the ZIP itself, so bytes after the last
+  complete state are a warning only when they are an interrupted addition and otherwise fail, like a directory that
+  holds more or less than its count or a member whose local header differs; a bad CRC-32 is a finding beside the hashes
+  instead of a traceback or a stop; a closed current state's root signatures are compared with the kept ones; `history/0`
+  fails; a crafted history number no longer exhausts memory; IRIs decode `\u` escapes and refuse what Turtle forbids
+- Containers: a stored file in a compression method nobody reads fails verification instead of "not checked", which
+  had let a swapped file in a signed container pass with a warning; `not_checked` stays for other tools' containers
+- Containers: whether a container is factum's is told by its layout, not by `version.txt`, which is not signed: a
+  missing or other `version.txt` or a missing `container.description` fails, the file is still checked, also against
+  the case log, and naming another tool no longer turns off the signature checks. A file that names a container of
+  the log but cannot be compared with it fails
+- Containers: members under `factum/history/` outside a close that was read fail, as does a signature at the root of an
+  open state, so a close can no longer be hidden behind a number or left out of the directory
+- Containers: a file is checked as what the log expects of it: Verify on a container, or a file at a place the log
+  records, must be that container, whatever uuid it names or none; `container.description` must agree with the ZIP
+  comment and the signed metadata; `not_signed` is a warning in every format, so an unsigned file is never called good;
+  the root `information.turtle.hashes` of a closed state is checked; a secondary store that cannot be read fails
+- Containers: crafted files can no longer stop verification: a stray `>` in Turtle hung the parser, a search through
+  end records has a limit linear in the file, an ImageStream index that repeats a chunk is damage, a signature or
+  chain is at most 4 MiB, and metadata has a limit of 128 times what the file stores of the members read, from 4 GiB
+  to 16 GiB, in factum and in `verify_container.py`, counted as a parse holds it, so a long subject or prefix repeated in
+  a short file stops there too. A check that runs out stops with one `too_large` finding, which does not mean alteration
+  and is no `log_mismatch`
+- `verify_container.py` prints its own SHA-256 when it starts, and the container's README says to run a trusted copy or
+  to compare that hash with `factum --version` or the release notes; neither is signed. It ends with `Result: NOT SIGNED`
+  rather than `OK` when the state it checked is not signed; the exit code stays 0
+- Containers: a source is opened without following a link or waiting on a FIFO, must still be the regular file of the
+  same size that was listed (otherwise it is reported as changed, not added), and is read no further than one byte
+  past that size
+- Containers: a link to the container inside an added folder is recorded as a link, not dropped, and a hard link to it
+  is listed as not added; files are no longer resolved one by one to find the container
+- Containers: paths and link targets that are not valid Unicode keep their bytes beside the text
+  (`factum:sourcePathRaw`, `factum:symlinkTargetRaw`, in the log `source_raw`, `base_path_raw`), and Add Again uses
+  them, so such sources can be added again; a Windows name with an unpaired surrogate keeps a raw form too; change
+  times before 1970 are no longer recorded as 1970
+- Containers: a mount point that is not UTF-8 no longer leaves every mount of the add unknown; it is matched by its
+  bytes and recorded with them (`factum:mountPointRaw`). A mount hidden by another is no longer reported
+- Containers: superblock options are recorded beside the mount's own (`factum:superOptions`; the source line shows
+  them when they say `ro` and the mount does not) and read-only counts if either says so; the image behind a partition of a loop device is recorded
+- Containers: on Windows a mount folder among the sources no longer decides the volume of its siblings; adding many
+  files no longer reads sysfs once per file
+- Containers: an X.509 signature no longer fails once its certificate has expired: every certificate of its chain
+  must have been valid at the time the signature states, and verification warns (`x509_expired`) that this rests on
+  the time the signer stated. A signature by another certificate than the first one stored in the container is a
+  failure, even when it chains to a trusted root, and a signature with no stored certificate a warning; this finds an
+  inconsistent file, not someone who replaces both. Only the comparison with the certificate recorded in the case
+  log, a failure too, defends against that
+- Containers: IRIs that do not fit the Turtle grammar are %-encoded when written and refused when read, and `\u`
+  escapes in IRIs are decoded
+- Containers: reading a member checks it against the CRC-32 of the central directory. In verification a mismatch is a
+  failure of its own, next to the hash results, and all other checks go on; the re-check before a close goes by the
+  hashes. A container whose version, description or metadata differs from its CRC-32 is not opened, and the message
+  says so and points to Verify Container
+- Containers: a central directory with entries behind its count (invisible to factum, read by other ZIP tools) is
+  refused, and a member whose local header differs from the central directory in name, method or flags fails
+  verification; verifying reports such bytes after the last state as a failure, not as an interrupted addition
+- Containers: a member keeps the time it was written; each later state rewrote the times of all earlier members
+- Opening a container for writing no longer cuts anything off after a read error, and refuses when the bytes after the
+  newest state could be more than an interrupted addition (a complete central directory that cannot be read, bytes no
+  crash of the writer leaves, an end before the state the case log records); an interrupted member is no longer taken
+  for a finished empty one and its content read as ZIP headers
+- `factum --verify <id>` and the lookup by name no longer stop at a case row that cannot be read; it is skipped by
+  name (and reported) and still reachable by id
+- IOC extraction: domains and emails with non-ASCII letters (`münchen.de`) are found; a URL keeps its final `/` and
+  loses trailing punctuation and an unbalanced `)`/`]`; SHA-512 hashes are found; real TLDs such as `.zip`, `.mov`,
+  `.app`, `.sh`, `.py` are no longer taken for file names; domains, emails, hashes and the scheme and host of URLs are
+  lowercased, so `Evil.COM` and `evil.com` are one IOC (IOCs stored by earlier versions are matched regardless of case)
+- A case or evidence item and its log entry are now written in one transaction, so a crash while signing can no
+  longer leave a row without its log event; the logged ids are unchanged
+- A case file number already used by an open case is refused, when creating a case and when editing one (archived cases
+  may share it)
+- A correction chain that loops in a tampered database gives an error instead of hanging
+- The images of one note version may add up to 50 MB; older notes over it can be corrected without adding images
+- `page#section` in a URL, `a#b` and `&#38;` no longer create tags in new notes; existing notes keep their tags
+- Tag and label suggestions come from the current case only
+- A tag such as `#İZMİR` no longer crashes the suggestion list
+- A signature made before its key expired is valid with a warning (`key_expired`) instead of invalid, in factum and in
+  `verify.py`; one made after the expiry is invalid. gpg gives no trust level for an expired key, so it counts as
+  trusted if it is ultimately trusted, or if only its signing subkey expired and the primary key is valid. An expired
+  primary key that was trusted only through certification by another key (a colleague's key you signed) still fails,
+  now as `key_untrusted`, not as an invalid signature
+- Keys with a certify-only primary key and a signing subkey can be selected; expired and revoked keys can no longer be
+  selected. A remembered key that expired or was revoked stays active and listed, so signing is still refused with an
+  error, never silently unsigned
+- Checking a tampered signature that holds a symmetric-encrypted message no longer opens a passphrase prompt
+- A malformed database cell (invalid UTF-8, wrong type) gives a FAIL for its row instead of stopping `--verify`
+- A database made by a newer factum says so and asks for an upgrade, instead of calling itself older
+- A seal file that cannot be read or parsed is reported as a warning naming the file instead of being skipped
+  silently, and a corrupt or incomplete signed copy (`.asc`) no longer hides the unsigned seal file (`.json`) it
+  replaces
+- Seal files of a case whose file number contains U+2028, U+2029 or U+0085 are no longer ignored by the verifier
+- Seal files are written to a temporary file and renamed, so a crash leaves no half-written seal
+- Very long case file numbers (e.g. 80 CJK characters) no longer fail to seal with "File name too long": the file
+  name is shortened, with a short hash keeping it unique
+- A container close signs only the state that was re-checked: it compares under the volume lock, and asks for a new
+  re-check when another process changed the container since
+- An addition or a close is refused when the container was closed meanwhile; Close as Damaged, Close Without File and
+  Reopen fail with "in use" while another process holds the file, and go through when it cannot be reached at all (a
+  dead mount)
+- Opening a container goes by the log as it is once the lock is held, so a late signature can no longer drop an
+  addition that another process committed while it waited
+- A `factum:replacedBy` that no addition in the case log records (or the reverse) fails Verify Container, so a forged
+  replacement no longer turns a failed hash into a warning
+- The container list says signed only when the newest close is, as the container's own view does: a late signature of
+  an older close no longer counts
+- Comparing a container with the case log no longer takes seconds with many folders (20,000: 4.9 s to 0.11 s, debug
+  build); Add Again plans and replaced files are looked up by ARN
+- A new evidence item with a container is two entries in one transaction, both signed before it: a failure leaves no
+  entry and no file, and trying again makes no duplicate
+- A close signs the stored `information.turtle` bytes, not a new serialization, so the closed state and the root stay
+  the same bytes whatever wrote them
+- A read error during the re-check that repeats while the start or end of the file reads (EIO from a bad sector)
+  counts as damage, so Close as Damaged and Add Again are offered; permissions, removed media and interrupted calls
+  stay retryable
+- A CRC-32 fault of a container's directory stops additions and signatures, even when the hashes match; Close as
+  Damaged works then too, writes nothing, and logs `directory_fault` so the log does not claim lost files, nor
+  undamaged ones it never reached (`unchecked_files`)
+- A hostile `factum/history/0/` member is a failure in Verify Container instead of a crash, a crafted high close
+  number no longer exhausts memory (one finding per gap) and a container cannot be closed past the highest number
+- `verify.py` fails on ZIP member names read differently by other tools: repeated names (Python reads the last copy,
+  unzip the first), absolute names, `..`, a backslash, names differing only in case
+- A table row taller than a page in the PDF report (a long evidence description, a long container path) continues on
+  the next page instead of running off the bottom and being lost, and a table header no longer stays alone
+- Characters neither PDF font has are drawn as a visible `�`, and copy and search give the real character (glyph 0
+  was mapped to the first such character in the whole report); the export warns about them and says the HTML report
+  shows them
+- Reports show the text of superseded note versions in the integrity appendix, with their time and signature, and a
+  note in the timeline is flagged when any of its versions failed verification, not only the newest
+- The Markdown report puts bare URLs, autolinks, e-mail addresses and link text equal to its address in code spans:
+  GitHub-style viewers made them clickable, which the report says links never are
+- An export that fails leaves no files behind: all are written to a temporary folder in the target folder and renamed
+  at the end, so reports no longer stay behind when the bundle fails
+- Export file names are shortened: 80 CJK characters in a case file number failed with "file name too long"
+- Export builds only the requested formats, so PDF or Markdown alone no longer build the HTML with its embedded images
+- Companion: selecting a case sends none of its content during the 30 seconds it can be opted out in; its history is
+  enriched only after its first successful pass
+- Companion: switching it off for a case, deleting the case, changing the settings and closing the program take effect
+  after the model call in hand instead of after the whole pass or backlog batch; a pass ends at once when the endpoint
+  stopped answering during its enrichment, instead of waiting out two more timeouts
+- Companion: related older entries are found when the newest entries are the best matches
+- Companion: new entries a later full pass had to cut for space are left to later passes instead of being marked as
+  seen; a case's first pass stays an overview, so what it cuts counts as seen
+- Companion: the long reasoning of a thinking model is shortened to what fits the second call, leaving it room to think;
+  the call failed with HTTP 400
+- Companion: token estimates follow the server's counts more carefully, so an identifier-heavy prompt no longer overflows
+  the window after a prose-heavy one
+- Companion: a huge or malformed model reply can no longer hang the repair of its JSON
+- Ask: large pinned notes no longer crowd out the retrieved entries or end in "Not in the case log." without asking the
+  model: they are shortened when they do not fit, half of the room is kept for the retrieved entries, and an excerpt
+  that does not fit no longer stops the ones after it. Ask uses the model's window and token ratio the companion found
+- GUI: a background task that dies no longer leaves its job hanging (the verify progress forever, additions blocked for
+  the session): it is reported as a failure and the job ends
+- GUI: a non-ASCII hash in a tampered log no longer panics the container view on every frame
+- GUI: a re-check or a container verification counts as cancelled only when stopping it ended it, not when a read error
+  did after Cancel or a path holds the word
+- Close as Damaged refuses a re-check of another state or another container
+- A container whose file holds no state as new as the log says is refused saying so, and that a copy holding that state
+  can be put back with Locate…
+- `verify.py` ends in failures and a verdict instead of a traceback on a bundle it cannot read: no ZIP, a member that
+  fails its CRC (named, the rest is still checked), a manifest or signed text that is not UTF-8, or a `case.json` that
+  is not JSON or of the wrong shape
+- A seal that changed after the verification is no longer signed: signing on a verification's report compares the
+  seal with what was verified and asks to verify again
+- GUI: Sign, Sign All Unsigned, Sign Seal and Export verify the case on a worker with the progress dialog, instead of
+  freezing the window for a gpg run per signature; signing follows on the GUI thread when the verification passed
+- Sign All Unsigned that stops part way says so ("Signed 5 of 20; stopped: ..."), in the GUI and the CLI, instead of
+  "nothing was signed"
+- GUI: a case whose id was reused after a permanent delete no longer shows the deleted case's verification status
+- GUI: a container with a directory fault offers Close as Damaged, also when an addition is refused for it and on the
+  way of Close and Archive, which no longer stops there; the faults go into the log. A damaged close with no file to
+  read back says the files were not checked
+- GUI: searching waits until the field rests for 200 ms and reuses the case tree and the built cards, so a long log no
+  longer re-reads and re-parses everything on every keystroke
+- GUI: a container event that cannot be read no longer stops the whole window from filling; it is logged and the
+  case shows without those containers
+- GUI: Ask shows only the answer to the newest question, and the question field is read-only while it runs
+- GUI: after a correction the focus moves to the new version, so P pins the note you see
+- GUI: the Case menu acts on the case it shows, and no longer panics when the selection went away
+- GUI: archiving or deleting evidence clears the selection only when it still points there and the call worked
+- GUI: a signing key changed on the command line is picked up while the window is open
+- GUI: Locate and Close Without File wait for a running addition or re-check, and so does archiving for a re-check
+- GUI: quitting with a running addition or re-check, a verification for a signature or an export, a note being written
+  or typed text in an open dialog asks once ("Quit anyway?", with the reason). Confirmed, a running addition is
+  cancelled and the window closes after its rewind; a finished addition is logged before the window closes
+
 ## [2.7.1] - 2026-10-29
 
 ### Fixed

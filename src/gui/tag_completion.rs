@@ -46,7 +46,7 @@ fn take_key(ui: &Ui, key: Key) -> usize {
 
 impl TagCompletion {
     /// Shows `field` (the note field, with id `id`) and the list for the #tag before the cursor.
-    pub fn show(&mut self, ui: &mut Ui, db: &Db, field: TextEdit<'_>, id: Id) -> egui::Response {
+    pub fn show(&mut self, ui: &mut Ui, db: &Db, case_id: Option<i64>, field: TextEdit<'_>, id: Id) -> egui::Response {
         let mut keys = Keys::default();
         if self.open && ui.memory(|m| m.has_focus(id)) {
             keys.down = take_key(ui, Key::ArrowDown);
@@ -95,7 +95,9 @@ impl TagCompletion {
             self.selected_for = typed.clone();
         }
         let known = self.known.get_or_insert_with(|| {
-            crate::tags::tag_counts(&db.conn)
+            // no case selected: nothing to offer
+            case_id
+                .map_or(Ok(Vec::new()), |case_id| crate::tags::tag_counts(&db.conn, case_id))
                 .inspect_err(|e| log::error!("Failed to load the tags in use: {e}"))
                 .unwrap_or_default()
                 .into_iter()

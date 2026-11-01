@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 git rev-parse -q --verify "refs/tags/v$version" >/dev/null && { echo "tag v$version exists already" >&2; exit 1; }
 grep -q '^## \[Unreleased\]' CHANGELOG.md || { echo "CHANGELOG.md has no '## [Unreleased]' section" >&2; exit 1; }
 
+# needs GNU sed (the "0,/re/" address); run it on Linux
 sed -i.bak "0,/^version = \".*\"/s//version = \"$version\"/" Cargo.toml && rm Cargo.toml.bak
 sed -i.bak "s/^## \[Unreleased\]/## [Unreleased]\n\n## [$version] - $(date -u +%Y-%m-%d)/" CHANGELOG.md && rm CHANGELOG.md.bak
 cargo update --workspace --quiet

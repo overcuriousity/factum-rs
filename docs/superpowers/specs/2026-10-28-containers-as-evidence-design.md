@@ -172,9 +172,14 @@ to the builder, as long as pyaff4 opens the result and the full original path ca
 With every add, factum records the mount the chosen sources lie on, so the log and the container say which device,
 file system and options the files were read through, and, where it can be found, which image file.
 
-- **Linux**: from `/proc/self/mountinfo`, the mount containing the base path (longest mount point prefix): mount
-  point, source device, file system type, mount options. For a loop device (`/dev/loopN`), the backing file from
-  `/sys/block/loopN/loop/backing_file`. For a device-mapper or NBD device, the device only.
+- **Linux**: from `/proc/self/mountinfo`, the mount containing the base path (longest mount point prefix, among the
+  mounts a path can reach: one with a mount on top of it, or below a folder mounted over later, is left out): mount
+  point, source device, file system type, mount options and superblock options. Read-only when either set says
+  `ro`; the source line names the superblock options only when they say `ro` and the mount's do not, the log and the
+  container always have them. A mount point is matched by its bytes; one that is not UTF-8 is recorded as text with U+FFFD and with its
+  bytes in Base64. For a loop device (`/dev/loopN`) or a partition of one (`/dev/loopNpM`), the backing file from
+  `/sys/class/block/<device>/loop/backing_file` of the whole device. For a device-mapper or NBD device, the device
+  only.
   For xmount and similar (image → FUSE mount → loop device → mounted file system), the backing file lies on a FUSE
   mount; that mount is recorded too (its mount point, source and type as `mountinfo` shows them), which usually
   names the tool and often the image. Going further is not required.
@@ -189,9 +194,14 @@ the add proceeds and records that the mount is unknown.
 
 Where it goes:
 - the `container_files_added` payload gets `sources`: a list of
-  `{mount_point, device, fs_type, options, read_only, image, volume_serial, volume_label, volume_guid}` (fields
-  absent where the platform does not give them);
-- the container's Add task (`aff4l:LogicalAcquisitionTask`) gets the same facts as factum properties;
+  `{mount_point, mount_point_raw, device, fs_type, options, super_options, read_only, image, volume_serial,
+  volume_label, volume_guid}` (fields absent where the platform does not give them; `mount_point_raw` only for a
+  mount point `mount_point` cannot hold, `super_options` not in earlier entries);
+- the payload has `base_path_raw` beside `base_path` and each file `source_raw` beside `source` when the text cannot
+  hold the path: Base64 of its bytes, which Add Again uses. Without them (all plain paths, all earlier entries) the
+  text is the path;
+- the container's Add task (`aff4l:LogicalAcquisitionTask`) gets the same facts as factum properties (among them
+  `factum:mountOptions`, `factum:superOptions`, `factum:mountPointRaw`);
 - the log text stays as today; the evidence view shows the source line per add (4.2);
 - reports show it with each add if the existing layout has a place for adds, else with the container.
 
@@ -225,6 +235,20 @@ logged.
   - **Close as Damaged**: a logged `container_closed` with `damaged: [paths]` and no signatures; the container shows
     "closed · damaged". Reopen works as for any closed container.
   - **Cancel**: the container stays open; the next Close re-checks again.
+- A read error counts as a mismatch at once when it is about the content (invalid data, a missing member, an early
+  end), and otherwise when it stays on a second attempt while the start or the end of the file still reads from the
+  disk (EIO from a bad sector). Permission errors, interrupted calls, locks, timeouts and devices or shares that went
+  away, and an EIO for both ends (a removed drive), only stop the check: nothing is logged and Close can be tried
+  again. An open that fails with an I/O error while the file can still be stat'ed counts with the faults of the
+  directory, as "could not be opened"; any other failed open only stops the check.
+- A close signs the re-checked state only: under the volume lock it compares the logged end, the files and the end of
+  the volume with what the re-check read, and asks for a new re-check when they differ. It signs the stored bytes of
+  the root `information.turtle`, so that closed state and root stay the same bytes.
+- A fault of the directory (a metadata member or, with matching hashes, a file that differs from the directory's
+  CRC-32; a directory that cannot be read) means no addition and no signature. The re-check returns it apart from the
+  mismatches, and the only way to close is Close as Damaged, with `damaged: []` and `directory_fault: [...]` when no
+  file failed: the log text says "no file found damaged", or "files not checked" with `unchecked_files: n` when the
+  re-check ended before them (metadata that cannot be read), whether any were due or not. Nothing is written to the file.
 - Verify Container… reports a replaced copy as a warning (naming the replacement) and an unreplaced mismatch as a
   fail, as for any stream today.
 - Closing with nothing added since the last close re-checks nothing (`files: 0`).
@@ -235,8 +259,10 @@ logged.
 `factum/README.txt` inside each container is written at creation (and rewritten at each close) with two added
 lines: the factum version that wrote the container, and the SHA-256 of the `verify_container.py` it carries, with
 the address of the same script on GitHub for that version
-(`https://github.com/overcuriousity/factum-rs/blob/v<version>/src/container/verify_container.py`). It tells the
-recipient to compare the hash before running the script. Whether the README is rewritten at close or only written at
+(`https://github.com/overcuriousity/factum-rs/blob/v<version>/src/container/verify_container.py`). Neither the README
+nor the script is signed, so the hash it names is worth no more than the README: it tells the recipient to run a copy
+they trust, or to compare the hash the script prints when it starts with `factum --version` or the release notes, which
+works without a network. Whether the README is rewritten at close or only written at
 creation is up to the builder, given the append-only container layout; it must name the script actually in the
 container.
 

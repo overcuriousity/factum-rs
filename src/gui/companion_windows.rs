@@ -23,6 +23,8 @@ pub enum CompanionWindow {
         answer: Option<Answer>,
         error: Option<String>,
         running: bool,
+        /// the newest question asked here, by its number: only its result is shown
+        request: u64,
         open: bool,
     },
 }
@@ -53,6 +55,7 @@ impl CompanionWindow {
                 error,
                 running,
                 open,
+                ..
             } => {
                 let id = Id::unique(("companion-ask", *case_id));
                 report_window(ctx, id, "Ask the Companion", open, [560.0, 360.0], 0.0, |ui| {
@@ -161,8 +164,11 @@ fn ask_body(
                 };
                 let field = ui
                     .with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        // read-only while running: the answer belongs to the text the field shows
+                        let mut shown = question.as_str();
+                        let text: &mut dyn egui::TextBuffer = if running { &mut shown } else { &mut *question };
                         ui.add(
-                            TextEdit::singleline(question)
+                            TextEdit::singleline(text)
                                 .hint_text("Ask about this case")
                                 .desired_width(f32::INFINITY),
                         )

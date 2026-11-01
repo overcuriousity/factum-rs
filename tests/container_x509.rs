@@ -106,3 +106,73 @@ fn signing_with_the_root_only_in_a_chain_file() {
     let list = std::fs::read_to_string(home.path().join("trustlist.txt")).unwrap();
     assert_eq!(list.lines().count(), 1);
 }
+
+fn expired_home() -> Option<(GpgsmHome, Gpgsm)> {
+    let Some(home) = GpgsmHome::with_expired_leaf() else {
+        eprintln!("skipped: no gpgsm, or an openssl without -not_before");
+        return None;
+    };
+    home.trusted();
+    let gpgsm = Gpgsm::new(Some(home.path()));
+    Some((home, gpgsm))
+}
+
+#[test]
+fn a_signature_by_a_certificate_that_has_expired_since_is_good() {
+    let Some((home, gpgsm)) = expired_home() else { return };
+    let signature = home.sign_while_valid(b"the turtle");
+    let check = gpgsm.verify_detached(&signature, b"the turtle");
+    assert!(
+        check.valid && check.trusted && check.valid_at_signing && check.expired,
+        "{check:?}"
+    );
+    assert!(check.status.contains("has expired"), "{}", check.status);
+    assert_eq!(check.fingerprint.as_deref(), Some(home.leaf_fingerprint.as_str()));
+    assert!(
+        check.signer_subject.as_deref().unwrap_or("").contains("Examiner One"),
+        "{check:?}"
+    );
+    assert!(!gpgsm.verify_detached(&signature, b"other data").valid);
+}
+
+#[test]
+fn a_signature_made_after_the_certificate_expired_is_not_valid_at_signing() {
+    let Some((home, gpgsm)) = expired_home() else { return };
+    // gpgsm refuses to sign with it, openssl does not
+    std::fs::write(home.file("data"), b"data").unwrap();
+    let output = std::process::Command::new("openssl")
+        .args(["cms", "-sign", "-binary", "-outform", "PEM", "-md", "sha256"])
+        .args([
+            "-signer", "leaf.pem", "-inkey", "leaf.key", "-in", "data", "-out", "late.pem",
+        ])
+        .current_dir(home.files.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let signature = std::fs::read_to_string(home.file("late.pem")).unwrap();
+    let check = gpgsm.verify_detached(&signature, b"data");
+    assert!(check.valid && !check.valid_at_signing, "{check:?}");
+}
+
+#[test]
+fn an_intermediate_that_had_expired_when_it_signed_is_not_valid_at_signing() {
+    let Some((home, gpgsm)) = expired_home() else { return };
+    let signature = home.sign_below_expired_intermediate(b"data");
+    let check = gpgsm.verify_detached(&signature, b"data");
+    assert!(check.valid && check.trusted && check.expired, "{check:?}");
+    assert!(!check.valid_at_signing, "{check:?}");
+    assert_eq!(check.root_fingerprint.as_deref(), Some(home.root_fingerprint.as_str()));
+}
+
+#[test]
+fn the_check_names_the_certificate_and_the_chain_starts_with_it() {
+    let Some((home, gpgsm)) = home() else { return };
+    home.trusted();
+    let (signature, chain) = gpgsm.sign_with_chain(&home.leaf_fingerprint, b"data", &[]).unwrap();
+    let check = gpgsm.verify_detached(&signature, b"data");
+    assert_eq!(check.fingerprint.as_deref(), Some(home.leaf_fingerprint.as_str()));
+    assert_eq!(
+        factum::container::x509::first_fingerprint(&chain).as_deref(),
+        Some(home.leaf_fingerprint.as_str())
+    );
+}

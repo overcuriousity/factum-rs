@@ -109,6 +109,11 @@ fn theme_label(theme: &str) -> &'static str {
 }
 
 impl Wizard {
+    /// The text of the fields, in one string (see [`Dialog::typed_text`](super::dialogs::Dialog::typed_text)).
+    pub fn typed_text(&self) -> String {
+        format!("{}\0{}", self.seal_folder, self.companion.typed_text())
+    }
+
     pub fn new(start: WizardStart) -> Self {
         let mut companion = CompanionSettingsDialog::new(&start.companion, start.db_path);
         // the wizard turns the companion on or off with its own choice
@@ -201,10 +206,10 @@ impl Wizard {
             Step::SealFolder if self.seal_env.is_none() => {
                 // the default folder is created with the first seal; another one has to exist
                 let folder = self.chosen_seal_folder();
-                if folder.is_empty() || std::path::Path::new(&folder).is_dir() {
+                if folder.is_empty() {
                     Ok(())
                 } else {
-                    Err("The folder does not exist.".into())
+                    super::dialogs::check_seal_folder(&folder)
                 }
             }
             _ => Ok(()),

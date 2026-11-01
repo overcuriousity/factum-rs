@@ -15,7 +15,7 @@ use super::prompts::{
 use super::questions::{PassKind, Question, Rating};
 use super::retrieval::{RetrievalQuery, fts_query, retrieve};
 use super::store::CompanionDb;
-use super::tokens::{BudgetError, CUT_MARKER, Cut, Packed, Section, TextKind, budget, pack};
+use super::tokens::{BudgetError, CUT_MARKER, Cut, Packed, Section, TextKind, budget, pack, truncate};
 use super::validate::{OutputQuestion, ValidationContext, parse_pass_output, validate};
 use crate::Factum;
 use crate::cases::Case;
@@ -34,6 +34,7 @@ const OUTPUT_RESERVE: usize = 1500;
 const TIMEOUT: Duration = Duration::from_secs(180);
 const NO_GOAL: &str = "No case goal has been set.";
 const NEW_ENTRIES: &str = "new entries";
+const TIMELINE: &str = "timeline";
 const RELATED: &str = "related";
 /// Rated examples of each kind in the prompt.
 const EXAMPLES: usize = 3;
@@ -70,7 +71,7 @@ pub struct PassSummary {
     pub withdrawn: usize,
     pub rephrased: usize,
     pub created: usize,
-    /// the newest entry the pass has read
+    /// where the case's `last_seen_entry_id` now stands: entries after it get a later pass
     pub entries_to: i64,
     /// one reason per item validation discarded
     pub dropped: Vec<String>,
@@ -85,6 +86,8 @@ pub enum PassError {
     Db(FactumError),
     Archived,
     NothingNew,
+    /// opt-out, delete, a settings change or shutdown ended the pass
+    Cancelled,
 }
 
 impl PassError {
@@ -108,13 +111,17 @@ impl fmt::Display for PassError {
             PassError::Db(e) => f.write_str(&e.message),
             PassError::Archived => f.write_str("case is archived"),
             PassError::NothingNew => f.write_str("nothing new"),
+            PassError::Cancelled => f.write_str("cancelled"),
         }
     }
 }
 
 impl From<LlmError> for PassError {
     fn from(e: LlmError) -> Self {
-        PassError::Llm(e)
+        match e {
+            LlmError::Cancelled => PassError::Cancelled,
+            e => PassError::Llm(e),
+        }
     }
 }
 
@@ -176,8 +183,8 @@ pub(super) fn load_case(case_db: &Db, case_id: i64) -> Result<CaseData> {
     })
 }
 
-/// Runs one pass over the case. On any error the pass row is closed as failed (skipped for an archived case or
-/// nothing new) and the ledger is left as it was.
+/// Runs one pass over the case. On any error the pass row is closed as failed (skipped for an archived case, nothing
+/// new or a cancelled pass) and the ledger is left as it was.
 pub fn run_pass(
     case_db: &Db,
     cdb: &CompanionDb,
@@ -190,7 +197,7 @@ pub fn run_pass(
     let result = reflect(case_db, cdb, client, case_id, kind, pass_id, &mut log);
     if let Err(e) = &result {
         let status = match e {
-            PassError::Archived | PassError::NothingNew => "skipped",
+            PassError::Archived | PassError::NothingNew | PassError::Cancelled => "skipped",
             _ => {
                 log::warn!("companion pass {pass_id} on case {case_id} failed: {}", e.detail());
                 "failed"
@@ -248,6 +255,10 @@ fn reflect(
     if !unenriched.is_empty()
         && let Err(e) = enrich(case_db, cdb, client, case_id, &unenriched)
     {
+        // a dead endpoint would only be waited for twice more
+        if matches!(e, LlmError::Unreachable(_) | LlmError::Timeout | LlmError::Cancelled) {
+            return Err(e.into());
+        }
         log::warn!("companion enrichment failed, the pass goes on without it: {e}");
     }
 
@@ -279,9 +290,12 @@ fn reflect(
             packed.shortened
         );
     }
-    if kind == PassKind::Diff {
-        log.entries_to = covered_to(&new, &packed, last_seen);
-    }
+    log.entries_to = match kind {
+        PassKind::Diff => covered_to(&new, &packed, last_seen),
+        // a case's first timeline is an overview: what it cut counts as seen, and the history is enriched after it
+        PassKind::Full if last_seen > 0 && timeline_lost_new(&data.entries, &packed, last_seen) => last_seen,
+        PassKind::Full => log.entries_to,
+    };
 
     // the packed prompt is the first user turn of both calls, so a prompt cache can serve the second
     let reasoning = client.chat(&ChatRequest {
@@ -295,7 +309,13 @@ fn reflect(
     if reasoning.text.trim().is_empty() {
         return Err(PassError::Output("the reasoning is empty".into()));
     }
-    let output = match serialize(client, &packed.text, &reasoning.text, log) {
+    // without a count from the server the calibration has not moved since the prompt was packed
+    let prompt_tokens = reasoning.prompt_tokens.map_or(packed.tokens, |tokens| tokens as usize);
+    let shortened = reasoning_for_call_two(client, prompt_tokens, &reasoning.text);
+    if shortened != reasoning.text {
+        log::warn!("companion pass {pass_id}: the reasoning was shortened for space");
+    }
+    let output = match serialize(client, &packed.text, &shortened, log) {
         Err(PassError::Output(reason)) => {
             // the prompt as sent, with half of the related lines it kept; without any, a retry could not be smaller
             let mut retry = packed.sections;
@@ -314,11 +334,14 @@ fn reflect(
             }
             log::warn!("companion pass {pass_id}: {reason}; retrying with half the related entries");
             let smaller = pack(retry, room, &calibration)?;
-            serialize(client, &smaller.text, &reasoning.text, log)?
+            serialize(client, &smaller.text, &shortened, log)?
         }
         other => other?,
     };
 
+    if client.stopped() {
+        return Err(PassError::Cancelled);
+    }
     let resolved = cdb.resolved_questions(case_id)?;
     let minus = cdb.minus_examples()?;
     let existing: HashSet<i64> = data.created.keys().copied().collect();
@@ -400,6 +423,37 @@ fn covered_to(new: &[&Entry], packed: &Packed, last_seen: i64) -> i64 {
         .filter(|&id| id < first_cut.id)
         .max()
         .unwrap_or(last_seen)
+}
+
+/// A later full pass's timeline loses its oldest lines, so when one of those is a new entry the first new entry is
+/// gone (pinned ones are shown in their own section): `last_seen` stays, and diff passes cover the new entries.
+fn timeline_lost_new(entries: &[Entry], packed: &Packed, last_seen: i64) -> bool {
+    let dropped = packed
+        .cut
+        .iter()
+        .find(|(name, _)| *name == TIMELINE)
+        .map_or(0, |&(_, n)| n);
+    entries
+        .iter()
+        .filter(|e| !e.is_pinned)
+        .take(dropped)
+        .any(|e| e.id > last_seen)
+}
+
+/// The reasoning as far as it fits call two beside the prompt, the instruction and the answer: a thinking model's
+/// call one has more room than `OUTPUT_RESERVE`, and a request over the window is refused for good. For a thinking
+/// model a tenth of the window stays spare, as for the thinking allowance, and half of the rest is left to its
+/// thinking in call two, which `OUTPUT_RESERVE` alone would not hold.
+fn reasoning_for_call_two(client: &Client, prompt_tokens: usize, reasoning: &str) -> String {
+    let calibration = client.calibration();
+    let used = prompt_tokens + calibration.estimate(&serialize_instruction(), TextKind::Prose) + OUTPUT_RESERVE;
+    let window = client.window() as usize;
+    let room = if client.thinks() {
+        (window * 9 / 10).saturating_sub(used) / 2
+    } else {
+        window.saturating_sub(used)
+    };
+    truncate(reasoning, calibration.chars_for(room, TextKind::Prose))
 }
 
 /// Call two: the reasoning back to the model, a flat JSON object out. A cut-off, empty or unreadable answer is an
@@ -518,7 +572,7 @@ impl PromptInput<'_> {
                     }
                 })
                 .collect();
-            ("timeline", timeline)
+            (TIMELINE, timeline)
         } else {
             let lines = self
                 .new

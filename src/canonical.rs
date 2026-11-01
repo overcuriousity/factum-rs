@@ -89,7 +89,11 @@ pub fn compact_utc(timestamp: &str) -> String {
 
 /// Return the signed text of an OpenPGP clearsigned block without checking the signature.
 pub fn extract_clearsigned_text(block: &str) -> Option<String> {
-    let lines = crate::pystr::splitlines(block);
+    // only \n (gpg on Windows: \r\n) ends a line: canonical JSON keeps U+2028, U+0085, ... unescaped
+    let lines: Vec<&str> = block
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
     let start = lines
         .iter()
         .position(|line| *line == "-----BEGIN PGP SIGNED MESSAGE-----")?;
@@ -171,6 +175,16 @@ mod tests {
         assert_eq!(
             extract_clearsigned_text(&CLEARSIGNED.replace('\n', "\r\n")).unwrap(),
             "{\"a\":1}\n-----BEGIN PGP SIGNATURE----- inside the text"
+        );
+    }
+
+    #[test]
+    fn extract_clearsigned_text_keeps_unicode_line_separators() {
+        let block = CLEARSIGNED.replace("{\"a\":1}", "{\"a\":\"x\u{2028}y\u{85}z\u{2029}\"}");
+        assert!(
+            extract_clearsigned_text(&block)
+                .unwrap()
+                .starts_with("{\"a\":\"x\u{2028}y\u{85}z\u{2029}\"}\n")
         );
     }
 

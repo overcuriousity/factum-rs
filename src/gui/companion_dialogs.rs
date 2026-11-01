@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Align, Layout, RichText, TextEdit};
 
-use super::dialogs::{DialogResult, buttons, error_line, title};
+use super::dialogs::{DialogResult, buttons, error_line, multi_line, single_line, title};
 use super::theme::{self, SMALL_SIZE};
 use super::workers::Worker;
 use crate::companion::llm::{self, LlmError, ModelInfo};
@@ -69,6 +69,22 @@ fn reason(e: LlmError) -> String {
 }
 
 impl CompanionSettingsDialog {
+    /// The text of the fields, in one string (see [`Dialog::typed_text`](super::dialogs::Dialog::typed_text)).
+    pub fn typed_text(&self) -> String {
+        let draft = &self.draft;
+        [
+            &draft.endpoint_url,
+            &draft.api_key,
+            &draft.user_agent,
+            &draft.extra_headers,
+            &draft.model,
+            &draft.global_guideline,
+            &self.context_window,
+        ]
+        .map(String::as_str)
+        .join("\0")
+    }
+
     pub fn new(settings: &Settings, db_path: PathBuf) -> Self {
         let key_stored = !settings.api_key_from_env && !settings.api_key.is_empty();
         let mut draft = settings.clone();
@@ -157,11 +173,11 @@ impl CompanionSettingsDialog {
 
     /// Polls the workers and starts a listing once the connection fields have been left alone for a moment.
     fn update_models(&mut self, ctx: &egui::Context) {
-        if let Some(result) = self.models_worker.as_mut().and_then(Worker::poll) {
+        if let Some(result) = self.models_worker.as_mut().and_then(Worker::poll_result) {
             self.models_worker = None;
             self.take_models(result);
         }
-        if let Some(result) = self.probe_worker.as_mut().and_then(Worker::poll) {
+        if let Some(result) = self.probe_worker.as_mut().and_then(Worker::poll_result) {
             self.probe_worker = None;
             self.probe = Some(match &result {
                 Ok(models) => Ok(models.len()),
@@ -296,7 +312,7 @@ impl CompanionSettingsDialog {
 
         let url = Self::labelled(ui, "Endpoint URL", |ui| {
             ui.add(
-                TextEdit::singleline(&mut self.draft.endpoint_url)
+                single_line(&mut self.draft.endpoint_url)
                     .hint_text("e.g. http://10.0.0.5:8000/v1")
                     .desired_width(f32::INFINITY),
             )
@@ -317,7 +333,7 @@ impl CompanionSettingsDialog {
             let hint = if self.key_stored { "(stored)" } else { "" };
             let key = Self::labelled(ui, "API key", |ui| {
                 ui.add(
-                    TextEdit::singleline(&mut self.draft.api_key)
+                    single_line(&mut self.draft.api_key)
                         .password(true)
                         .hint_text(hint)
                         .desired_width(f32::INFINITY),
@@ -341,11 +357,11 @@ impl CompanionSettingsDialog {
             .default_open(!self.draft.user_agent.trim().is_empty() || !self.draft.extra_headers.trim().is_empty())
             .show(ui, |ui| {
                 Self::labelled(ui, "User-Agent", |ui| {
-                    ui.add(TextEdit::singleline(&mut self.draft.user_agent).desired_width(f32::INFINITY))
+                    ui.add(single_line(&mut self.draft.user_agent).desired_width(f32::INFINITY))
                 });
                 let headers = Self::labelled(ui, "Extra headers", |ui| {
                     ui.add(
-                        TextEdit::multiline(&mut self.draft.extra_headers)
+                        multi_line(&mut self.draft.extra_headers)
                             .code_editor()
                             .hint_text(r#"{"X-Header": "value"}"#)
                             .desired_rows(2)
@@ -388,7 +404,7 @@ impl CompanionSettingsDialog {
                 }
                 // the field takes the width the list button leaves
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.add(TextEdit::singleline(&mut self.draft.model).desired_width(f32::INFINITY))
+                    ui.add(single_line(&mut self.draft.model).desired_width(f32::INFINITY))
                         .labelled_by(model_label.id);
                 });
             });
@@ -397,7 +413,7 @@ impl CompanionSettingsDialog {
 
         Self::labelled(ui, "Context window", |ui| {
             ui.add(
-                TextEdit::singleline(&mut self.context_window)
+                single_line(&mut self.context_window)
                     .hint_text("tokens (empty: unknown)")
                     .desired_width(f32::INFINITY),
             )
@@ -442,7 +458,7 @@ impl CompanionSettingsDialog {
             None => {
                 let label = ui.label("Guideline");
                 ui.add(
-                    TextEdit::multiline(&mut self.draft.global_guideline)
+                    multi_line(&mut self.draft.global_guideline)
                         .desired_rows(6)
                         .desired_width(f32::INFINITY),
                 )

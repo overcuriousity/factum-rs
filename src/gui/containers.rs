@@ -12,6 +12,7 @@ use crate::container::FACTUM_NS;
 use crate::container::verify::{ContainerFormat, ContainerReport};
 use crate::container::volume::AddProgress;
 use crate::containers::{ContainerDetail, ContainerSummary, human_size};
+use crate::pystr::head;
 use crate::verifier::{Finding, Level};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,11 +76,11 @@ pub fn menu(
     }
 }
 
-/// The status bar while files are added: how far it got.
-pub fn add_status(progress: &AddProgress, name: &str) -> String {
+/// How far work on a container got, for the status bar.
+fn progress_status(verb: &str, progress: &AddProgress, name: &str) -> String {
     let load = |value: &std::sync::atomic::AtomicU64| value.load(std::sync::atomic::Ordering::Relaxed);
     format!(
-        "Adding to \"{name}\": {} / {} files · {} / {}",
+        "{verb} \"{name}\": {} / {} files · {} / {}",
         load(&progress.files),
         load(&progress.total_files),
         human_size(load(&progress.bytes)),
@@ -87,9 +88,14 @@ pub fn add_status(progress: &AddProgress, name: &str) -> String {
     )
 }
 
+/// The status bar while files are added.
+pub fn add_status(progress: &AddProgress, name: &str) -> String {
+    progress_status("Adding to", progress, name)
+}
+
 /// The status bar while a close re-checks the container.
 pub fn recheck_status(progress: &AddProgress, name: &str) -> String {
-    add_status(progress, name).replacen("Adding to", "Re-checking", 1)
+    progress_status("Re-checking", progress, name)
 }
 
 /// An xsd:dateTime as the view shows it: 2026-10-27 21:10:04 UTC.
@@ -267,12 +273,17 @@ pub fn container_section(
     for (entry_id, utc) in &detail.closed_without_file {
         history.push((*entry_id, utc.clone(), "closed without its file (missing)".into()));
     }
-    for (entry_id, utc, paths) in &detail.damaged_closes {
-        history.push((
-            *entry_id,
-            utc.clone(),
-            format!("closed as damaged · {} not matching", plural(paths.len(), "file")),
-        ));
+    for (entry_id, utc, paths, faults) in &detail.damaged_closes {
+        let reason = match (paths.len(), faults.len()) {
+            (files, 0) => format!("{} not matching", plural(files, "file")),
+            (0, faults) => plural(faults, "directory fault"),
+            (files, faults) => format!(
+                "{} not matching · {}",
+                plural(files, "file"),
+                plural(faults, "directory fault")
+            ),
+        };
+        history.push((*entry_id, utc.clone(), format!("closed as damaged · {reason}")));
     }
     for (entry_id, utc) in &detail.reopens {
         history.push((*entry_id, utc.clone(), "reopened".into()));
@@ -340,7 +351,8 @@ pub fn container_section(
                         ui.label(small(modified, p.muted)).on_hover_text("Last written");
                     });
                     if !file.sha256.is_empty() {
-                        let short = format!("{}…", &file.sha256[..16.min(file.sha256.len())]);
+                        // the log can hold anything here: cut between characters
+                        let short = format!("{}…", head(&file.sha256, 16));
                         ui.label(RichText::new(short).size(MONO_SIZE).monospace().color(p.muted))
                             .on_hover_text(format!(
                                 "SHA-256 {}\nSHA-1 {}\nMD5 {}",

@@ -11,8 +11,11 @@ pub const MAX_LINE_CHARS: usize = 2000;
 pub const DEFAULT_CONTEXT_WINDOW: u32 = 16_000;
 
 const PROSE_CHARS_PER_TOKEN: f64 = 3.0;
-/// Dense text (JSON, identifiers) needs more tokens: the prose ratio times this.
+/// Dense text (JSON, identifiers) needs more tokens: the prose ratio times this, at most `DENSE_CHARS_PER_TOKEN`.
 const DENSE_FACTOR: f64 = 0.8;
+const DENSE_CHARS_PER_TOKEN: f64 = 2.4;
+/// How far a higher observed ratio moves the calibration.
+const RISE_SHARE: f32 = 0.2;
 /// What a section shows once every line was cut.
 pub const CUT_MARKER: &str = "(cut for space)";
 const EMPTY_MARKER: &str = "(none)";
@@ -48,10 +51,16 @@ impl Default for Calibration {
 }
 
 impl Calibration {
-    /// Takes the observed ratio, clamped to 1.5..=5.0; an empty observation is ignored.
+    /// Takes the observed ratio, clamped to 1.5..=5.0: a lower one at once, a higher one only by `RISE_SHARE`, so one
+    /// prompt that was mostly prose does not overflow the next. An empty observation is ignored.
     pub fn observe(&mut self, chars: usize, tokens: u32) {
         if chars > 0 && tokens > 0 {
-            self.chars_per_token = (chars as f32 / tokens as f32).clamp(1.5, 5.0);
+            let observed = (chars as f32 / tokens as f32).clamp(1.5, 5.0);
+            self.chars_per_token = if observed < self.chars_per_token {
+                observed
+            } else {
+                self.chars_per_token + (observed - self.chars_per_token) * RISE_SHARE
+            };
         }
     }
 
@@ -60,16 +69,21 @@ impl Calibration {
         self.estimate_chars(text.chars().count(), kind)
     }
 
-    fn estimate_chars(&self, chars: usize, kind: TextKind) -> usize {
+    /// The characters that many tokens hold at this ratio, rounded down.
+    pub fn chars_for(&self, tokens: usize, kind: TextKind) -> usize {
+        (tokens as f64 * self.ratio(kind)) as usize
+    }
+
+    fn ratio(&self, kind: TextKind) -> f64 {
         let prose = f64::from(self.chars_per_token);
-        ceil_tokens(
-            chars,
-            if kind == TextKind::Dense {
-                prose * DENSE_FACTOR
-            } else {
-                prose
-            },
-        )
+        match kind {
+            TextKind::Prose => prose,
+            TextKind::Dense => (prose * DENSE_FACTOR).min(DENSE_CHARS_PER_TOKEN),
+        }
+    }
+
+    fn estimate_chars(&self, chars: usize, kind: TextKind) -> usize {
+        ceil_tokens(chars, self.ratio(kind))
     }
 }
 
@@ -351,6 +365,37 @@ mod tests {
     fn estimate_uses_kind_ratio() {
         assert_eq!(estimate_tokens(&"a".repeat(30), TextKind::Prose), 10);
         assert_eq!(estimate_tokens(&"a".repeat(24), TextKind::Dense), 10);
+    }
+
+    #[test]
+    fn dense_text_is_never_estimated_above_the_default_ratio() {
+        let cal = Calibration { chars_per_token: 5.0 };
+        assert_eq!(cal.estimate(&"a".repeat(240), TextKind::Dense), 100);
+        assert_eq!(cal.estimate(&"a".repeat(250), TextKind::Prose), 50);
+        let low = Calibration { chars_per_token: 2.0 };
+        assert_eq!(low.estimate(&"a".repeat(160), TextKind::Dense), 100);
+    }
+
+    #[test]
+    fn observations_fall_at_once_and_rise_by_a_share() {
+        let mut cal = Calibration::default();
+        cal.observe(200, 100);
+        assert_eq!(cal.chars_per_token, 2.0);
+        // one airy prompt: a fifth of the way up
+        cal.observe(500, 100);
+        assert!((cal.chars_per_token - 2.6).abs() < 1e-6);
+        cal.observe(0, 100);
+        cal.observe(100, 0);
+        assert!((cal.chars_per_token - 2.6).abs() < 1e-6);
+        cal.observe(100, 100);
+        assert_eq!(cal.chars_per_token, 1.5);
+    }
+
+    #[test]
+    fn chars_for_inverts_the_estimate() {
+        let cal = Calibration::default();
+        assert_eq!(cal.chars_for(100, TextKind::Prose), 300);
+        assert_eq!(cal.chars_for(100, TextKind::Dense), 240);
     }
 
     #[test]

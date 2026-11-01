@@ -3,18 +3,20 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use crate::cases::Case;
+use crate::config::expand_user;
+use crate::db::Cells;
 use crate::error::{FactumError, Result};
 use crate::evidence::Evidence;
 use crate::log_service::{entry_signed_payload, leaf_data};
 use crate::merkle::{self, MerkleAccumulator};
 use crate::notes::{Entry, parse_payload};
-use crate::seals::seal_payload;
+use crate::seals::{SEAL_DIR_SETTING, seal_payload};
 use crate::services::Factum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,6 +85,10 @@ pub struct SignatureCheck {
     pub username: Option<String>,
     pub trust: Option<String>,
     pub signature_timestamp: Option<String>,
+    /// gpg found the signing key expired; with `valid`, the signature was made before that
+    pub key_expired: bool,
+    /// the subkey that signed, when it is not the primary key in `fingerprint`
+    pub signing_subkey: Option<String>,
 }
 
 impl SignatureCheck {
@@ -128,6 +134,7 @@ pub enum SealSource {
 pub struct TreeHeadResult {
     pub source: SealSource,
     pub label: String,
+    pub case_file: Option<String>,
     pub tree_size: i64,
     pub root_hash: String,
     pub created_utc: Option<String>,
@@ -156,6 +163,8 @@ pub struct CaseReport {
     /// (fingerprint, username)
     pub signers: Vec<(String, Option<String>)>,
     pub newest_seal_size: Option<i64>,
+    /// the seal folder that was checked for external seal copies
+    pub seal_dir: PathBuf,
 }
 
 impl CaseReport {
@@ -173,6 +182,21 @@ impl CaseReport {
 }
 
 pub type LateSignatures = HashMap<(String, i64), (String, String)>;
+/// A row of late_signatures that could not be read as the schema says.
+struct MalformedLateSignature {
+    row_id: i64,
+    /// what it signs; None when that is what could not be read
+    target: Option<(String, i64)>,
+    problems: Vec<String>,
+}
+
+impl MalformedLateSignature {
+    fn findings(&self, reference: Ref) -> Vec<Finding> {
+        let what = format!("Late signature #{}", self.row_id);
+        Factum::malformed_findings(&what, &self.problems, reference)
+    }
+}
+
 pub type Progress<'p> = &'p mut dyn FnMut(usize, usize);
 
 /// Python's repr() of a JSON value as it appears in messages.
@@ -228,25 +252,63 @@ impl fmt::Display for IdKey {
 
 impl Factum<'_> {
     pub fn load_case_row(&self, case_id: i64) -> Result<Case> {
-        self.require_case(case_id)
+        Ok(self.load_case_tolerant(case_id)?.0)
     }
 
+    /// The case row and what could not be read of it.
+    fn load_case_tolerant(&self, case_id: i64) -> Result<(Case, Vec<String>)> {
+        self.db
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM cases WHERE id = ?", Case::COLUMNS),
+                [case_id],
+                |row| Ok(Cells::tolerant(row, Case::read)),
+            )
+            .optional()?
+            .ok_or_else(|| FactumError::case_not_found(format!("Case #{case_id} does not exist.")))
+    }
+
+    /// Every entry of the case; a cell that cannot be read is kept as far as it can be and named in `malformed`.
     pub fn load_entries(&self, case_id: i64) -> Result<Vec<Entry>> {
         let mut statement = self.db.conn.prepare(&format!(
             "SELECT {} FROM entries WHERE case_id = ? ORDER BY leaf_index",
             Entry::COLUMNS
         ))?;
-        let rows = statement.query_map([case_id], Entry::from_row)?;
+        let rows = statement.query_map([case_id], Entry::from_row_tolerant)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn late_signatures(&self) -> Result<LateSignatures> {
+        Ok(self.late_signatures_tolerant()?.0)
+    }
+
+    fn late_signatures_tolerant(&self) -> Result<(LateSignatures, Vec<MalformedLateSignature>)> {
         let mut statement = self
             .db
             .conn
-            .prepare("SELECT target, target_id, signature, signed_utc FROM late_signatures")?;
-        let rows = statement.query_map([], |row| Ok(((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?))))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+            .prepare("SELECT id, target, target_id, signature, signed_utc FROM late_signatures")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                Cells::tolerant(row, |cells| (cells.text(1), cells.int(2))),
+                Cells::tolerant(row, |cells| (cells.int(0), cells.text(3), cells.text(4))),
+            ))
+        })?;
+        let mut signatures = LateSignatures::new();
+        let mut malformed = Vec::new();
+        for row in rows {
+            let ((target, target_problems), ((row_id, signature, signed_utc), mut problems)) = row?;
+            let target_known = target_problems.is_empty();
+            problems.extend(target_problems);
+            if !problems.is_empty() {
+                malformed.push(MalformedLateSignature {
+                    row_id,
+                    target: target_known.then(|| target.clone()),
+                    problems,
+                });
+            }
+            signatures.insert(target, (signature, signed_utc));
+        }
+        Ok((signatures, malformed))
     }
 
     pub fn check_signature(
@@ -279,6 +341,8 @@ impl Factum<'_> {
             username: result.username,
             trust: result.trust,
             signature_timestamp: result.signature_timestamp,
+            key_expired: result.key_expired,
+            signing_subkey: result.signing_subkey,
         }
     }
 
@@ -310,24 +374,45 @@ impl Factum<'_> {
             );
         }
         if !check.trusted {
-            return finding(
-                Level::Fail,
-                "key_untrusted",
+            // gpg names no trust level for an expired key
+            let message = if check.key_expired {
+                format!(
+                    "{what}: signing key {} has expired and is not trusted as far as gpg can tell.",
+                    or_none(&check.fingerprint)
+                )
+            } else {
                 format!(
                     "{what}: signing key {} is not trusted ({}).",
                     or_none(&check.fingerprint),
                     or_none(&check.trust)
-                ),
-            );
+                )
+            };
+            return finding(Level::Fail, "key_untrusted", message);
+        }
+        let mut findings = Vec::new();
+        if check.key_expired {
+            findings.extend(finding(
+                Level::Warn,
+                "key_expired",
+                format!("{what}: signing key {} has expired since.", or_none(&check.fingerprint)),
+            ));
         }
         if check.late {
-            return finding(
+            findings.extend(finding(
                 Level::Warn,
                 "signed_later",
                 format!("{what} was signed later on {}.", or_none(&check.late_signed_utc)),
-            );
+            ));
         }
-        Vec::new()
+        findings
+    }
+
+    /// One FAIL per cell of a row that could not be read.
+    fn malformed_findings(what: &str, problems: &[String], reference: Ref) -> Vec<Finding> {
+        problems
+            .iter()
+            .map(|problem| Finding::new(Level::Fail, "malformed", format!("{what}: {problem}."), reference))
+            .collect()
     }
 
     /// Recompute every leaf and tree head in order. Signatures are checked for all entries, or only for the
@@ -352,6 +437,7 @@ impl Factum<'_> {
                 tree_head_id: None,
             };
             let what = format!("Entry #{} (leaf {})", row.id, row.leaf_index);
+            findings.extend(Self::malformed_findings(&what, &row.malformed, reference));
             if row.leaf_index != position as i64 {
                 findings.push(Finding::new(
                     Level::Fail,
@@ -488,10 +574,10 @@ impl Factum<'_> {
     }
 
     pub fn verify_case(&self, case_id: i64, mut progress: Option<Progress<'_>>) -> Result<CaseReport> {
-        let case = self.load_case_row(case_id)?;
+        let (case, case_problems) = self.load_case_tolerant(case_id)?;
         let rows = self.load_entries(case_id)?;
-        let late = self.late_signatures()?;
-        let db_heads = self.list_tree_heads(case_id)?;
+        let (late, malformed_late) = self.late_signatures_tolerant()?;
+        let db_heads = self.list_tree_heads_tolerant(case_id)?;
         let total = rows.len() + db_heads.len();
         let (mut results, roots) = self.check_entries(
             case_id,
@@ -502,17 +588,45 @@ impl Factum<'_> {
             Some(total),
         );
         let size = rows.len() as i64;
+        for row in &malformed_late {
+            if let Some(("entry", id)) = row.target.as_ref().map(|(target, id)| (target.as_str(), *id))
+                && let Some(result) = results.iter_mut().find(|result| result.entry.id == id)
+            {
+                let reference = Ref {
+                    entry_id: Some(id),
+                    tree_head_id: None,
+                };
+                result.findings.extend(row.findings(reference));
+            }
+        }
         let mut findings: Vec<Finding> = results.iter().flat_map(|r| r.findings.clone()).collect();
+        findings.extend(Self::malformed_findings("Case", &case_problems, Ref::default()));
+        // the table is shared by all cases: a row that does not say what it signs is reported in every case
+        for row in malformed_late.iter().filter(|row| row.target.is_none()) {
+            findings.extend(row.findings(Ref::default()));
+        }
 
         let mut heads = Vec::new();
-        for (number, head) in db_heads.iter().enumerate() {
+        for (number, (head, problems)) in db_heads.iter().enumerate() {
             let reference = Ref {
                 entry_id: None,
                 tree_head_id: Some(head.id),
             };
             let what = format!("Seal #{} (size {}, {})", head.id, head.tree_size, head.reason);
-            let mut head_findings =
-                Self::head_findings(head.tree_size, &head.root_hash, &roots, size, &what, reference);
+            let mut head_findings = Self::malformed_findings(&what, problems, reference);
+            for row in &malformed_late {
+                if row.target.as_ref() == Some(&("tree_head".to_string(), head.id)) {
+                    head_findings.extend(row.findings(reference));
+                }
+            }
+            head_findings.extend(Self::head_findings(
+                head.tree_size,
+                &head.root_hash,
+                &roots,
+                size,
+                &what,
+                reference,
+            ));
             let expected = seal_payload(
                 case_id,
                 &head.case_file,
@@ -541,6 +655,7 @@ impl Factum<'_> {
             heads.push(TreeHeadResult {
                 source: SealSource::Database,
                 label: what,
+                case_file: Some(head.case_file.clone()),
                 tree_size: head.tree_size,
                 root_hash: head.root_hash.clone(),
                 created_utc: Some(head.created_utc.clone()),
@@ -555,13 +670,22 @@ impl Factum<'_> {
             }
         }
 
-        for seal_file in self.read_seal_files(case_id)? {
-            let name = seal_file
-                .path
-                .file_name()
+        let file_name = |path: &Path| {
+            path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let what = format!("Seal file {name}");
+                .unwrap_or_default()
+        };
+        let seal_files = self.read_seal_files(case_id)?;
+        for (path, problem) in &seal_files.unreadable {
+            findings.push(Finding::new(
+                Level::Warn,
+                "seal_file_unreadable",
+                format!("Seal file {} {problem} — it was not checked.", file_name(path)),
+                Ref::default(),
+            ));
+        }
+        for seal_file in seal_files.found {
+            let what = format!("Seal file {}", file_name(&seal_file.path));
             let mut head_findings = Self::head_findings(
                 seal_file.tree_size(),
                 seal_file.root_hash(),
@@ -589,6 +713,7 @@ impl Factum<'_> {
             heads.push(TreeHeadResult {
                 source: SealSource::File,
                 label: what,
+                case_file: seal_file.text_field("case_file"),
                 tree_size: seal_file.tree_size(),
                 root_hash: seal_file.root_hash().to_string(),
                 created_utc: seal_file.text_field("created_utc"),
@@ -620,14 +745,15 @@ impl Factum<'_> {
                 findings.push(finding);
             }
         }
+        let seal_dir = self.seal_dir();
         let seal_dir_is_default = self.seal_dir_is_default();
-        if !self.seal_dir().is_dir() && !seal_dir_is_default {
+        if !seal_dir.is_dir() && !seal_dir_is_default {
             findings.push(Finding::new(
                 Level::Warn,
                 "seal_dir_unreachable",
                 format!(
                     "The seal folder {} is not reachable — external seal copies were not checked.",
-                    self.seal_dir().display()
+                    seal_dir.display()
                 ),
                 Ref::default(),
             ));
@@ -637,6 +763,20 @@ impl Factum<'_> {
                 Level::Warn,
                 "seal_dir_default",
                 "Seal copies are stored next to the database, not externally. Set FACTUM_SEAL_DIR or choose a seal folder.",
+                Ref::default(),
+            ));
+        }
+        // a hint only: compared as text, so the path a database names is never opened, not even to resolve it
+        let stored = self.db.get_setting(SEAL_DIR_SETTING).unwrap_or_default();
+        if !stored.is_empty() && expand_user(&stored) != seal_dir {
+            findings.push(Finding::new(
+                Level::Warn,
+                "seal_dir_unused",
+                format!(
+                    "This database still names the seal folder {}, which is not used: seal files there were not \
+                     checked. If it is yours, set it as the seal folder.",
+                    crate::pystr::repr(&stored)
+                ),
                 Ref::default(),
             ));
         }
@@ -665,6 +805,7 @@ impl Factum<'_> {
             findings,
             signers: signers.into_iter().collect(),
             newest_seal_size: newest,
+            seal_dir,
         })
     }
 
@@ -726,12 +867,14 @@ impl Factum<'_> {
             .db
             .conn
             .prepare(&format!("SELECT {} FROM evidence WHERE case_id = ?", Evidence::COLUMNS))?;
-        let evidence_rows: BTreeMap<i64, Evidence> = statement
-            .query_map([case.id], Evidence::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .map(|evidence| (evidence.id, evidence))
-            .collect();
+        let mut malformed = Vec::new();
+        let mut evidence_rows: BTreeMap<i64, Evidence> = BTreeMap::new();
+        for row in statement.query_map([case.id], |row| Ok(Cells::tolerant(row, Evidence::read)))? {
+            let (evidence, problems) = row?;
+            let what = format!("Evidence #{}", evidence.id);
+            malformed.extend(Self::malformed_findings(&what, &problems, Ref::default()));
+            evidence_rows.insert(evidence.id, evidence);
+        }
         let mut created_events: BTreeMap<IdKey, serde_json::Map<String, Value>> = BTreeMap::new();
         let mut deleted_events: BTreeMap<IdKey, serde_json::Map<String, Value>> = BTreeMap::new();
         // the description: the newest edit, else the creation; a payload before schema 4 has none
@@ -802,6 +945,7 @@ impl Factum<'_> {
                 ));
             }
         }
+        failures.extend(malformed);
         Ok(failures)
     }
 }

@@ -1,6 +1,7 @@
 //! One container file: created, filled by Add operations, closed (signed state kept under factum/history/<n>/),
 //! reopened, and recovered after an interrupted Add.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -10,11 +11,15 @@ use serde_json::{Value, json};
 use sha2::Digest;
 
 use super::mounts::Mount;
-use super::source::{self, SourceKind, SourceMeta, encode_name, open_source, os_bytes, read_meta, stored_path};
+use super::source::{
+    self, SourceKind, SourceMeta, encode_name, exact_path, is_same_file, open_source, os_bytes, raw_path, read_meta,
+    stored_path,
+};
 use super::stream::{self, Storage, ZLIB};
 use super::turtle::{self, Graph, Term};
 use super::zip64::{
-    Appender, Archive, CdEntry, find_last_end, find_newest_end, member_bytes, member_reader, member_text, read_archive,
+    Appender, Archive, CdEntry, crc_mismatch, find_last_end, find_newest_end, member_bytes, member_bytes_and_crc,
+    member_reader, member_text, read_archive,
 };
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS, RDF_NS, XSD_NS, ZIP_SEGMENT_LIMIT, member_name};
 use crate::error::{FactumError, Result};
@@ -29,19 +34,19 @@ pub const SIGNATURE_MEMBERS: [&str; 4] = [SIG_GPG, KEY_GPG, SIG_X509, CER_X509];
 const README: &str = include_str!("README.txt");
 pub const VERIFY_CONTAINER_PY: &[u8] = include_bytes!("verify_container.py");
 
-/// The name of a closed state's copy of a member.
 /// The README a container carries: what it is, how to verify it, and which verifier it carries (spec 5.3).
 pub fn readme_text() -> String {
     let version = env!("CARGO_PKG_VERSION");
     let hash = hex::encode(sha2::Sha256::digest(VERIFY_CONTAINER_PY));
     format!(
-        "{README}\nWritten by factum {version}. verify_container.py in this container:\n  SHA-256 {hash}\n\
-         The same script is published at\n  \
-         https://github.com/overcuriousity/factum-rs/blob/v{version}/src/container/verify_container.py\n\
-         Compare the hash with that copy (sha256sum verify_container.py) before running it.\n"
+        "{README}\nWritten by factum {version}. verify_container.py as it was written into this container, which is \
+         worth no more than this file is:\n  SHA-256 {hash}\n\
+         Where there is a network, the same script is also published at\n  \
+         https://github.com/overcuriousity/factum-rs/blob/v{version}/src/container/verify_container.py\n"
     )
 }
 
+/// The name of a closed state's copy of a member.
 pub fn history_member(n: u32, name: &str) -> String {
     format!("factum/history/{n}/{name}")
 }
@@ -84,16 +89,28 @@ pub struct FileRecord {
     pub link: Option<String>,
     /// the absolute path it was read from (not recorded before 2.7)
     pub source: Option<String>,
+    /// Base64 of that path's bytes, when `source` cannot hold them
+    pub source_raw: Option<String>,
 }
 
 impl FileRecord {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "arn": self.arn, "path": self.path, "size": self.size, "md5": self.md5, "sha1": self.sha1,
             "sha256": self.sha256, "metadata_only": self.metadata_only,
             "excerpt": self.excerpt.map(|(from, to)| json!([from, to])), "link": self.link,
             "source": self.source,
-        })
+        });
+        if let Some(raw) = &self.source_raw {
+            value["source_raw"] = json!(raw);
+        }
+        value
+    }
+
+    /// The exact path it was read from.
+    pub fn source_path(&self) -> Option<PathBuf> {
+        let source = self.source.as_deref()?;
+        Some(exact_path(source, self.source_raw.as_deref()))
     }
 
     pub fn from_json(value: &Value) -> Option<Self> {
@@ -114,6 +131,7 @@ impl FileRecord {
             excerpt,
             link: text("link"),
             source: text("source"),
+            source_raw: text("source_raw"),
         })
     }
 }
@@ -264,6 +282,30 @@ fn io_error(path: &Path, e: io::Error) -> FactumError {
     FactumError::general(format!("The container {} could not be written: {e}", path.display()))
 }
 
+/// A read that failed for a reason other than what the file holds: it says nothing about the file.
+fn read_refused(path: &Path, e: io::Error) -> FactumError {
+    FactumError::general(format!(
+        "The container {} was not opened, nothing in it was changed: it could not be read ({e}).",
+        path.display()
+    ))
+}
+
+/// A failed read while opening: a differing CRC-32 (`crc_mismatch`, a kind of its own that says so), a read error, or
+/// what `other` makes of the file's content.
+fn open_error(path: &Path, e: io::Error, other: impl Fn(String) -> FactumError) -> FactumError {
+    use io::ErrorKind::{InvalidData, UnexpectedEof, Unsupported};
+    match crc_mismatch(&e) {
+        Some(member) => FactumError::container_crc(format!(
+            "The container {} was not opened, nothing in it was changed: {member} differs from the CRC-32 of the \
+             directory. Verify Container shows whether the content is intact; it can only be closed as damaged.",
+            path.display()
+        ))
+        .with_member(member),
+        None if matches!(e.kind(), InvalidData | UnexpectedEof | Unsupported) => other(e.to_string()),
+        None => read_refused(path, e),
+    }
+}
+
 /// What a re-check read back from the container file (spec 5.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recheck {
@@ -273,6 +315,36 @@ pub struct Recheck {
     pub uncached: bool,
     /// files whose stored content cannot be read or does not match their hashes
     pub mismatches: Vec<FileRecord>,
+    /// faults of the directory, not of the content: a metadata member, or `path (member)` of a file that matched its
+    /// hashes, that differs from the directory's CRC-32, or a directory that cannot be read. Such a state is not
+    /// signed; it can only be closed as damaged.
+    pub directory_faults: Vec<String>,
+    /// where the log's state ended when the re-check started
+    pub logged_end: Option<u64>,
+    /// the files it was to read back, in the order of the input
+    pub arns: Vec<String>,
+    /// it stopped at the metadata: nothing is known about the files, listed or not
+    pub ended_early: bool,
+    /// the end of the state it read
+    pub volume_end: u64,
+}
+
+impl Recheck {
+    /// Whether it can say nothing about the files: it stopped early, or nothing was due since the last close.
+    pub fn files_not_checked(&self) -> bool {
+        self.ended_early || (self.files == 0 && self.mismatches.is_empty())
+    }
+
+    /// Whether this re-check was of the state the log holds now.
+    pub fn is_of_log(&self, logged_end: Option<u64>, records: &[FileRecord]) -> bool {
+        self.logged_end == logged_end && self.arns.iter().eq(records.iter().map(|r| &r.arn))
+    }
+
+    /// Whether this re-check read what the log and the locked volume hold now: `mark` is the volume's, its write
+    /// position the end of a state that was set aside, which a re-check before that read.
+    pub fn is_of(&self, logged_end: Option<u64>, records: &[FileRecord], mark: Mark) -> bool {
+        self.is_of_log(logged_end, records) && (self.volume_end == mark.base_end || self.volume_end == mark.write_pos)
+    }
 }
 
 /// Drops the file's cached pages, so the next reads come from the disk; true when that was possible.
@@ -290,8 +362,23 @@ fn drop_cache(file: &File) -> bool {
     }
 }
 
-/// Whether a read error during a re-check means the stored content is damaged (missing, corrupt, cut short), rather
-/// than that the container could not be read right now (a pulled drive, a lock, permissions).
+/// Errors that say a device or share went away, in the numbers of the platform.
+#[cfg(target_os = "linux")]
+const MEDIUM_GONE: [i32; 4] = [libc::ENODEV, libc::ENXIO, libc::ENOMEDIUM, libc::EHOSTDOWN];
+#[cfg(all(unix, not(target_os = "linux")))]
+const MEDIUM_GONE: [i32; 3] = [libc::ENODEV, libc::ENXIO, libc::EHOSTDOWN];
+// ERROR_NOT_READY, _DEV_NOT_EXIST, _NETNAME_DELETED, _MEDIA_CHANGED, _NO_MEDIA_IN_DRIVE, _DEVICE_NOT_CONNECTED
+#[cfg(windows)]
+const MEDIUM_GONE: [i32; 6] = [21, 55, 64, 1110, 1112, 1167];
+
+/// The platform's number of an input/output error; `io::ErrorKind` has no stable name for it.
+#[cfg(unix)]
+const IO_ERROR: i32 = libc::EIO;
+// ERROR_IO_DEVICE
+#[cfg(windows)]
+const IO_ERROR: i32 = 1117;
+
+/// Whether a read error during a re-check means the stored content is damaged (missing, corrupt, cut short).
 fn is_damage(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -302,8 +389,109 @@ fn is_damage(kind: io::ErrorKind) -> bool {
     )
 }
 
+/// Whether a read error only says that the container could not be read right now (permissions, a lock, an
+/// interrupted call, a removed medium, a lost share): retried by the user, never logged as damage.
+fn is_transient(e: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        PermissionDenied
+            | Interrupted
+            | WouldBlock
+            | TimedOut
+            | ResourceBusy
+            | OutOfMemory
+            | NotConnected
+            | ConnectionReset
+            | ConnectionAborted
+            | HostUnreachable
+            | NetworkUnreachable
+            | NetworkDown
+            | StaleNetworkFileHandle
+    ) || e.raw_os_error().is_some_and(|code| MEDIUM_GONE.contains(&code))
+}
+
+/// Whether a read error that stayed on a second attempt counts as damage. Any error but a transient one does (EIO
+/// above all, which a bad sector gives), unless `rest_reads` fails too: a removed drive gives EIO for the whole file.
+fn counts_as_damage(e: &io::Error, rest_reads: impl FnOnce() -> bool) -> bool {
+    is_damage(e.kind()) || (!is_transient(e) && rest_reads())
+}
+
+/// Whether the medium is still there: the start or the end of the file can be read from the disk. A dead sector
+/// takes one of them at most, and a re-check reads the metadata at both ends first; a removed drive fails both.
+fn medium_reads(path: &Path) -> bool {
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    drop_cache(&file);
+    let mut buffer = [0; 4096];
+    let head = file.read(&mut buffer).is_ok_and(|read| read > 0);
+    let tail = file
+        .seek(SeekFrom::End(-4096))
+        .or_else(|_| file.rewind().map(|_| 0))
+        .is_ok()
+        && file.read(&mut buffer).is_ok_and(|read| read > 0);
+    #[cfg(test)]
+    let (head, tail) = tests::probed(head, tail);
+    head || tail
+}
+
+/// A state as a re-check finds it.
+struct RecheckState {
+    end: u64,
+    archive: Archive,
+    turtle: Vec<u8>,
+    /// the metadata members that differ from the directory's CRC-32
+    crc: Vec<String>,
+}
+
+/// Reads the directory of the state at `end` (the newest when None) and its metadata; None without a complete one.
+fn read_recheck_state(file: &mut File, end: Option<u64>) -> io::Result<Option<RecheckState>> {
+    #[cfg(test)]
+    if let Some(e) = tests::failed_metadata() {
+        return Err(e);
+    }
+    let Some(end) = find_last_end(file, end)? else {
+        return Ok(None);
+    };
+    let archive = read_archive(file, end)?;
+    let mut crc = Vec::new();
+    let mut turtle = Vec::new();
+    for name in ["version.txt", "container.description", HASHES, TURTLE] {
+        let Some(entry) = archive.get(name) else { continue };
+        let (data, matches) = member_bytes_and_crc(file, entry)?;
+        if !matches {
+            crc.push(name.to_string());
+        }
+        if name == TURTLE {
+            turtle = data;
+        }
+    }
+    if archive.get(TURTLE).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "information.turtle is missing",
+        ));
+    }
+    Ok(Some(RecheckState {
+        end,
+        archive,
+        turtle,
+        crc,
+    }))
+}
+
+fn open_for_recheck(path: &Path) -> io::Result<File> {
+    #[cfg(test)]
+    if let Some(e) = tests::failed_open() {
+        return Err(e);
+    }
+    File::open(path)
+}
+
 /// Reads the stored content of `records` back from the state that ends at `end` (the newest when None) and
-/// compares it with their hashes.
+/// compares it with their hashes. A read error that stays on a second attempt counts as damage when the file can
+/// otherwise be read (`counts_as_damage`); until then it is an error and nothing is decided.
 pub fn recheck(
     path: &Path,
     end: Option<u64>,
@@ -312,53 +500,102 @@ pub fn recheck(
     cancel: &AtomicBool,
 ) -> Result<Recheck> {
     let unreadable = |e: String| FactumError::general(format!("The container {} cannot be read: {e}", path.display()));
-    let mut file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
-    let uncached = drop_cache(&file);
-    let end = find_last_end(&mut file, end)
-        .map_err(|e| unreadable(e.to_string()))?
-        .ok_or_else(|| unreadable("no complete ZIP directory".into()))?;
-    let archive = read_archive(&mut file, end).map_err(|e| unreadable(e.to_string()))?;
-    let entry = archive
-        .get(TURTLE)
-        .ok_or_else(|| unreadable("information.turtle is missing".into()))?;
-    let text = member_text(&mut file, entry).map_err(|e| unreadable(e.to_string()))?;
-    let graph = turtle::parse(&text).map_err(unreadable)?;
+    let mut result = Recheck {
+        logged_end: end,
+        arns: records.iter().map(|r| r.arn.clone()).collect(),
+        ..Default::default()
+    };
+    let mut file = match open_for_recheck(path).or_else(|_| open_for_recheck(path)) {
+        Ok(file) => file,
+        // it is there, but an I/O error keeps it shut; that may be the disk or the drive going, so no more is said.
+        // Anything else (too many open files, say) is about this process and only stops the check.
+        Err(e) if e.raw_os_error() == Some(IO_ERROR) && std::fs::metadata(path).is_ok() => {
+            result.ended_early = true;
+            result
+                .directory_faults
+                .push(format!("the file could not be opened ({e})"));
+            return Ok(result);
+        }
+        Err(e) => return Err(unreadable(e.to_string())),
+    };
+    result.uncached = drop_cache(&file);
+    let state = match read_recheck_state(&mut file, end) {
+        Err(e) if !is_damage(e.kind()) && !is_transient(&e) => read_recheck_state(&mut file, end),
+        state => state,
+    };
+    let state = match state {
+        Ok(state) => state.ok_or_else(|| unreadable("no complete ZIP directory".into()))?,
+        // the directory itself is what cannot be read: nothing to go through, and nothing to sign
+        Err(e) if !is_damage(e.kind()) && counts_as_damage(&e, || medium_reads(path)) => {
+            result.ended_early = true;
+            result
+                .directory_faults
+                .push(format!("the directory cannot be read ({e})"));
+            return Ok(result);
+        }
+        Err(e) => return Err(unreadable(e.to_string())),
+    };
+    result.volume_end = state.end;
+    result.directory_faults = state.crc;
+    let archive = state.archive;
+    let parsed = String::from_utf8(state.turtle)
+        .map_err(|_| "information.turtle is not UTF-8 text".to_string())
+        .and_then(|text| turtle::parse(&text));
+    let graph = match parsed {
+        Ok(graph) => graph,
+        // it differs from its CRC-32 and cannot be read: the listed files cannot be found, whatever they hold
+        Err(_) if result.directory_faults.iter().any(|name| name == TURTLE) => {
+            result.ended_early = true;
+            return Ok(result);
+        }
+        Err(e) => return Err(unreadable(e)),
+    };
     progress.total_files.store(records.len() as u64, Ordering::Relaxed);
     progress
         .total_bytes
         .store(records.iter().map(|r| r.size).sum(), Ordering::Relaxed);
     progress.files.store(0, Ordering::Relaxed);
     progress.bytes.store(0, Ordering::Relaxed);
-    let cancelled = || FactumError::general("Re-check cancelled — the container was not closed.");
-    let mut result = Recheck {
-        uncached,
-        ..Default::default()
-    };
+    let cancelled = || FactumError::cancelled("Re-check cancelled — the container was not closed.");
     for record in records {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
         let done = result.bytes;
         let report = |read: u64| progress.bytes.store(done + read, Ordering::Relaxed);
-        let hashed = match content_reader(&mut file, &archive, &graph, &record.arn) {
-            Ok(Some(mut reader)) => stream::hash_only(&mut reader, &report, cancel).map(Some),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+        let hash = |file: &mut File| {
+            #[cfg(test)]
+            if let Some(e) = tests::failed_read() {
+                return Err(e);
+            }
+            match content_reader(file, &archive, &graph, &record.arn) {
+                Ok(Some(mut reader)) => stream::hash_stored(&mut reader, &report, cancel).map(Some),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            }
         };
-        let matches = match hashed {
+        let hashed = match hash(&mut file) {
+            Err(e) if !is_damage(e.kind()) && !is_transient(&e) => hash(&mut file),
+            hashed => hashed,
+        };
+        let (matches, crc) = match hashed {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(cancelled()),
             // not damage: the check stops, the container stays open and nothing is logged
-            Err(e) if !is_damage(e.kind()) => return Err(unreadable(e.to_string())),
-            Ok(Some((size, digests))) => {
+            Err(e) if !counts_as_damage(&e, || medium_reads(path)) => return Err(unreadable(e.to_string())),
+            Ok(Some((size, digests, crc))) => (
                 size == record.size
                     && digests.md5 == record.md5
                     && digests.sha1 == record.sha1
-                    && digests.sha256 == record.sha256
-            }
-            Ok(None) | Err(_) => false,
+                    && digests.sha256 == record.sha256,
+                crc,
+            ),
+            Ok(None) | Err(_) => (false, None),
         };
         if !matches {
             result.mismatches.push(record.clone());
+        } else if let Some(member) = crc {
+            // the hashes matched, so the fault is the directory's; damaged content explains its CRC-32 itself
+            result.directory_faults.push(format!("{} ({member})", record.path));
         }
         result.files += 1;
         result.bytes += record.size;
@@ -424,8 +661,24 @@ pub fn file_records(graph: &Graph) -> Vec<FileRecord> {
                 excerpt,
                 link: value(factum("symlinkTarget")),
                 source: value(factum("sourcePath")),
+                source_raw: value(factum("sourcePathRaw")),
             }
         })
+        .collect()
+}
+
+/// The (ARN, ARN of its copy added again) pairs a graph lists; what verification takes a replacement from.
+pub fn replaced_pairs(graph: &Graph) -> Vec<(String, String)> {
+    let predicate = factum("replacedBy");
+    graph
+        .subjects_of_type(&aff4("FileImage"))
+        .flat_map(|arn| {
+            graph
+                .objects(arn, &predicate)
+                .map(move |t| (arn, t))
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|(arn, t)| Some((arn.to_string(), t.iri()?.to_string())))
         .collect()
 }
 
@@ -510,6 +763,14 @@ fn name_and_meta(graph: &mut Graph, arn: &str, name: &[u8], stored: &[u8], meta:
     }
 }
 
+/// A path as a factum property, and its bytes as `<property>Raw` when the text cannot hold them.
+fn path_triples(graph: &mut Graph, arn: &str, property: &str, path: &Path) {
+    graph.add(arn, &factum(property), plain(path.display().to_string()));
+    if let Some(raw) = raw_path(path) {
+        graph.add(arn, &factum(&format!("{property}Raw")), typed(raw, "base64Binary"));
+    }
+}
+
 /// A mount as its own subject `arn`, and the FUSE mount behind it as another.
 fn mount_triples(graph: &mut Graph, arn: &str, mount: &Mount) {
     graph.add(arn, &rdf_type(), Term::Iri(factum("Mount")));
@@ -519,10 +780,14 @@ fn mount_triples(graph: &mut Graph, arn: &str, mount: &Mount) {
     if !mount.mount_point.is_empty() {
         graph.add(arn, &factum("mountPoint"), plain(&mount.mount_point));
     }
+    if let Some(raw) = &mount.mount_point_raw {
+        graph.add(arn, &factum("mountPointRaw"), typed(raw, "base64Binary"));
+    }
     for (property, value) in [
         ("device", &mount.device),
         ("fileSystem", &mount.fs_type),
         ("mountOptions", &mount.options),
+        ("superOptions", &mount.super_options),
         ("image", &mount.image),
         ("volumeSerial", &mount.volume_serial),
         ("volumeLabel", &mount.volume_label),
@@ -621,24 +886,57 @@ fn try_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
     file.try_lock()
 }
 
-/// Locks the file for this process. A lock held for a moment (a child process between fork and exec still shares
-/// the open file) is waited for, briefly.
-fn lock(file: &File) -> Result<()> {
-    for attempt in 0..20 {
+/// Locks the file, waiting briefly for a lock held for a moment (a child process between fork and exec still shares
+/// the open file). The last error is what stayed: `WouldBlock`, another process holds the lock.
+fn wait_for_lock(file: &File) -> std::result::Result<(), std::fs::TryLockError> {
+    #[cfg(test)]
+    if tests::NO_LOCKS.replace(false) {
+        return Err(std::fs::TryLockError::Error(io::Error::other("no locks here (test)")));
+    }
+    for _ in 0..19 {
         match try_lock(file) {
-            Ok(()) => return Ok(()),
-            Err(std::fs::TryLockError::WouldBlock) if attempt < 19 => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => break,
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(FactumError::general(format!("The container cannot be locked: {e}")));
-            }
+            Err(std::fs::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            result => return result,
         }
     }
-    Err(FactumError::general(
-        "The container is in use by another factum process.",
-    ))
+    try_lock(file)
+}
+
+fn in_use() -> FactumError {
+    FactumError::general("The container is in use by another factum process.")
+}
+
+/// Locks the file for this process.
+fn lock(file: &File) -> Result<()> {
+    match wait_for_lock(file) {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => Err(in_use()),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(FactumError::general(format!("The container cannot be locked: {e}")))
+        }
+    }
+}
+
+/// Holds the writer's lock of a container file while the log alone changes (the returned handle keeps it). Only
+/// another writer refuses: a file that cannot be opened or locked (missing, a dead mount, no permission) has none
+/// that could be waited for, and these steps are the way out then. Nothing is written through the handle.
+pub fn lock_file(path: &Path) -> Result<Option<File>> {
+    let opened = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .or_else(|_| File::open(path));
+    let Ok(file) = opened else {
+        return Ok(None);
+    };
+    match wait_for_lock(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(in_use()),
+        Err(std::fs::TryLockError::Error(e)) => {
+            log::warn!("{} could not be locked: {e}", path.display());
+            Ok(None)
+        }
+    }
 }
 
 /// The writer of a volume; gone only after a failed rollback left the file in an unknown state.
@@ -715,7 +1013,8 @@ impl Volume {
 
     /// Opens a container for writing. An interrupted Add left bytes after the last complete state: they are cut
     /// off (never a complete state); the second value says how many. `known` is where a complete state ends (the
-    /// case log's), from which the newest one is found quickly.
+    /// case log's), from which the newest one is found quickly. A read error, or bytes after that state that could
+    /// be more than an interrupted Add, refuse the open and leave the file as it is.
     pub fn open(path: &Path, known: Option<u64>) -> Result<(Volume, u64)> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -726,15 +1025,38 @@ impl Volume {
         let not_container =
             |why: String| FactumError::general(format!("{} is not a factum container: {why}", path.display()));
         let len = file.seek(SeekFrom::End(0)).map_err(|e| io_error(path, e))?;
-        let end = find_newest_end(&mut file, known)
-            .map_err(|e| not_container(e.to_string()))?
-            .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
-        let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
+        let refused = |e: io::Error| {
+            if e.kind() != io::ErrorKind::InvalidData {
+                return read_refused(path, e);
+            }
+            FactumError::general(format!(
+                "The container {} was not opened, nothing in it was changed: it may hold more than an interrupted \
+                 addition ({e}).",
+                path.display()
+            ))
+        };
+        let end = match find_newest_end(&mut file, known) {
+            // the log's state is gone from the file
+            Err(e)
+                if e.kind() == io::ErrorKind::InvalidData
+                    && matches!(find_newest_end(&mut file, None), Ok(Some(end)) if known.is_some_and(|k| end < k)) =>
+            {
+                let refusal = refused(e);
+                return Err(FactumError::general(format!(
+                    "{refusal} The file holds no state as new as the case log says. A copy that holds that state can \
+                     be put back: move this file away and use Locate…."
+                )));
+            }
+            end => end,
+        }
+        .map_err(refused)?
+        .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
+        let archive = read_archive(&mut file, end).map_err(|e| open_error(path, e, not_container))?;
         let read = |file: &mut File, name: &str| -> Result<Vec<u8>> {
             let entry = archive
                 .get(name)
                 .ok_or_else(|| not_container(format!("{name} is missing")))?;
-            member_bytes(file, entry).map_err(|e| not_container(e.to_string()))
+            member_bytes(file, entry).map_err(|e| open_error(path, e, not_container))
         };
         let version = String::from_utf8_lossy(&read(&mut file, "version.txt")?).into_owned();
         if !(version.contains("major=2") && version.contains("minor=1")) {
@@ -777,13 +1099,13 @@ impl Volume {
             |why: String| FactumError::general(format!("{} is not a factum container: {why}", path.display()));
         let mut file = File::open(path).map_err(|e| not_container(e.to_string()))?;
         let end = find_last_end(&mut file, None)
-            .map_err(|e| not_container(e.to_string()))?
+            .map_err(|e| open_error(path, e, not_container))?
             .ok_or_else(|| not_container("no complete ZIP directory".into()))?;
-        let archive = read_archive(&mut file, end).map_err(|e| not_container(e.to_string()))?;
+        let archive = read_archive(&mut file, end).map_err(|e| open_error(path, e, not_container))?;
         let entry = archive
             .get("container.description")
             .ok_or_else(|| not_container("container.description is missing".into()))?;
-        let description = member_text(&mut file, entry).map_err(|e| not_container(e.to_string()))?;
+        let description = member_text(&mut file, entry).map_err(|e| open_error(path, e, not_container))?;
         let description = description.trim();
         if description.as_bytes() != archive.comment.as_slice() {
             return Err(not_container("its description and its ZIP comment differ".into()));
@@ -820,11 +1142,6 @@ impl Volume {
 
     fn app(&mut self) -> Result<&mut Appender> {
         writer(&mut self.app, &self.path)
-    }
-
-    /// The bytes `information.turtle` has in the current state; what a close signs.
-    pub fn turtle_bytes(&self) -> Vec<u8> {
-        turtle::write(&self.graph, &turtle::factum_prefixes()).into_bytes()
     }
 
     /// How many times the container was closed.
@@ -930,12 +1247,27 @@ impl Volume {
             ));
         }
         let mut errors = Vec::new();
+        let mut skipped = Vec::new();
         let mut items = Vec::new();
-        // a container inside the folder being added never adds itself
-        let own = std::fs::canonicalize(&self.path).ok();
+        // a container inside the folder being added never adds itself; a symbolic link to it is recorded like any link
+        let own = std::fs::canonicalize(&self.path)
+            .ok()
+            .and_then(|real| Some((read_meta(&real).ok()?, real)));
+        let is_own = |path: &Path, meta: &SourceMeta| {
+            own.as_ref()
+                .is_some_and(|(own, real)| is_same_file(own, real, path, meta))
+        };
         for walked in source::walk(sources) {
             match walked {
-                Ok(item) if own.is_some() && std::fs::canonicalize(&item.0).ok() == own => {}
+                Ok((path, meta)) if is_own(&path, &meta) => {
+                    // the same file under another name (a hard link): left out, and the log says so
+                    if own.as_ref().map(|(_, real)| real) != std::fs::canonicalize(&path).ok().as_ref() {
+                        skipped.push((
+                            path.display().to_string(),
+                            "the container itself; not added".to_string(),
+                        ));
+                    }
+                }
                 Ok(item) => items.push(item),
                 Err((path, e)) => errors.push((path.display().to_string(), e.to_string())),
             }
@@ -985,7 +1317,6 @@ impl Volume {
         let mut graph = Graph::default();
         let mut records = Vec::new();
         let mut folders = Vec::new();
-        let mut skipped = Vec::new();
         let mut done_bytes = 0u64;
         let app = self.app()?;
         let cancelled = |app: &mut Appender| -> Result<Staged> {
@@ -1016,12 +1347,11 @@ impl Volume {
                 }
                 SourceKind::Link(target) => {
                     let arn = new_arn();
-                    let target = target.display().to_string();
                     graph.add(&arn, &rdf_type(), Term::Iri(aff4("FileImage")));
                     name_and_meta(&mut graph, &arn, &name, stored, meta);
                     graph.add(&arn, &aff4("size"), typed(0, "long"));
-                    graph.add(&arn, &factum("symlinkTarget"), plain(&target));
-                    graph.add(&arn, &factum("sourcePath"), plain(&display));
+                    path_triples(&mut graph, &arn, "symlinkTarget", target);
+                    path_triples(&mut graph, &arn, "sourcePath", path);
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     records.push(FileRecord {
                         arn,
@@ -1032,8 +1362,9 @@ impl Volume {
                         sha256: String::new(),
                         metadata_only: false,
                         excerpt: None,
-                        link: Some(target),
+                        link: Some(target.display().to_string()),
                         source: Some(display.clone()),
+                        source_raw: raw_path(path),
                     });
                     progress.files.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1043,16 +1374,18 @@ impl Volume {
                     let file_start = app.position();
                     let report = |read: u64| progress.bytes.store(done_bytes + read, Ordering::Relaxed);
                     let result = (|| -> io::Result<Content> {
-                        let mut src = open_source(path)?;
-                        if options.metadata_only {
-                            let (size, digests) = stream::hash_only(&mut src, &report, cancel)?;
-                            return Ok(Content::Hashed(size, digests));
-                        }
+                        let mut src = open_source(path, meta)?;
                         if let Some((from, to)) = options.excerpt {
                             src.seek(SeekFrom::Start(from))?;
                             let mut part = src.take(to - from);
                             return stream::store(app, &member, &mut part, to - from, limit, &report, cancel)
                                 .map(Content::Stored);
+                        }
+                        // one byte more than listed is enough to know it changed
+                        let mut src = src.take(meta.size.saturating_add(1));
+                        if options.metadata_only {
+                            let (size, digests) = stream::hash_only(&mut src, &report, cancel)?;
+                            return Ok(Content::Hashed(size, digests));
                         }
                         stream::store(app, &member, &mut src, meta.size, limit, &report, cancel).map(Content::Stored)
                     })();
@@ -1110,7 +1443,7 @@ impl Volume {
                         graph.add(&arn, &factum("excerptEnd"), typed(to, "long"));
                         graph.add(&arn, &factum("originalSize"), typed(meta.size, "long"));
                     }
-                    graph.add(&arn, &factum("sourcePath"), plain(&display));
+                    path_triples(&mut graph, &arn, "sourcePath", path);
                     graph.add(&arn, &factum("task"), Term::Iri(task_arn.clone()));
                     done_bytes += read_size;
                     progress.bytes.store(done_bytes, Ordering::Relaxed);
@@ -1126,19 +1459,28 @@ impl Volume {
                         excerpt: options.excerpt,
                         link: None,
                         source: Some(display.clone()),
+                        source_raw: raw_path(path),
                     });
                 }
             }
         }
         // a copy replaces a damaged one only when it is the same content: a source that changed since is new evidence
-        let earlier = file_records(&self.graph);
+        let earlier: HashMap<String, FileRecord> = file_records(&self.graph)
+            .into_iter()
+            .map(|r| (r.arn.clone(), r))
+            .collect();
+        let mut by_source: HashMap<PathBuf, &FileRecord> = HashMap::new();
+        for record in &records {
+            if let Some(source) = record.source_path() {
+                by_source.entry(source).or_insert(record);
+            }
+        }
         let replaced = options
             .replaces
             .iter()
             .filter_map(|(source, old)| {
-                let source = source.display().to_string();
-                let new = records.iter().find(|r| r.source.as_deref() == Some(source.as_str()))?;
-                let old_record = earlier.iter().find(|r| r.arn == *old)?;
+                let new = *by_source.get(source)?;
+                let old_record = earlier.get(old)?;
                 let same = (&new.md5, &new.sha1, &new.sha256, new.size)
                     == (&old_record.md5, &old_record.sha1, &old_record.sha256, old_record.size);
                 same.then(|| (old.clone(), new.arn.clone()))
@@ -1235,10 +1577,12 @@ impl Volume {
     }
 
     /// Closes the current state: its signatures at the root, and a copy of the signed state under
-    /// factum/history/<n>/. Returns n.
+    /// factum/history/<n>/, byte for byte the root `information.turtle`. Returns n.
     pub fn close(&mut self, signatures: &Signatures) -> Result<u32> {
-        let n = self.history_count() + 1;
-        let turtle = self.turtle_bytes();
+        let n = self.history_count().checked_add(1).ok_or_else(|| {
+            FactumError::general("The container lists a closed state with the highest number; it cannot be closed.")
+        })?;
+        let turtle = self.member(TURTLE)?;
         let hashes = hashes_bytes(&self.uuid, &turtle);
         let mut members: Vec<(String, Vec<u8>)> =
             vec![(history_member(n, TURTLE), turtle), (history_member(n, HASHES), hashes)];
@@ -1270,7 +1614,7 @@ impl Volume {
     /// while the current state is still that close's. Existing members are never replaced.
     pub fn add_late_signatures(&mut self, n: u32, signatures: &Signatures) -> Result<()> {
         let signed = self.member(&history_member(n, TURTLE))?;
-        let current = n == self.history_count() && signed == self.turtle_bytes();
+        let current = n == self.history_count() && signed == self.member(TURTLE)?;
         let mut members = Vec::new();
         for (name, data) in signatures.members() {
             let history = history_member(n, name);
@@ -1317,6 +1661,256 @@ mod tests {
         assert!(!setup.path().exists());
         // the name can be used again
         setup.create();
+    }
+
+    thread_local! {
+        /// what the next reads of stored content fail with, as (OS error, how many times)
+        pub static FAIL_READ: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    thread_local! {
+        /// what the next read of the metadata and the next opens fail with, as for FAIL_READ
+        pub static FAIL_METADATA: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+        pub static FAIL_OPEN: std::cell::Cell<(i32, u32)> = const { std::cell::Cell::new((0, 0)) };
+        /// the next lock fails with an error of its own, not because another process holds it
+        pub static NO_LOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// (head, tail) that a probe of the medium does not get
+        pub static DEAD: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+    }
+
+    fn next_failure(failure: &'static std::thread::LocalKey<std::cell::Cell<(i32, u32)>>) -> Option<io::Error> {
+        let (code, times) = failure.get();
+        (times > 0).then(|| {
+            failure.set((code, times - 1));
+            io::Error::from_raw_os_error(code)
+        })
+    }
+
+    pub fn failed_metadata() -> Option<io::Error> {
+        next_failure(&FAIL_METADATA)
+    }
+
+    pub fn failed_open() -> Option<io::Error> {
+        next_failure(&FAIL_OPEN)
+    }
+
+    pub fn probed(head: bool, tail: bool) -> (bool, bool) {
+        let (dead_head, dead_tail) = DEAD.get();
+        (head && !dead_head, tail && !dead_tail)
+    }
+
+    pub fn failed_read() -> Option<io::Error> {
+        next_failure(&FAIL_READ)
+    }
+
+    #[cfg(unix)]
+    fn eio() -> io::Error {
+        io::Error::from_raw_os_error(libc::EIO)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_errors_are_sorted_into_damage_and_transient() {
+        let fine = || true;
+        let gone = || false;
+        // what the content itself gives away counts at once
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(counts_as_damage(&kind.into(), gone));
+        }
+        // a read that fails while the file still reads
+        assert!(counts_as_damage(&eio(), fine));
+        assert!(counts_as_damage(&io::Error::other("anything else"), fine));
+        assert!(counts_as_damage(&io::ErrorKind::Unsupported.into(), fine));
+        // a removed drive gives EIO for all of the file
+        assert!(!counts_as_damage(&eio(), gone));
+        // these say nothing about the content, however often they come
+        for code in [
+            libc::EACCES,
+            libc::EPERM,
+            libc::EINTR,
+            libc::ENODEV,
+            libc::ENXIO,
+            libc::ETIMEDOUT,
+            libc::ESTALE,
+        ] {
+            assert!(!counts_as_damage(&io::Error::from_raw_os_error(code), fine), "{code}");
+        }
+    }
+
+    /// The result, the files, and how many of the failures were not used up.
+    fn recheck_with_failing_reads(code: i32, times: u32) -> (Result<Recheck>, Vec<FileRecord>, u32) {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let records = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1).records;
+        drop(volume);
+        FAIL_READ.set((code, times));
+        let result = recheck(
+            &setup.path(),
+            None,
+            &records,
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        );
+        (result, records, FAIL_READ.replace((0, 0)).1)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_error_that_repeats_is_damage() {
+        let (result, records, _) = recheck_with_failing_reads(libc::EIO, 2);
+        let result = result.unwrap();
+        assert_eq!(paths(&result.mismatches), [records[0].path.as_str()]);
+        assert_eq!(result.files as usize, records.len());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_error_that_goes_away_is_nothing() {
+        let (result, ..) = recheck_with_failing_reads(libc::EIO, 1);
+        assert!(result.unwrap().mismatches.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_transient_read_error_stops_the_recheck_and_decides_nothing() {
+        for code in [libc::EACCES, libc::ENODEV, libc::ENXIO] {
+            let (result, _, left) = recheck_with_failing_reads(code, 2);
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("cannot be read"), "{error}");
+            assert_eq!(left, 1, "retried: {code}");
+        }
+    }
+
+    /// A re-check with a failing setup, one small file listed.
+    fn recheck_set_up(fail: impl FnOnce()) -> Result<Recheck> {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let records = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1).records;
+        drop(volume);
+        fail();
+        let result = recheck(
+            &setup.path(),
+            None,
+            &records,
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        );
+        FAIL_METADATA.set((0, 0));
+        FAIL_OPEN.set((0, 0));
+        DEAD.set((false, false));
+        result
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dead_sector_at_the_start_is_not_a_removed_drive() {
+        let dead = |head, tail| {
+            recheck_set_up(|| {
+                FAIL_METADATA.set((libc::EIO, 2));
+                DEAD.set((head, tail));
+            })
+        };
+        for (head, tail) in [(true, false), (false, true), (false, false)] {
+            let result = dead(head, tail).unwrap();
+            assert_eq!(result.directory_faults.len(), 1, "{head} {tail}");
+            assert!(
+                result.directory_faults[0].contains("directory"),
+                "{:?}",
+                result.directory_faults
+            );
+            assert_eq!(result.files, 0);
+        }
+        // a removed drive
+        let error = dead(true, true).unwrap_err();
+        assert!(error.to_string().contains("cannot be read"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_open_that_fails_is_a_fault_only_while_the_file_is_there() {
+        let result = recheck_set_up(|| FAIL_OPEN.set((libc::EIO, 2))).unwrap();
+        assert_eq!(result.directory_faults.len(), 1);
+        assert!(
+            result.directory_faults[0].starts_with("the file could not be opened ("),
+            "{:?}",
+            result.directory_faults
+        );
+        assert!(result.ended_early);
+        assert_eq!((result.files, result.arns.is_empty()), (0, false));
+        // once is nothing, and a transient error stays one
+        assert!(
+            recheck_set_up(|| FAIL_OPEN.set((libc::EIO, 1)))
+                .unwrap()
+                .directory_faults
+                .is_empty()
+        );
+        assert!(recheck_set_up(|| FAIL_OPEN.set((libc::EACCES, 2))).is_err());
+        // only an I/O error is about the file: running out of descriptors is about this process
+        for code in [libc::EMFILE, libc::ENFILE, libc::ENOMEM] {
+            let error = recheck_set_up(|| FAIL_OPEN.set((code, 2))).unwrap_err();
+            assert!(error.to_string().contains("cannot be read"), "{error}");
+        }
+        // gone altogether: the stat fails as well
+        let missing = recheck(
+            &PathBuf::from("/nonexistent/c.aff4l"),
+            None,
+            &[],
+            &AddProgress::default(),
+            &AtomicBool::new(false),
+        );
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn a_lock_that_fails_for_itself_gives_no_lock_and_no_error() {
+        let setup = Setup::new();
+        drop(setup.create());
+        NO_LOCKS.set(true);
+        assert!(lock_file(&setup.path()).unwrap().is_none());
+        // a writer does need it
+        NO_LOCKS.set(true);
+        let error = Volume::open(&setup.path(), None).err().unwrap();
+        assert!(error.to_string().contains("cannot be locked"), "{error}");
+        // no file, no lock
+        assert!(lock_file(&setup.dir.path().join("gone")).unwrap().is_none());
+        let held = lock_file(&setup.path()).unwrap();
+        assert!(held.is_some());
+    }
+
+    #[test]
+    fn the_last_close_number_is_refused() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let comment = volume.archive.comment.clone();
+        let app = volume.app().unwrap();
+        app.add_bytes(&history_member(u32::MAX, TURTLE), 8, b"# nothing")
+            .unwrap();
+        let end = app.finish(&[], &comment).unwrap();
+        volume.archive = Archive::new(app.entries(), comment, end);
+        let error = volume.close(&Signatures::default()).unwrap_err();
+        assert!(error.to_string().contains("cannot be closed"), "{error}");
+    }
+
+    #[test]
+    fn a_close_copies_the_stored_turtle_byte_for_byte() {
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        let stored = format!(
+            "# by another version\n{}",
+            String::from_utf8(volume.member(TURTLE).unwrap()).unwrap()
+        );
+        let comment = volume.archive.comment.clone();
+        let app = volume.app().unwrap();
+        app.add_bytes(TURTLE, 8, stored.as_bytes()).unwrap();
+        let end = app.finish(&[], &comment).unwrap();
+        volume.archive = Archive::new(app.entries(), comment, end);
+        volume.close(&Signatures::default()).unwrap();
+        assert_eq!(volume.member(&history_member(1, TURTLE)).unwrap(), stored.as_bytes());
     }
 
     const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -1430,7 +2024,7 @@ mod tests {
         let n = volume.close(&Signatures::default()).unwrap();
         assert_eq!(n, 1);
         let history1 = volume.member("factum/history/1/information.turtle").unwrap();
-        assert_eq!(history1, volume.turtle_bytes());
+        assert_eq!(history1, volume.member(TURTLE).unwrap());
         let listed1: Vec<CdEntry> = volume.archive().entries.clone();
         // reopen (nothing in the file changes) and add more
         let second = add(
@@ -1792,6 +2386,122 @@ mod tests {
         assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), end);
     }
 
+    /// A state after the created one, and an interrupted Add after it; the end of each state and the file's length.
+    fn two_states_and_a_tail(setup: &Setup) -> (u64, u64, u64) {
+        let mut volume = setup.create();
+        let first = volume.end();
+        add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        let second = volume.end();
+        volume
+            .stage_add(
+                std::slice::from_ref(&setup.source),
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        drop(volume);
+        let len = std::fs::metadata(setup.path()).unwrap().len();
+        assert!(len > second);
+        (first, second, len)
+    }
+
+    #[test]
+    fn a_read_error_while_opening_cuts_nothing() {
+        let setup = Setup::new();
+        let (first, second, len) = two_states_and_a_tail(&setup);
+        // each read in turn fails once
+        for n in 1.. {
+            crate::container::zip64::FAIL_READ.with(|fail| fail.set(n));
+            let opened = Volume::open(&setup.path(), Some(first));
+            if crate::container::zip64::FAIL_READ.with(|fail| fail.replace(0)) != 0 {
+                let (volume, discarded) = opened.unwrap();
+                assert_eq!((volume.end(), discarded), (second, len - second));
+                break;
+            }
+            assert_read_refused(&opened.err().unwrap());
+            assert_eq!(std::fs::metadata(setup.path()).unwrap().len(), len, "{n}");
+        }
+    }
+
+    fn assert_read_refused(error: &FactumError) {
+        let text = error.to_string();
+        assert!(text.contains("was not opened, nothing in it was changed"), "{text}");
+        assert!(text.contains("could not be read") && text.contains("error 5"), "{text}");
+        assert!(!text.contains("not a factum container"), "{text}");
+        assert!(!error.is(crate::error::ErrorKind::ContainerCrc), "{text}");
+    }
+
+    #[test]
+    fn a_read_error_on_a_member_says_so() {
+        let setup = Setup::new();
+        drop(setup.create());
+        // every read in turn fails once, those of version.txt, the description and the metadata among them
+        let refused = |read: &dyn Fn() -> Result<()>| {
+            for n in 1.. {
+                crate::container::zip64::FAIL_READ.with(|fail| fail.set(n));
+                let result = read();
+                if crate::container::zip64::FAIL_READ.with(|fail| fail.replace(0)) != 0 {
+                    result.unwrap();
+                    return n - 1;
+                }
+                assert_read_refused(&result.err().unwrap());
+            }
+            unreachable!()
+        };
+        let opens = refused(&|| Volume::open(&setup.path(), None).map(|_| ()));
+        let descriptions = refused(&|| Volume::uuid_of(&setup.path()).map(|_| ()));
+        assert!(opens > descriptions && descriptions > 0, "{opens} {descriptions}");
+    }
+
+    #[test]
+    fn a_state_that_cannot_be_read_is_not_cut_off() {
+        let setup = Setup::new();
+        let (first, second, _) = two_states_and_a_tail(&setup);
+        // the classic end record of the newest state, damaged: bytes that end no directory, a state all the same
+        let mut bytes = std::fs::read(setup.path()).unwrap();
+        let locator = bytes[..second as usize]
+            .windows(4)
+            .rposition(|w| w == b"PK\x06\x07")
+            .unwrap();
+        bytes[locator + 20] ^= 1;
+        std::fs::write(setup.path(), &bytes).unwrap();
+        for known in [Some(first), None] {
+            let error = Volume::open(&setup.path(), known).err().unwrap();
+            assert!(
+                error.to_string().contains("more than an interrupted addition"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(setup.path()).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn a_logged_state_is_not_cut_off_whatever_replaced_it() {
+        let setup = Setup::new();
+        let (first, second, _) = two_states_and_a_tail(&setup);
+        let directory = bytes_before_directory(&setup, second);
+        // the newest directory and all that follows it, zeroed
+        let mut bytes = std::fs::read(setup.path()).unwrap();
+        bytes[directory..].fill(0);
+        std::fs::write(setup.path(), &bytes).unwrap();
+        for known in [Some(second), Some(first), None] {
+            let error = Volume::open(&setup.path(), known).err().unwrap();
+            assert!(error.to_string().contains("nothing in it was changed"), "{error}");
+            assert_eq!(std::fs::read(setup.path()).unwrap(), bytes);
+        }
+    }
+
+    /// Where the directory of the state ending at `end` starts.
+    fn bytes_before_directory(setup: &Setup, end: u64) -> usize {
+        let bytes = std::fs::read(setup.path()).unwrap();
+        let record = bytes[..end as usize]
+            .windows(4)
+            .rposition(|w| w == b"PK\x06\x06")
+            .unwrap();
+        u64::from_le_bytes(bytes[record + 48..record + 56].try_into().unwrap()) as usize
+    }
+
     #[test]
     fn second_open_is_refused_while_locked() {
         let setup = Setup::new();
@@ -1970,6 +2680,168 @@ mod tests {
     }
 
     #[test]
+    fn a_crash_in_the_first_bevy_of_a_large_zip_recovers_by_itself() {
+        let setup = Setup::new();
+        // as a large ZIP starts: a header and data that does not compress, stored raw in the first chunk
+        let mut x = 0x1234_5678u32;
+        let noise: Vec<u8> = (0..40_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let zip = setup.dir.path().join("evidence.zip");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&zip)
+            .unwrap();
+        let mut app = Appender::new(file, 0, Vec::new()).unwrap();
+        app.add_bytes("inner", 0, &noise).unwrap();
+        app.add_bytes("second", 0, b"second").unwrap();
+        app.finish(&[], b"").unwrap();
+        drop(app);
+        std::fs::copy(&zip, setup.source.join("large.zip")).unwrap();
+
+        let mut volume = setup.create();
+        let first = volume.end();
+        add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        let second = volume.end();
+        volume.segment_limit = 1000;
+        let staged = volume
+            .stage_add(
+                &[setup.source.join("large.zip")],
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let bevy = member_name(&format!("{}/00000000", staged.records[0].arn), &volume.arn());
+        drop(volume);
+
+        // the bevy being written: its placeholders, and part of its content
+        let mut bytes = std::fs::read(setup.path()).unwrap();
+        let header = bytes.windows(bevy.len()).position(|w| w == bevy.as_bytes()).unwrap() - 30;
+        let data = header + 30 + bevy.len() + 20;
+        assert_eq!(bytes[data..data + 4], *b"PK\x03\x04");
+        bytes[header + 14..header + 18].fill(0);
+        bytes[header + 30 + bevy.len() + 4..data].fill(0);
+        bytes.truncate(data + 45_000);
+        std::fs::write(setup.path(), &bytes).unwrap();
+
+        for known in [Some(second), Some(first), None] {
+            std::fs::write(setup.path(), &bytes).unwrap();
+            let (volume, discarded) = Volume::open(&setup.path(), known).unwrap();
+            assert_eq!((volume.end(), discarded), (second, bytes.len() as u64 - second));
+        }
+    }
+
+    /// Flips a bit in the CRC-32 of a central entry of the newest directory: the content stays as it is.
+    fn flip_crc_field(path: &Path, name: &str) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let name = [name.as_bytes(), &[1, 0, 24, 0]].concat();
+        let at = bytes.windows(name.len()).rposition(|w| w == name).unwrap();
+        assert_eq!(bytes[at - 46..at - 42], *b"PK\x01\x02");
+        bytes[at - 46 + 16] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_crc_field_alone_is_a_finding_of_its_own_and_no_damage_to_the_content() {
+        let setup = Setup::new();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+        std::fs::write(setup.source.join("big"), &data).unwrap();
+        let mut volume = setup.create();
+        let small = add(
+            &mut volume,
+            &[setup.source.join("Users/x/notes.txt")],
+            &setup.options(),
+            1,
+        );
+        volume.segment_limit = 1000;
+        let big = add(&mut volume, &[setup.source.join("big")], &setup.options(), 2);
+        let records = [small.records[0].clone(), big.records[0].clone()];
+        let segment = volume.archive().get_arn(&records[0].arn).unwrap().name_lossy();
+        let bevy = member_name(&format!("{}/00000000", records[1].arn), &volume.arn());
+        drop(volume);
+        let (progress, cancel) = (AddProgress::default(), AtomicBool::new(false));
+
+        // the content matches: the re-check says so, Verify says that and the CRC, a plain read fails
+        for (name, record) in [(&segment, &records[0]), (&bevy, &records[1])] {
+            flip_crc_field(&setup.path(), name);
+            let recheck = recheck(&setup.path(), None, &records, &progress, &cancel).unwrap();
+            assert_eq!(recheck.mismatches, Vec::new(), "{name}");
+
+            let report = crate::container::verify::verify_file(
+                &setup.path(),
+                &crate::signer::FakeSigner::new(false),
+                &crate::container::x509::Gpgsm::unavailable(),
+                &|_, _| {},
+                &cancel,
+            )
+            .unwrap();
+            assert_eq!(report.checked_files, 2);
+            let fails: Vec<_> = report
+                .findings
+                .iter()
+                .filter(|f| f.level == crate::verifier::Level::Fail)
+                .collect();
+            assert_eq!(fails.len(), 1, "{fails:?}");
+            assert_eq!(fails[0].code, "stream_hash");
+            assert!(fails[0].message.contains("CRC-32 differs"), "{}", fails[0].message);
+            assert!(fails[0].message.contains(name.as_str()), "{}", fails[0].message);
+
+            let (mut volume, _) = Volume::open(&setup.path(), None).unwrap();
+            let error = volume.read_file(&record.arn).unwrap().read_to_end(&mut Vec::new());
+            assert!(error.unwrap_err().to_string().contains("CRC-32"));
+            drop(volume);
+            flip_crc_field(&setup.path(), name);
+        }
+    }
+
+    #[test]
+    fn a_crc_field_refuses_the_open_and_says_what_to_do() {
+        let setup = Setup::new();
+        drop(setup.create());
+        let good = std::fs::read(setup.path()).unwrap();
+        for name in ["version.txt", "container.description", TURTLE] {
+            std::fs::write(setup.path(), &good).unwrap();
+            flip_crc_field(&setup.path(), name);
+            let flipped = std::fs::read(setup.path()).unwrap();
+            let mut errors = vec![Volume::open(&setup.path(), None).err().unwrap()];
+            if name == "container.description" {
+                errors.push(Volume::uuid_of(&setup.path()).unwrap_err());
+            }
+            for error in errors {
+                assert!(error.is(crate::error::ErrorKind::ContainerCrc), "{error}");
+                let text = error.to_string();
+                assert!(text.contains("was not opened, nothing in it was changed"), "{text}");
+                assert!(text.contains(&format!("{name} differs from the CRC-32")), "{text}");
+                assert!(text.contains("Verify Container"), "{text}");
+                assert!(!text.contains("not a factum container"), "{text}");
+            }
+            assert_eq!(std::fs::read(setup.path()).unwrap(), flipped);
+        }
+        // other failures stay what they were
+        std::fs::write(setup.path(), &good).unwrap();
+        rewrite_local_name(&setup.path(), "version.txt");
+        let error = Volume::open(&setup.path(), None).err().unwrap();
+        assert!(!error.is(crate::error::ErrorKind::ContainerCrc), "{error}");
+        assert!(error.to_string().contains("not a factum container"), "{error}");
+    }
+
+    /// Changes the name in a member's local header.
+    fn rewrite_local_name(path: &Path, name: &str) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = bytes.windows(name.len()).position(|w| w == name.as_bytes()).unwrap();
+        bytes[at] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
     fn recheck_tells_damage_from_read_errors() {
         use io::ErrorKind::*;
         for kind in [InvalidData, InvalidInput, NotFound, UnexpectedEof] {
@@ -2008,11 +2880,186 @@ mod tests {
             excerpt: Some((1, 3)),
             link: None,
             source: Some("/mnt/x".into()),
+            source_raw: None,
         };
         let json = record.to_json();
         assert_eq!(json["excerpt"], serde_json::json!([1, 3]));
         assert_eq!(json["link"], serde_json::Value::Null);
-        assert_eq!(FileRecord::from_json(&json), Some(record));
+        // the payload of a plain path is what it always was
+        assert!(json.get("source_raw").is_none());
+        assert_eq!(FileRecord::from_json(&json), Some(record.clone()));
+        let record = FileRecord {
+            source_raw: Some("L21udC94".into()),
+            ..record
+        };
+        assert_eq!(FileRecord::from_json(&record.to_json()), Some(record));
+    }
+
+    /// The source tree of `Setup` with two more files; the second comes after the first when walked.
+    #[cfg(unix)]
+    fn a_and_b(setup: &Setup) -> (PathBuf, PathBuf) {
+        let (a, b) = (setup.source.join("a"), setup.source.join("b"));
+        std::fs::write(&a, b"first").unwrap();
+        std::fs::write(&b, b"second").unwrap();
+        (a, b)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_swapped_in_after_the_walk_is_an_error_of_that_file() {
+        let setup = Setup::new();
+        let (a, b) = a_and_b(&setup);
+        let mut volume = setup.create();
+        // the walk is over when the first file has been read
+        let staged = volume
+            .stage_add_with(
+                &[a, b.clone()],
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+                &|path| {
+                    if path.ends_with("a") {
+                        std::fs::remove_file(&b).unwrap();
+                        let made = std::process::Command::new("mkfifo").arg(&b).status();
+                        assert!(made.is_ok_and(|s| s.success()));
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(paths(&staged.records), vec!["a"]);
+        assert_eq!(staged.errors.len(), 1);
+        assert!(staged.errors[0].0.ends_with("b"));
+        assert!(
+            staged.errors[0].1.contains("changed after it was listed"),
+            "{}",
+            staged.errors[0].1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_swapped_in_after_the_walk_is_not_followed() {
+        let setup = Setup::new();
+        let (a, b) = a_and_b(&setup);
+        let secret = setup.dir.path().join("secret");
+        std::fs::write(&secret, b"SECOND").unwrap();
+        let mut volume = setup.create();
+        let staged = volume
+            .stage_add_with(
+                &[a, b.clone()],
+                &setup.options(),
+                &AddProgress::default(),
+                &AtomicBool::new(false),
+                &|path| {
+                    if path.ends_with("a") {
+                        std::fs::remove_file(&b).unwrap();
+                        std::os::unix::fs::symlink(&secret, &b).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        assert_eq!(paths(&staged.records), vec!["a"]);
+        assert!(staged.errors[0].1.contains("changed after it was listed"));
+    }
+
+    /// A regular file of size 0 by its metadata that has content: reading stops one byte after the listed size.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_longer_than_listed_is_not_read_to_its_end() {
+        let status = PathBuf::from("/proc/self/status");
+        if !status.exists() {
+            return;
+        }
+        let setup = Setup::new();
+        let mut volume = setup.create();
+        for metadata_only in [true, false] {
+            let options = AddOptions {
+                base: PathBuf::new(),
+                keep_path: false,
+                metadata_only,
+                ..Default::default()
+            };
+            let progress = AddProgress::default();
+            let staged = volume
+                .stage_add(
+                    std::slice::from_ref(&status),
+                    &options,
+                    &progress,
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            assert!(staged.records.is_empty());
+            assert!(
+                staged.errors[0].1.contains("changed while it was read"),
+                "{:?}",
+                staged.errors
+            );
+            assert_eq!(progress.bytes.load(Ordering::Relaxed), 1);
+            volume.discard(staged).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_the_container_is_recorded_and_the_container_left_out() {
+        let setup = Setup::new();
+        let inside = setup.source.join("c.aff4l");
+        let mut volume =
+            Volume::create(&inside, "33333333-3333-3333-3333-333333333333", &VolumeInfo::default()).unwrap();
+        std::os::unix::fs::symlink(&inside, setup.source.join("link")).unwrap();
+        let staged = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        assert!(!paths(&staged.records).contains(&"c.aff4l"));
+        let link = staged.records.iter().find(|r| r.path == "link").unwrap();
+        assert_eq!(link.link.as_deref(), Some(inside.display().to_string().as_str()));
+    }
+
+    #[test]
+    fn a_hard_link_to_the_container_is_left_out_with_a_trace() {
+        let setup = Setup::new();
+        let inside = setup.source.join("c.aff4l");
+        let mut volume =
+            Volume::create(&inside, "33333333-3333-3333-3333-333333333333", &VolumeInfo::default()).unwrap();
+        let hard = setup.source.join("hard");
+        std::fs::hard_link(&inside, &hard).unwrap();
+        let staged = add(&mut volume, std::slice::from_ref(&setup.source), &setup.options(), 1);
+        assert!(staged.records.iter().all(|r| r.path != "hard" && r.path != "c.aff4l"));
+        // the container under its own name needs no mention
+        assert_eq!(
+            staged.skipped,
+            vec![(
+                hard.display().to_string(),
+                "the container itself; not added".to_string()
+            )]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn paths_that_are_not_unicode_keep_their_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let setup = Setup::new();
+        let file = setup.source.join(OsStr::from_bytes(b"caf\xe9.txt"));
+        let target = PathBuf::from(OsStr::from_bytes(b"target\xff"));
+        std::fs::write(&file, b"x").unwrap();
+        let link = setup.source.join(OsStr::from_bytes(b"link\xe9"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut volume = setup.create();
+        let staged = add(&mut volume, &[file.clone(), link.clone()], &setup.options(), 1);
+        // the file as written and read back, with the display text as it always was
+        let graph = read_graph(&setup.path(), None).unwrap();
+        let records = file_records(&graph);
+        assert_eq!(records, staged.records);
+        assert_eq!(records[0].source.as_deref(), Some(file.display().to_string().as_str()));
+        assert_eq!(records[0].source_path(), Some(file));
+        assert_eq!(records[1].source_path(), Some(link));
+        let raw = graph.first_value(&records[1].arn, &factum("symlinkTargetRaw")).unwrap();
+        assert_eq!(exact_path("", Some(raw)), target);
+        // plain paths have no raw form
+        let plain_path = setup.source.join("Users/x/evil.exe");
+        let staged = add(&mut volume, std::slice::from_ref(&plain_path), &setup.options(), 2);
+        assert_eq!(staged.records[0].source_raw, None);
+        assert_eq!(staged.records[0].source_path(), Some(plain_path));
     }
 
     #[test]

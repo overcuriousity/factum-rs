@@ -22,6 +22,8 @@ use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, Signa
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pending {
     Archive(i64),
+    /// quit in spite of what would be lost
+    Quit,
     /// close the case's open containers, then archive it
     CloseContainersAndArchive(i64),
     /// close an open container whose file is missing
@@ -100,6 +102,8 @@ pub enum Dialog {
         text: String,
         /// the images the correction is saved with: those of the version, and those added since
         images: Vec<NoteImage>,
+        /// the text field's id, new with every open: the field's undo history and cursor are kept under it
+        editor: Id,
         error: Option<String>,
     },
     Export {
@@ -118,6 +122,9 @@ pub enum Dialog {
     GpgHelp,
     SealFolder {
         folder: String,
+        /// the folder next to the database: it is created with the first seal, so it need not exist yet
+        default: String,
+        error: Option<String>,
     },
     Shortcuts {
         rows: Vec<(String, String)>,
@@ -157,10 +164,10 @@ pub enum Dialog {
         selected: Option<String>,
         chain_files: Vec<String>,
     },
-    /// a close's re-check found files that do not match their hashes
+    /// a close's re-check found files that do not match their hashes, or faults of the directory
     Damaged {
         container_id: i64,
-        mismatches: Vec<crate::container::volume::FileRecord>,
+        recheck: crate::container::volume::Recheck,
         /// how to add them again, or why that is not possible
         add_again: std::result::Result<Vec<(Vec<PathBuf>, AddOptions)>, String>,
         /// the case to archive once every container is closed (Close and Archive)
@@ -230,7 +237,7 @@ pub enum DialogResult {
     },
     CloseDamaged {
         container_id: i64,
-        mismatches: Vec<crate::container::volume::FileRecord>,
+        recheck: crate::container::volume::Recheck,
         then_archive: Option<i64>,
     },
     X509 {
@@ -315,7 +322,7 @@ pub(super) fn folder_field(ui: &mut egui::Ui, folder: &mut String, label: Option
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let browse = IconButton::new(icons::FOLDER, "Choose folder").show(ui);
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let field = ui.add(TextEdit::singleline(folder).desired_width(f32::INFINITY));
+                let field = ui.add(single_line(folder).desired_width(f32::INFINITY));
                 if let Some(label) = label {
                     field.labelled_by(label);
                 }
@@ -387,6 +394,18 @@ pub(super) fn suggestions_shown(suggestions: &[(&str, usize, crate::tags::Match)
     !suggestions.is_empty() && !(suggestions.len() == 1 && suggestions[0].2 == crate::tags::Match::Exact)
 }
 
+/// `name` split around the `len` characters at character position `at`. `at` was counted in the lowercased name; when
+/// lowercasing changed the length (`İ` becomes two characters) it does not point into `name`: no highlight.
+fn highlight_parts(name: &str, at: usize, len: usize) -> Option<(String, String, String)> {
+    let chars: Vec<char> = name.chars().collect();
+    if len == 0 || at > chars.len() || name.to_lowercase().chars().count() != chars.len() {
+        return None;
+    }
+    let end = (at + len).min(chars.len());
+    let part = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    Some((part(0..at), part(at..end), part(end..chars.len())))
+}
+
 /// The suggestions under a text field, like a dropdown attached to it: the typed part of each name in bold, how
 /// many entries carry it on the right. Returns the clicked one.
 pub(super) fn suggestion_list(
@@ -416,17 +435,15 @@ pub(super) fn suggestion_list(
                     Match::Typo(_) => None,
                 };
                 let mut job = egui::text::LayoutJob::default();
-                let chars: Vec<char> = name.chars().collect();
                 let plain = egui::TextFormat::simple(egui::FontId::proportional(theme::BODY_SIZE), p.text);
                 let bold = egui::TextFormat::simple(egui::FontId::new(theme::BODY_SIZE, theme::bold()), p.accent);
-                match start {
-                    Some(at) if typed_len > 0 => {
-                        let end = (at + typed_len).min(chars.len());
-                        job.append(&chars[..at].iter().collect::<String>(), 0.0, plain.clone());
-                        job.append(&chars[at..end].iter().collect::<String>(), 0.0, bold);
-                        job.append(&chars[end..].iter().collect::<String>(), 0.0, plain);
+                match start.and_then(|at| highlight_parts(name, at, typed_len)) {
+                    Some((before, hit, after)) => {
+                        job.append(&before, 0.0, plain.clone());
+                        job.append(&hit, 0.0, bold);
+                        job.append(&after, 0.0, plain);
                     }
-                    _ => job.append(name, 0.0, plain),
+                    None => job.append(name, 0.0, plain),
                 }
                 let background = ui.painter().add(egui::Shape::Noop);
                 let row = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
@@ -490,7 +507,7 @@ pub(super) fn note(ui: &mut egui::Ui, text: &str) {
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, focus: bool) -> egui::Response {
     let label = ui.label(label);
     let response = ui
-        .add(TextEdit::singleline(value).hint_text(hint).desired_width(f32::INFINITY))
+        .add(single_line(value).hint_text(hint).desired_width(f32::INFINITY))
         .labelled_by(label.id);
     if focus {
         focus_once(ui, &response);
@@ -629,11 +646,30 @@ fn key_row(ui: &mut egui::Ui, key: &GpgKey, chosen: bool) -> egui::Response {
     response.on_hover_text(tip)
 }
 
+/// A dialog's text field. Escape leaves it focused: egui would drop the focus, and with the dialog held open by the
+/// text typed into it, later keystrokes would go nowhere.
+fn keeps_focus_on_escape() -> egui::EventFilter {
+    egui::EventFilter {
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        tab: false,
+        escape: true,
+    }
+}
+
+pub(super) fn single_line(text: &mut String) -> TextEdit<'_> {
+    TextEdit::singleline(text).event_filter(keeps_focus_on_escape())
+}
+
+pub(super) fn multi_line(text: &mut String) -> TextEdit<'_> {
+    TextEdit::multiline(text).event_filter(keeps_focus_on_escape())
+}
+
 /// A multiline "Description" under its label.
 fn description_field(ui: &mut egui::Ui, value: &mut String, hint: &str) {
     let label = ui.label("Description");
     ui.add(
-        TextEdit::multiline(value)
+        multi_line(value)
             .hint_text(hint)
             .desired_rows(3)
             .desired_width(f32::INFINITY),
@@ -643,6 +679,34 @@ fn description_field(ui: &mut egui::Ui, value: &mut String, hint: &str) {
 
 fn enter_pressed(ui: &egui::Ui) -> bool {
     ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
+}
+
+/// The container's file name: the default when empty, `.aff4l` appended when missing; a path is refused, since the
+/// file belongs in the folder chosen above.
+fn container_file_name(typed: &str, default: &str) -> Result<String, String> {
+    if typed.is_empty() {
+        return Ok(default.to_string());
+    }
+    if typed.contains(['/', '\\', ':']) || typed.contains("..") {
+        return Err("The file name is a name, not a path: no separators, no \":\" and no \"..\".".into());
+    }
+    Ok(if typed.ends_with(".aff4l") {
+        typed.to_string()
+    } else {
+        format!("{typed}.aff4l")
+    })
+}
+
+/// A seal folder has to exist and be given in full, or the seals would follow the working directory.
+pub(super) fn check_seal_folder(folder: &str) -> Result<(), String> {
+    let path = Path::new(folder);
+    if !path.is_absolute() {
+        Err("Give the folder's full path.".into())
+    } else if !path.is_dir() {
+        Err("The folder does not exist.".into())
+    } else {
+        Ok(())
+    }
 }
 
 pub fn signature_text(check: &SignatureCheck) -> String {
@@ -663,10 +727,12 @@ pub fn signature_text(check: &SignatureCheck) -> String {
     } else {
         String::new()
     };
-    format!(
-        "valid{late} · {}",
-        check.trust.clone().unwrap_or_else(|| "trust unknown".into())
-    )
+    let trust = check.trust.clone().unwrap_or_else(|| "trust unknown".into());
+    if check.trusted {
+        format!("valid{late} · {trust}")
+    } else {
+        format!("valid signature{late}, key not trusted ({trust})")
+    }
 }
 
 fn first_line(text: &str) -> String {
@@ -714,10 +780,77 @@ pub fn gpg_help_text() -> &'static str {
     }
 }
 
+static CORRECT_OPENED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Dialog {
-    /// Draws the dialog; Some(result) closes it.
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<DialogResult> {
+    /// The Correct dialog for an entry's newest version.
+    pub fn correct(entry_id: i64, text: String, images: Vec<NoteImage>) -> Dialog {
+        let opened = CORRECT_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Dialog::Correct {
+            entry_id,
+            original: text.clone(),
+            text,
+            images,
+            editor: Id::unique(("correct-editor", entry_id, opened)),
+            error: None,
+        }
+    }
+
+    /// The text the dialog holds, in one string: when it differs from what the dialog opened with, closing loses it.
+    pub fn typed_text(&self) -> String {
+        match self {
+            Dialog::NewCase {
+                file,
+                name,
+                description,
+                ..
+            }
+            | Dialog::EditCase {
+                file,
+                name,
+                description,
+                ..
+            } => [file, name, description].map(String::as_str).join("\0"),
+            Dialog::NewEvidence {
+                name, hash, details, ..
+            }
+            | Dialog::EditEvidence {
+                name, hash, details, ..
+            } => [name, hash, details].map(String::as_str).join("\0"),
+            Dialog::AddLabel { label: text, .. }
+            | Dialog::TypedConfirm { typed: text, .. }
+            | Dialog::Export { folder: text, .. }
+            | Dialog::SealFolder { folder: text, .. }
+            | Dialog::CaseGoal { goal: text, .. } => text.clone(),
+            Dialog::Correct { text, images, .. } => format!("{text}\0{}", images.len()),
+            Dialog::NewContainer {
+                name,
+                hash,
+                details,
+                acquire,
+                folder,
+                file_name,
+                ..
+            } => [name, hash, details, acquire, folder, file_name]
+                .map(String::as_str)
+                .join("\0"),
+            Dialog::AddToContainer {
+                base,
+                excerpt_from,
+                excerpt_to,
+                ..
+            } => [base, excerpt_from, excerpt_to].map(String::as_str).join("\0"),
+            Dialog::CompanionSettings(dialog) => dialog.typed_text(),
+            Dialog::Wizard(wizard) => wizard.typed_text(),
+            _ => String::new(),
+        }
+    }
+
+    /// Draws the dialog; Some(result) closes it. `start` is what [`typed_text`](Self::typed_text) was when it opened:
+    /// once the text differs, Escape and a click outside do nothing and only the dialog's own buttons close it.
+    pub fn show(&mut self, ctx: &egui::Context, start: &str) -> Option<DialogResult> {
         // one id per kind of dialog: a modal keeps its last size under its id
+        let mut edited = false;
         let modal = egui::Modal::new(Id::unique(("factum-dialog", std::mem::discriminant(self))))
             .frame(theme::dialog_frame(ctx))
             .show(ctx, |ui| {
@@ -731,11 +864,13 @@ impl Dialog {
                     | Dialog::Wizard(_) => 560.0,
                     _ => 460.0,
                 });
-                self.contents(ui, ctx)
+                let result = self.contents(ui, ctx);
+                edited = self.typed_text() != start;
+                result
             });
         match modal.inner {
             Some(result) => Some(result),
-            None if modal.should_close() => Some(match self {
+            None if modal.should_close() && !edited => Some(match self {
                 Dialog::Wizard(wizard) => wizard.cancelled(),
                 _ => DialogResult::Cancel,
             }),
@@ -754,7 +889,7 @@ impl Dialog {
                     ui,
                     "What this case has to establish; the companion asks its questions toward it.",
                 );
-                ui.add(TextEdit::multiline(goal).desired_rows(4).desired_width(f32::INFINITY))
+                ui.add(multi_line(goal).desired_rows(4).desired_width(f32::INFINITY))
                     .labelled_by(heading.id);
                 let (ok, cancel) = buttons(ui, "OK", true);
                 if ok {
@@ -807,19 +942,17 @@ impl Dialog {
                 );
                 let folder_label = ui.label("Folder");
                 folder_field(ui, folder, Some(folder_label.id));
-                let default_name = format!("{}.aff4l", crate::seals::safe_filename(strip(name)));
+                let default_name = format!("{}.aff4l", crate::files::safe_filename(strip(name)));
                 field(ui, "File name", file_name, &default_name, false);
                 error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Create", true);
                 if ok || (enter_pressed(ui) && first.lost_focus()) {
-                    let file = if strip(file_name).is_empty() {
-                        default_name
-                    } else {
-                        strip(file_name).to_string()
-                    };
-                    let path = Path::new(strip(folder)).join(&file);
+                    let file = container_file_name(strip(file_name), &default_name);
+                    let path = Path::new(strip(folder)).join(file.as_deref().unwrap_or_default());
                     *error = if strip(name).is_empty() {
                         Some("A container name is required.".into())
+                    } else if let Err(problem) = &file {
+                        Some(problem.clone())
                     } else if !Path::new(strip(folder)).is_dir() {
                         Some(format!("The folder {} does not exist.", strip(folder)))
                     } else if path.exists() {
@@ -890,28 +1023,44 @@ impl Dialog {
             }
             Dialog::Damaged {
                 container_id,
-                mismatches,
+                recheck,
                 add_again,
                 then_archive,
             } => {
+                let (mismatches, faults) = (&recheck.mismatches, &recheck.directory_faults);
                 title(ui, "Container Damaged");
                 note(
                     ui,
                     &format!(
-                        "In the container, {}. The container file or its disk may be damaged.",
-                        crate::containers::mismatch_text(mismatches.len())
+                        "In the container, {}.{} The container file or its disk may be damaged.",
+                        crate::containers::damage_text(mismatches.len(), faults.len()),
+                        if recheck.files_not_checked() {
+                            " The files were not checked."
+                        } else {
+                            ""
+                        }
                     ),
                 );
-                let shown: Vec<&str> = mismatches.iter().take(6).map(|r| r.path.as_str()).collect();
+                let found = mismatches
+                    .iter()
+                    .map(|r| r.path.as_str())
+                    .chain(faults.iter().map(String::as_str));
+                let shown: Vec<&str> = found.take(6).collect();
                 let mut listed = shown.join("\n");
-                if mismatches.len() > shown.len() {
-                    listed += &format!("\n… and {} more", mismatches.len() - shown.len());
+                let all = mismatches.len() + faults.len();
+                if all > shown.len() {
+                    listed += &format!("\n… and {} more", all - shown.len());
                 }
                 ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE).monospace()).wrap());
                 note(
                     ui,
-                    "Add Again copies them again from their sources and then closes. Close as Damaged closes \
-                     without signing; the log records which files failed.",
+                    if faults.is_empty() {
+                        "Add Again copies them again from their sources and then closes. Close as Damaged closes \
+                         without signing; the log records which files failed."
+                    } else {
+                        "Close as Damaged closes without signing or writing; the log records what was found. Verify \
+                         Container shows whether the content is intact."
+                    },
                 );
                 let mut result = None;
                 button_row(ui, |ui| {
@@ -930,7 +1079,7 @@ impl Dialog {
                     if ui.button("Close as Damaged").clicked() {
                         result = Some(DialogResult::CloseDamaged {
                             container_id: *container_id,
-                            mismatches: mismatches.clone(),
+                            recheck: recheck.clone(),
                             then_archive: *then_archive,
                         });
                     }
@@ -978,11 +1127,10 @@ impl Dialog {
                 if single_file && !*metadata_only {
                     ui.horizontal(|ui| {
                         let from = ui.label("Excerpt: from byte");
-                        ui.add(TextEdit::singleline(excerpt_from).desired_width(90.0))
+                        ui.add(single_line(excerpt_from).desired_width(90.0))
                             .labelled_by(from.id);
                         let to = ui.label("to");
-                        ui.add(TextEdit::singleline(excerpt_to).desired_width(90.0))
-                            .labelled_by(to.id);
+                        ui.add(single_line(excerpt_to).desired_width(90.0)).labelled_by(to.id);
                     });
                     note(ui, "Empty: the whole file.");
                 }
@@ -1041,7 +1189,7 @@ impl Dialog {
                 field(ui, "Name", name, "Case name (defaults to the file number)", false);
                 ui.label("Description");
                 ui.add(
-                    TextEdit::multiline(description)
+                    multi_line(description)
                         .hint_text("Case description (optional)")
                         .desired_rows(3)
                         .desired_width(f32::INFINITY),
@@ -1138,11 +1286,7 @@ impl Dialog {
                 error_line(ui, error);
                 field(ui, "Name", name, "Case name (defaults to the file number)", false);
                 ui.label("Description");
-                ui.add(
-                    TextEdit::multiline(description)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
+                ui.add(multi_line(description).desired_rows(3).desired_width(f32::INFINITY));
                 let (ok, cancel) = buttons(ui, "Save", true);
                 if ok {
                     if strip(file).is_empty() {
@@ -1190,7 +1334,7 @@ impl Dialog {
                 let name = ui.label("Label");
                 let input = ui
                     .add(
-                        TextEdit::singleline(label)
+                        single_line(label)
                             .id(field_id)
                             .hint_text("Type to search the tags and labels in use")
                             .desired_width(f32::INFINITY),
@@ -1201,7 +1345,7 @@ impl Dialog {
                 if input.changed() {
                     *highlight = None;
                 }
-                let typed = strip(label).to_string();
+                let typed = crate::tags::clean_label(label).to_string();
                 let picked = suggestion_list(ui, &typed, &suggestions, highlighted);
                 let enter = enter_pressed(ui) && input.lost_focus();
                 let (ok, cancel) = buttons(ui, "Add", !typed.is_empty());
@@ -1224,6 +1368,7 @@ impl Dialog {
             Dialog::Confirm { message, then } => {
                 let (heading, verb) = match then {
                     Pending::Archive(_) => ("Archive Case?", "Archive"),
+                    Pending::Quit => ("Quit anyway?", "Quit"),
                     Pending::CloseContainersAndArchive(_) => ("Archive Case?", "Close and Archive"),
                     Pending::CloseContainerWithoutFile(_) => ("Close Without File?", "Close Without File"),
                     Pending::DeleteEvidence(_) => ("Delete Evidence?", "Delete"),
@@ -1254,7 +1399,7 @@ impl Dialog {
                 title(ui, "Delete Case Permanently?");
                 ui.add(egui::Label::new(message.as_str()).wrap());
                 ui.add(
-                    TextEdit::singleline(typed)
+                    single_line(typed)
                         .hint_text(expected.as_str())
                         .desired_width(f32::INFINITY),
                 );
@@ -1276,6 +1421,7 @@ impl Dialog {
                 original,
                 text,
                 images,
+                editor,
                 error,
             } => {
                 let heading = title(ui, &format!("Correct Note #{entry_id}"));
@@ -1283,21 +1429,27 @@ impl Dialog {
                     ui,
                     "The original stays in the log; the corrected text is added as a new, signed version.",
                 );
-                let editor = Id::unique("correct-editor");
+                let editor = *editor;
                 if let Err(e) = note_editor::toolbar(ui, editor, text, images) {
                     *error = Some(e.to_string());
                 }
                 if let Err(e) = note_editor::handle_input(ui.ctx(), editor, text, images) {
                     *error = Some(e.to_string());
                 }
-                ui.add(
-                    TextEdit::multiline(text)
-                        .id(editor)
-                        .font(egui::FontId::proportional(theme::NOTE_SIZE))
-                        .desired_rows(8)
-                        .desired_width(f32::INFINITY),
-                )
-                .labelled_by(heading.id);
+                // a long note scrolls, so the title and the buttons stay in view
+                egui::ScrollArea::vertical()
+                    .id_salt(editor)
+                    .max_height((ui.ctx().content_rect().height() - 320.0).max(160.0))
+                    .show(ui, |ui| {
+                        ui.add(
+                            multi_line(text)
+                                .id(editor)
+                                .font(egui::FontId::proportional(theme::NOTE_SIZE))
+                                .desired_rows(8)
+                                .desired_width(f32::INFINITY),
+                        )
+                        .labelled_by(heading.id);
+                    });
                 note_editor::thumbnails(ui, text, images);
                 error_line(ui, error);
                 let changed = !strip(text).is_empty() && strip(text) != strip(original);
@@ -1394,15 +1546,23 @@ impl Dialog {
                 ui.label(RichText::new(gpg_help_text()).font(egui::FontId::monospace(MONO_SIZE)));
                 close_button(ui, "OK").then_some(DialogResult::Cancel)
             }
-            Dialog::SealFolder { folder } => {
-                title(ui, "Seal Folder");
+            Dialog::SealFolder { folder, default, error } => {
+                let heading = title(ui, "Seal Folder");
                 ui.add(egui::Label::new(SEAL_EXPLAINED).wrap());
                 note(ui, SEAL_FOLDER_EXPLAINED);
                 ui.add_space(4.0);
-                folder_field(ui, folder, None);
+                folder_field(ui, folder, Some(heading.id));
+                error_line(ui, error);
                 let (ok, cancel) = buttons(ui, "Use this folder", !strip(folder).is_empty());
                 if ok {
-                    return Some(DialogResult::SealFolder(strip(folder).to_string()));
+                    *error = if strip(folder) == default.as_str() {
+                        None
+                    } else {
+                        check_seal_folder(strip(folder)).err()
+                    };
+                    if error.is_none() {
+                        return Some(DialogResult::SealFolder(strip(folder).to_string()));
+                    }
                 }
                 cancel.then_some(DialogResult::Cancel)
             }
@@ -1474,7 +1634,7 @@ impl Dialog {
                 let mut details = lines.join("\n");
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.add(
-                        TextEdit::multiline(&mut details)
+                        multi_line(&mut details)
                             .font(egui::FontId::monospace(MONO_SIZE))
                             .desired_width(f32::INFINITY)
                             .interactive(true),
@@ -1496,6 +1656,10 @@ pub struct VerifyWindow {
     pub id: u64,
     pub report: CaseReport,
     pub open: bool,
+    /// positions in the report's findings and entries, sorted out once
+    fails: Vec<usize>,
+    warnings: Vec<usize>,
+    ok_entries: Vec<usize>,
 }
 
 pub enum VerifyAction {
@@ -1552,6 +1716,24 @@ pub(super) fn plural(count: usize, word: &str) -> String {
 }
 
 impl VerifyWindow {
+    pub fn new(id: u64, report: CaseReport) -> Self {
+        let findings = |level| {
+            (0..report.findings.len())
+                .filter(|&i| report.findings[i].level == level)
+                .collect()
+        };
+        VerifyWindow {
+            id,
+            open: true,
+            fails: findings(Level::Fail),
+            warnings: findings(Level::Warn),
+            ok_entries: (0..report.entries.len())
+                .filter(|&i| report.entries[i].status() == Level::Ok)
+                .collect(),
+            report,
+        }
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, actions: &mut Vec<VerifyAction>) {
         let report = &self.report;
         let unsigned_heads: Vec<i64> = report
@@ -1572,9 +1754,7 @@ impl VerifyWindow {
             |ui| {
                 let p = *theme::current(ui.ctx());
                 let overall = report.overall();
-                let fails: Vec<&Finding> = report.findings.iter().filter(|f| f.level == Level::Fail).collect();
-                let warnings: Vec<&Finding> = report.findings.iter().filter(|f| f.level == Level::Warn).collect();
-                let ok_entries: Vec<&EntryResult> = report.entries.iter().filter(|r| r.status() == Level::Ok).collect();
+                let (fails, warnings, ok_entries) = (&self.fails, &self.warnings, &self.ok_entries);
                 // the verdict counts findings, like the sections below; the line under it counts entries
                 let verdict = match overall {
                     Level::Ok => format!("All {} entries verified", report.entries.len()),
@@ -1623,6 +1803,7 @@ impl VerifyWindow {
                                    details: String,
                                    entry_id: Option<i64>,
                                    head_id: Option<i64>,
+                                   wrap: bool,
                                    actions: &mut Vec<VerifyAction>| {
                             let id = ui.scope_id().with(("verify-row", &item, &details));
                             let shown = actions_shown(ui, id);
@@ -1645,7 +1826,8 @@ impl VerifyWindow {
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                         ui.label(RichText::new(verdict_mark(status)).color(verdict_color(ui, status)));
                                         ui.label(RichText::new(format!("{item:<10}")).monospace().color(p.secondary));
-                                        ui.add(egui::Label::new(details.as_str()).wrap().sense(egui::Sense::click()))
+                                        let label = egui::Label::new(details.as_str()).sense(egui::Sense::click());
+                                        ui.add(if wrap { label.wrap() } else { label.truncate() })
                                     })
                                     .inner
                                 })
@@ -1676,7 +1858,7 @@ impl VerifyWindow {
                         egui::CollapsingHeader::new(format!("Failures {}", fails.len()))
                             .default_open(true)
                             .show(ui, |ui| {
-                                for f in &fails {
+                                for f in fails.iter().map(|&i| &report.findings[i]) {
                                     row(
                                         ui,
                                         f.level,
@@ -1684,6 +1866,7 @@ impl VerifyWindow {
                                         f.message.clone(),
                                         f.entry_id,
                                         f.tree_head_id,
+                                        true,
                                         actions,
                                     );
                                 }
@@ -1691,7 +1874,7 @@ impl VerifyWindow {
                         egui::CollapsingHeader::new(format!("Warnings {}", warnings.len()))
                             .default_open(fails.is_empty())
                             .show(ui, |ui| {
-                                for f in &warnings {
+                                for f in warnings.iter().map(|&i| &report.findings[i]) {
                                     row(
                                         ui,
                                         f.level,
@@ -1699,6 +1882,7 @@ impl VerifyWindow {
                                         f.message.clone(),
                                         f.entry_id,
                                         f.tree_head_id,
+                                        true,
                                         actions,
                                     );
                                 }
@@ -1706,18 +1890,27 @@ impl VerifyWindow {
                         egui::CollapsingHeader::new(format!("Entries OK {}", ok_entries.len()))
                             .default_open(false)
                             .show(ui, |ui| {
-                                for r in &ok_entries {
-                                    let item = format!("#{} leaf {}", r.entry.id, r.entry.leaf_index);
-                                    row(
-                                        ui,
-                                        Level::Ok,
-                                        item,
-                                        first_line(&r.entry.text),
-                                        Some(r.entry.id),
-                                        None,
-                                        actions,
-                                    );
-                                }
+                                // a long report has thousands of these: only the rows in view are laid out
+                                // a row is as high as its icon button, which sits in it on hover
+                                let height = ui.text_style_height(&egui::TextStyle::Body).max(22.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("verify-entries-ok")
+                                    .max_height((height + ui.spacing().item_spacing.y) * 12.0)
+                                    .show_rows(ui, height, ok_entries.len(), |ui, rows| {
+                                        for r in ok_entries[rows].iter().map(|&i| &report.entries[i]) {
+                                            let item = format!("#{} leaf {}", r.entry.id, r.entry.leaf_index);
+                                            row(
+                                                ui,
+                                                Level::Ok,
+                                                item,
+                                                first_line(&r.entry.text),
+                                                Some(r.entry.id),
+                                                None,
+                                                false,
+                                                actions,
+                                            );
+                                        }
+                                    });
                             });
                         egui::CollapsingHeader::new(format!("Seals {}", report.tree_heads.len()))
                             .default_open(false)
@@ -1730,6 +1923,7 @@ impl VerifyWindow {
                                         signature_text(&h.signature),
                                         None,
                                         h.tree_head_id,
+                                        true,
                                         actions,
                                     );
                                 }
@@ -1750,6 +1944,7 @@ impl VerifyWindow {
                     .newest_seal_size
                     .map(|s| format!("size {s}"))
                     .unwrap_or_else(|| "none".into());
+                let seal_dir = report.seal_dir.display().to_string();
                 egui::Grid::new("verify-facts")
                     .num_columns(2)
                     .spacing([16.0, 2.0])
@@ -1757,6 +1952,7 @@ impl VerifyWindow {
                         for (name, value) in [
                             ("Signers", if signers.is_empty() { "none" } else { signers.as_str() }),
                             ("Newest valid seal", newest.as_str()),
+                            ("Seal folder checked", seal_dir.as_str()),
                         ] {
                             ui.label(RichText::new(name).size(SMALL_SIZE).color(p.muted));
                             ui.label(RichText::new(value).size(SMALL_SIZE).color(p.secondary));
@@ -1773,16 +1969,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn highlight_survives_names_that_change_length_when_lowercased() {
+        // 'İ' lowercases to two characters: the offset of the match is past the end of the name
+        let known = [("İZMİR".to_string(), 1)];
+        let found = crate::tags::suggest("r", &known, 5);
+        let crate::tags::Match::Substring(at) = found[0].2 else {
+            panic!("expected a substring match")
+        };
+        assert_eq!(highlight_parts("İZMİR", at, 1), None);
+        assert_eq!(
+            highlight_parts("Malware", 3, 4),
+            Some(("Mal".into(), "ware".into(), String::new()))
+        );
+    }
+
+    #[test]
+    fn container_file_names_stay_in_the_folder() {
+        assert_eq!(container_file_name("", "fs01.aff4l").unwrap(), "fs01.aff4l");
+        assert_eq!(container_file_name("image", "x.aff4l").unwrap(), "image.aff4l");
+        assert_eq!(container_file_name("image.aff4l", "x.aff4l").unwrap(), "image.aff4l");
+        for bad in ["/etc/x", "../x", "a/b", "a\\b", "..", "C:\\x", "C:x"] {
+            assert!(container_file_name(bad, "x.aff4l").is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn seal_folders_are_absolute_directories() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(check_seal_folder(&dir.display().to_string()).is_ok());
+        assert!(check_seal_folder("relative/folder").is_err());
+        assert!(check_seal_folder(&dir.join("factum-no-such-folder-14").display().to_string()).is_err());
+    }
+
+    #[test]
     fn signature_texts() {
         assert_eq!(signature_text(&SignatureCheck::default()), "not signed");
         let good = SignatureCheck {
             present: true,
             valid: true,
             covers_payload: true,
+            trusted: true,
             trust: Some("TRUST_ULTIMATE".into()),
             ..Default::default()
         };
         assert_eq!(signature_text(&good), "valid · TRUST_ULTIMATE");
+        let untrusted = SignatureCheck {
+            trusted: false,
+            trust: Some("TRUST_UNDEFINED".into()),
+            ..good.clone()
+        };
+        assert_eq!(
+            signature_text(&untrusted),
+            "valid signature, key not trusted (TRUST_UNDEFINED)"
+        );
         let late = SignatureCheck {
             late: true,
             late_signed_utc: Some("2026".into()),

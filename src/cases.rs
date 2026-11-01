@@ -2,8 +2,9 @@ use rusqlite::{OptionalExtension, Row, params};
 use serde_json::{Value, json};
 
 use crate::canonical::utc_now;
-use crate::error::{FactumError, Result};
-use crate::log_service::{Append, KIND_SYSTEM};
+use crate::db::Cells;
+use crate::error::{ErrorKind, FactumError, Result};
+use crate::log_service::{Append, KIND_SYSTEM, MAX_ATTEMPTS};
 use crate::pystr::strip;
 use crate::services::Factum;
 
@@ -23,18 +24,23 @@ impl Case {
         self.archived_utc.is_some()
     }
 
-    const COLUMNS: &'static str = "id, case_file, case_name, description, created_utc, is_active, archived_utc";
+    pub(crate) const COLUMNS: &'static str =
+        "id, case_file, case_name, description, created_utc, is_active, archived_utc";
+
+    pub(crate) fn read(cells: &mut Cells) -> Self {
+        Self {
+            id: cells.int(0),
+            case_file: cells.text(1),
+            case_name: cells.text(2),
+            description: cells.text(3),
+            created_utc: cells.text(4),
+            is_active: cells.int(5) != 0,
+            archived_utc: cells.optional_text(6),
+        }
+    }
 
     fn from_row(row: &Row) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            case_file: row.get(1)?,
-            case_name: row.get(2)?,
-            description: row.get(3)?,
-            created_utc: row.get(4)?,
-            is_active: row.get::<_, i64>(5)? != 0,
-            archived_utc: row.get(6)?,
-        })
+        Cells::strict(row, Self::read)
     }
 }
 
@@ -42,6 +48,32 @@ impl Case {
 pub fn case_payload(event: &str, case: &Case) -> Value {
     json!({"event": event, "case_id": case.id, "case_file": case.case_file, "case_name": case.case_name,
            "description": case.description, "created_utc": case.created_utc})
+}
+
+/// The id a plain insert into `table` (rowid, no AUTOINCREMENT) would get.
+pub(crate) fn next_id(conn: &rusqlite::Connection, table: &str) -> Result<i64> {
+    Ok(
+        conn.query_row(&format!("SELECT COALESCE(MAX(id), 0) + 1 FROM {table}"), [], |row| {
+            row.get(0)
+        })?,
+    )
+}
+
+/// An open case may not share its file number with another open one (archived cases may).
+fn ensure_case_file_free(conn: &rusqlite::Connection, case_file: &str, own_id: Option<i64>) -> Result<()> {
+    let used: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM cases WHERE case_file = ? AND archived_utc IS NULL AND id != ?",
+            params![case_file, own_id.unwrap_or(-1)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match used {
+        Some(id) => Err(FactumError::general(format!(
+            "The case file number {case_file} is already used by the open case #{id}."
+        ))),
+        None => Ok(()),
+    }
 }
 
 impl Factum<'_> {
@@ -53,31 +85,71 @@ impl Factum<'_> {
         let case_name = Some(strip(case_name))
             .filter(|name| !name.is_empty())
             .unwrap_or(case_file);
-        let case_id = self.db.transaction(|conn| {
-            conn.execute(
-                "INSERT INTO cases (case_file, case_name, description, created_utc) VALUES (?, ?, ?, ?)",
-                params![case_file, case_name, description, utc_now()],
-            )?;
-            Ok(conn.last_insert_rowid())
-        })?;
-        let case = self.require_case(case_id)?;
-        let appended = self.append(
-            case_id,
-            KIND_SYSTEM,
-            &format!("Case created: {case_file} — {case_name}"),
-            Append {
-                payload: Some(case_payload("case_created", &case)),
-                ..Default::default()
-            },
-        );
-        if let Err(e) = appended {
-            // the row has no entries yet, so removing it leaves no trace in any log
-            self.db
-                .transaction(|conn| Ok(conn.execute("DELETE FROM cases WHERE id = ?", [case_id])?))?;
-            return Err(e);
+        self.ensure_case_file_free(case_file, None)?;
+        let created_utc = utc_now();
+        // the id is predicted and signed without the write lock (pinentry can take minutes); the row is inserted
+        // under the lock in the same transaction as the log entry, and a prediction that went stale is redone
+        for _ in 0..MAX_ATTEMPTS {
+            let case = Case {
+                id: self.next_id("cases")?,
+                case_file: case_file.to_string(),
+                case_name: case_name.to_string(),
+                description: description.to_string(),
+                created_utc: created_utc.clone(),
+                is_active: false,
+                archived_utc: None,
+            };
+            let reserve = |conn: &rusqlite::Connection| -> Result<()> {
+                ensure_case_file_free(conn, case_file, None)?;
+                if next_id(conn, "cases")? != case.id {
+                    return Err(FactumError::log_changed(
+                        "Another case was created meanwhile, nothing was saved — try again.",
+                    ));
+                }
+                conn.execute(
+                    "INSERT INTO cases (id, case_file, case_name, description, created_utc) VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        case.id,
+                        case.case_file,
+                        case.case_name,
+                        case.description,
+                        case.created_utc
+                    ],
+                )?;
+                Ok(())
+            };
+            let appended = self.append(
+                case.id,
+                KIND_SYSTEM,
+                &format!("Case created: {case_file} — {case_name}"),
+                Append {
+                    payload: Some(case_payload("case_created", &case)),
+                    allow_archived: true, // the case does not exist before reserve
+                    reserve: Some(&reserve),
+                    ..Default::default()
+                },
+            );
+            match appended {
+                Err(e) if e.is(ErrorKind::LogChanged) => continue,
+                Err(e) => return Err(e),
+                Ok(_) => {
+                    log::debug!("Case created with ID: {}", case.id);
+                    return Ok(case.id);
+                }
+            }
         }
-        log::debug!("Case created with ID: {case_id}");
-        Ok(case_id)
+        Err(FactumError::log_changed(
+            "Another case was created meanwhile, nothing was saved — try again.",
+        ))
+    }
+
+    /// The id the next row of `table` gets.
+    pub(crate) fn next_id(&self, table: &str) -> Result<i64> {
+        next_id(&self.db.conn, table)
+    }
+
+    fn ensure_case_file_free(&self, case_file: &str, own_id: Option<i64>) -> Result<()> {
+        ensure_case_file_free(&self.db.conn, case_file, own_id)
     }
 
     pub fn get_case(&self, case_id: i64) -> Result<Option<Case>> {
@@ -145,13 +217,21 @@ impl Factum<'_> {
             return Err(FactumError::general("A case file number is required."));
         }
         let name = strip(case_name);
+        let renamed = case.case_file != case_file;
         let updated = Case {
             case_file: case_file.to_string(),
             case_name: if name.is_empty() { case_file } else { name }.to_string(),
             description: description.to_string(),
             ..case
         };
+        // an unchanged number is not checked: an older database may already hold two open cases with one number
+        if renamed {
+            self.ensure_case_file_free(&updated.case_file, Some(case_id))?;
+        }
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
+            if renamed {
+                ensure_case_file_free(conn, &updated.case_file, Some(case_id))?;
+            }
             conn.execute(
                 "UPDATE cases SET case_file = ?, case_name = ?, description = ? WHERE id = ?",
                 params![updated.case_file, updated.case_name, updated.description, case_id],
@@ -215,10 +295,14 @@ impl Factum<'_> {
     }
 
     pub fn reopen_case(&self, case_id: i64) -> Result<()> {
-        if !self.require_case(case_id)?.is_archived() {
+        let case = self.require_case(case_id)?;
+        if !case.is_archived() {
             return Err(FactumError::general(format!("Case #{case_id} is not archived.")));
         }
+        // the number may have been taken by another case since the archive
+        self.ensure_case_file_free(&case.case_file, Some(case_id))?;
         let apply = |conn: &rusqlite::Connection, _entry_id: i64| -> Result<()> {
+            ensure_case_file_free(conn, &case.case_file, Some(case_id))?;
             conn.execute("UPDATE cases SET archived_utc = NULL WHERE id = ?", [case_id])?;
             Ok(())
         };

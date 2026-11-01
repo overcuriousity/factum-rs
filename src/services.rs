@@ -11,7 +11,7 @@ pub struct Factum<'a> {
     pub signer: &'a dyn Signer,
     /// explicit seal folder (tests, or a caller that knows better); overrides everything else
     pub seal_dir_override: Option<PathBuf>,
-    /// FACTUM_SEAL_DIR
+    /// FACTUM_SEAL_DIR: the process environment, else the user config `.env` (the GUI's seal folder setting)
     pub env_seal_dir: Option<PathBuf>,
 }
 
@@ -21,7 +21,7 @@ impl<'a> Factum<'a> {
             db,
             signer,
             seal_dir_override: None,
-            env_seal_dir: crate::config::settings().seal_dir.clone(),
+            env_seal_dir: crate::config::seal_dir(),
         }
     }
 

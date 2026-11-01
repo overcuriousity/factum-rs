@@ -18,6 +18,7 @@ mod workers;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -28,6 +29,7 @@ use crate::cases::Case;
 use crate::companion::ask::Answer;
 use crate::companion::thread::{Command, CompanionHandle, Status};
 use crate::companion::{CompanionDb, Settings, companion_db_path};
+use crate::config;
 use crate::db::Db;
 use crate::error::{ErrorKind, FactumError, Result};
 use crate::evidence::Evidence;
@@ -35,7 +37,7 @@ use crate::images::{self, NoteImage};
 use crate::markup;
 use crate::notes::{Entry, EntryFilter};
 use crate::pystr::{strip, tail};
-use crate::seals::{REASON_CHECKPOINT, SEAL_DIR_SETTING};
+use crate::seals::REASON_CHECKPOINT;
 use crate::services::Factum;
 use crate::signer::{ACTIVE_KEY_SETTING, GnupgSigner, Signer};
 use crate::verifier::{CaseReport, Level, SignatureCheck};
@@ -63,6 +65,8 @@ const DEFAULT_SIDE_PANEL_WIDTH: f32 = 340.0;
 const DEFAULT_TREE_WIDTH: f32 = 240.0;
 const DEFAULT_COMPOSER_HEIGHT: f32 = 170.0;
 const MIN_COMPOSER_HEIGHT: f32 = 150.0;
+/// how long the search field has to rest before the log is searched
+const SEARCH_DEBOUNCE: f64 = 0.2;
 const NOTE_PLACEHOLDER: &str = "Write a note. It is time-stamped when added; #tags categorize it.";
 const ICON: &[u8] = include_bytes!("../../assets/icon.png");
 
@@ -86,7 +90,8 @@ const SHOW_SYSTEM: KeyboardShortcut = shortcut(CTRL_SHIFT, Key::S);
 const SIDE_PANEL: KeyboardShortcut = shortcut(Modifiers::COMMAND, Key::B);
 const HELP: KeyboardShortcut = shortcut(Modifiers::NONE, Key::F1);
 
-pub fn run(db: Db) -> std::result::Result<(), String> {
+/// `notice`: a message shown once at the start (the seal folder taken from the database)
+pub fn run(db: Db, notice: Option<String>) -> std::result::Result<(), String> {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Factum")
         .with_app_id("factum") // on Wayland the window gets the icon of the factum.desktop launcher
@@ -104,7 +109,11 @@ pub fn run(db: Db) -> std::result::Result<(), String> {
         options,
         Box::new(|creation| {
             theme::install_fonts(&creation.egui_ctx);
-            Ok(Box::new(FactumApp::new(db, &creation.egui_ctx)))
+            let mut app = FactumApp::new(db, &creation.egui_ctx);
+            if let Some(text) = notice {
+                app.message("Seal folder", text);
+            }
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| e.to_string())
@@ -117,9 +126,11 @@ struct CaseNode {
     containers: Vec<crate::containers::ContainerSummary>,
 }
 
+/// Shared with the cache of built items: a card is costly (its parsed Markdown, its history).
+#[derive(Clone)]
 enum Item {
-    Note(Card),
-    System(Entry),
+    Note(Rc<Card>),
+    System(Rc<Entry>),
 }
 
 impl Item {
@@ -136,12 +147,23 @@ struct CaseStatus {
     entries: usize,
     /// when the newest seal was made
     last_seal: Option<String>,
+    /// the root hash of the newest entry
+    root_hash: String,
+}
+
+/// A case's last verification in this session and the log it covered: only that log (not a newer state, not a case
+/// that got the id of a deleted one) shows it.
+struct Verified {
+    level: Level,
+    utc: String,
+    tree_size: i64,
+    root_hash: String,
 }
 
 /// Everything the window shows, read from the database in one go.
 #[derive(Default)]
 struct View {
-    tree: Vec<CaseNode>,
+    tree: Rc<Vec<CaseNode>>,
     /// archived cases, shown or not
     archived_cases: usize,
     /// the case of the selection, and the evidence if evidence is selected
@@ -151,7 +173,7 @@ struct View {
     items: Vec<Item>,
     empty_text: Option<String>,
     note_count: String,
-    pinned: Vec<Card>,
+    pinned: Vec<Rc<Card>>,
     pinned_empty_text: Option<String>,
     iocs: BTreeMap<String, Vec<String>>,
     cli_active: String,
@@ -185,6 +207,8 @@ struct CloseJob {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Close and Archive: the case to archive once its containers are closed
     then_archive: Option<i64>,
+    /// why the file was refused when it was opened: not a close then, the re-check is to say what can be done
+    refused: Option<FactumError>,
 }
 
 /// A container file being verified.
@@ -199,6 +223,18 @@ struct VerifyJob {
     worker: workers::Worker<workers::VerifyResult>,
     progress: Arc<workers::Progress>,
     started: Instant,
+    then: AfterVerify,
+}
+
+/// What a case's verification is for. Signing and exporting need it, gpg per signature, so it runs on the worker
+/// and they go on here on the GUI thread (pinentry) when it is done.
+enum AfterVerify {
+    ShowReport,
+    SignEntry(i64),
+    SignSeal(i64),
+    SignAll,
+    /// (the export, sealed already; its folder)
+    Export(crate::export::ExportPlan, String),
 }
 
 struct FactumApp {
@@ -207,7 +243,12 @@ struct FactumApp {
     egui_ctx: egui::Context,
     // one signing service for everything, so the active key and the pinentry state are shared
     signer: GnupgSigner,
+    /// FACTUM_SEAL_DIR of the process environment: it overrides the seal folder setting
     env_seal_dir: Option<PathBuf>,
+    /// the seal folder setting, FACTUM_SEAL_DIR in user_env; None: next to the database
+    seal_dir: Option<PathBuf>,
+    /// the user config .env (a temporary one in tests)
+    user_env: PathBuf,
     // what is selected in the tree; when evidence is selected, case_id is None (like the case tree items)
     case_id: Option<i64>,
     evidence_id: Option<i64>,
@@ -233,6 +274,13 @@ struct FactumApp {
     tag_completion: tag_completion::TagCompletion,
     view: View,
     dirty: bool,
+    /// when the search field was last edited (egui's clock): the search runs once it rests
+    search_edited: Option<f64>,
+    /// the next rebuild is for the search alone: the tree and the built items stay
+    search_only: bool,
+    /// the items built since the last rebuild that was not for the search, by entry id; what changes a card (a label,
+    /// a pin, a correction, the selection, another connection's commit) goes through such a rebuild
+    built_items: std::cell::RefCell<HashMap<i64, Item>>,
     focused_card: Option<i64>,
     history_open: HashSet<i64>,
     /// the image shown full size: its entry and the image; one at a time
@@ -259,13 +307,18 @@ struct FactumApp {
     note_images: std::cell::RefCell<HashMap<i64, Arc<[NoteImage]>>>,
     container_verify_job: Option<ContainerVerifyJob>,
     container_verify_windows: Vec<containers::ContainerVerifyWindow>,
-    /// each case's last verification in this session: outcome, time and the tree size it covered
-    verified: HashMap<i64, (Level, String, i64)>,
+    /// each case's last verification in this session
+    verified: HashMap<i64, Verified>,
     dialogs: Vec<Dialog>,
+    /// each open dialog's text when it opened, for telling what quitting would lose
+    dialog_starts: Vec<String>,
+    /// Quit was confirmed: the window closes once the running jobs have ended
+    quitting: bool,
     verify_windows: Vec<VerifyWindow>,
     companion_windows: Vec<CompanionWindow>,
-    // running Ask calls, by case
-    ask_jobs: Vec<(i64, workers::Worker<workers::AskResult>)>,
+    // running Ask calls: (case, request number, worker)
+    ask_jobs: Vec<(i64, u64, workers::Worker<workers::AskResult>)>,
+    next_ask_request: u64,
     next_window_id: u64,
     gpg_help_prompted: bool,
     // asked once per GUI session before sealing without a key
@@ -277,6 +330,8 @@ struct FactumApp {
     focus_search: bool,
     focus_composer: bool,
     gpg_status: (String, bool),
+    /// ACTIVE_KEY_SETTING as of the last update_gpg_status: the command line can change it
+    key_setting: String,
     // None until the companion is first configured (the file is created on first use), or when it cannot be opened
     companion_db: Option<CompanionDb>,
     // the companion database exists but cannot be opened: its settings cannot be edited either
@@ -291,11 +346,12 @@ struct FactumApp {
 
 impl FactumApp {
     fn new(db: Db, ctx: &egui::Context) -> Self {
-        Self::build(db, ctx, true)
+        Self::build(db, ctx, true, config::user_env_path())
     }
 
     /// `start_companion`: start the companion thread when it is configured (tests have no endpoint).
-    fn build(db: Db, ctx: &egui::Context, start_companion: bool) -> Self {
+    /// `user_env`: the .env the seal folder setting is read from and written to.
+    fn build(db: Db, ctx: &egui::Context, start_companion: bool, user_env: PathBuf) -> Self {
         let signer = GnupgSigner::new(&db, None);
         let setting = |key: &str| db.get_setting(key).unwrap_or_default();
         let mut theme = setting(THEME_SETTING);
@@ -335,7 +391,9 @@ impl FactumApp {
             db,
             egui_ctx: ctx.clone(),
             signer,
-            env_seal_dir: crate::config::settings().seal_dir.clone(),
+            env_seal_dir: config::env_seal_dir(),
+            seal_dir: config::file_seal_dir(&user_env),
+            user_env,
             case_id: None,
             evidence_id: None,
             container_id: None,
@@ -356,6 +414,9 @@ impl FactumApp {
             tag_completion: Default::default(),
             view: View::default(),
             dirty: true,
+            search_edited: None,
+            search_only: false,
+            built_items: Default::default(),
             focused_card: None,
             history_open: HashSet::new(),
             image_viewer: None,
@@ -375,9 +436,12 @@ impl FactumApp {
             container_verify_windows: Vec::new(),
             verified: HashMap::new(),
             dialogs: Vec::new(),
+            dialog_starts: Vec::new(),
+            quitting: false,
             verify_windows: Vec::new(),
             companion_windows: Vec::new(),
             ask_jobs: Vec::new(),
+            next_ask_request: 0,
             next_window_id: 0,
             gpg_help_prompted: false,
             no_gpg_key_prompted: false,
@@ -387,6 +451,7 @@ impl FactumApp {
             focus_search: false,
             focus_composer: false,
             gpg_status: (String::new(), false),
+            key_setting: String::new(),
             companion_db,
             companion_db_failed,
             companion_settings,
@@ -424,7 +489,11 @@ impl FactumApp {
             current_key: self.signer.active_key(),
             companion: self.companion_settings.clone(),
             db_path: self.db.path.clone(),
-            seal_folder: self.db.get_setting(SEAL_DIR_SETTING).unwrap_or_default(),
+            seal_folder: self
+                .seal_dir
+                .as_ref()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
             default_seal_folder: self.factum().default_seal_dir().display().to_string(),
             seal_env: self.env_seal_dir.clone(),
             theme: self.theme.clone(),
@@ -458,12 +527,8 @@ impl FactumApp {
             self.save_x509(certificate, chain_files);
         }
         match choices.seal_folder.as_deref() {
-            Some("") => {
-                let _ = self.db.delete_setting(SEAL_DIR_SETTING);
-            }
-            Some(folder) => {
-                let _ = self.db.set_setting(SEAL_DIR_SETTING, folder);
-            }
+            Some("") => self.set_seal_folder(None),
+            Some(folder) => self.set_seal_folder(Some(folder)),
             None => {}
         }
         match choices.theme {
@@ -564,11 +629,14 @@ impl FactumApp {
             db: &self.db,
             signer: &self.signer,
             seal_dir_override: None,
-            env_seal_dir: self.env_seal_dir.clone(),
+            env_seal_dir: self.env_seal_dir.clone().or_else(|| self.seal_dir.clone()),
         }
     }
 
+    /// After every change of the key, here or elsewhere: this window's own writes do not move data_version, so what it
+    /// last knew of the setting has to be kept here for `reload_active_key` to see the next change.
     fn update_gpg_status(&mut self) {
+        self.key_setting = self.db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default();
         self.gpg_status = if !self.signer.available() {
             ("GPG not installed".into(), true)
         } else if let Some(key) = self.signer.active_key() {
@@ -576,6 +644,14 @@ impl FactumApp {
         } else {
             ("No signing key".into(), true)
         };
+    }
+
+    /// `factum --set-active gpg`: a key chosen elsewhere is the one notes are signed with from now on.
+    fn reload_active_key(&mut self) {
+        if self.db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default() != self.key_setting {
+            self.signer.reload_active_key(&self.db);
+            self.update_gpg_status();
+        }
     }
 
     fn current_case_id(&self) -> Option<i64> {
@@ -604,7 +680,12 @@ impl FactumApp {
 
     fn rebuild(&mut self, ctx: &egui::Context) {
         self.dirty = false;
-        match self.read_view() {
+        self.search_edited = None; // it reads the field as it is now
+        let search_only = std::mem::take(&mut self.search_only);
+        if !search_only {
+            self.built_items.borrow_mut().clear();
+        }
+        match self.read_view(search_only) {
             Ok(view) => self.view = view,
             Err(e) => log::error!("Failed to populate the window: {e}"),
         }
@@ -616,6 +697,10 @@ impl FactumApp {
             .chain(self.view.pinned.iter().map(|card| card.entry.id))
             .collect();
         self.note_images.borrow_mut().retain(|id, _| shown.contains(id));
+        // a correction, here or on the command line: the focus stays on the note, in its newest version
+        if let Some(entry_id) = self.focused_card {
+            self.focused_card = self.factum().latest_version_id(entry_id).ok().or(self.focused_card);
+        }
         self.reload_history();
         self.notify_companion();
         self.check_shown_signatures(ctx);
@@ -703,12 +788,38 @@ impl FactumApp {
         })
     }
 
-    fn read_view(&self) -> Result<View> {
-        let factum = self.factum();
-        let mut view = View {
-            archived_cases: factum.list_cases(true)?.len() - factum.list_cases(false)?.len(),
-            ..Default::default()
+    /// The search field rests: time to search. A change that is due anyway takes the search along.
+    fn search_when_rested(&mut self, ctx: &egui::Context) {
+        let Some(edited) = self.search_edited else { return };
+        let waited = ctx.input(|i| i.time) - edited;
+        if waited < SEARCH_DEBOUNCE {
+            ctx.request_repaint_after_secs((SEARCH_DEBOUNCE - waited) as f32);
+            return;
+        }
+        self.search_only = !self.dirty;
+        self.dirty = true;
+    }
+
+    /// The item of an entry, built once until something changes; None for an entry that is gone.
+    fn item(&self, factum: &Factum, entry_id: i64, case: &Case) -> Result<Option<Item>> {
+        if let Some(item) = self.built_items.borrow().get(&entry_id) {
+            return Ok(Some(item.clone()));
+        }
+        let Some(entry) = factum.get_entry_without_payload(entry_id)? else {
+            return Ok(None);
         };
+        let item = if entry.is_note() {
+            Item::Note(Rc::new(self.card(factum, entry, case)?))
+        } else {
+            Item::System(Rc::new(entry))
+        };
+        self.built_items.borrow_mut().insert(entry_id, item.clone());
+        Ok(Some(item))
+    }
+
+    /// The case tree, and how many cases are archived.
+    fn read_tree(&self, factum: &Factum) -> Result<(Vec<CaseNode>, usize)> {
+        let mut tree = Vec::new();
         for case_id in factum.list_cases(self.show_archived)? {
             let Some(case) = factum.get_case(case_id)? else {
                 continue;
@@ -724,13 +835,35 @@ impl FactumApp {
                     evidence.push((item, factum.list_entries(case_id, &filter)?.len()));
                 }
             }
-            let containers = factum.list_containers(case_id)?;
-            view.tree.push(CaseNode {
+            tree.push(CaseNode {
                 case,
                 notes,
                 evidence,
-                containers,
+                containers: Self::containers_of(factum, case_id),
             });
+        }
+        Ok((tree, factum.list_cases(true)?.len() - factum.list_cases(false)?.len()))
+    }
+
+    /// A log the containers cannot be read from still shows the rest of the case.
+    fn containers_of(factum: &Factum, case_id: i64) -> Vec<crate::containers::ContainerSummary> {
+        factum
+            .list_containers(case_id)
+            .inspect_err(|e| log::error!("The containers of case #{case_id} cannot be read: {e}"))
+            .unwrap_or_default()
+    }
+
+    /// `search_only`: the search changed and nothing else, so the tree stays and the items built last time are reused.
+    fn read_view(&self, search_only: bool) -> Result<View> {
+        let factum = self.factum();
+        let mut view = View::default();
+        if search_only {
+            view.tree = self.view.tree.clone();
+            view.archived_cases = self.view.archived_cases;
+        } else {
+            let (tree, archived_cases) = self.read_tree(&factum)?;
+            view.tree = Rc::new(tree);
+            view.archived_cases = archived_cases;
         }
         let case_id = self.current_case_id();
         view.case = match case_id {
@@ -771,14 +904,7 @@ impl FactumApp {
             }
             for entry_id in entry_ids.iter().rev() {
                 // newest first
-                let Some(entry) = factum.get_entry_without_payload(*entry_id)? else {
-                    continue;
-                };
-                view.items.push(if entry.is_note() {
-                    Item::Note(self.card(&factum, entry, &case)?)
-                } else {
-                    Item::System(entry)
-                });
+                view.items.extend(self.item(&factum, *entry_id, &case)?);
             }
             let notes = view.items.iter().filter(|item| matches!(item, Item::Note(_))).count();
             let mut text = format!("{notes} note{}", if notes == 1 { "" } else { "s" });
@@ -811,8 +937,12 @@ impl FactumApp {
                 },
             )?;
             for entry_id in pinned_ids.iter().rev() {
-                if let Some(entry) = factum.get_entry_without_payload(*entry_id)? {
-                    view.pinned.push(self.card(&factum, entry, &case)?);
+                match self.item(&factum, *entry_id, &case)? {
+                    Some(Item::Note(card)) => view.pinned.push(card),
+                    Some(Item::System(entry)) => {
+                        view.pinned.push(Rc::new(self.card(&factum, (*entry).clone(), &case)?))
+                    }
+                    None => {}
                 }
             }
             if view.pinned.is_empty() {
@@ -820,14 +950,13 @@ impl FactumApp {
             }
             // the newest entry is never a superseded one; its tree size counts every entry, earlier versions too
             let newest = factum.list_entries(case.id, &EntryFilter::default())?.into_iter().max();
-            let entries = match newest {
-                Some(id) => factum
-                    .get_entry_without_payload(id)?
-                    .map_or(0, |entry| entry.tree_size as usize),
-                None => 0,
+            let newest = match newest {
+                Some(id) => factum.get_entry_without_payload(id)?,
+                None => None,
             };
             view.case_status = Some(CaseStatus {
-                entries,
+                entries: newest.as_ref().map_or(0, |entry| entry.tree_size as usize),
+                root_hash: newest.map(|entry| entry.root_hash).unwrap_or_default(),
                 last_seal: factum
                     .list_tree_heads(case.id)?
                     .into_iter()
@@ -863,9 +992,12 @@ impl FactumApp {
                 None => case.case_name,
             };
         }
-        let selected_case = view.case.as_ref().map(|c| c.id);
-        let summaries = match selected_case {
-            Some(case_id) => factum.list_containers(case_id)?,
+        // an archived case can be selected while the tree hides it
+        let summaries = match &view.case {
+            Some(case) => match view.tree.iter().find(|node| node.case.id == case.id) {
+                Some(node) => node.containers.clone(),
+                None => Self::containers_of(&factum, case.id),
+            },
             None => Vec::new(),
         };
         let shown: Vec<&crate::containers::ContainerSummary> = summaries
@@ -973,23 +1105,26 @@ impl FactumApp {
         if let Some(worker) = self.signature_worker.as_mut()
             && let Some(checks) = worker.poll()
         {
-            self.signature_checks.extend(checks);
+            match checks {
+                Ok(checks) => self.signature_checks.extend(checks),
+                Err(stopped) => log::error!("Checking signatures failed: {stopped}"),
+            }
             self.signature_worker = None;
             if std::mem::take(&mut self.signature_check_pending) {
                 self.check_shown_signatures(ctx);
             }
         }
         if let Some(job) = self.verify_job.as_mut()
-            && let Some(result) = job.worker.poll()
+            && let Some(result) = job.worker.poll_result()
         {
-            self.verify_job = None;
+            let then = self.verify_job.take().expect("polled").then;
             match result {
-                Ok(report) => self.show_case_report(report),
+                Ok(report) => self.after_verification(then, report),
                 Err(message) => self.message("Factum", format!("Verification failed: {message}")),
             }
         }
         if let Some(job) = self.container_verify_job.as_mut()
-            && let Some(result) = job.worker.poll()
+            && let Some(result) = job.worker.poll_result()
         {
             self.container_verify_job = None;
             match result {
@@ -1001,12 +1136,12 @@ impl FactumApp {
                         open: true,
                     });
                 }
-                Err(message) if message.contains("cancelled") => self.message("Factum", "Verification cancelled."),
-                Err(message) => self.message("Factum", format!("Verification failed: {message}")),
+                Err(e) if e.cancelled => self.message("Factum", "Verification cancelled."),
+                Err(e) => self.message("Factum", format!("Verification failed: {}", e.message)),
             }
         }
         if let Some(job) = self.add_job.as_mut() {
-            if let Some(result) = job.worker.poll() {
+            if let Some(result) = job.worker.poll_result() {
                 let job = self.add_job.take().expect("polled");
                 self.finish_add(job.container_id, result);
             } else {
@@ -1014,23 +1149,28 @@ impl FactumApp {
             }
         }
         if let Some(job) = self.close_job.as_mut() {
-            if let Some(result) = job.worker.poll() {
+            if let Some(result) = job.worker.poll_result() {
                 let job = self.close_job.take().expect("polled");
-                self.finish_close(job.container_id, job.then_archive, result);
+                self.finish_close(job, result);
             } else {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
         }
         let mut finished = Vec::new();
-        self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll() {
-            Some(result) => {
-                finished.push((*case_id, result));
-                false
-            }
-            None => true,
-        });
-        for (case_id, result) in finished {
-            self.set_ask_state(case_id, |answer, error, running| {
+        self.ask_jobs
+            .retain_mut(|(case_id, request, worker)| match worker.poll_result() {
+                Some(result) => {
+                    finished.push((*case_id, *request, result));
+                    false
+                }
+                None => true,
+            });
+        for (case_id, finished_request, result) in finished {
+            self.set_ask_state(case_id, |request, answer, error, running| {
+                // a window closed and opened again meanwhile asks its own questions
+                if *request != finished_request {
+                    return;
+                }
                 *running = false;
                 match result {
                     Ok(a) => *answer = Some(a),
@@ -1056,6 +1196,7 @@ impl FactumApp {
                 self.dirty = true;
                 // another connection wrote: decode afresh what is shown, whatever it changed
                 self.note_images.borrow_mut().clear();
+                self.reload_active_key();
             }
         }
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -1126,12 +1267,17 @@ impl FactumApp {
     }
 
     /// Verifies a container file in the background; the result opens in a window.
-    fn verify_container_file(&mut self, path: PathBuf) {
-        self.start_container_verification(path, Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    fn verify_container_file(&mut self, path: PathBuf, expected: Option<i64>) {
+        self.start_container_verification(path, expected, Arc::new(std::sync::atomic::AtomicBool::new(false)));
     }
 
-    /// `cancel` stops it (the progress dialog's Cancel sets it).
-    fn start_container_verification(&mut self, path: PathBuf, cancel: Arc<std::sync::atomic::AtomicBool>) {
+    /// `expected` is the container the file has to be; `cancel` stops it (the progress dialog's Cancel sets it).
+    fn start_container_verification(
+        &mut self,
+        path: PathBuf,
+        expected: Option<i64>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) {
         if self
             .container_verify_job
             .as_ref()
@@ -1141,8 +1287,14 @@ impl FactumApp {
             return;
         }
         let ctx = self.egui_ctx.clone();
-        let (worker, progress) =
-            workers::verify_container(&ctx, self.db.path.clone(), self.signer.gpg_home(), path, cancel.clone());
+        let (worker, progress) = workers::verify_container(
+            &ctx,
+            self.db.path.clone(),
+            self.signer.gpg_home(),
+            path,
+            expected,
+            cancel.clone(),
+        );
         self.container_verify_job = Some(ContainerVerifyJob {
             worker,
             progress,
@@ -1289,6 +1441,7 @@ impl FactumApp {
         sources: Vec<PathBuf>,
         options: crate::container::volume::AddOptions,
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        then_archive: Option<i64>,
     ) -> bool {
         if self.add_job.is_some() {
             self.message(
@@ -1297,8 +1450,17 @@ impl FactumApp {
             );
             return false;
         }
-        let result = self.factum().open_container_for_add(id);
-        let Some(volume) = self.run(result) else { return false };
+        let volume = match self.factum().open_container_for_add(id) {
+            // a directory fault: it is not added to, and closing it as damaged is the way out
+            Err(e) if e.is(ErrorKind::ContainerCrc) => {
+                self.start_recheck(id, then_archive, Some(e));
+                return false;
+            }
+            result => match self.run(result) {
+                Some(volume) => volume,
+                None => return false,
+            },
+        };
         let name = self.factum().container(id).map(|d| d.summary.name).unwrap_or_default();
         let ctx = self.egui_ctx.clone();
         let (worker, progress) = workers::add_to_container(&ctx, volume, sources, options, cancel.clone());
@@ -1329,7 +1491,7 @@ impl FactumApp {
             }
             Err(e) => {
                 failed(self);
-                return self.message("Factum", e);
+                return self.message("Factum", capitalize(&e));
             }
         };
         let mut notes = Vec::new();
@@ -1357,7 +1519,7 @@ impl FactumApp {
                 match self.pending_adds.pop_front() {
                     Some((sources, options)) => {
                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        if !self.start_add(id, sources, options, cancel) {
+                        if !self.start_add(id, sources, options, cancel, then_archive) {
                             failed(self);
                         }
                     }
@@ -1385,13 +1547,16 @@ impl FactumApp {
 
     fn container_action(&mut self, action: ContainerAction, _ctx: &egui::Context) {
         let summary = |app: &Self, id: i64| app.factum().container(id).ok().map(|d| d.summary);
-        // a running addition holds the container's lock: changing it has to wait
+        // a running addition holds the container's lock, and a close goes on from what its re-check read: changing
+        // the container or where its file is has to wait (Locate takes no lock)
         let changes = matches!(
             action,
             ContainerAction::AddFiles(_)
                 | ContainerAction::AddFolder(_)
                 | ContainerAction::Close(_)
+                | ContainerAction::CloseWithoutFile(_)
                 | ContainerAction::Reopen(_)
+                | ContainerAction::Locate(_)
         );
         if let Some(job) = self.add_job.as_ref().filter(|_| changes) {
             let message = format!(
@@ -1455,7 +1620,7 @@ impl FactumApp {
             }
             ContainerAction::Verify(id) => {
                 if let Some(path) = summary(self, id).and_then(|s| s.path) {
-                    self.verify_container_file(path);
+                    self.verify_container_file(path, Some(id));
                 }
             }
         }
@@ -1464,6 +1629,10 @@ impl FactumApp {
 
     /// Close: the re-check runs on a worker thread; `finish_close` closes, or asks what to do about damage.
     fn start_close(&mut self, id: i64, then_archive: Option<i64>) {
+        self.start_recheck(id, then_archive, None);
+    }
+
+    fn start_recheck(&mut self, id: i64, then_archive: Option<i64>, refused: Option<FactumError>) {
         if self.add_job.is_some() || self.close_job.is_some() {
             self.message(
                 "Factum",
@@ -1483,29 +1652,61 @@ impl FactumApp {
             progress,
             cancel,
             then_archive,
+            refused,
         });
     }
 
-    fn finish_close(&mut self, id: i64, then_archive: Option<i64>, result: workers::RecheckResult) {
-        self.dirty = true;
-        let recheck = match result {
-            Ok(recheck) => recheck,
-            Err(e) => return self.message("Factum", e),
+    /// Asks what to do about what the re-check found. A directory fault leaves one way: its container is neither
+    /// added to nor signed.
+    fn show_damage(&mut self, id: i64, recheck: crate::container::volume::Recheck, then_archive: Option<i64>) {
+        let add_again = if recheck.directory_faults.is_empty() {
+            let plan = self.factum().add_again_plan(id, &recheck.mismatches);
+            plan.map_err(|e| e.to_string())
+        } else {
+            Err("A container with a directory fault is not added to.".to_string())
         };
-        if !recheck.mismatches.is_empty() {
-            let add_again = self
-                .factum()
-                .add_again_plan(id, &recheck.mismatches)
-                .map_err(|e| e.to_string());
-            self.dialogs.push(Dialog::Damaged {
-                container_id: id,
-                mismatches: recheck.mismatches,
-                add_again,
-                then_archive,
-            });
-            return;
+        self.dialogs.push(Dialog::Damaged {
+            container_id: id,
+            recheck,
+            add_again,
+            then_archive,
+        });
+    }
+
+    fn finish_close(&mut self, job: CloseJob, result: workers::RecheckResult) {
+        let CloseJob {
+            container_id: id,
+            then_archive,
+            refused,
+            ..
+        } = job;
+        self.dirty = true;
+        if self.quitting {
+            return; // the close was given up, whatever the re-check found
         }
-        let result = self.factum().close_container_with(id, &self.factum().gpgsm(), &recheck);
+        let mut recheck = match (result, &refused) {
+            (Ok(recheck), _) => recheck,
+            // nobody asked for a close here: what stands is the refusal
+            (Err(e), Some(refused)) if e.cancelled => return self.message("Factum", refused.to_string()),
+            (Err(e), Some(refused)) => {
+                return self.message("Factum", format!("{refused}\n\n{}", capitalize(&e.message)));
+            }
+            (Err(e), None) => return self.message("Factum", capitalize(&e.message)),
+        };
+        // what opening it refused counts, whether or not the re-check, which reads less, came across it
+        if let Some(refused) = refused.filter(|_| recheck.directory_faults.is_empty()) {
+            recheck.directory_faults.push(refused_fault(&refused));
+        }
+        if !recheck.mismatches.is_empty() || !recheck.directory_faults.is_empty() {
+            return self.show_damage(id, recheck, then_archive);
+        }
+        let result = match self.factum().close_container_with(id, &self.factum().gpgsm(), &recheck) {
+            Err(e) if e.is(ErrorKind::ContainerCrc) => {
+                recheck.directory_faults.push(refused_fault(&e));
+                return self.show_damage(id, recheck, then_archive);
+            }
+            result => result,
+        };
         let Some(close) = self.run(result) else { return };
         if let Some(reason) = close.x509_refused {
             self.message(
@@ -1556,7 +1757,22 @@ impl FactumApp {
             Pending::Archive(case_id) => {
                 let result = self.factum().archive_case(case_id);
                 self.run(result); // the case is archived even when sealing failed
-                self.select(None, None);
+                let archived = self.factum().get_case(case_id).ok().flatten();
+                if archived.is_some_and(|c| c.is_archived()) && self.current_case_id() == Some(case_id) {
+                    self.select(None, None);
+                }
+            }
+            Pending::Quit => {
+                self.quitting = true;
+                self.pending_adds.clear();
+                self.close_after_adds = None;
+                // the addition rewinds the file; what it had finished by then is still logged
+                if let Some(job) = &self.add_job {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                if let Some(job) = &self.close_job {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
             }
             Pending::CloseContainersAndArchive(case_id) => self.close_next_and_archive(case_id),
             Pending::CloseContainerWithoutFile(id) => {
@@ -1565,8 +1781,9 @@ impl FactumApp {
             }
             Pending::DeleteEvidence(evidence_id) => {
                 let result = self.factum().delete_evidence(evidence_id);
-                self.run(result);
-                self.select(None, None);
+                if self.run(result).is_some() && self.evidence_id == Some(evidence_id) {
+                    self.select(None, None);
+                }
             }
             Pending::Seal(case_id) => {
                 let result = self.factum().seal(case_id, REASON_CHECKPOINT).and_then(|id| {
@@ -1596,12 +1813,13 @@ impl FactumApp {
                 formats,
                 folder,
             } => {
+                if self.verification_running() {
+                    return;
+                }
                 let formats: Vec<&str> = formats.iter().map(String::as_str).collect();
-                let result = self.factum().export(case_id, &formats, &PathBuf::from(&folder));
-                if let Some(paths) = self.run(result) {
-                    let _ = self.db.set_setting(EXPORT_DIR_SETTING, &folder);
-                    let written: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                    self.message("Export finished", format!("Written:\n{}", written.join("\n")));
+                let result = self.factum().begin_export(case_id, &formats, &PathBuf::from(&folder));
+                if let Some(plan) = self.run(result) {
+                    self.start_verification(case_id, AfterVerify::Export(plan, folder));
                 }
             }
         }
@@ -1660,34 +1878,93 @@ impl FactumApp {
         });
     }
 
-    fn verify_case(&mut self, ctx: &egui::Context, case_id: i64) {
-        if self.verify_job.as_ref().is_some_and(|job| job.worker.is_running()) {
-            self.message("Factum", "A verification is already running.");
-            return;
+    fn verify_case(&mut self, case_id: i64) {
+        if !self.verification_running() {
+            self.start_verification(case_id, AfterVerify::ShowReport);
         }
-        let (worker, progress) = workers::verify_case(ctx, self.db.path.clone(), self.signer.gpg_home(), case_id);
+    }
+
+    /// One verification at a time: says so when one is running. A finished one counts until it was polled, its
+    /// result has something to go on with.
+    fn verification_running(&mut self) -> bool {
+        let running = self.verify_job.is_some();
+        if running {
+            self.message("Factum", "A verification is already running.");
+        }
+        running
+    }
+
+    fn start_verification(&mut self, case_id: i64, then: AfterVerify) {
+        let (worker, progress) = workers::verify_case(
+            &self.egui_ctx.clone(),
+            self.db.path.clone(),
+            self.signer.gpg_home(),
+            self.factum().env_seal_dir,
+            case_id,
+        );
         self.verify_job = Some(VerifyJob {
             worker,
             progress,
             started: Instant::now(),
+            then,
         });
+    }
+
+    fn after_verification(&mut self, then: AfterVerify, report: CaseReport) {
+        if self.quitting {
+            return; // given up with the quit, which said so
+        }
+        match then {
+            AfterVerify::ShowReport => self.show_case_report(report),
+            AfterVerify::SignEntry(entry_id) => {
+                let result = self.factum().sign_entry_checked(&report, entry_id);
+                if self.run(result).is_some() {
+                    self.signature_checks.remove(&entry_id);
+                }
+            }
+            AfterVerify::SignSeal(tree_head_id) => {
+                let result = self.factum().sign_tree_head_checked(&report, tree_head_id);
+                if self.run(result).is_some() {
+                    self.message("Factum", format!("Seal #{tree_head_id} signed."));
+                }
+            }
+            AfterVerify::SignAll => self.finish_sign_all(report),
+            AfterVerify::Export(plan, folder) => {
+                let result = self.factum().finish_export(plan, report);
+                if let Some(exported) = self.run(result) {
+                    let _ = self.db.set_setting(EXPORT_DIR_SETTING, &folder);
+                    let written: Vec<String> = exported.paths.iter().map(|p| p.display().to_string()).collect();
+                    let mut text = format!("Written:\n{}", written.join("\n"));
+                    for warning in &exported.warnings {
+                        text += &format!("\n\n{warning}");
+                    }
+                    self.message("Export finished", text);
+                }
+            }
+        }
     }
 
     fn show_case_report(&mut self, report: CaseReport) {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        self.verified
-            .insert(report.case.id, (report.overall(), now, report.tree_size));
+        let verified = Verified {
+            level: report.overall(),
+            utc: now,
+            tree_size: report.tree_size,
+            // as stored, like the status bar's: a log that fails has another one recomputed
+            root_hash: report
+                .entries
+                .last()
+                .map(|r| r.entry.root_hash.clone())
+                .unwrap_or_default(),
+        };
+        self.verified.insert(report.case.id, verified);
         for result in &report.entries {
             if result.signature.present {
                 self.signature_checks.insert(result.entry.id, result.signature.clone());
             }
         }
         self.next_window_id += 1;
-        self.verify_windows.push(VerifyWindow {
-            id: self.next_window_id,
-            report,
-            open: true,
-        });
+        self.verify_windows.push(VerifyWindow::new(self.next_window_id, report));
     }
 
     fn archive(&mut self, case_id: i64) {
@@ -1702,6 +1979,18 @@ impl FactumApp {
         {
             let message = format!(
                 "Files are being added to \"{}\" in this case. Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
+        if let Some(job) = self
+            .close_job
+            .as_ref()
+            .filter(|job| open.iter().any(|c| c.id == job.container_id))
+        {
+            let message = format!(
+                "\"{}\" is being re-checked. Wait for it, or cancel it in the status bar.",
                 job.name
             );
             self.message("Factum", message);
@@ -1792,8 +2081,26 @@ impl FactumApp {
     }
 
     fn sign_all_unsigned(&mut self, case_id: i64) {
-        let result = self.factum().sign_all_unsigned(case_id);
-        let Some(count) = self.run(result) else { return };
+        if !self.verification_running() {
+            self.start_verification(case_id, AfterVerify::SignAll);
+        }
+    }
+
+    fn finish_sign_all(&mut self, report: CaseReport) {
+        let result = self.factum().sign_all_checked(&report);
+        let Some((count, stopped)) = self.run(result) else {
+            return;
+        };
+        match stopped {
+            // a failure at once may be the passphrase prompt that cannot show: run() knows what to say about that
+            Some(e) if count == 0 => {
+                self.run::<()>(Err(e));
+                return;
+            }
+            Some(e) => return self.message("Factum", e.to_string()),
+            None => {}
+        }
+        let case_id = report.case.id;
         // the entries are signed already: say so even when the containers are not
         let (containers, skipped) = match self.factum().sign_unsigned_containers(case_id) {
             Ok(done) => done,
@@ -1906,7 +2213,15 @@ impl FactumApp {
                     .into_iter()
                     .map(|(tag, _)| tag)
                     .collect();
-                let known = crate::tags::tag_counts(&self.db.conn)
+                // an entry that is gone offers nothing
+                let known = self
+                    .factum()
+                    .get_entry_without_payload(entry_id)
+                    .ok()
+                    .flatten()
+                    .map_or(Ok(Vec::new()), |entry| {
+                        crate::tags::tag_counts(&self.db.conn, entry.case_id)
+                    })
                     .inspect_err(|e| log::error!("The tags in use cannot be read: {e}"))
                     .unwrap_or_default()
                     .into_iter()
@@ -1926,13 +2241,8 @@ impl FactumApp {
             CardAction::Correct(entry_id) => {
                 let factum = self.factum();
                 if let Ok(Some(newest)) = factum.latest_version_id(entry_id).and_then(|id| factum.get_entry(id)) {
-                    self.dialogs.push(Dialog::Correct {
-                        entry_id: newest.id,
-                        original: newest.text.clone(),
-                        images: newest.images(),
-                        text: newest.text,
-                        error: None,
-                    });
+                    let images = newest.images();
+                    self.dialogs.push(Dialog::correct(newest.id, newest.text, images));
                 }
             }
             CardAction::CopySignature(entry_id) => match self.factum().get_entry(entry_id) {
@@ -1943,9 +2253,11 @@ impl FactumApp {
                 _ => log::warn!("No GPG signature found."),
             },
             CardAction::Sign(entry_id) => {
-                let result = self.factum().sign_entry(entry_id);
-                if self.run(result).is_some() {
-                    self.signature_checks.remove(&entry_id);
+                let result = self.factum().case_of_unsigned_entry(entry_id);
+                if !self.verification_running()
+                    && let Some(case_id) = self.run(result)
+                {
+                    self.start_verification(case_id, AfterVerify::SignEntry(entry_id));
                 }
             }
             CardAction::Verify(entry_id) => {
@@ -2056,7 +2368,7 @@ impl FactumApp {
                             ..Default::default()
                         };
                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        self.start_add(id, vec![acquire], options, cancel);
+                        self.start_add(id, vec![acquire], options, cancel, None);
                     }
                 }
             }
@@ -2070,7 +2382,7 @@ impl FactumApp {
                 options,
             } => {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                self.start_add(container_id, sources, options, cancel);
+                self.start_add(container_id, sources, options, cancel, None);
             }
             DialogResult::AddAgain {
                 container_id,
@@ -2081,7 +2393,7 @@ impl FactumApp {
                 if let Some((sources, options)) = plan.pop_front() {
                     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     // the run continues only once its first addition is under way
-                    if self.start_add(container_id, sources, options, cancel) {
+                    if self.start_add(container_id, sources, options, cancel, then_archive) {
                         self.pending_adds = plan;
                         self.close_after_adds = Some((container_id, then_archive));
                     }
@@ -2089,10 +2401,10 @@ impl FactumApp {
             }
             DialogResult::CloseDamaged {
                 container_id,
-                mismatches,
+                recheck,
                 then_archive,
             } => {
-                let result = self.factum().close_container_damaged(container_id, &mismatches);
+                let result = self.factum().close_container_damaged(container_id, &recheck);
                 if self.run(result).is_some()
                     && let Some(case_id) = then_archive
                 {
@@ -2102,9 +2414,11 @@ impl FactumApp {
             }
             DialogResult::TypedConfirmed { case_id, typed } => {
                 let result = self.factum().delete_case_permanently(case_id, &typed);
-                if self.run(result).is_some()
-                    && let Some(cdb) = &self.companion_db
-                {
+                let deleted = self.run(result).is_some();
+                if deleted {
+                    self.verified.remove(&case_id);
+                }
+                if deleted && let Some(cdb) = &self.companion_db {
                     if let Err(e) = cdb.delete_case(case_id) {
                         log::error!("The companion data of case {case_id} cannot be deleted: {e}");
                     }
@@ -2116,7 +2430,11 @@ impl FactumApp {
             }
             DialogResult::Correct { entry_id, text, images } => {
                 let result = self.factum().correct_note_with_images(entry_id, &text, &images);
-                self.run(result);
+                if let Some(corrected) = self.run(result)
+                    && self.focused_card == Some(entry_id)
+                {
+                    self.focused_card = Some(corrected);
+                }
             }
             DialogResult::Export {
                 case_id,
@@ -2145,11 +2463,9 @@ impl FactumApp {
             },
             // the default folder is stored as no setting, so it follows the database
             DialogResult::SealFolder(folder) if folder == self.factum().default_seal_dir().display().to_string() => {
-                let _ = self.db.delete_setting(SEAL_DIR_SETTING);
+                self.set_seal_folder(None);
             }
-            DialogResult::SealFolder(folder) => {
-                let _ = self.db.set_setting(SEAL_DIR_SETTING, &folder);
-            }
+            DialogResult::SealFolder(folder) => self.set_seal_folder(Some(&folder)),
             DialogResult::WizardFinished(choices) => self.finish_wizard(ctx, *choices),
             DialogResult::WizardCancelled { theme } => {
                 theme::apply(ctx, &theme);
@@ -2221,6 +2537,7 @@ impl FactumApp {
                         answer: None,
                         error: None,
                         running: false,
+                        request: 0,
                         open: true,
                     });
                 }
@@ -2267,11 +2584,15 @@ impl FactumApp {
                     self.db.path.clone(),
                     cdb.path.clone(),
                     self.companion_settings.clone(),
+                    self.companion.as_ref().map(|c| c.status().learned).unwrap_or_default(),
                     case_id,
                     question,
                 );
-                self.ask_jobs.push((case_id, worker));
-                self.set_ask_state(case_id, |answer, error, running| {
+                self.next_ask_request += 1;
+                let asked = self.next_ask_request;
+                self.ask_jobs.push((case_id, asked, worker));
+                self.set_ask_state(case_id, |request, answer, error, running| {
+                    *request = asked;
                     *answer = None;
                     *error = None;
                     *running = true;
@@ -2282,18 +2603,23 @@ impl FactumApp {
     }
 
     /// Updates the Ask window of the case, if it is still open.
-    fn set_ask_state(&mut self, case: i64, f: impl FnOnce(&mut Option<Answer>, &mut Option<String>, &mut bool)) {
+    fn set_ask_state(
+        &mut self,
+        case: i64,
+        f: impl FnOnce(&mut u64, &mut Option<Answer>, &mut Option<String>, &mut bool),
+    ) {
         for window in &mut self.companion_windows {
             if let CompanionWindow::Ask {
                 case_id,
                 answer,
                 error,
                 running,
+                request,
                 ..
             } = window
                 && *case_id == case
             {
-                f(answer, error, running);
+                f(request, answer, error, running);
                 return;
             }
         }
@@ -2302,6 +2628,26 @@ impl FactumApp {
     fn open_companion_settings(&mut self) {
         let dialog = CompanionSettingsDialog::new(&self.companion_settings, self.db.path.clone());
         self.dialogs.push(Dialog::CompanionSettings(Box::new(dialog)));
+    }
+
+    /// Stores the seal folder in the user config (None: next to the database), never in the database that the
+    /// verifier checks. This decides the question seal_dir_unused asks, so a folder still named by the open database
+    /// is dropped. The change goes to the application log.
+    fn set_seal_folder(&mut self, folder: Option<&str>) {
+        let before = self.factum().seal_dir();
+        if let Err(e) = config::set_seal_dir(&self.user_env, folder) {
+            let text = format!("The seal folder could not be saved to {}: {e}", self.user_env.display());
+            log::error!("{text}");
+            self.message("Seal folder", text);
+            return;
+        }
+        self.seal_dir = config::file_seal_dir(&self.user_env);
+        let _ = self.db.delete_setting(crate::seals::SEAL_DIR_SETTING);
+        log::info!(
+            "Seal folder changed from {} to {}.",
+            before.display(),
+            self.factum().seal_dir().display()
+        );
     }
 
     fn choose_seal_folder(&mut self) {
@@ -2314,7 +2660,12 @@ impl FactumApp {
             return;
         }
         let folder = self.factum().seal_dir().display().to_string();
-        self.dialogs.push(Dialog::SealFolder { folder });
+        let default = self.factum().default_seal_dir().display().to_string();
+        self.dialogs.push(Dialog::SealFolder {
+            folder,
+            default,
+            error: None,
+        });
     }
 
     fn set_theme(&mut self, ctx: &egui::Context, theme: &str) {
@@ -2367,6 +2718,65 @@ impl FactumApp {
             .set_setting(COMPOSER_HEIGHT_SETTING, &format!("{:.0}", self.composer_height));
     }
 
+    /// What quitting now would lose, in words.
+    fn quit_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if let Some(job) = &self.add_job {
+            reasons.push(format!("Files are being added to \"{}\": that is cancelled.", job.name));
+        }
+        if let Some(job) = &self.close_job {
+            reasons.push(format!("\"{}\" is being re-checked: it stays open.", job.name));
+        }
+        match self.verify_job.as_ref().map(|job| &job.then) {
+            Some(AfterVerify::SignEntry(_) | AfterVerify::SignSeal(_) | AfterVerify::SignAll) => {
+                reasons.push("The case is being verified for signing: nothing is signed.".to_string());
+            }
+            Some(AfterVerify::Export(..)) => {
+                reasons.push(
+                    "The case is being verified for an export: its seal stays, no files are written.".to_string(),
+                );
+            }
+            Some(AfterVerify::ShowReport) | None => {}
+        }
+        if !strip(&self.composer).is_empty() || !self.composer_images.is_empty() {
+            reasons.push("The note being written is lost.".to_string());
+        }
+        let mut dialogs = self.dialogs.iter().zip(&self.dialog_starts);
+        if dialogs.any(|(dialog, start)| dialog.typed_text() != *start) {
+            reasons.push("The text in the open dialog is lost.".to_string());
+        }
+        reasons
+    }
+
+    /// The window is asked to close. With something to lose it stays open and asks once; after Yes it stays open
+    /// until the running jobs have ended.
+    fn close_requested(&mut self, ctx: &egui::Context) {
+        // an addition that is done is logged, whatever comes next
+        if self.add_job.as_ref().is_some_and(|job| !job.worker.is_running()) {
+            self.poll(ctx);
+        }
+        let reasons = self.quit_reasons();
+        let busy = self.add_job.is_some() || self.close_job.is_some();
+        let nothing_lost = if self.quitting { !busy } else { reasons.is_empty() };
+        if nothing_lost {
+            return self.quit();
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        let asked = matches!(
+            self.dialogs.last(),
+            Some(Dialog::Confirm {
+                then: Pending::Quit,
+                ..
+            })
+        );
+        if !self.quitting && !asked {
+            self.dialogs.push(Dialog::Confirm {
+                message: reasons.join("\n"),
+                then: Pending::Quit,
+            });
+        }
+    }
+
     fn quit(&mut self) {
         // a running verification is not torn down: let it finish first
         if let Some(job) = self.verify_job.as_mut() {
@@ -2402,7 +2812,7 @@ impl FactumApp {
         if pressed(VERIFY_CASE)
             && let Some(case_id) = self.current_case_id()
         {
-            self.verify_case(ctx, case_id);
+            self.verify_case(case_id);
         }
         if pressed(SHOW_SYSTEM) {
             self.show_system = !self.show_system;
@@ -2446,8 +2856,8 @@ impl FactumApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let case_id = self.current_case_id();
         let case = self.view.case.clone();
+        let case_id = case.as_ref().map(|c| c.id);
         let is_open = case.as_ref().is_some_and(|c| !c.is_archived());
         let archived = case.as_ref().is_some_and(|c| c.is_archived());
         let p = *theme::current(&ctx);
@@ -2459,8 +2869,9 @@ impl FactumApp {
                         egui::Button::new("Export Case…").shortcut_text(ctx.format_shortcut(&EXPORT)),
                     )
                     .clicked()
+                    && let Some(case_id) = case_id
                 {
-                    self.export(case_id.unwrap());
+                    self.export(case_id);
                 }
                 ui.separator();
                 if ui
@@ -2590,8 +3001,10 @@ impl FactumApp {
 
     /// The Case menu; also opens from the "⋯" button above the case tree.
     fn case_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let case_id = self.current_case_id();
         let case = self.view.case.clone();
+        // what the buttons are enabled from is what they act on
+        let case_id = case.as_ref().map(|c| c.id);
+        let evidence_id = self.evidence_id;
         let is_open = case.as_ref().is_some_and(|c| !c.is_archived());
         let archived = case.as_ref().is_some_and(|c| c.is_archived());
         if ui
@@ -2609,20 +3022,22 @@ impl FactumApp {
         {
             self.open_new_evidence();
         }
-        if ui.add_enabled(is_open, egui::Button::new("Edit Case…")).clicked() {
-            self.open_edit_case(case_id.unwrap());
+        if ui.add_enabled(is_open, egui::Button::new("Edit Case…")).clicked()
+            && let Some(case_id) = case_id
+        {
+            self.open_edit_case(case_id);
         }
         if ui
-            .add_enabled(
-                is_open && self.evidence_id.is_some(),
-                egui::Button::new("Edit Evidence…"),
-            )
+            .add_enabled(is_open && evidence_id.is_some(), egui::Button::new("Edit Evidence…"))
             .clicked()
+            && let Some(evidence_id) = evidence_id
         {
-            self.open_edit_evidence(self.evidence_id.unwrap());
+            self.open_edit_evidence(evidence_id);
         }
-        if ui.add_enabled(is_open, egui::Button::new("New Container…")).clicked() {
-            self.open_new_container(case_id.unwrap());
+        if ui.add_enabled(is_open, egui::Button::new("New Container…")).clicked()
+            && let Some(case_id) = case_id
+        {
+            self.open_new_container(case_id);
         }
         ui.separator();
         if ui
@@ -2631,27 +3046,30 @@ impl FactumApp {
                 egui::Button::new("Verify Case").shortcut_text(ctx.format_shortcut(&VERIFY_CASE)),
             )
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.verify_case(ctx, case_id.unwrap());
+            self.verify_case(case_id);
         }
         if ui.button("Verify Container…").clicked()
             && let Some(path) = rfd::FileDialog::new()
                 .add_filter("AFF4-L container", &["aff4l", "aff4"])
                 .pick_file()
         {
-            self.verify_container_file(path);
+            self.verify_container_file(path, None);
         }
         if ui
             .add_enabled(case_id.is_some(), egui::Button::new("Seal Now"))
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.with_key_check(Pending::Seal(case_id.unwrap()));
+            self.with_key_check(Pending::Seal(case_id));
         }
         if ui
             .add_enabled(case_id.is_some(), egui::Button::new("Sign All Unsigned"))
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.sign_all_unsigned(case_id.unwrap());
+            self.sign_all_unsigned(case_id);
         }
         if ui
             .add_enabled(
@@ -2659,8 +3077,9 @@ impl FactumApp {
                 egui::Button::new("Export Case…").shortcut_text(ctx.format_shortcut(&EXPORT)),
             )
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.export(case_id.unwrap());
+            self.export(case_id);
         }
         let cli_text = if self.evidence_id.is_some() {
             "Set Evidence as CLI Active"
@@ -2675,11 +3094,15 @@ impl FactumApp {
             }
         }
         ui.separator();
-        if ui.add_enabled(is_open, egui::Button::new("Archive Case…")).clicked() {
-            self.archive(case_id.unwrap());
+        if ui.add_enabled(is_open, egui::Button::new("Archive Case…")).clicked()
+            && let Some(case_id) = case_id
+        {
+            self.archive(case_id);
         }
-        if ui.add_enabled(archived, egui::Button::new("Reopen Case")).clicked() {
-            let result = self.factum().reopen_case(case_id.unwrap());
+        if ui.add_enabled(archived, egui::Button::new("Reopen Case")).clicked()
+            && let Some(case_id) = case_id
+        {
+            let result = self.factum().reopen_case(case_id);
             self.run(result);
             self.select(None, None);
         }
@@ -2687,14 +3110,17 @@ impl FactumApp {
         let delete = ui
             .add_enabled(deletable, egui::Button::new("Delete Evidence…"))
             .on_disabled_hover_text("Only evidence without notes");
-        if delete.clicked() {
-            self.delete_evidence(self.evidence_id.unwrap());
+        if delete.clicked()
+            && let Some(evidence_id) = evidence_id
+        {
+            self.delete_evidence(evidence_id);
         }
         if ui
             .add_enabled(archived, egui::Button::new("Delete Case Permanently…"))
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.delete_case(case_id.unwrap());
+            self.delete_case(case_id);
         }
         if self.companion_db.is_some() && self.companion_settings.is_configured() {
             ui.separator();
@@ -2753,7 +3179,7 @@ impl FactumApp {
             let mut clicked_container: Option<i64> = None;
             let mut menu_action: Option<TreeAction> = None;
             let new_evidence = ctx.format_shortcut(&NEW_EVIDENCE);
-            for node in &self.view.tree {
+            for node in self.view.tree.iter() {
                 let case = &node.case;
                 let selected = self.case_id == Some(case.id) && self.container_id.is_none();
                 let (name, color) = if case.is_archived() {
@@ -2967,7 +3393,7 @@ impl FactumApp {
             TreeAction::Edit(case_id) => self.open_edit_case(case_id),
             TreeAction::CliCase(case_id) => self.set_cli_active_case(case_id),
             TreeAction::CliEvidence(evidence_id) => self.set_cli_active_evidence(evidence_id),
-            TreeAction::Verify(case_id) => self.verify_case(ctx, case_id),
+            TreeAction::Verify(case_id) => self.verify_case(case_id),
             TreeAction::Seal(case_id) => self.with_key_check(Pending::Seal(case_id)),
             TreeAction::Export(case_id) => self.export(case_id),
             TreeAction::SignAll(case_id) => self.sign_all_unsigned(case_id),
@@ -3166,11 +3592,11 @@ impl FactumApp {
                         search.request_focus();
                     }
                     if search.changed() {
-                        self.dirty = true;
+                        self.search_edited = Some(ctx.input(|i| i.time));
                     }
                     if clear && IconButton::new(icons::CLOSE, "Clear search").show(ui).clicked() {
                         self.filter.clear();
-                        self.dirty = true;
+                        self.search_edited = Some(f64::NEG_INFINITY); // nothing to wait for
                     }
                 });
             });
@@ -3281,6 +3707,7 @@ impl FactumApp {
             ui.visuals().widgets.inactive.bg_stroke
         };
         let inner = (ui.available_height() - 2.0 * stroke.width).max(24.0);
+        let case_id = self.current_case_id();
         let editor = egui::Frame::new()
             .fill(ui.visuals().text_edit_bg_color())
             .stroke(stroke)
@@ -3300,7 +3727,7 @@ impl FactumApp {
                             // the panel sets the height, not the default of four rows
                             .desired_rows(1)
                             .min_size(egui::vec2(0.0, inner));
-                        self.tag_completion.show(ui, &self.db, field, id)
+                        self.tag_completion.show(ui, &self.db, case_id, field, id)
                     })
                     .inner
             })
@@ -3504,10 +3931,12 @@ impl FactumApp {
                     .map(widgets::display_time)
                     .unwrap_or_else(|| "Case ▸ Seal Now".into());
                 ui.label(small(&sealed, p.muted)).on_hover_text(tip);
-                if let Some((level, utc, size)) = self.verified.get(&case.id)
-                    && *size as usize == status.entries
+                if let Some(verified) = self.verified.get(&case.id)
+                    && verified.tree_size as usize == status.entries
+                    && verified.root_hash == status.root_hash
                 {
-                    let (text, color) = match level {
+                    let utc = &verified.utc;
+                    let (text, color) = match verified.level {
                         Level::Ok => ("✓ verified", p.ok),
                         Level::Warn => ("⚠ verified with warnings", p.warn),
                         Level::Fail => ("✗ verification failed", p.fail),
@@ -3608,6 +4037,15 @@ enum TreeAction {
     /// New Container for an evidence item
     NewContainerFor(i64),
     Container(ContainerAction),
+}
+
+/// A refusal to open as the log records a directory fault: the member. Opening names it; without a name all that is
+/// known is the format's other case.
+fn refused_fault(refused: &FactumError) -> String {
+    refused
+        .member
+        .clone()
+        .unwrap_or_else(|| "the directory cannot be read".to_string())
 }
 
 fn capitalize(text: &str) -> String {
@@ -3730,6 +4168,7 @@ impl eframe::App for FactumApp {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         self.shortcuts(&ctx);
+        self.search_when_rested(&ctx);
         if self.dirty {
             self.rebuild(&ctx);
         }
@@ -3774,9 +4213,11 @@ impl eframe::App for FactumApp {
             match action {
                 VerifyAction::ShowEntry(entry_id) => self.jump_to_entry(entry_id),
                 VerifyAction::SignSeal(tree_head_id) => {
-                    let result = self.factum().sign_tree_head(tree_head_id);
-                    if self.run(result).is_some() {
-                        self.message("Factum", format!("Seal #{tree_head_id} signed."));
+                    let result = self.factum().unsigned_tree_head(tree_head_id);
+                    if !self.verification_running()
+                        && let Some(head) = self.run(result)
+                    {
+                        self.start_verification(head.case_id, AfterVerify::SignSeal(tree_head_id));
                     }
                 }
             }
@@ -3802,10 +4243,16 @@ impl eframe::App for FactumApp {
             self.handle_window_action(action, &ctx);
         }
         self.verification_progress(&ctx);
+        // the dialogs that opened since the last frame, before anything is typed into them
+        for dialog in self.dialogs.iter().skip(self.dialog_starts.len()) {
+            self.dialog_starts.push(dialog.typed_text());
+        }
+        self.dialog_starts.truncate(self.dialogs.len());
         if let Some(dialog) = self.dialogs.last_mut()
-            && let Some(result) = dialog.show(&ctx)
+            && let Some(result) = dialog.show(&ctx, self.dialog_starts.last().map_or("", String::as_str))
         {
             let closed = self.dialogs.pop();
+            self.dialog_starts.truncate(self.dialogs.len());
             if matches!(
                 (&closed, &result),
                 (Some(Dialog::CompanionSettings(_)), DialogResult::Cancel)
@@ -3815,9 +4262,10 @@ impl eframe::App for FactumApp {
             self.handle_dialog_result(result, &ctx);
         }
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.quit();
+            self.close_requested(&ctx);
+        } else if self.quitting && self.add_job.is_none() && self.close_job.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let _ = ACTIVE_KEY_SETTING;
     }
 }
 

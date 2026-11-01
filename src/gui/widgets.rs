@@ -115,7 +115,6 @@ pub enum CheckView<'a> {
 pub enum Tone {
     Plain,
     Ok,
-    Warn,
     Bad,
 }
 
@@ -124,7 +123,6 @@ impl Tone {
         match self {
             Tone::Plain => p.muted,
             Tone::Ok => p.ok,
-            Tone::Warn => p.warn,
             Tone::Bad => p.fail,
         }
     }
@@ -145,8 +143,8 @@ pub fn signature_display(entry: &Entry, check: CheckView) -> (String, Tone, Stri
     if !check.valid {
         if check.status.contains("no public key") {
             return (
-                "⚠ Key missing".into(),
-                Tone::Warn,
+                "✗ Key missing".into(),
+                Tone::Bad,
                 format!("{} is not in the keyring", none(&check.key_id)),
             );
         }
@@ -161,8 +159,8 @@ pub fn signature_display(entry: &Entry, check: CheckView) -> (String, Tone, Stri
     }
     if !check.trusted {
         return (
-            "⚠ Untrusted key".into(),
-            Tone::Warn,
+            "✗ Untrusted key".into(),
+            Tone::Bad,
             format!("{} · trust {}", none(&check.fingerprint), none(&check.trust)),
         );
     }
@@ -803,6 +801,7 @@ mod tests {
             is_pinned: false,
             format: 1,
             late_signature: None,
+            malformed: Vec::new(),
         }
     }
 
@@ -833,8 +832,8 @@ mod tests {
                     trusted: false,
                     ..good.clone()
                 },
-                "⚠ Untrusted key",
-                Tone::Warn,
+                "✗ Untrusted key",
+                Tone::Bad,
             ),
             (
                 SignatureCheck {
@@ -850,8 +849,8 @@ mod tests {
                     status: "no public key".into(),
                     ..good.clone()
                 },
-                "⚠ Key missing",
-                Tone::Warn,
+                "✗ Key missing",
+                Tone::Bad,
             ),
             (
                 SignatureCheck {

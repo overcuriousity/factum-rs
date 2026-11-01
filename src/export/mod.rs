@@ -10,14 +10,91 @@ use std::path::{Path, PathBuf};
 
 use crate::canonical::{compact_utc, utc_now};
 use crate::error::{FactumError, Result};
-use crate::seals::{REASON_EXPORT, safe_filename};
+use crate::export::model::ReportModel;
+use crate::files::safe_filename_capped;
+use crate::seals::REASON_EXPORT;
 use crate::services::Factum;
+use crate::verifier::{CaseReport, Level};
 
 pub const FORMATS: [&str; 4] = ["html", "pdf", "md", "bundle"];
+
+/// The case file number in an export's file names, in bytes; the time and a suffix come on top of it.
+const NAME_MAX_BYTES: usize = 100;
+
+/// What an export wrote.
+#[derive(Debug)]
+pub struct Exported {
+    pub paths: Vec<PathBuf>,
+    /// the verdict of the verification the files describe
+    pub verdict: Level,
+    /// what a reader of the files should know; the export itself worked
+    pub warnings: Vec<String>,
+}
+
+/// An export between its seal and its files: the sealed case is verified next, then
+/// [`finish_export`](Factum::finish_export) writes them. Dropped, it leaves only the seal.
+#[derive(Debug)]
+pub struct ExportPlan {
+    formats: Vec<String>,
+    out_dir: PathBuf,
+    staging: tempfile::TempDir,
+    seal_id: i64,
+}
+
+/// The reports an export needs; one no format asks for stays empty. The HTML holds the images as base64.
+#[derive(Debug)]
+pub struct Rendered {
+    pub html: Vec<u8>,
+    pub pdf: Vec<u8>,
+    /// the characters no font of the PDF has
+    pub unsupported: Vec<char>,
+}
+
+/// Renders what the formats need: the bundle carries all reports.
+pub fn render_needed(model: &ReportModel, formats: &[&str]) -> Rendered {
+    let needed = |report: &str| formats.contains(&report) || formats.contains(&"bundle");
+    let html = if needed("html") {
+        html::render_html(model, false).into_bytes()
+    } else {
+        Vec::new()
+    };
+    let (pdf, unsupported) = if needed("pdf") {
+        pdf::render_pdf_checked(model)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Rendered { html, pdf, unsupported }
+}
+
+/// Moves the outputs from the staging folder into the target folder, all of them or none.
+fn publish(staging: &Path, target: &Path, names: &[String]) -> Result<()> {
+    for (index, name) in names.iter().enumerate() {
+        if let Err(e) = std::fs::rename(staging.join(name), target.join(name)) {
+            for moved in &names[..index] {
+                let _ = std::fs::rename(target.join(moved), staging.join(moved));
+            }
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
 
 impl Factum<'_> {
     /// Seals the case, verifies it and writes the requested formats; returns the written files.
     pub fn export(&self, case_id: i64, formats: &[&str], out_dir: &Path) -> Result<Vec<PathBuf>> {
+        Ok(self.export_checked(case_id, formats, out_dir)?.paths)
+    }
+
+    /// Like [`export`](Self::export), with the verdict and the warnings. All files appear together at the end; an
+    /// export that fails leaves none, only its seal.
+    pub fn export_checked(&self, case_id: i64, formats: &[&str], out_dir: &Path) -> Result<Exported> {
+        let plan = self.begin_export(case_id, formats, out_dir)?;
+        let report = self.verify_case(case_id, None)?;
+        self.finish_export(plan, report)
+    }
+
+    /// The first half of an export: checks the formats and the folder, and seals the case.
+    pub fn begin_export(&self, case_id: i64, formats: &[&str], out_dir: &Path) -> Result<ExportPlan> {
         let mut unique: Vec<&str> = Vec::new();
         for format in formats {
             if !unique.contains(format) {
@@ -37,55 +114,108 @@ impl Factum<'_> {
             )));
         }
         std::fs::create_dir_all(out_dir)?;
+        // in the target folder: the outputs get there by a rename. Dropped, it takes everything in it along
+        let staging = tempfile::Builder::new().prefix(".factum-export-").tempdir_in(out_dir)?;
         // seal first, so the report and the bundle describe exactly the sealed state
         let seal_id = self.seal(case_id, REASON_EXPORT)?;
-        let report = self.verify_case(case_id, None)?;
+        Ok(ExportPlan {
+            formats: unique.into_iter().map(str::to_string).collect(),
+            out_dir: out_dir.to_path_buf(),
+            staging,
+            seal_id,
+        })
+    }
+
+    /// The second half of an export: writes the files, from `report`, the verification made after the seal.
+    pub fn finish_export(&self, plan: ExportPlan, report: CaseReport) -> Result<Exported> {
+        let ExportPlan {
+            formats,
+            out_dir,
+            staging,
+            seal_id,
+        } = plan;
+        let unique: Vec<&str> = formats.iter().map(String::as_str).collect();
+        let out_dir = out_dir.as_path();
+        let verdict = report.overall();
         let exported_utc = utc_now();
         let seal = self.get_tree_head(seal_id)?.expect("the seal was just created");
         let model = self.build_model(report, seal, self.signer.active_key(), &exported_utc)?;
         // built by concatenation: case file numbers may contain dots, which with_extension would cut off
         let stem = format!(
             "{}_{}",
-            safe_filename(&model.case.case_file),
+            safe_filename_capped(&model.case.case_file, NAME_MAX_BYTES),
             compact_utc(&exported_utc)
         );
-        let html = html::render_html(&model, false).into_bytes();
+        let Rendered { html, pdf, unsupported } = render_needed(&model, &unique);
         // borrowed from the model: nothing is copied for formats that do not write image files
         let images = markdown::image_files(&model);
         let image_dir = format!("{stem}_images");
-        let pdf = if unique.contains(&"pdf") || unique.contains(&"bundle") {
-            pdf::render_pdf(&model)
-        } else {
-            Vec::new()
-        };
+        // what goes into out_dir, and the files that makes for the caller
+        let mut outputs = Vec::new();
         let mut written = Vec::new();
         for (format, suffix, content) in [("html", ".html", &html), ("pdf", ".pdf", &pdf)] {
             if unique.contains(&format) {
-                let path = out_dir.join(format!("{stem}{suffix}"));
-                std::fs::write(&path, content)?;
-                written.push(path);
+                let name = format!("{stem}{suffix}");
+                std::fs::write(staging.path().join(&name), content)?;
+                written.push(out_dir.join(&name));
+                outputs.push(name);
             }
         }
         if unique.contains(&"md") {
-            let path = out_dir.join(format!("{stem}.md"));
-            std::fs::write(&path, markdown::render_markdown(&model, &image_dir))?;
-            written.push(path);
+            let name = format!("{stem}.md");
+            std::fs::write(
+                staging.path().join(&name),
+                markdown::render_markdown(&model, &image_dir),
+            )?;
+            written.push(out_dir.join(&name));
+            outputs.push(name);
             if !images.is_empty() {
-                let folder = out_dir.join(&image_dir);
-                std::fs::create_dir_all(&folder)?;
+                let folder = staging.path().join(&image_dir);
+                std::fs::create_dir(&folder)?;
                 for (name, bytes) in &images {
-                    let path = folder.join(name);
-                    std::fs::write(&path, bytes)?;
-                    written.push(path);
+                    std::fs::write(folder.join(name), bytes)?;
+                    written.push(out_dir.join(&image_dir).join(name));
                 }
+                outputs.push(image_dir);
             }
         }
         if unique.contains(&"bundle") {
             // not the .md report's text: the bundle links its images under images/
             let markdown = markdown::render_markdown(&model, "images").into_bytes();
             let reports = [("report.html", html), ("report.pdf", pdf), ("report.md", markdown)];
-            written.push(self.build_bundle(&model, &reports, &images, &out_dir.join(format!("{stem}.zip")))?);
+            let name = format!("{stem}.zip");
+            self.build_bundle(&model, &reports, &images, &staging.path().join(&name))?;
+            written.push(out_dir.join(&name));
+            outputs.push(name);
         }
-        Ok(written)
+        publish(staging.path(), out_dir, &outputs)?;
+        Ok(Exported {
+            paths: written,
+            verdict,
+            warnings: pdf::unsupported_warning(&unsupported).into_iter().collect(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_rename_takes_back_what_was_moved() {
+        let (staging, target) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        for name in ["a", "b"] {
+            std::fs::write(staging.path().join(name), name).unwrap();
+        }
+        // a folder with something in it cannot be renamed over
+        std::fs::create_dir_all(target.path().join("b").join("full")).unwrap();
+        let names = ["a".to_string(), "b".to_string()];
+        assert!(publish(staging.path(), target.path(), &names).is_err());
+        assert!(!target.path().join("a").exists());
+        assert_eq!(std::fs::read(staging.path().join("a")).unwrap(), b"a");
+        std::fs::remove_dir_all(target.path().join("b")).unwrap();
+        publish(staging.path(), target.path(), &names).unwrap();
+        assert_eq!(std::fs::read(target.path().join("b")).unwrap(), b"b");
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 }

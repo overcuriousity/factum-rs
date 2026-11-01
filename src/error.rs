@@ -14,6 +14,11 @@ pub enum ErrorKind {
     LogChanged,
     Confirmation,
     LogBroken,
+    /// a container member differs from the CRC-32 of the directory, so the container is not opened; Verify tells
+    /// whether its content is intact
+    ContainerCrc,
+    /// the user asked a running check to stop
+    Cancelled,
     /// a database or file system error that is not a user error
     Internal,
 }
@@ -23,6 +28,8 @@ pub enum ErrorKind {
 pub struct FactumError {
     pub kind: ErrorKind,
     pub message: String,
+    /// the member that differs from the directory's CRC-32, as the directory names it, when opening refused for that
+    pub member: Option<String>,
 }
 
 impl FactumError {
@@ -30,11 +37,17 @@ impl FactumError {
         Self {
             kind,
             message: message.into(),
+            member: None,
         }
     }
 
     pub fn general(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::General, message)
+    }
+
+    pub fn with_member(mut self, member: &str) -> Self {
+        self.member = Some(member.to_string());
+        self
     }
 
     pub fn is(&self, kind: ErrorKind) -> bool {
@@ -82,4 +95,6 @@ constructors! {
     log_changed => LogChanged,
     confirmation => Confirmation,
     log_broken => LogBroken,
+    container_crc => ContainerCrc,
+    cancelled => Cancelled,
 }

@@ -58,7 +58,7 @@ ureq = { version = "3", optional = true, default-features = false, features = ["
 # a path is shortened between graphemes, so an accent stays on its letter (egui depends on it already)
 unicode-segmentation = { version = "1", optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

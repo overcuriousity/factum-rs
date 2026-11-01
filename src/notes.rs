@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+
 use rusqlite::{OptionalExtension, Row, ToSql, params};
 use serde_json::Value;
 
-use crate::db::ensure_entry_case_open;
+use crate::db::{Cells, ensure_entry_case_open};
 use crate::error::{FactumError, Result};
 use crate::images::{self, NoteImage};
 use crate::log_service::{Append, KIND_NOTE};
@@ -34,6 +36,8 @@ pub struct Entry {
     pub is_pinned: bool,
     pub format: i64,
     pub late_signature: Option<LateSignature>,
+    /// cells that could not be read as the schema says (only from [`Entry::from_row_tolerant`])
+    pub malformed: Vec<String>,
 }
 
 /// The columns [`Entry::from_row`] reads, in its order, with `$payload` in the place of the payload.
@@ -52,25 +56,36 @@ impl Entry {
     /// [`Self::COLUMNS`] with `NULL` for the payload, which may hold megabytes of images.
     const COLUMNS_WITHOUT_PAYLOAD: &'static str = entry_columns!("NULL");
 
-    pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
-        Ok(Self {
-            id: row.get(0)?,
-            case_id: row.get(1)?,
-            leaf_index: row.get(2)?,
-            kind: row.get(3)?,
-            evidence_id: row.get(4)?,
-            text: row.get(5)?,
-            payload_json: row.get(6)?,
-            corrects_id: row.get(7)?,
-            created_utc: row.get(8)?,
-            leaf_hash: row.get(9)?,
-            tree_size: row.get(10)?,
-            root_hash: row.get(11)?,
-            signature: row.get(12)?,
-            is_pinned: row.get::<_, i64>(13)? != 0,
-            format: row.get(14)?,
+    fn read(cells: &mut Cells) -> Self {
+        Self {
+            id: cells.int(0),
+            case_id: cells.int(1),
+            leaf_index: cells.int(2),
+            kind: cells.text(3),
+            evidence_id: cells.optional_int(4),
+            text: cells.text(5),
+            payload_json: cells.optional_text(6),
+            corrects_id: cells.optional_int(7),
+            created_utc: cells.text(8),
+            leaf_hash: cells.text(9),
+            tree_size: cells.int(10),
+            root_hash: cells.text(11),
+            signature: cells.optional_text(12),
+            is_pinned: cells.int(13) != 0,
+            format: cells.int(14),
             late_signature: None,
-        })
+            malformed: Vec::new(),
+        }
+    }
+
+    pub fn from_row(row: &Row) -> rusqlite::Result<Self> {
+        Cells::strict(row, Self::read)
+    }
+
+    /// [`Self::from_row`] for the verifier: a cell that cannot be read goes into `malformed`.
+    pub fn from_row_tolerant(row: &Row) -> rusqlite::Result<Self> {
+        let (entry, malformed) = Cells::tolerant(row, Self::read);
+        Ok(Self { malformed, ..entry })
     }
 
     /// The parsed payload; an edited row whose JSON does not parse is kept as a string, so verification
@@ -172,6 +187,26 @@ fn referenced_images(text: &str, images: &[NoteImage]) -> Result<Vec<NoteImage>>
         .collect()
 }
 
+/// The images of one note version may not add up to more than the limit. A correction of a note that is over it
+/// already (from before the limit) may keep its images, but not add any.
+fn check_total_size(kept: &[NoteImage], previous: &[NoteImage]) -> Result<()> {
+    let total: usize = kept.iter().map(|image| image.bytes.len()).sum();
+    if total > images::MAX_NOTE_IMAGE_BYTES && kept.iter().any(|image| images::find(previous, &image.id).is_none()) {
+        return Err(FactumError::general(format!(
+            "The images of a note may add up to {} MB at most; these are {} MB.",
+            images::MAX_NOTE_IMAGE_BYTES / (1024 * 1024),
+            total.div_ceil(1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+fn inconsistent_chain(entry_id: i64) -> FactumError {
+    FactumError::general(format!(
+        "The correction chain of entry #{entry_id} is inconsistent (it loops); the database was changed outside factum."
+    ))
+}
+
 impl Factum<'_> {
     pub fn create_note(&self, note_text: &str, evidence_id: Option<i64>, case_id: i64) -> Result<i64> {
         self.create_note_with_images(note_text, &[], evidence_id, case_id)
@@ -215,6 +250,7 @@ impl Factum<'_> {
             }
         }
         let kept = referenced_images(note_text, images)?;
+        check_total_size(&kept, &[])?;
         self.append(
             case_id,
             KIND_NOTE,
@@ -252,6 +288,8 @@ impl Factum<'_> {
         let kept = referenced_images(new_text, images)?;
         // versions never branch: a correction always attaches to the newest version of the line
         let newest = self.latest_version_id(note_id)?;
+        let previous = self.get_entry(newest)?.map(|e| e.images()).unwrap_or_default();
+        check_total_size(&kept, &previous)?;
         // the pin and the labels follow the newest version
         let move_pin_and_labels = |conn: &rusqlite::Connection, new_id: i64| -> Result<()> {
             let pinned: i64 =
@@ -326,8 +364,12 @@ impl Factum<'_> {
     }
 
     pub fn latest_version_id(&self, entry_id: i64) -> Result<i64> {
+        let mut seen = HashSet::from([entry_id]);
         let mut current = entry_id;
         while let Some(successor) = self.successor_id(current)? {
+            if !seen.insert(successor) {
+                return Err(inconsistent_chain(entry_id));
+            }
             current = successor;
         }
         Ok(current)
@@ -336,6 +378,7 @@ impl Factum<'_> {
     /// All versions of the entry's line, oldest first.
     pub fn history(&self, entry_id: i64) -> Result<Vec<i64>> {
         let mut first = entry_id;
+        let mut seen = HashSet::from([entry_id]);
         loop {
             let corrects: Option<Option<i64>> = self
                 .db
@@ -345,12 +388,21 @@ impl Factum<'_> {
                 })
                 .optional()?;
             match corrects {
-                Some(Some(previous)) => first = previous,
+                Some(Some(previous)) => {
+                    if !seen.insert(previous) {
+                        return Err(inconsistent_chain(entry_id));
+                    }
+                    first = previous;
+                }
                 _ => break,
             }
         }
         let mut versions = vec![first];
+        let mut seen = HashSet::from([first]);
         while let Some(successor) = self.successor_id(*versions.last().unwrap())? {
+            if !seen.insert(successor) {
+                return Err(inconsistent_chain(entry_id));
+            }
             versions.push(successor);
         }
         Ok(versions)

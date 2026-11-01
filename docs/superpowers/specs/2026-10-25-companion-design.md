@@ -147,8 +147,9 @@ passes for it. Case menu → "Case goal…" opens a multi-line text dialog that 
 
 First configuration, and cases without a `case_settings` row: no model work happens for a case until it is selected
 in the tree. Selecting a case that has entries but no companion state runs one full pass (4.7) with the compact
-timeline, so the first questions appear within one pass; the newest 20 entries are enriched before it, the rest of
-the history is enriched afterwards in batches of 50, newest first, only while the thread has nothing else to do.
+timeline, an overview of the case: entries it cuts for space count as seen. The first questions appear within one
+pass; the newest 20 entries are enriched before it, the rest of the history is enriched after a successful pass in
+batches of 50, newest first, only while the thread has nothing else to do.
 Retrieval over not-yet-enriched entries works on their raw text. The status item shows "indexing n of m" during
 backlog enrichment. While the endpoint is unreachable the companion thread re-probes every 60 s on its own; after a
 pass fails with a model-call error the case is retried once after the minimum spacing. The companion thread serves
@@ -220,7 +221,8 @@ frame, what must be answered. Sent verbatim.
 
 Every model call is built from sections in a fixed order with a token budget per section. Token estimates: chars/3.0
 for prose, chars/2.4 for JSON and identifier-heavy text; when a response carries usage counts, the ratio is
-recalibrated from them for the session. Budget: `0.8 × context_window − output_reserve`, where `context_window` is
+recalibrated from them for the session (a lower ratio at once, a higher one by a fifth of the difference, the dense
+ratio never above 2.4). Budget: `0.8 × context_window − output_reserve`, where `context_window` is
 the setting; else, for the Anthropic protocol, the `max_input_tokens` field of the chosen model from the models
 listing; else 16k, so an unknown endpoint never overflows. `output_reserve` is 1 500 tokens for a reflection pass, 800 for enrichment, 1 000 for Ask. A call
 that still overflows after the cuts below falls back to shortening the fixed sections (last resort, after section 6);
@@ -239,7 +241,9 @@ Order and cutting rule for a reflection pass:
 5. Open questions: id, archetype, text, entry ids, rating (never cut; the ≤ 7 cap keeps this small).
 6. New entries since the last pass, verbatim, oldest first, each as `#id · timestamp · evidence · text` (cut from the
    newest end second in a diff pass, so `last_seen_entry_id` advances only to the newest entry that stayed in the
-   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end). A diff pass
+   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end; when a later
+   full pass cuts a new entry `last_seen_entry_id` stays where it was, so diff passes cover it, while what a case's
+   first pass cuts counts as seen, its timeline being an overview). A diff pass
    always keeps its oldest new entry, as a last resort cut to 400 characters, so no single entry can stall the case.
 
 Last resort order, once 7, 8 and the cuttable lines of 6 are gone: pinned lines shortened, evidence lines shortened,
@@ -403,8 +407,10 @@ increments. No further input is asked for.
 
 ### 4.9 Ask
 
-Input: one question. Retrieval as 4.6 with k = 8 and no exclusion, plus every pinned note; packed greedily by rank
-into the budget as numbered excerpts `[n] #id · timestamp · text`. One call, prose output. The instruction: answer
+Input: one question. Retrieval as 4.6 with k = 8 and no exclusion, plus every pinned note not retrieved. Those pinned
+notes come first and leave half of the budget to the hits, as far as the hits need it; one that does not fit is cut to
+300 characters, then left out. The hits follow by rank, whole; one that does not fit is left out. They are numbered
+excerpts `[n] #id · timestamp · text`. One call, prose output. The instruction: answer
 only from the excerpts, cite as `[n]`, quote paths and values exactly, answer partially if only part is covered, and
 start with exactly "Not in the case log." when no excerpt mentions any part of the subject. After the answer, a
 check without a model call flags paths, hashes, numbers and commands in the answer that occur in no excerpt and

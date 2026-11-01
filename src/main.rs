@@ -16,12 +16,30 @@ fn main() {
         Ok(db) => db,
         Err(e) => {
             log::error!("{e}");
-            std::process::exit(1);
+            std::process::exit(2);
+        }
+    };
+    // up to 2.7.1 the GUI kept the seal folder in the database
+    let env_file = config::user_env_path();
+    let notice = match factum::seals::migrate_seal_dir_setting(&db, &env_file) {
+        Ok(moved) => moved.map(|folder| {
+            format!(
+                "The seal folder {folder} was taken from this database and is now set in {}. Check that it is the \
+                 folder you chose.",
+                env_file.display()
+            )
+        }),
+        Err(e) => {
+            log::warn!("{e}");
+            None
         }
     };
     if args.gui {
-        run_gui(db);
+        run_gui(db, notice);
     } else {
+        if config::settings().db_from_env {
+            eprintln!("Database: {}", db.path.display());
+        }
         let mut stdout = std::io::stdout().lock();
         let code = cli::run(&db, &args, None, None, &mut stdout);
         drop(db);
@@ -29,20 +47,21 @@ fn main() {
     }
 }
 
+/// `notice`: shown once in a message when the GUI starts
 #[cfg(feature = "gui")]
-fn run_gui(db: Db) {
+fn run_gui(db: Db, notice: Option<String>) {
     #[cfg(windows)]
     detach_console();
-    if let Err(e) = factum::gui::run(db) {
+    if let Err(e) = factum::gui::run(db, notice) {
         log::error!("The GUI could not be started: {e}");
-        std::process::exit(1);
+        std::process::exit(2);
     }
 }
 
 #[cfg(not(feature = "gui"))]
-fn run_gui(_db: Db) {
+fn run_gui(_db: Db, _notice: Option<String>) {
     log::error!("This factum binary was built without the GUI (cargo feature 'gui').");
-    std::process::exit(1);
+    std::process::exit(2);
 }
 
 /// A shortcut that starts `factum --gui` gets a console window of its own; close it. A console the GUI was

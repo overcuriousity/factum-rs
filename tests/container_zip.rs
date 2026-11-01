@@ -123,3 +123,37 @@ fn unzip_tests_output() {
     assert!(output.status.success(), "{text}");
     assert!(text.contains("No errors detected"), "{text}");
 }
+
+/// The reviewer's container: two members, the second renamed `information.turtle` in its local header and in the
+/// directory, the ZIP64 counts lowered to 1. Python, unzip and 7-Zip go by the directory's size and read both.
+#[test]
+fn an_entry_hidden_behind_a_lowered_count_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.aff4l");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let mut app = Appender::new(file, 0, Vec::new()).unwrap();
+    app.add_bytes("information.turtle", 0, b"what factum shows").unwrap();
+    app.add_bytes("informatioX.turtle", 0, b"what the others show").unwrap();
+    let end = app.finish(&[], b"aff4://v").unwrap();
+    let archive = read_archive(&mut app.into_file(), end).unwrap();
+    assert_eq!(archive.entries.len(), 2);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    let renamed = bytes.windows(18).filter(|w| *w == b"informatioX.turtle").count();
+    assert_eq!(renamed, 2);
+    while let Some(at) = bytes.windows(18).position(|w| w == b"informatioX.turtle") {
+        bytes[at..at + 18].copy_from_slice(b"information.turtle");
+    }
+    // count on this disk and total count of the ZIP64 record
+    let record = bytes.windows(4).rposition(|w| w == b"PK\x06\x06").unwrap();
+    bytes[record + 24..record + 40].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let error = read_archive(&mut std::fs::File::open(&path).unwrap(), end).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}

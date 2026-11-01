@@ -72,6 +72,19 @@ fn reports_show_the_evidence_description() {
 }
 
 #[test]
+fn reports_name_the_seal_folder_checked() {
+    let f = Fixture::new();
+    let model = model(&f);
+    let line = format!("Seal folder checked: {}", f.seal_dir.display());
+    assert!(render_html(&model, false).contains(&format!("<p class='mono'>{line}</p>")));
+    assert!(render_markdown(&model, "images").contains(&format!("\n{}\n", inline(&line))));
+    let pdf = factum::export::pdf::render_pdf(&model);
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(extracted.contains("Seal folder checked:"), "{extracted}");
+    }
+}
+
+#[test]
 fn short_line() {
     let f = Fixture::new();
     let model = model(&f);
@@ -299,6 +312,53 @@ fn failing_case_is_still_exported() {
 }
 
 #[test]
+fn a_failed_export_leaves_nothing_behind() {
+    let f = Fixture::with_signer(FakeSigner::new(true));
+    let factum = f.factum();
+    let case_id = export_case(&factum);
+    let image = small_image();
+    factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let out = f.path().join("out");
+    // the bundle is the last output, and its manifest cannot be signed
+    f.signer.fail_detached_after.set(Some(0));
+    let formats = ["html", "pdf", "md", "bundle"];
+    assert!(factum.export(case_id, &formats, &out).is_err());
+    let left: Vec<_> = std::fs::read_dir(&out).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+    // nothing stays behind after a good one either, and all outputs are there
+    let paths = factum.export(case_id, &formats, &out).unwrap();
+    assert!(paths.iter().all(|path| path.is_file()), "{paths:?}");
+    let mut names: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 5, "{names:?}"); // four files and the image folder
+    assert!(names.iter().all(|name| !name.starts_with('.')), "{names:?}");
+}
+
+#[test]
+fn long_case_file_numbers_make_short_file_names() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case(&"案".repeat(80), "Case", "").unwrap();
+    let image = small_image();
+    factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let paths = factum
+        .export(case_id, &["html", "pdf", "md", "bundle"], &f.path().join("out"))
+        .unwrap();
+    assert_eq!(paths.len(), 5);
+    for path in paths {
+        assert!(path.is_file(), "{path:?}");
+        assert!(path.file_name().unwrap().len() <= 143, "{path:?}");
+    }
+}
+
+#[test]
 fn unknown_format_is_refused() {
     let f = Fixture::new();
     let factum = f.factum();
@@ -404,7 +464,8 @@ fn run_verify(bundle: &Path, gnupg_home: Option<&Path>, flags: &[&str]) -> Optio
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    Some((output.status.code().unwrap_or(-1), text))
+    // Python's text output on Windows
+    Some((output.status.code().unwrap_or(-1), text.replace("\r\n", "\n")))
 }
 
 #[test]
@@ -598,6 +659,694 @@ fn non_ascii_case_file_seals_verify_outside_factum() {
 }
 
 #[test]
+fn verify_py_accepts_a_key_expired_since_with_a_warning() {
+    let home = common::GpgHome::at_time(
+        Some("20200101T000000"),
+        "Expired Key <expired@factum.invalid>",
+        "sign",
+        "2020-02-01",
+    );
+    let Some(home) = home else { return };
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &home);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    home.set_clock(None);
+    let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains("has expired since") && output.contains("Result: OK"),
+        "{output}"
+    );
+}
+
+fn expired_key_bundle(f: &Fixture) -> Option<(common::GpgHome, PathBuf)> {
+    let home = common::GpgHome::at_time(
+        Some("20200101T000000"),
+        "Expired Key <expired@factum.invalid>",
+        "sign",
+        "2020-02-01",
+    )?;
+    let signer = gpg_signer(&f.db, &home);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    Some((home, bundle))
+}
+
+#[test]
+fn verify_py_refuses_an_expired_key_gpg_cannot_say_is_trusted() {
+    let f = Fixture::new();
+    let Some((home, bundle)) = expired_key_bundle(&f) else {
+        return;
+    };
+    let elsewhere = require_gpg!("Someone Else <else@factum.invalid>");
+    let path = elsewhere.path().join("key.asc");
+    std::fs::write(&path, home.gpg_ok(&["--armor", "--export"]).stdout).unwrap();
+    elsewhere.gpg_ok(&["--batch", "--import", path.to_str().unwrap()]);
+    let Some((code, output)) = run_verify(&bundle, Some(&elsewhere.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 1, "{output}");
+    assert!(
+        output.contains("has expired and is not trusted as far as gpg can tell"),
+        "{output}"
+    );
+}
+
+#[test]
+fn verify_py_with_bundled_keys_accepts_an_expired_key_with_a_warning() {
+    let f = Fixture::new();
+    let Some((_home, bundle)) = expired_key_bundle(&f) else {
+        return;
+    };
+    let empty_home = tempfile::Builder::new().prefix("fe-").tempdir_in("/tmp").unwrap();
+    let Some((code, output)) = run_verify(&bundle, Some(empty_home.path()), &["--use-bundled-keys"]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("has expired since"), "{output}");
+    let _ = Command::new("gpgconf")
+        .arg("--homedir")
+        .arg(empty_home.path())
+        .args(["--kill", "gpg-agent"])
+        .output();
+}
+
+#[test]
+fn verify_py_accepts_an_expired_subkey_on_a_certified_primary_key() {
+    let user_id = "Colleague <c@factum.invalid>";
+    let Some(owner) = common::GpgHome::at_time(Some("20200101T000000"), user_id, "cert", "never") else {
+        return;
+    };
+    let fingerprint = owner.fingerprints("c@factum.invalid")[0].clone();
+    owner.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-add-key",
+        &fingerprint,
+        "ed25519",
+        "sign",
+        "2020-02-01",
+    ]);
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &owner);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    let home = require_gpg!("Examiner <examiner@factum.invalid>");
+    let path = home.path().join("key.asc");
+    std::fs::write(&path, owner.gpg_ok(&["--armor", "--export"]).stdout).unwrap();
+    home.gpg_ok(&["--batch", "--import", path.to_str().unwrap()]);
+    home.gpg_ok(&["--batch", "--yes", "--quick-lsign-key", &fingerprint]);
+    let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("has expired since"), "{output}");
+}
+
+/// Adds a member with python's zipfile, which writes what the zip crate refuses (repeated names).
+fn append_member(bundle: &Path, name: &str, content: &str) {
+    // Python on Windows stores `\\` as `/`: written under a name as long, and the name's bytes changed afterwards
+    let stored = name.replace('\\', "_");
+    let code = "import sys, warnings, zipfile\n\
+                warnings.simplefilter('ignore')\n\
+                zipfile.ZipFile(sys.argv[1], 'a').writestr(sys.argv[2], sys.argv[3])";
+    let python = which::which("python3").unwrap();
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(code)
+        .arg(bundle)
+        .arg(&stored)
+        .arg(content)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    if stored != name {
+        let mut bytes = std::fs::read(bundle).unwrap();
+        let places: Vec<usize> = (0..bytes.len() - stored.len())
+            .filter(|&at| bytes[at..].starts_with(stored.as_bytes()))
+            .collect();
+        assert_eq!(places.len(), 2, "the local and the central header");
+        for at in places {
+            bytes[at..at + name.len()].copy_from_slice(name.as_bytes());
+        }
+        std::fs::write(bundle, bytes).unwrap();
+    }
+}
+
+#[test]
+fn verify_py_fails_on_names_tools_read_differently() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let Some((_, clean)) = run_verify(&bundle, None, &[]) else {
+        return;
+    };
+    assert!(clean.contains("File names\nManifest\n"), "{clean}");
+    for (name, expected) in [
+        ("case.json", "'case.json' is in the bundle more than once"),
+        ("Case.json", "'case.json' and 'Case.json' differ only in case"),
+        ("/etc/passwd", "'/etc/passwd' is not a safe name"),
+        ("C:/windows/x", "'C:/windows/x' is not a safe name"),
+        ("images/../../x", "'images/../../x' is not a safe name"),
+        ("..", "'..' is not a safe name"),
+        (r"images\x", r"'images\\x' is not a safe name"),
+    ] {
+        let copy = f.path().join("copy.zip");
+        std::fs::copy(&bundle, &copy).unwrap();
+        append_member(&copy, name, "{}");
+        let (code, output) = run_verify(&copy, None, &[]).unwrap();
+        assert_eq!(code, 1, "{name}: {output}");
+        assert!(output.contains(&format!("FAIL  {expected}")), "{name}: {output}");
+    }
+}
+
+#[test]
+fn verify_py_checks_the_names_in_an_extracted_folder() {
+    // an extracted folder can hold case-only variants on a file system that tells them apart
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let folder = f.path().join("extracted");
+    for (name, content) in read_zip(&bundle) {
+        let path = folder.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    let Some((_, clean)) = run_verify(&folder, None, &[]) else {
+        return;
+    };
+    assert!(!clean.contains("differ only in case"), "{clean}");
+    std::fs::write(folder.join("CASE.JSON"), "{}").unwrap();
+    if std::fs::read(folder.join("case.json")).unwrap() == b"{}" {
+        return; // a file system that folds case: there is only the one file, overwritten
+    }
+    let (_, output) = run_verify(&folder, None, &[]).unwrap();
+    assert!(output.contains("differ only in case"), "{output}");
+}
+
+#[test]
+fn verify_py_fails_a_case_json_that_cannot_be_read() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    for shape in [
+        &b"{}"[..],
+        b"[]",
+        b"null",
+        b"1",
+        b"\"x\"",
+        b"true",
+        br#"{"case":1}"#,
+        br#"{"case":{},"entries":[{}],"tree_heads":[{}],"evidence":[{}]}"#,
+        b"{",
+        b"\xff",
+    ] {
+        rewrite_zip(&bundle, &[("case.json", shape.to_vec())]);
+        let Some((code, output)) = run_verify(&bundle, None, &[]) else {
+            return;
+        };
+        if output.contains("Nothing was checked.") {
+            return; // no gpg to go on with
+        }
+        assert!(!output.contains("Traceback"), "{output}");
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("  FAIL  case.json cannot be read"), "{output}");
+        assert!(output.contains("Result: FAIL"), "{output}");
+    }
+}
+
+/// Runs verify.py's `main` in one process on each of `shapes` as the bundle's case.json, gpg left out, and prints a
+/// line for each that raises or passes.
+const CASE_SHAPES_DRIVER: &str = r#"
+import contextlib, importlib.util, io, json, sys
+spec = importlib.util.spec_from_file_location("verify", sys.argv[1])
+verify = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verify)
+
+class Gpg(object):
+    def __init__(self, *args):
+        self.signers = {}
+    def check(self, *args, **kwargs):
+        return True
+    def cleanup(self):
+        pass
+
+verify.Gpg = Gpg
+verify.find_gpg = lambda bundle: ("gpg", None)
+verify.old_gpg = lambda program: None
+files, listed = verify.load_bundle(sys.argv[2])
+with open(sys.argv[3], encoding="utf-8") as handle:
+    shapes = json.load(handle)
+for shape in shapes:
+    verify.load_bundle = lambda path: (dict(files, **{"case.json": shape.encode("utf-8")}), listed)
+    del verify.FAILS[:]
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = verify.main(["bundle"])
+    if "did not finish" in output.getvalue():
+        print("raised: %s: %s" % (verify.FAILS[-1], shape[:300]))
+    elif code != 1 or not verify.FAILS:
+        print("passed: %s" % shape[:300])
+print("%d shapes" % len(shapes))
+"#;
+
+/// `clean` with each value the script reads gone or of another type, in every row and every event's payload.
+fn wrong_shapes(clean: &serde_json::Value) -> Vec<String> {
+    use serde_json::json;
+    let values = [
+        json!(null),
+        json!(true),
+        json!(1),
+        json!(1.5),
+        json!("x"),
+        json!([1]),
+        json!({"a": 1}),
+    ];
+    let mut shapes: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+    let mut objects = vec![String::new(), "/case".to_string()];
+    for list in ["entries", "tree_heads", "evidence"] {
+        let rows = clean[list].as_array().unwrap();
+        assert!(!rows.is_empty(), "{list}");
+        for (index, row) in rows.iter().enumerate() {
+            objects.push(format!("/{list}/{index}"));
+            if row["payload"].is_object() {
+                objects.push(format!("/{list}/{index}/payload"));
+            }
+            for value in &values {
+                let mut changed = clean.clone();
+                changed[list][index] = value.clone();
+                shapes.push(changed.to_string());
+            }
+        }
+    }
+    for object in objects {
+        for key in clean.pointer(&object).unwrap().as_object().unwrap().keys() {
+            let mut gone = clean.clone();
+            let holder = gone.pointer_mut(&object).unwrap();
+            holder.as_object_mut().unwrap().remove(key);
+            shapes.push(gone.to_string());
+            for value in &values {
+                let mut changed = clean.clone();
+                changed.pointer_mut(&object).unwrap()[key] = value.clone();
+                shapes.push(changed.to_string());
+            }
+        }
+    }
+    // what serde_json does not write: an unpaired surrogate, and nesting deeper than Python goes
+    let mut marked = clean.clone();
+    marked["entries"][0]["text"] = json!("SURROGATE");
+    marked["tree_heads"][0]["reason"] = json!("SURROGATE");
+    shapes.push(marked.to_string().replace("SURROGATE", "\\ud800"));
+    for depth in [500, 900, 100_000] {
+        let mut marked = clean.clone();
+        marked["entries"][0]["payload"] = json!("NESTED");
+        let nested = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        shapes.push(marked.to_string().replace("\"NESTED\"", &nested));
+    }
+    shapes
+}
+
+/// Where `name` stands in the ZIP: its local header, its data, the size of that.
+fn member_at(path: &Path, name: &str) -> (u64, u64, u64) {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+    let member = archive.by_name(name).unwrap();
+    (
+        member.header_start(),
+        member.data_start().unwrap(),
+        member.compressed_size(),
+    )
+}
+
+/// verify.py on `path` ends in FAIL lines and a verdict; its output, None where it cannot run at all.
+fn failed_with(path: &Path, expected: &str) -> Option<String> {
+    let (code, output) = run_verify(path, None, &[])?;
+    if output.contains("Nothing was checked.") {
+        return None; // no gpg to go on with
+    }
+    assert!(!output.contains("Traceback"), "{output}");
+    assert_eq!(code, 1, "{output}");
+    assert!(output.contains(&format!("  FAIL  {expected}")), "{expected}: {output}");
+    assert!(output.contains("Result: FAIL"), "{output}");
+    Some(output)
+}
+
+#[test]
+fn verify_py_fails_a_file_that_is_no_zip() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let clean = std::fs::read(&bundle).unwrap();
+    std::fs::write(&bundle, b"not a zip").unwrap();
+    failed_with(&bundle, "The bundle cannot be read as a ZIP");
+    std::fs::write(&bundle, &clean[..clean.len() / 2]).unwrap();
+    failed_with(&bundle, "The bundle cannot be read as a ZIP");
+    std::fs::remove_file(&bundle).unwrap();
+    failed_with(&bundle, "The bundle cannot be read as a ZIP");
+}
+
+#[test]
+fn verify_py_names_a_member_with_a_flipped_byte_and_checks_the_rest() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let clean = std::fs::read(&bundle).unwrap();
+    let name = REPORTS[0].0;
+    let (header, data, size) = member_at(&bundle, name);
+    // the header, what zlib refuses, what only the CRC-32 tells; not the last byte, padding that changes no content
+    for at in [header, data, data + size / 2] {
+        let mut bytes = clean.clone();
+        bytes[at as usize] ^= 0xFF;
+        std::fs::write(&bundle, bytes).unwrap();
+        let Some(output) = failed_with(&bundle, &format!("{name} cannot be read from the bundle")) else {
+            return;
+        };
+        assert!(
+            output.contains("Case log") && !output.contains(", 0 entries"),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn verify_py_fails_a_manifest_that_is_no_text() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    rewrite_zip(&bundle, &[("MANIFEST.sha256", b"\xff\xfe  x\n".to_vec())]);
+    failed_with(&bundle, "MANIFEST.sha256 is not UTF-8 text.");
+}
+
+#[test]
+fn verify_py_fails_a_signature_that_is_no_text() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let files = read_zip(&bundle);
+    let name = files.keys().find(|name| name.starts_with("signatures/")).unwrap();
+    rewrite_zip(&bundle, &[(name.as_str(), b"\xff\xfe".to_vec())]);
+    failed_with(&bundle, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_py_fails_a_file_in_a_folder_it_cannot_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("link")).unwrap();
+    failed_with(dir.path(), "link cannot be read");
+}
+
+/// verify.py's `main` on `bundle` with `change` applied to it as `verify`.
+fn verify_py_changed(change: &str, bundle: &Path) -> Option<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let code = format!(
+        "import importlib.util, sys\nspec = importlib.util.spec_from_file_location('verify', sys.argv[1])\n\
+         verify = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(verify)\n\
+         verify.find_gpg = lambda bundle: ('gpg', None)\nverify.old_gpg = lambda program: None\n{change}\n\
+         sys.exit(verify.main([sys.argv[2]]))\n"
+    );
+    let output = Command::new(which::which("python3").ok()?)
+        .args(["-I", "-X", "utf8", "-c", &code])
+        .arg(&script)
+        .arg(bundle)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(!text.contains("Traceback") && text.contains("Result: FAIL"), "{text}");
+    Some(text)
+}
+
+#[test]
+fn verify_py_fails_what_gpg_says_was_signed_when_it_is_no_text() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let Some(output) = verify_py_changed(
+        "good = [('GOODSIG', ['KEY', 'user']), ('VALIDSIG', ['KEY']), ('TRUST_ULTIMATE', [])]\n\
+         verify.Gpg.run = lambda self, args: (b'\\xff', good, 0)",
+        &bundle,
+    ) else {
+        return;
+    };
+    assert!(
+        output.contains("the signature was made over different data."),
+        "{output}"
+    );
+}
+
+#[test]
+fn verify_py_says_when_a_check_did_not_finish() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let Some(output) = verify_py_changed(
+        "def broken(files):\n    raise KeyError('a bug')\nverify.check_manifest = broken",
+        &bundle,
+    ) else {
+        return;
+    };
+    assert!(output.contains("  FAIL  The check did not finish"), "{output}");
+}
+
+#[test]
+fn verify_py_never_stops_on_a_value_of_case_json() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let shapes = wrong_shapes(&case_json(&bundle));
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let list = dir.path().join("shapes.json");
+    std::fs::write(&list, serde_json::to_string(&shapes).unwrap()).unwrap();
+    let output = Command::new(python)
+        .args(["-I", "-X", "utf8", "-c", CASE_SHAPES_DRIVER])
+        .arg(&script)
+        .arg(&bundle)
+        .arg(&list)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(text.trim(), format!("{} shapes", shapes.len()), "{text}");
+}
+
+#[test]
+fn version_shows_the_hashes_the_scripts_print() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let version = |flag: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_factum"))
+            .arg(flag)
+            .env("HOME", f.path())
+            .env("XDG_CONFIG_HOME", f.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let scripts = [
+        ("verify.py", factum::export::bundle::VERIFY_PY),
+        ("verify_container.py", factum::container::volume::VERIFY_CONTAINER_PY),
+    ];
+    let lines: Vec<String> = scripts
+        .iter()
+        .map(|(name, content)| format!("{name} SHA-256 {}", hex::encode(sha2::Sha256::digest(content))))
+        .collect();
+    let first = format!("factum {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(version("--version"), format!("{first}\n{}\n{}\n", lines[0], lines[1]));
+    // one line, for what reads the version
+    assert_eq!(version("-V"), format!("{first}\n"));
+    for ((name, content), line) in scripts.iter().zip(&lines) {
+        let script = f.path().join(name);
+        std::fs::write(&script, content).unwrap();
+        let output = Command::new(&python)
+            .arg(&script)
+            .arg(f.path().join("missing"))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(text.lines().next(), Some(line.as_str()), "{text}");
+    }
+}
+
+/// A gpg that leaves `ran` behind if it is ever started.
+#[cfg(unix)]
+fn planted_gpg(folder: &Path, ran: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(folder).unwrap();
+    let gpg = folder.join("gpg");
+    // the PATH it runs with holds no `touch`
+    std::fs::write(&gpg, format!("#!/bin/sh\n: > '{}'\n", ran.display())).unwrap();
+    std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_py_refuses_a_gpg_beside_the_bundle_or_in_the_current_folder() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let scripts = tempfile::tempdir().unwrap();
+    let script = scripts.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let ran = f.path().join("gpg-ran");
+    let folder = f.path().join("extracted");
+    let current = f.path().join("current");
+    planted_gpg(&folder.join("sub"), &ran);
+    planted_gpg(&current, &ran);
+    planted_gpg(f.path(), &ran);
+    for (target, path, working_folder) in [
+        // inside an extracted bundle
+        (&folder, folder.join("sub"), f.path()),
+        // beside the ZIP
+        (&bundle, f.path().to_path_buf(), &current),
+        // the current folder: what Windows looks in first, here through the PATH
+        (&bundle, PathBuf::from("."), &current),
+    ] {
+        let output = Command::new(&python)
+            .arg(&script)
+            .arg(target)
+            .env("PATH", path)
+            .current_dir(working_folder)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "{text}");
+        assert!(
+            text.contains("Refusing ") && text.contains("Nothing was checked."),
+            "{text}"
+        );
+        assert!(!text.contains("Result:"), "{text}");
+        assert!(!ran.exists(), "{text}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_py_says_when_gpg_is_too_old() {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let dir = tempfile::tempdir().unwrap();
+    let gpg = dir.path().join("gpg");
+    std::fs::write(&gpg, "#!/bin/sh\necho 'gpg (GnuPG) 2.0.22'\necho 'libgcrypt 1.5.3'\n").unwrap();
+    std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let script = dir.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let output = Command::new(python)
+        .arg(&script)
+        .arg(&bundle)
+        .env("PATH", dir.path())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("needs gpg 2.1 or newer, this is gpg 2.0.22"), "{text}");
+    assert!(!text.contains("Result:"), "{text}");
+}
+
+#[test]
+fn verify_py_names_the_primary_key_of_a_subkey_signature() {
+    let user_id = "Subkey Signer <subkey@factum.invalid>";
+    let Some(home) = common::GpgHome::with_key(user_id, "cert", "never") else {
+        return;
+    };
+    let primary = home.fingerprints("subkey@factum.invalid")[0].clone();
+    home.gpg_ok(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-add-key",
+        &primary,
+        "ed25519",
+        "sign",
+        "never",
+    ]);
+    let subkey = home.fingerprints("subkey@factum.invalid")[1].clone();
+    let f = Fixture::new();
+    let signer = gpg_signer(&f.db, &home);
+    let bundle = make_bundle(&f.db, &signer, &f.seal_dir, f.path(), "C-1");
+    let Some((code, output)) = run_verify(&bundle, Some(&home.path()), &[]) else {
+        return;
+    };
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains(&primary) && !output.contains(&subkey), "{output}");
+}
+
+/// The answer of verify.py's signature_problem to gpg's status lines and exit code; None without python3.
+fn signature_problem(status: &str, exit_code: i32) -> Option<String> {
+    let python = which::which("python3").ok()?;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("verify.py"), factum::export::bundle::VERIFY_PY).unwrap();
+    let code = "import sys, verify\n\
+                lines = [line.split(' ') for line in sys.argv[1].split('|')]\n\
+                print(verify.signature_problem([(p[0], p[1:]) for p in lines], int(sys.argv[2])))";
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(code)
+        .arg(status)
+        .arg(exit_code.to_string())
+        .env("PYTHONPATH", dir.path())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[test]
+fn verify_py_wants_exactly_one_good_signature() {
+    let valid = "VALIDSIG AAAA 2020-01-15 1000 0 4 0 22 10 01 AAAA";
+    let cases = [
+        (format!("GOODSIG 1 A|{valid}"), 0, "None"),
+        (format!("GOODSIG 1 A|{valid}"), 2, "bad signature"),
+        (format!("GOODSIG 1 A|{valid}|FAILURE gpg-exit 1"), 0, "bad signature"),
+        (
+            format!("GOODSIG 1 A|{valid}|GOODSIG 2 B|{valid}"),
+            0,
+            "more than one signature",
+        ),
+        (format!("GOODSIG 1 A|{valid}|BADSIG 2 B"), 1, "bad signature"),
+        (
+            format!("GOODSIG 1 A|{valid}|ERRSIG 2 22 10 01 1000 9"),
+            0,
+            "bad signature",
+        ),
+        ("GOODSIG 1 A".to_string(), 0, "bad signature"),
+        (format!("REVKEYSIG 1 A|{valid}"), 0, "signing key was revoked"),
+        (format!("EXPSIG 1 A|{valid}"), 1, "signature expired"),
+        (format!("KEYEXPIRED 2000|EXPKEYSIG 1 A|{valid}"), 0, "None"),
+        (format!("EXPKEYSIG 1 A|{valid}"), 0, "None"),
+        (
+            format!("KEYEXPIRED 500|EXPKEYSIG 1 A|{valid}"),
+            0,
+            "signature made after the signing key expired",
+        ),
+        // of the other subkeys, only the last one before EXPKEYSIG is the signing key's
+        (
+            format!("KEYEXPIRED 500|KEYEXPIRED 2000|EXPKEYSIG 1 A|{valid}|KEYEXPIRED 500"),
+            0,
+            "None",
+        ),
+        (format!("KEYEXPIRED 500|GOODSIG 1 A|{valid}"), 0, "None"),
+    ];
+    for (status, exit_code, expected) in cases {
+        let Some(answer) = signature_problem(&status, exit_code) else {
+            return;
+        };
+        assert_eq!(answer, expected, "{status}");
+    }
+}
+
+#[test]
 fn verify_py_accepts_seals_made_before_a_rename() {
     let home = require_gpg!("Factum Test <test@factum.invalid>");
     let f = Fixture::new();
@@ -737,7 +1486,14 @@ fn report_lists_container_sources_and_damaged_state() {
     let record = staged.records[0].clone();
     factum.commit_container_add(id, &mut volume, staged).unwrap();
     drop(volume);
-    factum.close_container_damaged(id, &[record]).unwrap();
+    let input = factum.recheck_input(id).unwrap();
+    let recheck = factum::container::volume::Recheck {
+        mismatches: vec![record],
+        logged_end: input.end,
+        arns: input.records.iter().map(|r| r.arn.clone()).collect(),
+        ..Default::default()
+    };
+    factum.close_container_damaged(id, &recheck).unwrap();
     let seal_id = factum.seal(case_id, "export").unwrap();
     let model = build(&factum, case_id, seal_id, None);
     let row = &model.containers[0];
@@ -1040,7 +1796,7 @@ fn markdown_report_marks_missing_and_external_images() {
         "{markdown}"
     );
     assert!(
-        markdown.contains("[external image https://x.test/a.png not loaded]"),
+        markdown.contains("[external image `https://x.test/a.png` not loaded]"),
         "{markdown}"
     );
     assert!(!markdown.contains("!["), "{markdown}");
@@ -1348,6 +2104,271 @@ fn pdf_marks_missing_external_and_undecodable_images() {
             assert!(flat.contains(&expected), "{expected:?} in {flat}");
         }
     }
+}
+
+#[test]
+fn pdf_keeps_a_table_row_taller_than_a_page() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let words: Vec<String> = (0..4000).map(|n| format!("w{n}.")).collect();
+    factum.create_evidence(case_id, "disk", "", &words.join(" ")).unwrap();
+    let [path] = factum
+        .export(case_id, &["pdf"], &f.path().join("out"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let pdf = std::fs::read(path).unwrap();
+    assert!(String::from_utf8_lossy(&pdf).contains("/CIDToGIDMap /Identity"));
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        for word in words {
+            assert!(extracted.contains(&word), "{word} is lost");
+        }
+    }
+}
+
+#[test]
+fn pdf_gives_the_text_of_characters_it_cannot_show_and_warns() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("Fall 案件 مرحبا 🦊 Ende ✓", None, case_id).unwrap();
+    let out = f.path().join("out");
+    for formats in [&["pdf"][..], &["bundle"]] {
+        let exported = factum.export_checked(case_id, formats, &out).unwrap();
+        assert_eq!(exported.warnings.len(), 1, "{formats:?}");
+        assert!(exported.warnings[0].contains("件, 案"), "{:?}", exported.warnings);
+        assert!(exported.warnings[0].contains("HTML report"), "{:?}", exported.warnings);
+        assert!(exported.warnings[0].contains("U+1F98A"), "{:?}", exported.warnings);
+    }
+    assert!(
+        factum
+            .export_checked(case_id, &["md"], &out)
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+    let pdf = std::fs::read(factum.export(case_id, &["pdf"], &out).unwrap().remove(0)).unwrap();
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        // the right-to-left word changes the order pdftotext gives
+        for expected in ["Fall 案件", "🦊", "ابحرم", "Ende ✓"] {
+            assert!(extracted.contains(expected), "{expected} in {extracted}");
+        }
+    }
+}
+
+#[test]
+fn pdf_has_no_warning_for_characters_its_fonts_have() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("Müller ✓ Привет", None, case_id).unwrap();
+    let out = f.path().join("out");
+    assert!(
+        factum
+            .export_checked(case_id, &["pdf"], &out)
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+}
+
+#[test]
+fn reports_show_superseded_versions_with_time_and_signature() {
+    let f = Fixture::new();
+    let model = model(&f);
+    let old = model.appendix.iter().find(|item| item.superseded).unwrap();
+    assert_eq!(model.appendix.iter().filter(|item| item.superseded).count(), 1);
+    let time = old.created_utc.clone();
+    let written = format!("Superseded: version 1, written {time}");
+    let html = render_html(&model, false);
+    let markdown = render_markdown(&model, "images");
+    for text in [&html, &markdown, &render_html(&model, true)] {
+        let appendix = &text[text.find("Integrity appendix").unwrap()..];
+        for expected in [&written, "Signature:  signed", "| first"] {
+            assert!(appendix.contains(expected), "{expected} in {appendix}");
+        }
+        // the timeline keeps the newest text only
+        assert!(!text[..text.find("Integrity appendix").unwrap()].contains("| first"));
+    }
+    // the plain variant does not hide the text in a closed section
+    let before = &html[..html.find(&written).unwrap()];
+    assert!(before.rfind("<details").unwrap() == before.rfind("<details open>").unwrap());
+    assert_eq!(html.matches("<details open>").count(), 1);
+    let pdf = factum::export::pdf::render_pdf(&model);
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(
+            extracted.contains(&written) && extracted.contains("| first"),
+            "{extracted}"
+        );
+    }
+}
+
+/// Every line of superseded text starts with its mark. Where a long line wraps, the PDF repeats the mark and the HTML
+/// keeps the line in a barred block. Markdown has only the source line: a viewer that wraps code breaks it unmarked.
+#[test]
+fn every_line_of_superseded_text_carries_its_mark() {
+    const FORGED: &str = "Signature:  signed by NOBODY";
+    for separator in ["\n", "\r", "\r\n", "\u{2028}", "\u{85}", "\u{c}"] {
+        let f = Fixture::new();
+        let factum = f.factum();
+        let case_id = factum.create_case("C-1", "Case", "").unwrap();
+        let first = factum
+            .create_note(&format!("x{separator}{FORGED}"), None, case_id)
+            .unwrap();
+        factum.correct_note(first, "y").unwrap();
+        let seal_id = factum.seal(case_id, "export").unwrap();
+        let model = build(&factum, case_id, seal_id, None);
+        let markdown = render_markdown(&model, "images");
+        assert!(
+            markdown.contains(&format!("\n| x\n| {FORGED}\n")),
+            "{separator:?}: {markdown}"
+        );
+        let html = render_html(&model, true);
+        let span = format!("<span class='quoted'>| {FORGED}</span>");
+        assert!(html.contains(&span), "{separator:?}: {html}");
+        for text in [&markdown, &html] {
+            assert!(!text.contains(separator) || separator == "\n", "{separator:?}: {text}");
+        }
+        let pdf = factum::export::pdf::render_pdf(&model);
+        if let Some(extracted) = pdf_text(&f, &pdf) {
+            // pdftotext closes up the two spaces
+            assert!(extracted.contains("signed by NOBODY"), "{separator:?}: {extracted}");
+            let mut forged = extracted.lines().filter(|line| line.contains("signed by NOBODY"));
+            assert!(
+                forged.all(|line| line.trim_start().starts_with("| ")),
+                "{separator:?}: {extracted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_long_superseded_line_keeps_its_mark_where_the_pdf_wraps_it() {
+    const FORGED: &str = "Signature: signed by NOBODY";
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    // whatever the room on a line, one of these lengths puts the forged words at the start of a wrapped one
+    let text: String = (100..130).map(|n| format!("{} {FORGED} ", "a".repeat(n))).collect();
+    let first = factum.create_note(&text, None, case_id).unwrap();
+    factum.correct_note(first, "y").unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let pdf = factum::export::pdf::render_pdf(&build(&factum, case_id, seal_id, None));
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(extracted.contains(FORGED), "{extracted}");
+        assert!(
+            !extracted.lines().any(|line| line.trim_start().starts_with(FORGED)),
+            "{extracted}"
+        );
+    }
+}
+
+#[test]
+fn only_the_reports_the_formats_need_are_built() {
+    let f = Fixture::new();
+    let model = model(&f);
+    let built = |formats: &[&str]| {
+        let rendered = factum::export::render_needed(&model, formats);
+        (!rendered.html.is_empty(), !rendered.pdf.is_empty())
+    };
+    assert_eq!(built(&["pdf"]), (false, true));
+    assert_eq!(built(&["html"]), (true, false));
+    assert_eq!(built(&["md"]), (false, false));
+    assert_eq!(built(&["md", "pdf"]), (false, true));
+    assert_eq!(built(&["bundle"]), (true, true));
+}
+
+/// What a planted `hashlib.py` beside the script does, with and without `-I`.
+fn planted_module_runs(python: &Path, name: &str, script: &[u8], flags: &[&str]) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    let ran = dir.path().join("ran");
+    std::fs::write(&path, script).unwrap();
+    std::fs::write(
+        dir.path().join("hashlib.py"),
+        format!("open({:?}, 'w').close()\n", ran.to_str().unwrap()),
+    )
+    .unwrap();
+    let output = Command::new(python)
+        .args(flags)
+        .arg(&path)
+        .arg(dir.path().join("missing"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    // with -I the script itself ran, up to its own hash
+    if !ran.exists() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.starts_with(&format!("{name} SHA-256 ")), "{text}");
+    }
+    ran.exists()
+}
+
+#[test]
+fn isolated_mode_keeps_a_module_planted_beside_the_script_from_running() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    for (name, script) in [
+        ("verify.py", factum::export::bundle::VERIFY_PY),
+        ("verify_container.py", factum::container::volume::VERIFY_CONTAINER_PY),
+    ] {
+        assert!(planted_module_runs(&python, name, script, &[]), "{name}");
+        assert!(!planted_module_runs(&python, name, script, &["-I"]), "{name}");
+    }
+    // the command the READMEs give is the isolated one
+    assert!(factum::export::bundle::BUNDLE_README.contains("python3 -I verify.py <this-bundle>.zip"));
+    assert!(factum::export::bundle::BUNDLE_README.contains("py -I verify.py"));
+    assert!(!factum::export::bundle::BUNDLE_README.contains("python3 verify.py"));
+}
+
+#[test]
+fn the_timeline_flags_a_note_when_an_earlier_version_failed() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = model_case(&factum);
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let clean = build(&factum, case_id, seal_id, None);
+    let old = clean.appendix.iter().find(|item| item.superseded).unwrap().entry_id;
+    assert!(!render_html(&clean, false).contains("This note failed the integrity check"));
+    // a text change would fail the entries after it too; a signature fails on its own
+    f.exec(&format!("UPDATE entries SET signature = 'forged' WHERE id = {old}"));
+    let failing = build(&factum, case_id, seal_id, None);
+    let line = failing.timeline.iter().find(|item| item.origin_id == old).unwrap();
+    assert_eq!(line.status, Level::Fail);
+    assert_eq!(line.text, "first, corrected");
+    // the appendix keeps each version's own status
+    let newest = failing
+        .appendix
+        .iter()
+        .find(|item| item.entry_id == line.entry_id)
+        .unwrap();
+    assert_ne!(newest.status, Level::Fail);
+    let html = render_html(&failing, false);
+    assert!(html[..html.find("<h2>Evidence").unwrap()].contains("This note failed the integrity check"));
+    let markdown = render_markdown(&failing, "images");
+    assert!(markdown[..markdown.find("## Evidence").unwrap()].contains("This note failed the integrity check"));
+    let pdf = factum::export::pdf::render_pdf(&failing);
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(
+            extracted.contains("This note failed the integrity check"),
+            "{extracted}"
+        );
+    }
+}
+
+#[test]
+fn markdown_report_defangs_addresses() {
+    let f = Fixture::new();
+    let text = "See https://evil.test/a_b, www.evil.test, me@evil.test, <https://auto.test> and [https://same.test](https://same.test).";
+    let markdown = markdown_of_note(&f, text, &[]);
+    assert!(
+        markdown.contains(
+            "See `https://evil.test/a_b`, `www.evil.test`, `me@evil.test`, `https://auto.test` and `https://same.test`."
+        ),
+        "{markdown}"
+    );
 }
 
 #[test]

@@ -21,6 +21,13 @@ pub enum Term {
 }
 
 impl Term {
+    fn text_len(&self) -> u64 {
+        match self {
+            Term::Iri(iri) => iri.len() as u64,
+            Term::Literal { value, datatype } => (value.len() + datatype.as_ref().map_or(0, String::len)) as u64,
+        }
+    }
+
     pub fn iri(&self) -> Option<&str> {
         match self {
             Term::Iri(iri) => Some(iri),
@@ -175,6 +182,29 @@ fn escape(value: &str) -> String {
     out
 }
 
+/// What the Turtle grammar does not allow between `<` and `>`, written or escaped.
+fn not_in_iri(c: char) -> bool {
+    c <= ' ' || "<>\"{}|^`\\".contains(c)
+}
+
+/// `<iri>`. What an IRI cannot hold is %-encoded, so whatever an IRI holds, it stays one term on one line; an IRI
+/// that can be written as it is stays as it is.
+fn iri_ref(iri: &str) -> String {
+    let mut out = String::with_capacity(iri.len() + 2);
+    out.push('<');
+    for c in iri.chars() {
+        if not_in_iri(c) || c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('>');
+    out
+}
+
 /// `prefix:local` when a prefix covers the IRI and the local part is plain, else `<iri>`.
 fn compact(iri: &str, prefixes: &[(&str, &str)]) -> String {
     for (prefix, namespace) in prefixes {
@@ -185,14 +215,14 @@ fn compact(iri: &str, prefixes: &[(&str, &str)]) -> String {
             return format!("{prefix}:{local}");
         }
     }
-    format!("<{iri}>")
+    iri_ref(iri)
 }
 
 /// Writes the graph: the prefixes, then each subject (in the order they first appear) with one triple per line.
 pub fn write(graph: &Graph, prefixes: &[(&str, &str)]) -> String {
     let mut out = String::new();
     for (prefix, namespace) in prefixes {
-        let _ = writeln!(out, "@prefix {prefix}: <{namespace}> .");
+        let _ = writeln!(out, "@prefix {prefix}: {} .", iri_ref(namespace));
     }
     let mut order: Vec<&str> = Vec::new();
     let mut by_subject: HashMap<&str, Vec<&Triple>> = HashMap::new();
@@ -205,7 +235,7 @@ pub fn write(graph: &Graph, prefixes: &[(&str, &str)]) -> String {
     }
     for subject in order {
         let triples = &by_subject[subject];
-        let _ = write!(out, "\n<{subject}>\n");
+        let _ = write!(out, "\n{}\n", iri_ref(subject));
         for (index, triple) in triples.iter().enumerate() {
             let predicate = if triple.predicate == RDF_TYPE {
                 "a".to_string()
@@ -240,34 +270,108 @@ enum Token {
     Directive(String),
 }
 
-fn tokenize(text: &str) -> Result<Vec<Token>, String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut tokens = Vec::new();
+/// Crafted text in an error message is cut before it is formatted, so the message stays small.
+const EXCERPT: usize = 60;
+
+fn cut(text: &str) -> String {
+    match text.char_indices().nth(EXCERPT) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// What the parser found instead of what it expected, with its text cut.
+fn found(token: Option<Token>) -> String {
+    let token = token.map(|token| match token {
+        Token::Iri(text) => Token::Iri(cut(&text)),
+        Token::Name(text) => Token::Name(cut(&text)),
+        Token::Str(text) => Token::Str(cut(&text)),
+        Token::Directive(text) => Token::Directive(cut(&text)),
+        other => other,
+    });
+    format!("{token:?}")
+}
+
+impl Token {
+    fn text_len(&self) -> u64 {
+        match self {
+            Token::Iri(text) | Token::Name(text) | Token::Str(text) | Token::Directive(text) => text.len() as u64,
+            _ => 0,
+        }
+    }
+}
+
+/// The character of a `\u` or `\U` escape whose digits start at `at`, and where they end.
+fn uchar(text: &str, at: usize, escaped: char) -> Result<(char, usize), String> {
+    let len = if escaped == 'u' { 4 } else { 8 };
+    let hex = text.get(at..at + len).ok_or("bad \\u escape")?;
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("bad \\u escape".into());
+    }
+    let code = u32::from_str_radix(hex, 16).map_err(|_| "bad \\u escape")?;
+    Ok((char::from_u32(code).ok_or("bad \\u escape")?, at + len))
+}
+
+/// What a token holds in memory, its text apart, while the graph is built from it: only while it is.
+const TOKEN_COST: u64 = 96;
+/// What a parsed line of factum's layout holds in memory, its text apart (a triple, a subject, a prefix), as measured on
+/// large containers. `verify_container.py` charges the same.
+const LINE_COST: u64 = 200;
+pub const TOO_MUCH: &str = "more metadata than fits the memory set aside for it";
+
+/// `at` walks the text by bytes and stays on character boundaries: what delimits a token is ASCII, which is never a
+/// part of another character.
+///
+/// Returns the tokens and what they hold in memory, as they stay held while the graph is built from them.
+fn tokenize(text: &str, budget: u64) -> Result<(Vec<Token>, u64), String> {
+    let bytes = text.as_bytes();
+    let char_at = |at: usize| text[at..].chars().next();
+    let mut tokens: Vec<Token> = Vec::new();
     let mut at = 0;
     let delimiter = |c: char| c.is_whitespace() || ";,<>\"'()[]#".contains(c);
-    while at < chars.len() {
-        let c = chars[at];
+    // what the tokens so far hold: each owns its text, and a long one holds it while it grows
+    let (mut counted, mut held) = (0, 0);
+    while let Some(c) = char_at(at) {
         if c.is_whitespace() {
-            at += 1;
+            at += c.len_utf8();
         } else if c == '#' {
-            while at < chars.len() && chars[at] != '\n' {
-                at += 1;
-            }
+            at = text[at..].find('\n').map_or(text.len(), |n| at + n);
         } else if c == '<' {
-            let end = (at + 1..chars.len())
-                .find(|&i| chars[i] == '>')
-                .ok_or("unterminated IRI")?;
-            tokens.push(Token::Iri(chars[at + 1..end].iter().collect()));
-            at = end + 1;
+            at += 1;
+            let mut iri = String::new();
+            loop {
+                if held + iri.capacity() as u64 > budget {
+                    return Err(TOO_MUCH.into());
+                }
+                let mut ch = char_at(at).ok_or("unterminated IRI")?;
+                at += ch.len_utf8();
+                if ch == '>' {
+                    break;
+                }
+                if ch == '\\' {
+                    let escaped = char_at(at).filter(|e| matches!(e, 'u' | 'U'));
+                    let escaped = escaped.ok_or("an IRI allows only \\u and \\U escapes")?;
+                    (ch, at) = uchar(text, at + 1, escaped)?;
+                }
+                if not_in_iri(ch) {
+                    return Err(format!("{ch:?} is not allowed in an IRI"));
+                }
+                iri.push(ch);
+            }
+            tokens.push(Token::Iri(iri));
         } else if c == '"' || c == '\'' {
-            let long = chars.get(at + 1) == Some(&c) && chars.get(at + 2) == Some(&c);
+            let quote = c as u8;
+            let long = bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote);
             at += if long { 3 } else { 1 };
             let mut value = String::new();
             loop {
-                let Some(&ch) = chars.get(at) else {
+                if held + value.capacity() as u64 > budget {
+                    return Err(TOO_MUCH.into());
+                }
+                let Some(ch) = char_at(at) else {
                     return Err("unterminated string".into());
                 };
-                if long && ch == c && chars.get(at + 1) == Some(&c) && chars.get(at + 2) == Some(&c) {
+                if long && ch == c && bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote) {
                     at += 3;
                     break;
                 }
@@ -279,8 +383,8 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                     return Err("line break in a short string".into());
                 }
                 if ch == '\\' {
-                    let escaped = *chars.get(at + 1).ok_or("unterminated string")?;
-                    at += 2;
+                    let escaped = char_at(at + 1).ok_or("unterminated string")?;
+                    at += 1 + escaped.len_utf8();
                     match escaped {
                         't' => value.push('\t'),
                         'b' => value.push('\u{8}'),
@@ -289,34 +393,32 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
                         'f' => value.push('\u{c}'),
                         '"' | '\'' | '\\' => value.push(escaped),
                         'u' | 'U' => {
-                            let len = if escaped == 'u' { 4 } else { 8 };
-                            let hex: String = chars.get(at..at + len).ok_or("bad \\u escape")?.iter().collect();
-                            let code = u32::from_str_radix(&hex, 16).map_err(|_| "bad \\u escape")?;
-                            value.push(char::from_u32(code).ok_or("bad \\u escape")?);
-                            at += len;
+                            let (decoded, end) = uchar(text, at, escaped)?;
+                            value.push(decoded);
+                            at = end;
                         }
                         other => return Err(format!("unknown escape \\{other}")),
                     }
                     continue;
                 }
                 value.push(ch);
-                at += 1;
+                at += ch.len_utf8();
             }
             tokens.push(Token::Str(value));
         } else if c == '@' {
             let start = at + 1;
             at = start;
-            while at < chars.len() && (chars[at].is_ascii_alphanumeric() || chars[at] == '-') {
+            while bytes.get(at).is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'-') {
                 at += 1;
             }
-            let word: String = chars[start..at].iter().collect();
+            let word = &text[start..at];
             // after a string it is a language tag, otherwise a directive
             if matches!(tokens.last(), Some(Token::Str(_))) {
                 tokens.push(Token::LangTag);
             } else {
                 tokens.push(Token::Directive(word.to_ascii_lowercase()));
             }
-        } else if c == '^' && chars.get(at + 1) == Some(&'^') {
+        } else if c == '^' && bytes.get(at + 1) == Some(&b'^') {
             tokens.push(Token::Carets);
             at += 2;
         } else if c == ';' {
@@ -325,7 +427,7 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
         } else if c == ',' {
             tokens.push(Token::Comma);
             at += 1;
-        } else if c == '.' && chars.get(at + 1).is_none_or(|n| delimiter(*n)) {
+        } else if c == '.' && char_at(at + 1).is_none_or(delimiter) {
             tokens.push(Token::Dot);
             at += 1;
         } else if "()[]".contains(c) {
@@ -333,10 +435,17 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             at += 1;
         } else {
             let start = at;
-            while at < chars.len() && !delimiter(chars[at]) {
-                at += 1;
+            while let Some(ch) = char_at(at).filter(|ch| !delimiter(*ch)) {
+                at += ch.len_utf8();
             }
-            let mut word: String = chars[start..at].iter().collect();
+            // a delimiter nothing above takes: left where it is, this would never end
+            if at == start {
+                return Err(format!("unexpected {c:?}"));
+            }
+            if held + (at - start) as u64 > budget {
+                return Err(TOO_MUCH.into());
+            }
+            let mut word = text[start..at].to_string();
             // a name never ends with a dot: that one ends the statement
             let mut dots = 0;
             while word.ends_with('.') {
@@ -346,8 +455,15 @@ fn tokenize(text: &str) -> Result<Vec<Token>, String> {
             tokens.push(Token::Name(word));
             tokens.extend(std::iter::repeat_n(Token::Dot, dots.min(1)));
         }
+        for token in &tokens[counted..] {
+            held += TOKEN_COST + token.text_len();
+        }
+        counted = tokens.len();
+        if held > budget {
+            return Err(TOO_MUCH.into());
+        }
     }
-    Ok(tokens)
+    Ok((tokens, held))
 }
 
 struct Parser {
@@ -355,9 +471,16 @@ struct Parser {
     at: usize,
     prefixes: HashMap<String, String>,
     graph: Graph,
+    /// what may still be held: each text comes out of it before it is, as one statement can hold any number of copies
+    left: u64,
 }
 
 impl Parser {
+    fn hold(&mut self, count: u64) -> Result<(), String> {
+        self.left = self.left.checked_sub(count).ok_or(TOO_MUCH)?;
+        Ok(())
+    }
+
     fn next(&mut self) -> Option<Token> {
         let token = self.tokens.get(self.at).cloned();
         self.at += 1;
@@ -371,7 +494,7 @@ impl Parser {
     fn expect(&mut self, token: Token, what: &str) -> Result<(), String> {
         match self.next() {
             Some(found) if found == token => Ok(()),
-            found => Err(format!("expected {what}, found {found:?}")),
+            other => Err(format!("expected {what}, found {}", found(other))),
         }
     }
 
@@ -381,12 +504,16 @@ impl Parser {
         }
         let (prefix, local) = name
             .split_once(':')
-            .ok_or_else(|| format!("'{name}' is neither an IRI nor a prefixed name"))?;
+            .ok_or_else(|| format!("'{}' is neither an IRI nor a prefixed name", cut(name)))?;
         let namespace = self
             .prefixes
             .get(prefix)
-            .ok_or_else(|| format!("unknown prefix '{prefix}:'"))?;
-        Ok(format!("{namespace}{local}"))
+            .ok_or_else(|| format!("unknown prefix '{}:'", cut(prefix)))?;
+        // it exists before its triple is charged, and one prefix can make any number of them
+        if (namespace.len() + local.len()) as u64 > self.left {
+            return Err(TOO_MUCH.into());
+        }
+        Ok([namespace.as_str(), local].concat())
     }
 
     fn iri(&mut self, what: &str) -> Result<String, String> {
@@ -396,7 +523,7 @@ impl Parser {
             Some(Token::Name(name)) => self.resolve(&name),
             Some(Token::Open('[')) => Err("blank node ([ … ]) is not supported".into()),
             Some(Token::Open('(')) => Err("collections are not supported".into()),
-            found => Err(format!("expected {what}, found {found:?}")),
+            other => Err(format!("expected {what}, found {}", found(other))),
         }
     }
 
@@ -456,17 +583,22 @@ impl Parser {
                 self.prefix_declaration()?;
                 self.expect(Token::Dot, "'.' after @prefix")
             }
-            Some(Token::Directive(word)) => Err(format!("@{word} is not supported")),
+            Some(Token::Directive(word)) => Err(format!("@{} is not supported", cut(word))),
             Some(Token::Name(word)) if word.eq_ignore_ascii_case("prefix") => {
                 self.at += 1;
                 self.prefix_declaration()
             }
             _ => {
                 let subject = self.iri("subject")?;
+                // the index has a copy of its own
+                if !self.graph.by_subject.contains_key(&subject) {
+                    self.hold(LINE_COST + subject.len() as u64)?;
+                }
                 loop {
                     let predicate = self.iri("predicate")?;
                     loop {
                         let object = self.object()?;
+                        self.hold(LINE_COST + (subject.len() + predicate.len()) as u64 + object.text_len())?;
                         self.graph.add(&subject, &predicate, object);
                         if self.peek() == Some(&Token::Comma) {
                             self.at += 1;
@@ -497,6 +629,7 @@ impl Parser {
         let Some(Token::Iri(namespace)) = self.next() else {
             return Err("expected the prefix's IRI".into());
         };
+        self.hold(LINE_COST + (prefix.len() + namespace.len()) as u64)?;
         self.prefixes.insert(prefix, namespace);
         Ok(())
     }
@@ -504,15 +637,26 @@ impl Parser {
 
 /// Parses the Turtle subset AFF4 containers use; anything else is an error naming it.
 pub fn parse(text: &str) -> Result<Graph, String> {
+    let mut unlimited = u64::MAX;
+    parse_within(text, &mut unlimited)
+}
+
+/// Like `parse`, for what a container claims: takes what its graph holds in memory from `budget` as the graph grows, and
+/// refuses what does not fit before it is held: a short text can make many lines, and each triple has a copy of the text
+/// of its subject, its predicate and of any prefix. The tokens count only while they are there.
+pub fn parse_within(text: &str, budget: &mut u64) -> Result<Graph, String> {
+    let (tokens, held) = tokenize(text, *budget)?;
     let mut parser = Parser {
-        tokens: tokenize(text)?,
+        tokens,
         at: 0,
         prefixes: HashMap::new(),
         graph: Graph::default(),
+        left: *budget - held,
     };
     while parser.peek().is_some() {
         parser.statement()?;
     }
+    *budget = parser.left + held;
     Ok(parser.graph)
 }
 
@@ -533,6 +677,177 @@ mod tests {
     use crate::container::{AFF4_NS, AFF4L_NS, RDF_NS, XSD_NS};
 
     const PREFIXES: [(&str, &str); 4] = [("aff4", AFF4_NS), ("aff4l", AFF4L_NS), ("rdf", RDF_NS), ("xsd", XSD_NS)];
+
+    #[test]
+    fn a_stray_closing_bracket_is_an_error_not_a_hang() {
+        assert_eq!(parse("x> .").unwrap_err(), "unexpected '>'");
+        assert_eq!(parse("<a> <b> > .").unwrap_err(), "unexpected '>'");
+    }
+
+    #[test]
+    fn what_is_refused_in_a_budget_is_refused_before_it_is_held() {
+        let text = "<a> <b> <c> .\n";
+        // a triple and its subject, the two lines factum writes for it, the text of both, and the tokens meanwhile
+        let graph = 2 * LINE_COST + 3 + 1;
+        let tokens = 4 * TOKEN_COST + 3;
+        let mut budget = graph + tokens;
+        parse_within(text, &mut budget).unwrap();
+        assert_eq!(budget, tokens);
+        let mut budget = graph + tokens - 1;
+        assert_eq!(parse_within(text, &mut budget).unwrap_err(), TOO_MUCH);
+        // a few bytes make a token each
+        let mut budget = 1 << 20;
+        assert_eq!(parse_within(&";".repeat(1 << 19), &mut budget).unwrap_err(), TOO_MUCH);
+    }
+
+    #[test]
+    fn an_error_holds_an_excerpt_of_crafted_text() {
+        let long = "\x7f".repeat(1 << 20);
+        let words = "w".repeat(1 << 20);
+        for text in [
+            // expect: a long token where the dot belongs
+            format!("@prefix p: <a> {words}"),
+            // iri: a long token where a subject belongs
+            format!("\"{long}\" <b> <c> ."),
+            // resolve: no colon, and an unknown prefix
+            format!("{words} <b> <c> ."),
+            format!("{words}:x <b> <c> ."),
+            // a directive
+            format!("@{words} ."),
+        ] {
+            let message = parse_within(&text, &mut (64 << 20)).unwrap_err();
+            assert!(message.chars().count() < 600, "{}", message.chars().count());
+        }
+        // a short token reads as before, and a cut falls on a character boundary
+        let message = parse_within("\"s\" <b> <c> .", &mut (1 << 20)).unwrap_err();
+        assert_eq!(message, "expected subject, found Some(Str(\"s\"))");
+        let wide = "é".repeat(100);
+        assert_eq!(cut(&wide), format!("{}…", "é".repeat(EXCERPT)));
+        assert_eq!(cut(&wide[..2 * EXCERPT]), "é".repeat(EXCERPT));
+    }
+
+    #[test]
+    fn tokens_count_for_their_text_while_they_are_held() {
+        let text = format!("\"{}\" ", "x".repeat(1 << 16));
+        assert_eq!(tokenize(&text.repeat(2), 1 << 16).unwrap_err(), TOO_MUCH);
+        let (tokens, held) = tokenize(&text.repeat(2), (2 << 16) + 2 * TOKEN_COST).unwrap();
+        assert_eq!((tokens.len(), held), (2, (2 << 16) + 2 * TOKEN_COST));
+        // one step of the text can make two tokens, and the last step counts too
+        assert_eq!(tokenize("xxx.", 2 * TOKEN_COST + 3).unwrap().1, 2 * TOKEN_COST + 3);
+        assert_eq!(tokenize("xxx.", 2 * TOKEN_COST + 2).unwrap_err(), TOO_MUCH);
+        // a directive keeps its word
+        assert_eq!(tokenize("@xxx", TOKEN_COST + 3).unwrap().1, TOKEN_COST + 3);
+        assert_eq!(tokenize("@xxx", TOKEN_COST + 2).unwrap_err(), TOO_MUCH);
+    }
+
+    #[test]
+    fn text_counts_for_what_it_holds() {
+        // a long literal
+        let long = format!("<a> <b> \"{}\" .\n", "x".repeat(1 << 20));
+        let mut budget = 1 << 20;
+        assert_eq!(parse_within(&long, &mut budget).unwrap_err(), TOO_MUCH);
+        let mut budget = 3 << 20;
+        parse_within(&long, &mut budget).unwrap();
+        assert!(budget <= 2 << 20, "{budget}");
+        // a long subject, which every triple of a statement holds a copy of
+        let subject = "s".repeat(1 << 16);
+        let triples = "<b> <c> ; ".repeat(1 << 10);
+        let repeated = format!("<{subject}> {triples} <b> <c> .\n");
+        let mut budget = 16 << 20;
+        assert_eq!(parse_within(&repeated, &mut budget).unwrap_err(), TOO_MUCH);
+    }
+
+    /// A token is held as it grows: one with no end is refused for its size, not for having none.
+    #[test]
+    fn a_token_stops_as_it_grows_not_at_its_end() {
+        let long = "x".repeat(1 << 16);
+        for text in [format!("\"{long}"), format!("'''{long}"), format!("<{long}")] {
+            assert_eq!(tokenize(&text, 1 << 10).unwrap_err(), TOO_MUCH, "{}", &text[..4]);
+            assert_ne!(tokenize(&text, 1 << 20).unwrap_err(), TOO_MUCH, "{}", &text[..4]);
+        }
+    }
+
+    /// An expansion exists before its triple is charged, so one that cannot fit is not made, and it holds only its text.
+    #[test]
+    fn an_expansion_that_does_not_fit_is_not_made() {
+        let long = "s".repeat(1 << 16);
+        let parser = |left| Parser {
+            tokens: Vec::new(),
+            at: 0,
+            prefixes: HashMap::from([("p".to_string(), long.clone())]),
+            graph: Graph::default(),
+            left,
+        };
+        assert_eq!(parser(1 << 16).resolve("p:c").unwrap_err(), TOO_MUCH);
+        let expanded = parser((1 << 16) + 1).resolve("p:c").unwrap();
+        assert_eq!((expanded.len(), expanded.capacity()), ((1 << 16) + 1, (1 << 16) + 1));
+    }
+
+    /// One statement can hold any number of copies of a long text, so it stops as it grows, not at its end.
+    #[test]
+    fn a_statement_stops_where_its_triples_no_longer_fit() {
+        let long = "s".repeat(1 << 16);
+        let more = 1 << 10;
+        let prefix = format!("@prefix p: <{long}> .\n");
+        for text in [
+            format!("<{long}> <b> <c>{} .\n", " , <c>".repeat(more)),
+            format!("<{long}> <b> <c>{} .\n", " ; <b> <c>".repeat(more)),
+            format!("<a> <{long}> <c>{} .\n", " , <c>".repeat(more)),
+            format!("{prefix}<a> <b> p:c{} .\n", " , p:c".repeat(more)),
+            format!("{prefix}<a> p:b <c>{} .\n", " ; p:b <c>".repeat(more)),
+            format!("{prefix}<a> <b> \"x\"^^p:c{} .\n", " , \"x\"^^p:c".repeat(more)),
+        ] {
+            let budget = 1 << 20;
+            let (tokens, held) = tokenize(&text, budget).unwrap();
+            let mut parser = Parser {
+                tokens,
+                at: 0,
+                prefixes: HashMap::new(),
+                graph: Graph::default(),
+                left: budget - held,
+            };
+            let stopped = loop {
+                match parser.statement() {
+                    Ok(()) => assert!(parser.peek().is_some(), "{}", &text[text.len() - 20..]),
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(stopped, TOO_MUCH);
+            assert!(parser.graph.triples().len() <= 16, "{}", parser.graph.triples().len());
+        }
+    }
+
+    /// A subject is held twice, in its triples and in the index; a prefix once more, beside what uses it.
+    #[test]
+    fn a_subject_and_a_prefix_count_for_their_own_text() {
+        let long = "s".repeat(1 << 20);
+        let cost = |text: &str| {
+            let mut budget = 16 << 20;
+            parse_within(text, &mut budget).unwrap();
+            (16 << 20) - budget
+        };
+        let short = cost("<a> <b> <c> .\n");
+        assert_eq!(cost(&format!("<{long}> <b> <c> .\n")) - short, (2 << 20) - 2);
+        assert_eq!(
+            cost(&format!("@prefix p: <{long}> .\n<a> <b> <c> .\n")) - short,
+            LINE_COST + 1 + (1 << 20)
+        );
+    }
+
+    #[test]
+    fn characters_of_more_than_one_byte_are_read_whole() {
+        let graph = parse("<aff4://ä> <p:ü> \"🦀\\u00e4\" . # kömment\n<b>\u{a0}<c> '''é'''.").unwrap();
+        assert_eq!(graph.triples()[0].subject, "aff4://ä");
+        assert_eq!(graph.triples()[0].object.value(), Some("🦀ä"));
+        assert_eq!(graph.triples()[1].object.value(), Some("é"));
+    }
+
+    #[test]
+    fn an_escape_is_hex_digits_only() {
+        assert!(parse("<a\\u+041> <b> <c> .").is_err());
+        assert!(parse("<a> <b> \"\\u+041\" .").is_err());
+        assert!(parse("<a\\uä000> <b> <c> .").is_err());
+    }
 
     fn typed(value: &str, datatype: &str) -> Term {
         Term::Literal {
@@ -577,6 +892,78 @@ mod tests {
     fn round_trip_preserves_triples() {
         let graph = sample();
         assert_eq!(parse(&write(&graph, &PREFIXES)).unwrap(), graph);
+    }
+
+    #[test]
+    fn the_iris_factum_writes_stay_as_they_are() {
+        let mut graph = sample();
+        let iris = [
+            "aff4://28617d0f-2ca1-47c0-82cb-4a8374029805/information.turtle",
+            "https://www.ietf.org/rfc/rfc1950.txt",
+            "https://factum.invalid/Schema/2026/#sourcePathRaw",
+            "aff4://a/b%20c?d=e&f#g",
+            "aff4://ü/ネコ",
+        ];
+        for iri in iris {
+            graph.add(iri, iri, Term::Iri(iri.into()));
+        }
+        let text = write(&graph, &PREFIXES);
+        for iri in iris {
+            assert!(text.contains(&format!("<{iri}>")), "{text}");
+        }
+        assert_eq!(parse(&text).unwrap(), graph);
+    }
+
+    #[test]
+    fn what_an_iri_cannot_hold_is_encoded() {
+        let mut graph = Graph::default();
+        graph.add(
+            "aff4://s a<b>\"{c}|^`\\\n\u{7f}\u{85}\u{2028}",
+            &format!("{AFF4_NS}p q"),
+            Term::Iri("aff4://o>\n<aff4://forged> a <x".into()),
+        );
+        let text = write(&graph, &PREFIXES);
+        let body: Vec<&str> = text.lines().skip_while(|l| !l.starts_with('<')).collect();
+        assert_eq!(body.len(), 2, "{text}");
+        assert_eq!(
+            body[0],
+            "<aff4://s%20a%3Cb%3E%22%7Bc%7D%7C%5E%60%5C%0A%7F%C2%85%E2%80%A8>"
+        );
+        assert_eq!(
+            body[1],
+            "    <http://aff4.org/Schema#p%20q> <aff4://o%3E%0A%3Caff4://forged%3E%20a%20%3Cx> ."
+        );
+        let graph = parse(&text).unwrap();
+        assert_eq!(graph.triples().len(), 1);
+        assert_eq!(
+            graph.triples()[0].object,
+            Term::Iri("aff4://o%3E%0A%3Caff4://forged%3E%20a%20%3Cx".into())
+        );
+    }
+
+    #[test]
+    fn escapes_in_iris_are_decoded() {
+        let graph = parse("<aff4://\\u0061\\U00000062> <http://p/\\u00FC> <aff4://o> .").unwrap();
+        assert_eq!(graph.triples()[0].subject, "aff4://ab");
+        assert_eq!(graph.triples()[0].predicate, "http://p/ü");
+    }
+
+    #[test]
+    fn what_no_iri_may_hold_is_refused_written_or_escaped() {
+        for iri in [
+            "<aff4://a b>",
+            "<aff4://a\nb>",
+            "<aff4://a{b>",
+            "<aff4://a\\u0020b>",
+            "<aff4://a\\u003Eb>",
+            "<aff4://a\\u005Cb>",
+            "<aff4://a\\nb>",
+            "<aff4://a\\u00>",
+            "<aff4://a\\uD800b>",
+        ] {
+            assert!(parse(&format!("{iri} <http://p> <aff4://o> .")).is_err(), "{iri}");
+        }
+        assert!(parse("<aff4://a").unwrap_err().contains("unterminated"));
     }
 
     #[test]

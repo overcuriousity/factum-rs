@@ -59,7 +59,7 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 
 ### Requirements
 
-- **GPG** for signing and verification: `gpg` on the `PATH` (Linux: the `gnupg2`/`gnupg` package; macOS:
+- **GPG** for signing and verification: `gpg` 2.1 or newer on the `PATH` (Linux: the `gnupg2`/`gnupg` package; macOS:
   `brew install gnupg`; Windows: [Gpg4win](https://www.gpg4win.org/)). Without it, notes can still be written, unsigned.
 - **gpgsm** (part of GnuPG) only for X.509-signed evidence containers.
 - **GUI on Linux**: OpenGL (Mesa) and an X11 or Wayland session; nothing else is linked. The GUI's file dialogs use
@@ -78,13 +78,15 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   copy of the seal was removed too
 - **Verify Case** (GUI) / `factum --verify`: recomputes every leaf and tree head, checks all signatures, all seals
   (database and seal folder) and that case and evidence details match the log. Failures: changed or missing entries,
-  unsigned entries, invalid signatures, unknown or untrusted keys, broken seals. Warnings: entries signed later, entries
-  added after the newest seal, seal folder next to the database
+  unsigned entries, invalid signatures, unknown or untrusted keys, broken seals. Warnings: entries signed later,
+  signing keys expired since, entries added after the newest seal, seal folder next to the database, a seal folder
+  still named in the database but not in use
 - Entries and seals created without a key can be **signed later**; they are then shown as "signed later on <date>"
 
 ### Cases and evidence
 - Create cases (file number, name, description) and evidence items (name, hash, description), in the GUI or with
-  `--new-case`/`--new-evidence`; both are recorded in the log
+  `--new-case`/`--new-evidence`; both are recorded in the log. An open case cannot reuse the file number of another
+  open case (archived cases may share it)
 - **Edit Case** changes file number, name and description through a signed `case_edited` entry; earlier seals stay
   valid
 - **Edit Description…** on an evidence item changes its description through a signed `evidence_edited` entry; name
@@ -108,12 +110,20 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Case report as **HTML** (integrity details in collapsible sections, no JavaScript), **PDF** (A4, rendered by factum
   itself — no browser or Qt needed) and **Markdown** (short integrity line per entry plus an integrity appendix)
 - **Verification bundle** (ZIP): `case.json`, all signatures, signers' public keys, the three reports, a signed
-  `MANIFEST.sha256` and a dependency-free `verify.py`: `python3 verify.py bundle.zip`
+  `MANIFEST.sha256` and a dependency-free `verify.py`: `python3 -I verify.py bundle.zip` (`-I` keeps Python from
+  loading modules from the script's folder). The script comes with the bundle it checks: run a copy you trust, or
+  compare the SHA-256 it prints when it starts with `factum --version` or the release notes
 - Exporting seals the case first; a case that fails verification is still exported, with the failures on top
+- All files of an export appear together when the last one is complete; a failed export leaves none
+- The PDF embeds its own fonts, which have no CJK, Arabic, emoji and the like: such characters are drawn as `�`, copy
+  and search still give the real text, and the export warns that the HTML report shows them
 
 ### IOC extraction
-- IPv4 addresses, domains, URLs, emails, MD5/SHA-1/SHA-256 hashes, grouped by type in the side panel
-- File names such as `evil.exe` or `notes.txt` are not reported as domains
+- IPv4 addresses, domains, URLs, emails, MD5/SHA-1/SHA-256/SHA-512 hashes, grouped by type in the side panel
+- Domains and emails may contain non-ASCII letters (`münchen.de`); they are stored as written, in lowercase. A URL
+  keeps its path and a final `/`, without the punctuation of the sentence around it
+- File names such as `evil.exe` or `notes.txt` are not reported as domains; real TLDs such as `.zip`, `.mov` or `.sh`
+  are
 
 ### Analytical companion
 - An optional mentor that reads the case log through an LLM and keeps a short list of open analytical questions per
@@ -162,20 +172,40 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - **Closing re-checks first**: everything added since the last close is read back from the container file and
   compared with its hashes (on Linux past the page cache, from the disk). If something does not match, a dialog
   offers **Add Again** (copy the files again from their sources; the damaged copies stay, marked as replaced),
-  **Close as Damaged** (logged with the failed files, not signed) or **Cancel**
+  **Close as Damaged** (logged with the failed files, not signed) or **Cancel**. A read error counts as damage when
+  it repeats while the rest of the file reads; a removed drive or missing permissions only stop the check. A close
+  signs only the state that was re-checked: if the container changed since, re-check again
+- **A fault in a container's ZIP directory** (a CRC-32 that differs from what is stored) stops additions and
+  signatures, even when the hashes match; **Close as Damaged** is the way out, writes nothing to the file and logs the
+  fault, not lost files
 - **Closing signs the container**: a GPG signature over `information.turtle`, which lists every file's hashes, plus an
   X.509 (CMS) signature when **Settings → X.509 Certificate…** names a gpgsm certificate (the setup wizard offers it
   too). Without a key the container can be closed unsigned and signed later (**Sign All Unsigned**)
 - Reopened and extended, a container keeps every closed state: its bytes never move, and each close's signed metadata
   stays under `factum/history/<n>/`. A copy handed over after an earlier close still verifies
 - **Verify Container…** checks every stored file against its hashes, the metadata against its hash file, the GPG and
-  X.509 signatures (X.509 only against roots gpgsm trusts on this machine; revocation is not checked offline), every
-  closed state, and, for a container of this database, that the file matches the case log. Containers from other
-  tools get the AFF4-L v1.0 checks; older AFF4 formats are reported as unsupported
+  X.509 signatures (X.509 only against roots gpgsm trusts on this machine and only by the certificate the container
+  and the case log name; one that has expired since counts, with a warning, if it was valid when it signed;
+  revocation is not checked offline), every closed state, and, for a container of this database, that the file
+  matches the case log. Containers from other tools get the AFF4-L v1.0 checks; older AFF4 formats are reported as
+  unsupported
 - Recipients without factum run the script the container carries: extract `verify_container.py` and run
-  `python3 verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
-  `gpg` and `openssl` for the signatures). The container's `factum/README.txt` names the script's SHA-256 and the
-  same script on GitHub for that version, to compare before running it
+  `python3 -I verify_container.py <container>.aff4l [--ca ROOT.pem] [--use-carried-key]` (Python 3 standard library;
+  `gpg` 2.1 or newer and `openssl` for the signatures, installed: one in the current folder, the container's or the
+  script's is refused). Each finding ends with factum's code for it. On a container
+  written by factum it reaches factum's verdict without the case log, but for these differences: it has no case log, so
+  each `replacedBy` stays a warning; it has no trust list, so without `--ca` an X.509 root stays a warning, and with it
+  only that root counts; and it reads only factum's Turtle layout, so valid Turtle in another layout, such as a comment,
+  or a line over 1 MiB, fails where factum reads it. On a file that is not factum's it is stricter: it takes every file
+  for factum's, so what another tool's container may lack (signatures, Maps, metadata streams) fails or warns, and an
+  older AFF4 file fails where factum warns that it does not support it. Neither calls an unsigned file good: a closed
+  state without a signature fails (`unsigned`) in both, and an open state, which has none yet, is a warning
+  (`not_signed`) in both; with nothing else wrong, the script then exits 0 with `Result: NOT SIGNED`. Both hold 128
+  times what the file stores of the metadata they read, at least 4 GiB and at most 16 GiB, and stop with `too_large`
+  beyond that, which does not mean the container was altered; a file close to that limit can get different verdicts.
+  The script and the container's `factum/README.txt` are not signed: whoever could change the container could change
+  them. So run a copy of the script you trust, or compare the SHA-256 it prints when it starts with `factum --version`
+  or the release notes
 - `samples/container/` holds a signed sample container with throwaway TEST ONLY keys, for checking other AFF4-L
   tools against factum's GPG and X.509 signatures
 - Reports list each container with its files; the verification bundle carries the log entries, not the container
@@ -212,7 +242,7 @@ factum --list-cases [--all]
 factum --set-active case 1              # by ID, file number or name; clears the active evidence
 factum --list-evidence                  # evidence of the active case
 factum --set-active evidence none       # notes go to the case itself again
-factum --verify [case] [-v]             # exit code 1 if verification fails
+factum --verify [case] [-v]             # exit code 1 if it fails
 factum --checkpoint [case]              # seal the current state
 factum --sign-unsigned [case]           # sign entries and seals created without a key
 factum --export [case] --format html,pdf,md,bundle --out ./reports
@@ -220,6 +250,12 @@ factum --list-gpg
 factum --set-active gpg <key-id>
 factum --log-level DEBUG --list-cases
 ```
+
+A case is given by `#<id>`, its file number, its name or its id. An exact file number or name wins over an id (so a
+case numbered `2` is not case #2), several matches are an error that lists them, and `#12` always means id 12. A note
+cannot be combined with an option. Exit codes: 0 done (a verification with only warnings is done), 1 a verification
+failed (`--export` of a case that fails it writes the files, warns on stderr and exits 1), 2 an error (unknown case,
+bad arguments, database or file problem). With `FACTUM_DB` set, the CLI prints `Database: <path>` on stderr.
 
 Without a case argument, `--verify`, `--checkpoint`, `--sign-unsigned` and `--export` use the active case. Archiving,
 reopening and permanent deletion are only available in the GUI, so the typed confirmation cannot be scripted away.
@@ -264,18 +300,24 @@ never modified — set `FACTUM_DB` to a new file.
 ## Configuration
 
 Optional settings are read from a `.env` file in the user config directory (Linux: `~/.config/factum/.env`, macOS:
-`~/Library/Application Support/factum/.env`, Windows: `%LOCALAPPDATA%\factum\.env`), then from `.env` in the current
-directory; real environment variables override both. See [.env.example](.env.example).
+`~/Library/Application Support/factum/.env`, Windows: `%LOCALAPPDATA%\factum\.env`); real environment variables
+override it. A `.env` in the current directory is not read, so the folder factum is started from cannot change which
+database or seal folder it uses. See [.env.example](.env.example).
 
 | Variable                   | Meaning                                                                                       |
 |----------------------------|-----------------------------------------------------------------------------------------------|
 | `LOG_LEVEL`                | `DEBUG`, `INFO` (default), `WARNING`, `ERROR`, `CRITICAL`; `--log-level` overrides it         |
 | `FACTUM_DB`                | Path of the database file                                                                     |
-| `FACTUM_SEAL_DIR`          | Folder for external seal copies; must already exist (default: GUI setting, else `seals/` next to the database) |
+| `FACTUM_SEAL_DIR`          | Folder for external seal copies; must already exist (default: `seals/` next to the database). **Settings → Seal Folder…** writes it to the user config `.env` |
 | `FACTUM_COMPANION_API_KEY` | API key of the analytical companion; overrides the stored key                                 |
 
-A launcher (application menu, Start menu) does not read `.env` from a working directory: put settings in the user
-config directory.
+The seal folder is never taken from the database: someone who can edit the database could otherwise point the check
+at an empty folder. On the first start of this version, a seal folder chosen in the GUI of factum up to
+2.7.1 (stored in the database opened then) is moved to the user config `.env`, unless that already sets one; factum
+warns when it does, and asks to check the folder. A marker file `seal-dir-migrated` next to the `.env` records the first
+start, so no database is read for this again. A folder still named in the database but not in use is only mentioned
+in a warning, as a hint: it is not checked; choosing a seal folder in the GUI removes it. Every verify report (CLI, GUI, HTML/Markdown/PDF) names the seal folder
+it checked.
 
 ## What the integrity checks protect against
 
@@ -300,7 +342,7 @@ cargo test
 ```
 
 Requires Rust 1.95 or newer. On Linux no development packages are needed: SQLite is compiled in, and OpenGL,
-X11 and Wayland are loaded at runtime. `cargo run --example demo_db` fills a database (`FACTUM_DB`) with a demo case.
+X11 and Wayland are loaded at runtime. `FACTUM_DB=/tmp/demo.db cargo run --example demo_db` fills a database with a demo case (it refuses without `FACTUM_DB` or a path argument).
 GUI screenshots for review: `FACTUM_SCREENSHOTS=/tmp/shots cargo test --lib gui::` (needs a GPU or Mesa's lavapipe).
 
 Releases: `scripts/release.sh 2.0.1 && git push origin HEAD v2.0.1` — the release workflow builds and publishes

@@ -13,10 +13,15 @@ use sha2::Digest;
 use super::stream;
 use super::turtle::{self, Graph, Term};
 use super::volume::{
-    CER_X509, FileRecord, HASHES, KEY_GPG, SIG_GPG, SIG_X509, TURTLE, content_reader, file_records, history_member,
+    CER_X509, FileRecord, HASHES, KEY_GPG, SIG_GPG, SIG_X509, SIGNATURE_MEMBERS, TURTLE, content_reader, file_records,
+    history_member,
 };
-use super::x509::{Gpgsm, X509Check};
-use super::zip64::{Archive, find_last_end, member_bytes, read_archive};
+use super::x509::{Gpgsm, X509Check, first_fingerprint};
+use super::zip64::{
+    Archive, MAX_IN_MEMORY, MAX_METADATA_BUDGET, MAX_SIGNATURE_MEMBER, METADATA_BUDGET_PER_STORED_BYTE,
+    MIN_METADATA_BUDGET, find_last_end, find_newest_end, member_bytes_and_crc, member_bytes_up_to, read_archive,
+    search_gave_up,
+};
 use super::{AFF4_NS, AFF4L_NS, FACTUM_NS};
 use crate::error::{FactumError, Result};
 use crate::services::Factum;
@@ -83,25 +88,165 @@ impl ContainerReport {
         worst(&self.findings)
     }
 
-    fn finding(&mut self, level: Level, code: &'static str, message: impl Into<String>) {
+    /// Whether the check stopped because a container's metadata did not fit: nothing past that point was judged.
+    pub(crate) fn stopped_on_budget(&self) -> bool {
+        self.findings
+            .iter()
+            .any(|f| f.code == "too_large" && f.level == Level::Fail)
+    }
+
+    pub(crate) fn finding(&mut self, level: Level, code: &'static str, message: impl Into<String>) {
         self.findings.push(Finding::new(level, code, message, Ref::default()));
     }
 }
 
-fn read_member(file: &mut File, archive: &Archive, name: &str) -> Option<io::Result<Vec<u8>>> {
-    Some(member_bytes(file, archive.get(name)?))
+const HISTORY: &[u8] = b"factum/history/";
+const GIB: f64 = (1u64 << 30) as f64;
+
+/// Whether the check reads a member of this name as a state's metadata: the root's, or that of a close.
+fn is_read_metadata(name: &[u8]) -> bool {
+    let leaf = |name: &[u8]| name == TURTLE.as_bytes() || name == HASHES.as_bytes();
+    if leaf(name) {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix(HISTORY) else {
+        return false;
+    };
+    let mut parts = rest.splitn(2, |byte| *byte == b'/');
+    let number = parts.next().and_then(|n| std::str::from_utf8(n).ok());
+    number
+        .and_then(|text| text.parse::<u32>().ok().filter(|n| *n > 0 && n.to_string() == text))
+        .is_some()
+        && parts.next().is_some_and(leaf)
 }
 
-/// A member's content; one that is listed but cannot be read is a failure (with `code`), not an error.
-fn read_checked(
+/// Whether factum wrote this container, by what only its files hold. The tool named in version.txt says nothing: that
+/// file is not signed, and what it would decide is whether a missing signature counts.
+fn factum_layout(archive: &Archive) -> bool {
+    ["factum/README.txt", "verify_container.py"]
+        .iter()
+        .chain(&SIGNATURE_MEMBERS)
+        .any(|name| archive.get(name).is_some())
+        || archive.entries.iter().any(|e| e.name.starts_with(HISTORY))
+}
+
+/// How many members under factum/history/ belong to none of `closes`, and the first of them.
+fn outside_closes(archive: &Archive, closes: &std::collections::BTreeSet<u32>) -> (usize, Option<String>) {
+    let inside = |name: &[u8]| {
+        let rest = &name[HISTORY.len()..];
+        let number = rest.split(|byte| *byte == b'/').next().unwrap_or_default();
+        rest.len() > number.len()
+            && std::str::from_utf8(number)
+                .ok()
+                .and_then(|text| text.parse().ok().filter(|n: &u32| n.to_string() == text))
+                .is_some_and(|n| closes.contains(&n))
+    };
+    let mut outside = archive
+        .entries
+        .iter()
+        .filter(|e| e.name.starts_with(HISTORY) && !inside(&e.name))
+        .map(|e| e.name_lossy());
+    let first = outside.next();
+    (outside.count() + usize::from(first.is_some()), first)
+}
+
+/// What one check may hold of a container's metadata, all its states and their graphs together. It grows with what the
+/// file stores of it, so a real large container fits, and a few MiB that inflate to many members do not.
+struct Budget {
+    left: u64,
+    limit: u64,
+    /// spent: the check stopped there, which says nothing about the container
+    exhausted: bool,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Self {
+            left: limit,
+            limit,
+            exhausted: false,
+        }
+    }
+
+    /// For a file of `len` bytes: a directory can claim any compressed size, the file cannot hold more than it holds.
+    /// What counts is what the check reads, so stored bytes that nothing reads buy nothing.
+    fn for_archive(archive: &Archive, len: u64) -> Self {
+        let stored = archive
+            .entries
+            .iter()
+            .filter(|e| is_read_metadata(&e.name))
+            .fold(0u64, |sum, e| sum.saturating_add(e.compressed_size))
+            .min(len);
+        Self::new(
+            stored
+                .saturating_mul(METADATA_BUDGET_PER_STORED_BYTE)
+                .clamp(MIN_METADATA_BUDGET, MAX_METADATA_BUDGET),
+        )
+    }
+
+    fn stop(&mut self) -> FactumError {
+        self.exhausted = true;
+        FactumError::general("the metadata does not fit its budget")
+    }
+
+    fn take(&mut self, count: u64) -> Result<()> {
+        match self.left.checked_sub(count) {
+            Some(left) => {
+                self.left = left;
+                Ok(())
+            }
+            None => Err(self.stop()),
+        }
+    }
+
+    /// The graph of a member's bytes, or why it is none; an error only when the budget is spent. Bytes that are not
+    /// UTF-8 are not refused here: the hashes and signatures say what they are worth. Each may become three.
+    fn parse(&mut self, bytes: &[u8]) -> Result<std::result::Result<Graph, String>> {
+        if std::str::from_utf8(bytes).is_err() {
+            self.take(bytes.len() as u64 * 3)?;
+        }
+        match turtle::parse_within(&String::from_utf8_lossy(bytes), &mut self.left) {
+            Err(e) if e == turtle::TOO_MUCH => Err(self.stop()),
+            parsed => Ok(parsed),
+        }
+    }
+
+    /// The one finding of a check that stopped here.
+    fn finding(&self) -> String {
+        format!(
+            "The metadata of this container needs more memory than this check sets aside ({:.1} GiB in all, {:.1} GiB \
+             for one member), so the check stopped here and did not finish. That alone does not mean the container was \
+             altered.",
+            self.limit as f64 / GIB,
+            MAX_IN_MEMORY as f64 / GIB
+        )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test seam: the budget of the next check.
+    static BUDGET: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A member's content; one that is listed but cannot be read is a failure (with `code`), not an error. So is a CRC-32
+/// that differs, and the content then still counts: what is wrong may be the field, and the checks say the rest.
+fn read_limited(
     file: &mut File,
     archive: &Archive,
     name: &str,
     code: &'static str,
     findings: &mut Vec<Finding>,
+    limit: u64,
 ) -> Option<Vec<u8>> {
-    match read_member(file, archive, name)? {
-        Ok(data) => Some(data),
+    match member_bytes_up_to(file, archive.get(name)?, limit) {
+        Ok((data, crc_matches)) => {
+            let message = format!("{name}: CRC-32 differs from the central directory.");
+            if !crc_matches && !findings.iter().any(|f| f.message == message) {
+                findings.push(Finding::new(Level::Fail, code, message, Ref::default()));
+            }
+            Some(data)
+        }
         Err(e) => {
             findings.push(Finding::new(
                 Level::Fail,
@@ -112,6 +257,42 @@ fn read_checked(
             None
         }
     }
+}
+
+/// `read_limited` for what is held for the rest of the check, so it comes out of `budget`.
+fn read_checked(
+    file: &mut File,
+    archive: &Archive,
+    name: &str,
+    code: &'static str,
+    findings: &mut Vec<Finding>,
+    budget: &mut Budget,
+) -> Result<Option<Vec<u8>>> {
+    if archive.get(name).is_some_and(|entry| entry.size > MAX_IN_MEMORY) {
+        return Err(budget.stop());
+    }
+    let data = read_limited(file, archive, name, code, findings, MAX_IN_MEMORY);
+    if let Some(data) = &data {
+        budget.take(data.len() as u64)?;
+    }
+    Ok(data)
+}
+
+/// A signature member: looked at once and let go, so the budget has no part in it, and there is no reason for one to be
+/// large. A public key can be, with its certifications.
+fn read_signature(
+    file: &mut File,
+    archive: &Archive,
+    name: &str,
+    code: &'static str,
+    findings: &mut Vec<Finding>,
+) -> Option<Vec<u8>> {
+    let limit = if name.ends_with(KEY_GPG) {
+        MAX_IN_MEMORY
+    } else {
+        MAX_SIGNATURE_MEMBER
+    };
+    read_limited(file, archive, name, code, findings, limit)
 }
 
 fn hash_value(graph: &Graph, subject: &str, algorithm: &str) -> Option<String> {
@@ -126,14 +307,18 @@ fn hash_value(graph: &Graph, subject: &str, algorithm: &str) -> Option<String> {
 }
 
 /// information.turtle against its hashes file (AFF4-L v1.0, 10.1); the hashes file is mandatory.
-fn check_turtle_hashes(turtle: &[u8], hashes: Option<&[u8]>, label: &str) -> Vec<Finding> {
+fn check_turtle_hashes(turtle: &[u8], hashes: Option<&[u8]>, label: &str, budget: &mut Budget) -> Result<Vec<Finding>> {
     let fail = |message: String| vec![Finding::new(Level::Fail, "turtle_hash", message, Ref::default())];
     let Some(hashes) = hashes else {
-        return fail(format!("{label}: information.turtle.hashes is missing."));
+        return Ok(fail(format!("{label}: information.turtle.hashes is missing.")));
     };
-    let graph = match turtle::parse(&String::from_utf8_lossy(hashes)) {
+    let graph = match budget.parse(hashes)? {
         Ok(graph) => graph,
-        Err(e) => return fail(format!("{label}: information.turtle.hashes cannot be read ({e}).")),
+        Err(e) => {
+            return Ok(fail(format!(
+                "{label}: information.turtle.hashes cannot be read ({e})."
+            )));
+        }
     };
     let mut findings = Vec::new();
     let mut checked = 0;
@@ -158,7 +343,7 @@ fn check_turtle_hashes(turtle: &[u8], hashes: Option<&[u8]>, label: &str) -> Vec
             "{label}: information.turtle.hashes has no SHA-256 or SHA-512."
         )));
     }
-    findings
+    Ok(findings)
 }
 
 fn gpg_check(signer: &dyn Signer, signature: &str, turtle: &[u8]) -> SignatureCheck {
@@ -176,6 +361,8 @@ fn gpg_check(signer: &dyn Signer, signature: &str, turtle: &[u8]) -> SignatureCh
         username: result.username,
         trust: result.trust,
         signature_timestamp: result.signature_timestamp,
+        key_expired: result.key_expired,
+        signing_subkey: result.signing_subkey,
     }
 }
 
@@ -211,17 +398,58 @@ fn x509_findings(check: &X509Check, label: &str) -> Vec<Finding> {
         return finding(
             Level::Fail,
             "x509_invalid",
-            format!("{label}: the signing certificate was not valid when the signature was made."),
+            format!(
+                "{label}: the signing certificate or one in its chain was not valid at the time the signature states."
+            ),
+        );
+    }
+    if check.expired {
+        return finding(
+            Level::Warn,
+            "x509_expired",
+            format!(
+                "{label}: the X.509 signature is good, but its certificate or one in its chain has expired since. \
+                 That they were valid at signing rests on the signing time the signer stated; nothing confirms it."
+            ),
         );
     }
     Vec::new()
 }
 
-/// The signature members of a state: (gpg signature, x509 signature).
-fn signature_names(close: Option<u32>) -> (String, String) {
+/// The certificate that made a signature against the first of the chain stored beside it: any certificate below a
+/// trusted root makes a good signature, so a signature alone does not say it is the examiner's.
+fn stored_certificate_findings(check: &X509Check, chain: &[u8], label: &str) -> Vec<Finding> {
+    let Some(signer) = &check.fingerprint else {
+        return Vec::new();
+    };
+    let stored = first_fingerprint(&String::from_utf8_lossy(chain));
+    if stored
+        .as_ref()
+        .is_some_and(|stored| stored.eq_ignore_ascii_case(signer))
+    {
+        return Vec::new();
+    }
+    vec![Finding::new(
+        Level::Fail,
+        "x509_mismatch",
+        format!(
+            "{label}: the X.509 signature was made by certificate {signer}, not by the one stored in the container \
+             ({}).",
+            stored.as_deref().unwrap_or("none readable")
+        ),
+        Ref::default(),
+    )]
+}
+
+/// The signature members of a state: (gpg signature, x509 signature, x509 certificate chain).
+fn signature_names(close: Option<u32>) -> (String, String, String) {
     match close {
-        Some(n) => (history_member(n, SIG_GPG), history_member(n, SIG_X509)),
-        None => (SIG_GPG.to_string(), SIG_X509.to_string()),
+        Some(n) => (
+            history_member(n, SIG_GPG),
+            history_member(n, SIG_X509),
+            history_member(n, CER_X509),
+        ),
+        None => (SIG_GPG.to_string(), SIG_X509.to_string(), CER_X509.to_string()),
     }
 }
 
@@ -229,7 +457,8 @@ fn signature_names(close: Option<u32>) -> (String, String) {
 enum Content {
     /// nothing stored (metadata only, a link, a folder)
     None,
-    Hashed(u64, stream::Digests),
+    /// size, digests and the members that differ from the directory's CRC-32
+    Hashed(u64, stream::Digests, Vec<String>),
     /// stored in a way factum does not read (another codec, special map targets)
     NotChecked(String),
 }
@@ -245,8 +474,8 @@ fn number(graph: &Graph, subject: &str, local: &str) -> Option<u64> {
 }
 
 fn hash_reader(reader: &mut dyn Read, progress: &dyn Fn(u64), cancel: &AtomicBool) -> io::Result<Content> {
-    let (size, digests) = stream::hash_only(reader, progress, cancel)?;
-    Ok(Content::Hashed(size, digests))
+    let (size, digests, crc) = stream::hash_stored(reader, progress, cancel)?;
+    Ok(Content::Hashed(size, digests, crc.into_iter().collect()))
 }
 
 /// The content of `arn`: a ZipSegment, an ImageStream, data in the metadata (`aff4:dataStream`, also as the
@@ -309,7 +538,16 @@ fn hash_map(
     cancel: &AtomicBool,
 ) -> io::Result<Content> {
     let missing = |what: &str| io::Error::new(io::ErrorKind::NotFound, format!("{map}: {what} is missing"));
-    let read_arn = |file: &mut File, arn: String| archive.get_arn(&arn).map(|entry| member_bytes(file, entry));
+    let mut crc = Vec::new();
+    let mut read_arn = |file: &mut File, arn: String| {
+        archive.get_arn(&arn).map(|entry| {
+            let (data, crc_matches) = member_bytes_and_crc(file, entry)?;
+            if !crc_matches {
+                crc.push(entry.name_lossy());
+            }
+            Ok::<_, io::Error>(data)
+        })
+    };
     let entries = read_arn(file, format!("{map}/map")).ok_or_else(|| missing("its map"))??;
     let index = read_arn(file, format!("{map}/idx")).ok_or_else(|| missing("its idx"))??;
     let targets: Vec<String> = String::from_utf8_lossy(&index)
@@ -417,6 +655,7 @@ fn hash_map(
                     format!("{target} ends early"),
                 ));
             }
+            crc.extend(reader.crc_mismatch().map(str::to_string));
         } else {
             return Ok(Content::NotChecked(format!(
                 "its map target {target} is not an ImageStream"
@@ -428,7 +667,9 @@ fn hash_map(
     if size > position {
         fill(&mut hasher, position, size - position, 0)?;
     }
-    Ok(Content::Hashed(size.max(position), hasher.finish()))
+    crc.sort();
+    crc.dedup();
+    Ok(Content::Hashed(size.max(position), hasher.finish(), crc))
 }
 
 struct HashWriter<'h>(&'h mut stream::Hasher);
@@ -446,7 +687,15 @@ impl io::Write for HashWriter<'_> {
 
 /// Joins the secondary information stores (`aff4l:imports`, AFF4-L v1.0 section 9) into the graph, each checked
 /// against the hash the primary store gives for it (section 10.2).
-fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: &str, label: &str) -> Vec<Finding> {
+fn resolve_imports(
+    file: &mut File,
+    archive: &Archive,
+    graph: &mut Graph,
+    uuid: &str,
+    label: &str,
+    layout: bool,
+    budget: &mut Budget,
+) -> Result<Vec<Finding>> {
     let volume = format!("aff4://{uuid}");
     let fail = |message: String| Finding::new(Level::Fail, "turtle_hash", message, Ref::default());
     let mut findings = Vec::new();
@@ -464,8 +713,11 @@ fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: 
         for store in imports {
             done.insert(store.clone());
             let name = super::member_name(&store, &volume);
-            let Some(Ok(data)) = read_member(file, archive, &name) else {
+            if archive.get(&name).is_none() {
                 findings.push(fail(format!("{label}: the secondary store {name} is missing.")));
+                continue;
+            }
+            let Some(data) = read_checked(file, archive, &name, "turtle_hash", &mut findings, budget)? else {
                 continue;
             };
             let expected: Vec<(&str, String)> = [("SHA512", "SHA512"), ("SHA256", "SHA256")]
@@ -484,8 +736,10 @@ fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: 
                     findings.push(fail(format!("{label}: {name} does not match its {algorithm}.")));
                 }
             }
-            match turtle::parse(&String::from_utf8_lossy(&data)) {
+            match budget.parse(&data)? {
                 Ok(secondary) => graph.extend(secondary),
+                // what another tool wrote may just be beyond this reader; factum writes nothing it cannot read
+                Err(e) if layout => findings.push(fail(format!("{label}: {name} cannot be read ({e})."))),
                 Err(e) => findings.push(Finding::new(
                     Level::Warn,
                     "not_checked",
@@ -495,7 +749,7 @@ fn resolve_imports(file: &mut File, archive: &Archive, graph: &mut Graph, uuid: 
             }
         }
     }
-    findings
+    Ok(findings)
 }
 
 fn plural_files(count: usize) -> String {
@@ -530,32 +784,82 @@ pub fn verify_file(
         checked_files: 0,
         graph: None,
     };
+    let mut budget = Budget::new(MIN_METADATA_BUDGET);
+    match check_file(&mut report, &mut budget, path, signer, gpgsm, progress, cancel) {
+        // what is left unread stays unjudged: no rule may read anything into it
+        Err(_) if budget.exhausted => {
+            let level = if report.format == ContainerFormat::Factum {
+                Level::Fail
+            } else {
+                Level::Warn
+            };
+            report.finding(level, "too_large", budget.finding());
+            Ok(report)
+        }
+        Err(e) => Err(e),
+        Ok(()) => Ok(report),
+    }
+}
+
+fn check_file(
+    report: &mut ContainerReport,
+    budget: &mut Budget,
+    path: &Path,
+    signer: &dyn Signer,
+    gpgsm: &Gpgsm,
+    progress: &dyn Fn(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<()> {
     let mut file =
         File::open(path).map_err(|e| FactumError::general(format!("{} cannot be read: {e}", path.display())))?;
     let len = file.seek(SeekFrom::End(0))?;
     let end = match find_last_end(&mut file, None) {
         Ok(Some(end)) => end,
-        _ => {
-            report.finding(
-                Level::Fail,
-                "not_aff4",
-                format!("{} is not a ZIP (AFF4) container.", path.display()),
-            );
-            return Ok(report);
+        Ok(None) => {
+            let message = if search_gave_up(&mut file)? {
+                format!(
+                    "No complete state was found in {}: the search through its end records stopped at its limit, so \
+                     this does not say what the file is.",
+                    path.display()
+                )
+            } else {
+                format!("{} is not a ZIP (AFF4) container.", path.display())
+            };
+            report.finding(Level::Fail, "not_aff4", message);
+            return Ok(());
         }
+        Err(e) => return Err(FactumError::general(format!("{} cannot be read: {e}", path.display()))),
     };
     if end < len {
         report.discarded_tail = len - end;
-        report.finding(
-            Level::Warn,
-            "trailing_data",
-            format!(
-                "{} bytes after the last complete state (an interrupted addition); the last complete state was checked.",
-                len - end
+        match find_newest_end(&mut file, Some(end)) {
+            Ok(_) => report.finding(
+                Level::Warn,
+                "trailing_data",
+                format!(
+                    "{} bytes after the last complete state (an interrupted addition); the last complete state was \
+                     checked.",
+                    len - end
+                ),
             ),
-        );
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => report.finding(
+                Level::Fail,
+                "trailing_data",
+                format!(
+                    "{} bytes after the last complete state may be more than an interrupted addition ({e}); the last \
+                     complete state was checked.",
+                    len - end
+                ),
+            ),
+            Err(e) => return Err(FactumError::general(format!("{} cannot be read: {e}", path.display()))),
+        }
     }
     let archive = read_archive(&mut file, end)?;
+    *budget = Budget::for_archive(&archive, len);
+    #[cfg(test)]
+    if let Some(limit) = BUDGET.with(std::cell::Cell::take) {
+        *budget = Budget::new(limit);
+    }
     for name in archive.duplicates() {
         report.finding(
             Level::Fail,
@@ -563,18 +867,50 @@ pub fn verify_file(
             format!("{name} is listed more than once; ZIP tools may read a different one than this check did."),
         );
     }
-    let version = read_member(&mut file, &archive, "version.txt").and_then(|r| r.ok());
-    let Some(version) = version.map(|v| String::from_utf8_lossy(&v).into_owned()) else {
-        report.format = ContainerFormat::Legacy;
+    let layout = factum_layout(&archive);
+    if layout {
+        report.format = ContainerFormat::Factum;
+    }
+    // before anything can end the check: it is what ties the file to its case log
+    let description = read_checked(
+        &mut file,
+        &archive,
+        "container.description",
+        "history",
+        &mut report.findings,
+        budget,
+    )?;
+    let volume = description.map_or_else(|| archive.volume(), |d| String::from_utf8_lossy(&d).trim().to_string());
+    report.uuid = Some(volume.trim_start_matches("aff4://").to_string()).filter(|uuid| !uuid.is_empty());
+    if layout && archive.get("container.description").is_none() {
         report.finding(
-            Level::Warn,
-            "unsupported",
-            "No version.txt: an AFF4 container from before AFF4-L v1.0. This format is not supported; nothing was checked.",
+            Level::Fail,
+            "history",
+            "container.description is missing, which ties this container to its case log.",
         );
-        return Ok(report);
-    };
+    } else if layout && volume != archive.volume() {
+        report.finding(
+            Level::Fail,
+            "history",
+            format!(
+                "container.description names {volume}, the ZIP comment {}.",
+                archive.volume()
+            ),
+        );
+    }
+    let version = read_checked(
+        &mut file,
+        &archive,
+        "version.txt",
+        "history",
+        &mut report.findings,
+        budget,
+    )?;
+    let version = version.map(|v| String::from_utf8_lossy(&v).into_owned());
     let property = |key: &str| {
         version
+            .as_deref()
+            .unwrap_or_default()
             .lines()
             .find_map(|l| l.strip_prefix(&format!("{key}=")))
             .map(|v| v.trim().to_string())
@@ -584,15 +920,26 @@ pub fn verify_file(
         property("minor").unwrap_or_default(),
     );
     if (major.as_str(), minor.as_str()) != ("2", "1") {
-        report.format = ContainerFormat::Legacy;
+        let found = match version {
+            Some(_) => format!("AFF4 version {major}.{minor}"),
+            None => "No version.txt".to_string(),
+        };
+        if !layout {
+            report.format = ContainerFormat::Legacy;
+            report.finding(
+                Level::Warn,
+                "unsupported",
+                format!("{found}: only AFF4-L v1.0 (2.1) is supported; nothing was checked."),
+            );
+            return Ok(());
+        }
         report.finding(
-            Level::Warn,
+            Level::Fail,
             "unsupported",
-            format!("AFF4 version {major}.{minor}: only AFF4-L v1.0 (2.1) is supported; nothing was checked."),
+            format!("{found}, though factum wrote this container; it was checked all the same."),
         );
-        return Ok(report);
     }
-    report.format = if property("tool").is_some_and(|t| t.starts_with("factum")) {
+    report.format = if layout {
         ContainerFormat::Factum
     } else {
         ContainerFormat::Aff4l
@@ -616,26 +963,17 @@ pub fn verify_file(
             ),
         );
     }
-    report.uuid = read_member(&mut file, &archive, "container.description")
-        .and_then(|r| r.ok())
-        .map(|d| {
-            String::from_utf8_lossy(&d)
-                .trim()
-                .trim_start_matches("aff4://")
-                .to_string()
-        });
 
     // the states: every closed one, and the current one when it is not the newest close
-    let Some(Ok(current_turtle)) = read_member(&mut file, &archive, TURTLE) else {
-        report.finding(
-            Level::Fail,
-            "turtle_hash",
-            "information.turtle is missing or unreadable.",
-        );
-        return Ok(report);
+    let current_turtle = read_checked(&mut file, &archive, TURTLE, "turtle_hash", &mut report.findings, budget)?;
+    let Some(current_turtle) = current_turtle else {
+        if archive.get(TURTLE).is_none() {
+            report.finding(Level::Fail, "turtle_hash", "information.turtle is missing.");
+        }
+        return Ok(());
     };
     // every closed state kept, numbered from 1 without gaps: a gap is a closed state that was removed
-    let closes: std::collections::BTreeSet<u32> = archive
+    let mut closes: std::collections::BTreeSet<u32> = archive
         .entries
         .iter()
         .filter_map(|e| {
@@ -646,15 +984,45 @@ pub fn verify_file(
                 .ok()
         })
         .collect();
-    let count = closes.last().copied().unwrap_or(0);
-    for missing in (1..count).filter(|n| !closes.contains(n)) {
+    if closes.remove(&0) {
         report.finding(
             Level::Fail,
             "history",
-            format!("The closed state of close {missing} is missing from the container."),
+            "A closed state numbered 0: closes are numbered from 1; it was not checked.",
+        );
+    }
+    let count = closes.last().copied().unwrap_or(0);
+    // from one kept state to the next: a crafted number must not make this count up to it
+    let mut next = 1;
+    for &n in &closes {
+        match n - next {
+            0 => {}
+            1 => report.finding(
+                Level::Fail,
+                "history",
+                format!("The closed state of close {next} is missing from the container."),
+            ),
+            _ => report.finding(
+                Level::Fail,
+                "history",
+                format!(
+                    "The closed states of closes {next} to {} are missing from the container.",
+                    n - 1
+                ),
+            ),
+        }
+        next = n.saturating_add(1);
+    }
+    // a close that cannot be read is no close: what it held must not pass for something else, or for nothing
+    if let (count @ 1.., Some(first)) = outside_closes(&archive, &closes) {
+        report.finding(
+            Level::Fail,
+            "history",
+            format!("{count} member(s) under factum/history/ belong to no closed state ({first})."),
         );
     }
     let mut parsed = Vec::new();
+    let mut close_unread = false;
     for n in closes.iter().copied() {
         let turtle = read_checked(
             &mut file,
@@ -662,30 +1030,42 @@ pub fn verify_file(
             &history_member(n, TURTLE),
             "history",
             &mut report.findings,
-        )
-        .unwrap_or_default();
+            budget,
+        )?;
+        close_unread |= turtle.is_none();
+        let turtle = turtle.unwrap_or_default();
         let hashes = read_checked(
             &mut file,
             &archive,
             &history_member(n, HASHES),
             "turtle_hash",
             &mut report.findings,
-        );
+            budget,
+        )?;
         parsed.push((Some(n), n == count && turtle == current_turtle, turtle, hashes));
     }
     if count == 0 || parsed.last().is_some_and(|p| !p.1) {
-        let hashes = read_checked(&mut file, &archive, HASHES, "turtle_hash", &mut report.findings);
+        let hashes = read_checked(&mut file, &archive, HASHES, "turtle_hash", &mut report.findings, budget)?;
+        budget.take(current_turtle.len() as u64)?;
         parsed.push((None, true, current_turtle.clone(), hashes));
     }
     let mut states = Vec::new();
     for (close, current, turtle, hashes) in parsed {
         let label = close.map_or("current".to_string(), |n| format!("close {n}"));
         // metadata that cannot be parsed is a failure; the state's hashes and signatures are still checked below
-        let graph = match turtle::parse(&String::from_utf8_lossy(&turtle)) {
+        let graph = match budget.parse(&turtle)? {
             Ok(mut graph) => {
                 let uuid = report.uuid.clone().unwrap_or_default();
-                let findings = resolve_imports(&mut file, &archive, &mut graph, &uuid, &label);
+                let findings = resolve_imports(&mut file, &archive, &mut graph, &uuid, &label, layout, budget)?;
                 report.findings.extend(findings);
+                // the signed metadata says which volume it describes
+                if layout && !graph.has_type(&volume, &format!("{AFF4_NS}ZipVolume")) {
+                    report.finding(
+                        Level::Fail,
+                        "history",
+                        format!("{label}: information.turtle does not describe the volume {volume}."),
+                    );
+                }
                 Some(graph)
             }
             Err(e) => {
@@ -721,10 +1101,10 @@ pub fn verify_file(
             files: state.graph.as_ref().map_or(0, |g| file_records(g).len()),
             gpg: None,
             x509: None,
-            findings: check_turtle_hashes(&state.turtle, state.hashes.as_deref(), &label),
+            findings: check_turtle_hashes(&state.turtle, state.hashes.as_deref(), &label, budget)?,
         };
-        let (gpg_name, x509_name) = signature_names(state.close);
-        if let Some(signature) = read_checked(
+        let (gpg_name, x509_name, chain_name) = signature_names(state.close);
+        if let Some(signature) = read_signature(
             &mut file,
             &archive,
             &gpg_name,
@@ -739,11 +1119,23 @@ pub fn verify_file(
             ));
             result.gpg = Some(check);
         }
-        if let Some(signature) = read_checked(&mut file, &archive, &x509_name, "x509_invalid", &mut result.findings) {
+        if let Some(signature) = read_signature(&mut file, &archive, &x509_name, "x509_invalid", &mut result.findings) {
             let check = gpgsm.verify_detached(&String::from_utf8_lossy(&signature), &state.turtle);
-            result
-                .findings
-                .extend(x509_findings(&check, &format!("Container state '{label}'")));
+            let what = format!("Container state '{label}'");
+            result.findings.extend(x509_findings(&check, &what));
+            if let Some(chain) = read_signature(&mut file, &archive, &chain_name, "x509_invalid", &mut result.findings)
+            {
+                result
+                    .findings
+                    .extend(stored_certificate_findings(&check, &chain, &what));
+            } else if archive.get(&chain_name).is_none() {
+                result.findings.push(Finding::new(
+                    Level::Warn,
+                    "x509_no_certificate",
+                    format!("{what}: an X.509 signature without the certificate chain stored beside it."),
+                    Ref::default(),
+                ));
+            }
             result.x509 = Some(check);
         }
         if state.close.is_some()
@@ -761,8 +1153,8 @@ pub fn verify_file(
         // the root signatures of a closed current state are that close's
         if let (Some(n), true) = (state.close, state.current) {
             for name in [SIG_GPG, KEY_GPG, SIG_X509, CER_X509] {
-                let root = read_checked(&mut file, &archive, name, "history", &mut result.findings);
-                let kept = read_checked(
+                let root = read_signature(&mut file, &archive, name, "history", &mut result.findings);
+                let kept = read_signature(
                     &mut file,
                     &archive,
                     &history_member(n, name),
@@ -778,14 +1170,34 @@ pub fn verify_file(
                     ));
                 }
             }
+            // what readers of the standard go by; the close's copy above is another member
+            let root = read_checked(&mut file, &archive, HASHES, "turtle_hash", &mut result.findings, budget)?;
+            if root.is_some() || archive.get(HASHES).is_none() {
+                let at_root = format!("{label}, at the root");
+                let findings = check_turtle_hashes(&state.turtle, root.as_deref(), &at_root, budget)?;
+                result.findings.extend(findings);
+            }
+        }
+        // every state factum writes takes the root signatures away, so an open state has none: one that does is a
+        // close that was taken out of the directory
+        if state.close.is_none()
+            && !close_unread
+            && let Some(name) = SIGNATURE_MEMBERS.iter().find(|name| archive.get(name).is_some())
+        {
+            result.findings.push(Finding::new(
+                Level::Fail,
+                "history",
+                format!("{name} is at the root of a state that was never closed."),
+                Ref::default(),
+            ));
         }
         report.findings.extend(result.findings.clone());
         report.states.push(result);
     }
 
     // the states whose metadata could be read; the others failed above
-    let newest_readable = states.last().is_some_and(|s| s.graph.is_some());
-    let states: Vec<(&Parsed, &Graph)> = states.iter().filter_map(|s| s.graph.as_ref().map(|g| (s, g))).collect();
+    let mut parsed = states;
+    let states: Vec<(&Parsed, &Graph)> = parsed.iter().filter_map(|s| s.graph.as_ref().map(|g| (s, g))).collect();
     // a closed state's files are the same files, described alike (storage included), in every later state
     if let Some(&(newest, newest_graph)) = states.last() {
         let listed: HashMap<String, FileRecord> = file_records(newest_graph)
@@ -814,7 +1226,7 @@ pub fn verify_file(
             }
         }
         // what was added after the last close is not signed yet; a container never closed is not signed at all
-        if report.format == ContainerFormat::Factum && newest.close.is_none() {
+        if newest.close.is_none() {
             let closed = states
                 .iter()
                 .rev()
@@ -850,7 +1262,7 @@ pub fn verify_file(
         progress(0, total);
         for record in &stored {
             if cancel.load(Ordering::Relaxed) {
-                return Err(FactumError::general("Verification cancelled."));
+                return Err(FactumError::cancelled("Verification cancelled."));
             }
             let name = if record.path.is_empty() {
                 record.arn.clone()
@@ -858,11 +1270,12 @@ pub fn verify_file(
                 record.path.clone()
             };
             let findings_before = report.findings.len();
+            let mut crc_differs = Vec::new();
             // content longer than its listed size (a damaged or crafted container) never shows more than all of it
             let report_progress = |read: u64| progress((done + read).min(total), total);
             match hash_content(&mut file, &archive, graph, &record.arn, &report_progress, cancel) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    return Err(FactumError::general("Verification cancelled."));
+                    return Err(FactumError::cancelled("Verification cancelled."));
                 }
                 Err(e) => report.finding(
                     Level::Fail,
@@ -879,10 +1292,15 @@ pub fn verify_file(
                     );
                 }
                 Ok(Content::None) => {}
+                // factum stores files in one way, so another is no format it cannot read: the hashes must not be
+                // skipped by naming one
+                Ok(Content::NotChecked(why)) if report.format == ContainerFormat::Factum => {
+                    report.finding(Level::Fail, "stream_hash", format!("{name}: not checked ({why})."));
+                }
                 Ok(Content::NotChecked(why)) => {
                     report.finding(Level::Warn, "not_checked", format!("{name}: not checked ({why})."));
                 }
-                Ok(Content::Hashed(size, digests)) => {
+                Ok(Content::Hashed(size, digests, crc)) => {
                     report.checked_files += 1;
                     let mut compared = 0;
                     for (algorithm, actual) in digests.typed() {
@@ -897,6 +1315,7 @@ pub fn verify_file(
                             }
                         }
                     }
+                    crc_differs = crc;
                     if number(graph, &record.arn, "size").is_some_and(|listed| listed != size) {
                         report.finding(
                             Level::Fail,
@@ -934,10 +1353,12 @@ pub fn verify_file(
                     Term::Iri(arn) => Some(arn.clone()),
                     Term::Literal { .. } => None,
                 });
+            let mut damage_replaced = false;
             if let Some(replacement) = replacement {
                 let failed = report.findings[findings_before..]
                     .iter()
                     .any(|f| f.code == "stream_hash");
+                damage_replaced = failed;
                 if failed {
                     let tail = report.findings.split_off(findings_before);
                     report
@@ -972,16 +1393,25 @@ pub fn verify_file(
                     }
                 }
             }
+            // content that was replaced for its damage explains its CRC-32; otherwise it is a fault of its own
+            if !damage_replaced {
+                for member in crc_differs {
+                    report.finding(
+                        Level::Fail,
+                        "stream_hash",
+                        format!("{name}: CRC-32 differs from the central directory ({member})."),
+                    );
+                }
+            }
             if counted(record) {
                 done += record.size;
             }
         }
         progress(total, total);
-        if newest_readable {
-            report.graph = Some(graph.clone());
-        }
     }
-    Ok(report)
+    // the newest state's metadata goes on to the log checks; a clone of it would be the peak of the whole check
+    report.graph = parsed.pop().and_then(|state| state.graph);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1037,6 +1467,22 @@ mod tests_support {
         extra(&mut app);
         app.finish(&[], format!("aff4://{VOLUME}").as_bytes()).unwrap();
         path
+    }
+
+    /// A container with what makes it factum's, and `graph`.
+    pub fn factum_laid_out(dir: &tempfile::TempDir, graph: &Graph, extra: &mut dyn FnMut(&mut Appender)) -> PathBuf {
+        let volume = format!("aff4://{VOLUME}");
+        let mut graph = graph.clone();
+        a(&mut graph, &volume, &aff4("ZipVolume"));
+        foreign(
+            dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes("factum/README.txt", 0, b"readme").unwrap();
+                extra(app);
+            },
+            V21,
+        )
     }
 
     pub fn check(path: &Path) -> ContainerReport {
@@ -1099,7 +1545,9 @@ mod tests {
         in_metadata(&mut graph, "aff4://b", "dataSteam", b"hello world", sha1); // the standard's spelling
         let report = check(&foreign(&dir, &graph, &mut |_| {}, V21));
         assert_eq!(report.format, ContainerFormat::Aff4l);
-        assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+        // everything checks out, and still nothing signs it
+        assert_eq!(codes(&report, Level::Warn), vec!["not_signed"], "{:?}", report.findings);
+        assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
         assert_eq!(report.checked_files, 2);
 
         let dir = tempfile::tempdir().unwrap();
@@ -1132,7 +1580,8 @@ mod tests {
             V21,
         );
         let report = check(&path);
-        assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+        assert_eq!(codes(&report, Level::Warn), vec!["not_signed"], "{:?}", report.findings);
+        assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
         assert_eq!(report.checked_files, 2);
     }
 
@@ -1186,7 +1635,7 @@ mod tests {
         assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
         assert_eq!(
             codes(&report, Level::Warn),
-            vec!["not_checked"],
+            vec!["not_signed", "not_checked"],
             "{:?}",
             report.findings
         );
@@ -1211,7 +1660,7 @@ mod tests {
         );
         let report = check(&path);
         assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
-        assert_eq!(codes(&report, Level::Warn), vec!["not_checked"]);
+        assert_eq!(codes(&report, Level::Warn), vec!["not_signed", "not_checked"]);
     }
 
     fn with_import(dir: &tempfile::TempDir, hash_of_secondary: Option<String>) -> PathBuf {
@@ -1248,7 +1697,8 @@ mod tests {
     fn imports_are_hashed() {
         let dir = tempfile::tempdir().unwrap();
         let report = check(&with_import(&dir, None));
-        assert_eq!(report.overall(), Level::Ok, "{:?}", report.findings);
+        assert_eq!(codes(&report, Level::Warn), vec!["not_signed"], "{:?}", report.findings);
+        assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
         assert_eq!(report.checked_files, 1); // the imported store's file joined the graph
         let dir = tempfile::tempdir().unwrap();
         let report = check(&with_import(&dir, Some("00".repeat(64))));
@@ -1278,10 +1728,13 @@ mod tests {
             V21,
         );
         let report = check(&path);
-        assert_eq!(codes(&report, Level::Warn), vec!["not_checked"]);
+        assert_eq!(codes(&report, Level::Warn), vec!["not_checked", "not_signed"]);
         std::fs::write(dir.path().join("c.aff4l.1"), b"part two").unwrap();
         let report = check(&path);
-        assert_eq!(codes(&report, Level::Warn), vec!["not_checked", "not_checked"]);
+        assert_eq!(
+            codes(&report, Level::Warn),
+            vec!["not_checked", "not_checked", "not_signed"]
+        );
     }
 
     #[test]
@@ -1304,7 +1757,238 @@ mod crafted {
     use super::*;
     use crate::container::XSD_NS;
     use crate::container::stream::ZLIB;
+    use crate::container::zip64::Appender;
     use std::io::Write;
+
+    #[test]
+    fn a_secondary_store_that_cannot_be_read_fails_in_factums_layout_and_warns_in_others() {
+        let store = format!("aff4://{VOLUME}/information.turtle.2");
+        let text = b"x> .";
+        let graph = |graph: &mut Graph| {
+            graph.add(
+                &format!("aff4://{VOLUME}"),
+                &format!("{AFF4L_NS}imports"),
+                Term::Iri(store.clone()),
+            );
+            graph.add(
+                &store,
+                &aff4("hash"),
+                typed(hex::encode(sha2::Sha256::digest(text)), &aff4("SHA256")),
+            );
+        };
+        let mut imports = Graph::default();
+        graph(&mut imports);
+        let add = |app: &mut Appender| {
+            app.add_bytes("information.turtle.2", 8, text).unwrap();
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let report = check(&factum_laid_out(&dir, &imports, &mut { add }));
+        assert!(
+            codes(&report, Level::Fail).contains(&"turtle_hash"),
+            "{:?}",
+            report.findings
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let report = check(&foreign(&dir, &imports, &mut { add }, V21));
+        assert!(codes(&report, Level::Fail).is_empty(), "{:?}", report.findings);
+        assert!(
+            codes(&report, Level::Warn).contains(&"not_checked"),
+            "{:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_budget_grows_with_what_is_stored_and_not_with_what_a_directory_claims() {
+        let entry = |name: &str, compressed_size: u64| crate::container::zip64::CdEntry {
+            name: name.as_bytes().to_vec(),
+            compressed_size,
+            ..Default::default()
+        };
+        let archive = |entries| Archive::new(entries, Vec::new(), 0);
+        // a few MiB of it, however far they inflate: the floor
+        let small = archive(vec![entry(TURTLE, 3 << 20)]);
+        assert_eq!(Budget::for_archive(&small, 3 << 20).limit, MIN_METADATA_BUDGET);
+        // a real large one: every copy it reads counts, what is no metadata does not
+        let large = archive(vec![
+            entry(TURTLE, 40 << 20),
+            entry("factum/history/1/information.turtle", 40 << 20),
+            entry("factum/history/1/information.turtle.hashes", 1 << 10),
+            entry("evidence", 1 << 40),
+        ]);
+        assert_eq!(
+            Budget::for_archive(&large, 2 << 40).limit,
+            ((80 << 20) + (1 << 10)) * METADATA_BUDGET_PER_STORED_BYTE
+        );
+        // stored bytes that nothing reads buy nothing, whatever they are called
+        for pad in [
+            "evidence/information.turtle.pad",
+            "information.turtle.2",
+            "factum/history/x/information.turtle",
+            "factum/history/01/information.turtle",
+            "factum/history/0/information.turtle",
+            "factum/history/1/x/information.turtle",
+            "factum/history/1/information.turtle.asc",
+            "factum/history/4294967296/information.turtle",
+            "factum/history/5000000000/information.turtle",
+        ] {
+            let padded = archive(vec![entry(TURTLE, 3 << 20), entry(pad, 1 << 30)]);
+            assert_eq!(
+                Budget::for_archive(&padded, 2 << 30).limit,
+                MIN_METADATA_BUDGET,
+                "{pad}"
+            );
+        }
+        // however much is stored, a ceiling
+        let huge = archive(vec![entry(TURTLE, 1 << 40)]);
+        assert_eq!(Budget::for_archive(&huge, 2 << 40).limit, MAX_METADATA_BUDGET);
+        // a directory that claims it: the file holds no more than it holds
+        let claimed = archive(vec![entry(TURTLE, 1 << 50)]);
+        assert_eq!(Budget::for_archive(&claimed, 1 << 20).limit, MIN_METADATA_BUDGET);
+    }
+
+    /// A genuine container that hits the limit, on the only path factum verifies by: the log has nothing to add.
+    #[test]
+    fn a_stop_at_the_limit_is_no_finding_of_the_log() {
+        use crate::db::Db;
+        use crate::services::Factum;
+        use crate::signer::FakeSigner;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("f.db")).unwrap();
+        let signer = FakeSigner::new(true);
+        let factum = Factum::with_seal_dir(&db, &signer, Some(dir.path().to_path_buf()));
+        let case_id = factum.create_case("C-1", "Case", "").unwrap();
+        let evidence = factum.create_evidence(case_id, "disk", "", "").unwrap();
+        let path = dir.path().join("c.aff4l");
+        let id = factum.create_container(case_id, "C", evidence, &path, "/mnt").unwrap();
+        factum.close_container(id).unwrap();
+        let verify = |expected, budget| {
+            BUDGET.with(|cell| cell.set(budget));
+            factum
+                .verify_expected_container(
+                    &path,
+                    expected,
+                    &Gpgsm::unavailable(),
+                    &|_, _| {},
+                    &AtomicBool::new(false),
+                )
+                .unwrap()
+        };
+        let report = verify(None, None);
+        assert!(report.log.is_some(), "{:?}", report.findings);
+        for expected in [Some(id), None] {
+            let report = verify(expected, Some(1_000));
+            assert_eq!(codes(&report, Level::Fail), vec!["too_large"], "{:?}", report.findings);
+            assert!(report.log.is_none());
+        }
+    }
+
+    /// The same stop on a file that shows no sign of factum is no failure of its own, so the log still has its say.
+    #[test]
+    fn a_stop_at_the_limit_keeps_a_stripped_file_from_the_log_no_longer_than_it_stops() {
+        let graph = Graph::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = foreign(&dir, &graph, &mut |_| {}, V21);
+        BUDGET.with(|budget| budget.set(Some(10)));
+        let report = check(&path);
+        assert_eq!(codes(&report, Level::Warn), vec!["too_large"], "{:?}", report.findings);
+        assert!(!report.stopped_on_budget(), "{:?}", report.findings);
+    }
+
+    /// Two closes, each with its signature, and the last one out of reach of a budget that fits the first.
+    fn two_closes(dir: &tempfile::TempDir) -> (PathBuf, u64) {
+        let mut graph = Graph::default();
+        a(&mut graph, "aff4://file", &aff4("FileImage"));
+        let turtle = turtle::write(&graph, &[("aff4", AFF4_NS)]);
+        let padded = format!("{turtle}{}", "\n".repeat(4000));
+        let path = factum_laid_out(dir, &graph, &mut |app| {
+            for n in 1..=2 {
+                app.add_bytes(&history_member(n, TURTLE), 8, padded.as_bytes()).unwrap();
+                app.add_bytes(&history_member(n, SIG_GPG), 0, b"signature").unwrap();
+            }
+        });
+        (path, padded.len() as u64)
+    }
+
+    #[test]
+    fn a_check_that_runs_out_says_that_once_and_reads_nothing_into_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, padded) = two_closes(&dir);
+        BUDGET.with(|budget| budget.set(Some(padded + 3000)));
+        let report = check(&path);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].level, Level::Fail);
+        assert_eq!(report.findings[0].code, "too_large");
+        assert!(report.findings[0].message.contains("does not mean"));
+        // what is no container of factum's warns, as it is nothing to fail
+        let dir = tempfile::tempdir().unwrap();
+        let graph = Graph::default();
+        let path = foreign(&dir, &graph, &mut |_| {}, V21);
+        BUDGET.with(|budget| budget.set(Some(10)));
+        let report = check(&path);
+        assert_eq!(codes(&report, Level::Warn), vec!["too_large"], "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_budget_stops_once_and_keeps_what_is_left() {
+        let mut budget = Budget::new(10);
+        budget.take(4).unwrap();
+        assert_eq!(budget.left, 6);
+        assert!(budget.take(7).is_err() && budget.exhausted);
+        let mut budget = Budget::new(5);
+        assert!(budget.parse(b"<a> <b> <c> .").is_err() && budget.exhausted);
+        let mut budget = Budget::new(1 << 20);
+        assert!(budget.parse(b"x> .").unwrap().is_err() && !budget.exhausted);
+        let finding = Budget::new((14 << 30) / 3).finding();
+        assert!(
+            finding.contains("does not mean") && finding.contains("4.7 GiB in all"),
+            "{finding}"
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_count_for_what_they_become() {
+        let text = [b"<a> <b> \"".as_slice(), &[0xFF; 1 << 12], b"\" .\n"].concat();
+        // the text itself would fit, what it is read as does not
+        let mut budget = Budget::new(2 << 12);
+        assert!(budget.parse(&text).is_err() && budget.exhausted);
+        let mut budget = Budget::new(16 << 12);
+        assert!(budget.parse(&text).unwrap().is_ok());
+        // in a comment, where nothing of it reaches a token: only what it is read as counts
+        let comment = [b"# ".as_slice(), &[0xFF; 1 << 12], b"\n"].concat();
+        let mut budget = Budget::new(2 << 12);
+        assert!(budget.parse(&comment).is_err() && budget.exhausted);
+    }
+
+    #[test]
+    fn an_unreadable_secondary_store_is_one_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = Graph::default();
+        let store = "aff4://secondary";
+        graph.add(
+            &format!("aff4://{VOLUME}"),
+            &format!("{AFF4L_NS}imports"),
+            Term::Iri(store.to_string()),
+        );
+        let name = crate::container::member_name(store, &format!("aff4://{VOLUME}"));
+        let path = foreign(
+            &dir,
+            &graph,
+            &mut |app| {
+                app.add_bytes(&name, 0, b"secondary").unwrap();
+            },
+            V21,
+        );
+        // its local header differs from the directory
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.windows(name.len()).position(|w| w == name.as_bytes()).unwrap();
+        bytes[at] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let report = check(&path);
+        let store: Vec<_> = report.findings.iter().filter(|f| f.message.contains(&name)).collect();
+        assert_eq!(store.len(), 1, "{store:?}");
+        assert!(store[0].message.contains("cannot be read"), "{}", store[0].message);
+    }
 
     #[test]
     fn implausible_chunk_size_is_reported() {

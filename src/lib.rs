@@ -15,6 +15,7 @@ pub mod db;
 pub mod error;
 pub mod evidence;
 pub mod export;
+pub mod files;
 
 pub mod images;
 pub mod iocs;

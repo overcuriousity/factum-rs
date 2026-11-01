@@ -6,6 +6,7 @@ use egui_kittest::kittest::Queryable;
 
 use super::*;
 use crate::companion::{Preset, Rating};
+use crate::seals::SEAL_DIR_SETTING;
 use crate::signer::FakeSigner;
 use companion_dialogs::BUILTIN_GUIDELINE;
 
@@ -46,8 +47,18 @@ impl Fixture {
         Db::open(&self.path).unwrap()
     }
 
+    /// stands in for the user config .env
+    fn user_env(&self) -> PathBuf {
+        self.path.with_file_name("config.env")
+    }
+
+    fn seal_folder_setting(&self) -> Option<PathBuf> {
+        config::file_seal_dir(&self.user_env())
+    }
+
     fn harness(&self) -> Harness<'static, FactumApp> {
         let db = self.db();
+        let user_env = self.user_env();
         let builder = Harness::builder().with_size(egui::vec2(1280.0, 820.0));
         // rendering needs a GPU adapter (CI runners have none): only for screenshots
         let builder = if std::env::var_os("FACTUM_SCREENSHOTS").is_some() {
@@ -58,11 +69,43 @@ impl Fixture {
         let mut harness = builder.build_eframe(move |cc| {
             theme::install_fonts(&cc.egui_ctx);
             // no companion thread: tests have no endpoint; a stub handle is installed where commands matter
-            FactumApp::build(db, &cc.egui_ctx, false)
+            FactumApp::build(db, &cc.egui_ctx, false, user_env)
         });
         harness.run_ok();
         harness
     }
+}
+
+#[test]
+fn export_finished_names_what_the_pdf_cannot_show() {
+    let fixture = Fixture::empty();
+    let db = fixture.db();
+    let signer = crate::signer::FakeSigner::new(true);
+    let factum = crate::services::Factum::new(&db, &signer);
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("案件", None, case_id).unwrap();
+    let mut harness = fixture.harness();
+    let folder = fixture.path.with_file_name("out");
+    harness.state_mut().carry_out(Pending::Export {
+        case_id,
+        formats: vec!["pdf".to_string()],
+        folder: folder.display().to_string(),
+    });
+    assert!(harness.state().verify_job.is_some(), "the worker verifies");
+    // polled, not drawn: the test fonts have no glyph for the text
+    let ctx = harness.ctx.clone();
+    while harness.state().verify_job.is_some() {
+        harness.state_mut().poll(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let Some(Dialog::Message { title, text }) = harness.state().dialogs.last() else {
+        panic!("no message");
+    };
+    assert_eq!(title, "Export finished");
+    assert!(
+        text.contains("Written:\n") && text.contains("The PDF cannot show 2 character(s)"),
+        "{text}"
+    );
 }
 
 fn screenshot(harness: &mut Harness<'_, FactumApp>, name: &str) {
@@ -93,7 +136,7 @@ fn case_view_shows_system_rows_and_newest_versions() {
         .items
         .iter()
         .filter_map(|i| match i {
-            Item::Note(c) => Some(c),
+            Item::Note(c) => Some(&**c),
             _ => None,
         })
         .collect();
@@ -143,7 +186,7 @@ fn evidence_view_and_deletable_evidence() {
         .items
         .iter()
         .filter_map(|i| match i {
-            Item::Note(c) => Some(c),
+            Item::Note(c) => Some(&**c),
             _ => None,
         })
         .collect();
@@ -281,17 +324,9 @@ fn verification_runs_in_the_background_and_opens_a_report() {
     let fixture = Fixture::new();
     let mut harness = fixture.harness();
     select_case(&mut harness);
-    let ctx = harness.ctx.clone();
     let case_id = harness.state().case_id.unwrap();
-    harness.state_mut().verify_case(&ctx, case_id);
-    for _ in 0..200 {
-        harness.step();
-        if !harness.state().verify_windows.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    harness.run_ok();
+    harness.state_mut().verify_case(case_id);
+    run_until(&mut harness, |h| !h.state().verify_windows.is_empty());
     assert_eq!(harness.state().verify_windows.len(), 1);
     assert!(harness.query_by_label_contains("Failures ").is_some());
     screenshot(&mut harness, "verify");
@@ -383,13 +418,23 @@ fn type_into(harness: &mut Harness<'_, FactumApp>, label: &str, text: &str) {
     harness.run_ok();
 }
 
-/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit).
+/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit), then draws what that
+/// changed: `run_ok` gives up after a few frames while a worker repaints, and a window that came with the last of them
+/// has no labels before its next frame. Panics, naming the call, when `done` never holds.
+#[track_caller]
 fn run_until(harness: &mut Harness<'_, FactumApp>, done: impl Fn(&Harness<'_, FactumApp>) -> bool) {
-    for _ in 0..30 {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
         harness.run_ok();
         if done(harness) {
+            harness.run_ok();
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "run_until at {}: the condition did not hold within 3 s",
+            std::panic::Location::caller()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -915,7 +960,7 @@ fn skipping_everything_writes_only_the_flag() {
     let db = fixture.db();
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
     assert_eq!(db.get_setting(ACTIVE_KEY_SETTING).unwrap(), "");
-    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(fixture.seal_folder_setting(), None);
     assert_eq!(db.get_setting(THEME_SETTING).unwrap(), "");
     assert!(!companion_db_path(&fixture.path).exists());
 }
@@ -964,10 +1009,10 @@ fn finish_writes_choices() {
     assert!(harness.state().dialogs.is_empty());
     let db = fixture.db();
     assert_eq!(db.get_setting(THEME_SETTING).unwrap(), "dark");
-    assert_eq!(
-        db.get_setting(SEAL_DIR_SETTING).unwrap(),
-        seals.path().display().to_string()
-    );
+    // in the user config, not in the database the verifier checks
+    assert_eq!(fixture.seal_folder_setting(), Some(seals.path().to_path_buf()));
+    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(harness.state().factum().seal_dir(), seals.path());
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
     let saved = Settings::load(&CompanionDb::open_for(&fixture.path).unwrap()).unwrap();
     assert_eq!((saved.preset, saved.model.as_str()), (Preset::Osint, "m"));
@@ -1046,20 +1091,21 @@ fn menu_opens_wizard() {
 fn clearing_the_seal_folder_in_the_wizard_clears_the_setting() {
     let fixture = Fixture::new();
     let seals = tempfile::tempdir().unwrap();
-    fixture
-        .db()
-        .set_setting(SEAL_DIR_SETTING, &seals.path().display().to_string())
-        .unwrap();
+    config::set_seal_dir(&fixture.user_env(), Some(&seals.path().display().to_string())).unwrap();
+    // left behind by an earlier version: the choice below answers the verifier's seal_dir_unused hint
+    fixture.db().set_setting(SEAL_DIR_SETTING, "/old/seals").unwrap();
     let mut harness = fixture.harness();
     harness.state_mut().open_wizard();
     harness.run_ok();
     wizard_to(&mut harness, "Next", Step::SealFolder);
+    assert_eq!(wizard(&harness).seal_folder, seals.path().display().to_string());
     if let Some(Dialog::Wizard(wizard)) = harness.state_mut().dialogs.last_mut() {
         wizard.seal_folder.clear();
     }
     wizard_to(&mut harness, "Next", Step::Summary);
     assert!(harness.query_by_label_contains("(next to the database)").is_some());
     click_label(&mut harness, "Finish");
+    assert_eq!(fixture.seal_folder_setting(), None);
     assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
 }
 
@@ -1145,6 +1191,227 @@ fn a_notes_actions_show_under_the_pointer() {
     harness.get_by_label("Correct").click();
     harness.run_ok();
     assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Correct { .. })));
+}
+
+#[test]
+fn escape_closes_a_dialog_until_text_is_typed_into_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::CaseGoal {
+        case_id: 1,
+        goal: String::new(),
+    });
+    harness.run_ok();
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+    harness.state_mut().dialogs.push(Dialog::CaseGoal {
+        case_id: 1,
+        goal: String::new(),
+    });
+    harness.run_ok();
+    if let Some(Dialog::CaseGoal { goal, .. }) = harness.state_mut().dialogs.last_mut() {
+        goal.push_str("find the dropper");
+    }
+    harness.run_ok();
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::CaseGoal { .. })));
+    // Cancel still closes it
+    harness.get_by_label("Cancel").click();
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+}
+
+/// One click on the backdrop, far from the dialog.
+fn click_backdrop(harness: &mut Harness<'_, FactumApp>) {
+    let at = egui::pos2(4.0, 4.0);
+    harness.event(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.run_ok();
+}
+
+#[test]
+fn a_backdrop_click_closes_a_dialog_until_text_is_typed_into_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let goal = |goal: &str| Dialog::CaseGoal {
+        case_id: 1,
+        goal: goal.into(),
+    };
+    harness.state_mut().dialogs.push(goal(""));
+    harness.run_ok();
+    click_backdrop(&mut harness);
+    assert!(harness.state().dialogs.is_empty());
+    harness.state_mut().dialogs.push(goal(""));
+    harness.run_ok();
+    type_into(&mut harness, "Case goal", "find the dropper");
+    click_backdrop(&mut harness);
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::CaseGoal { .. })));
+}
+
+#[test]
+fn escape_leaves_the_typing_field_focused() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::CaseGoal {
+        case_id: 1,
+        goal: String::new(),
+    });
+    harness.run_ok();
+    type_into(&mut harness, "Case goal", "find");
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(harness.get_by_label("Case goal").is_focused());
+    harness.get_by_label("Case goal").type_text(" it");
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::CaseGoal { goal, .. }) => assert_eq!(goal, "find it"),
+        _ => panic!("the dialog closed"),
+    }
+}
+
+#[test]
+fn the_wizard_survives_escape_and_a_backdrop_click_once_text_is_typed() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    wizard_to(&mut harness, "Skip", Step::Companion);
+    click_label(&mut harness, "Use the AI companion");
+    type_into(&mut harness, "Endpoint URL", "http://127.0.0.1:9/v1");
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    click_backdrop(&mut harness);
+    assert!(wizard_open(&harness));
+    assert_eq!(fixture.db().get_setting(ONBOARDING_SETTING).unwrap(), "");
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().dialogs.is_empty());
+    assert_eq!(fixture.db().get_setting(ONBOARDING_SETTING).unwrap(), "1");
+}
+
+/// Opens the correction of `note` through the card's action, as the button does.
+fn open_correction(harness: &mut Harness<'_, FactumApp>, note: i64) {
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+}
+
+#[test]
+fn undo_in_a_correction_does_not_bring_back_another_notes_text() {
+    let fixture = Fixture::new();
+    let a = add_note(&fixture, "alpha note", &[]);
+    let b = add_note(&fixture, "bravo note", &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    open_correction(&mut harness, a);
+    let field = format!("Correct Note #{a}");
+    type_into(&mut harness, &field, " with more words");
+    harness.run_ok();
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().dialogs.is_empty());
+    open_correction(&mut harness, b);
+    harness.get_by_label(&format!("Correct Note #{b}")).focus();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::Correct { text, .. }) => assert_eq!(text, "bravo note"),
+        _ => panic!("no correction dialog"),
+    }
+}
+
+#[test]
+fn a_long_note_keeps_the_correction_buttons_in_the_window() {
+    let fixture = Fixture::new();
+    let long = (0..300).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+    let note = add_note(&fixture, &long, &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    open_correction(&mut harness, note);
+    harness.run_ok();
+    let window = harness.ctx.content_rect();
+    let button = harness.get_by_label("Add corrected version").rect();
+    assert!(window.contains_rect(button), "{button:?} is not in {window:?}");
+}
+
+#[test]
+fn each_correction_dialog_has_its_own_text_field() {
+    let id = |dialog: Dialog| match dialog {
+        Dialog::Correct { editor, .. } => editor,
+        _ => unreachable!(),
+    };
+    let a = id(Dialog::correct(1, "a".into(), Vec::new()));
+    let b = id(Dialog::correct(2, "b".into(), Vec::new()));
+    let a_again = id(Dialog::correct(1, "a".into(), Vec::new()));
+    assert!(a != b && a != a_again && b != a_again);
+}
+
+#[test]
+fn the_verify_windows_ok_entries_list_lays_out_only_the_rows_in_view() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().verify_case(case_id);
+    run_until(&mut harness, |h| !h.state().verify_windows.is_empty());
+    // the fixture's notes are unsigned, which warns: take the findings away, and make the report long
+    let mut report = harness.state().verify_windows[0].report.clone();
+    report.findings.clear();
+    for result in &mut report.entries {
+        result.findings.clear();
+    }
+    let entries = report.entries.clone();
+    report.entries = entries.iter().cycle().take(500).cloned().collect();
+    harness.state_mut().verify_windows = vec![dialogs::VerifyWindow::new(1, report)];
+    harness.run_ok();
+    let rows = |h: &Harness<'_, FactumApp>| h.query_all_by_label_contains(" leaf ").count();
+    assert_eq!(rows(&harness), 0, "closed");
+    harness.get_by_label_contains("Entries OK").click();
+    harness.run_ok();
+    let shown = rows(&harness);
+    assert!((1..100).contains(&shown), "{shown} of 500 rows laid out");
+}
+
+#[test]
+fn a_seal_folder_that_does_not_exist_is_refused() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::SealFolder {
+        folder: "relative/seals".into(),
+        default: "/nowhere/default".into(),
+        error: None,
+    });
+    harness.run_ok();
+    harness.get_by_label("Use this folder").click();
+    harness.run_ok();
+    assert!(matches!(
+        harness.state().dialogs.last(),
+        Some(Dialog::SealFolder { error: Some(_), .. })
+    ));
+}
+
+#[test]
+fn a_label_of_only_hashes_cannot_be_added() {
+    let fixture = Fixture::new();
+    let (_, versions) = first_note_versions(&fixture);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::AddLabel(versions[1]), &ctx);
+    harness.run_ok();
+    type_into(&mut harness, "Label", "##");
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::AddLabel { .. })));
 }
 
 #[test]
@@ -1330,6 +1597,7 @@ fn a_key_is_chosen_by_clicking_its_row() {
             String::new()
         },
         validity: validity.into(),
+        ..Default::default()
     };
     let keys = vec![
         key(1, "Ana Analyst", "u"),
@@ -1369,7 +1637,7 @@ fn the_wizard_shows_the_seal_folder_in_use() {
     // the default may not exist yet, and leaving it writes no setting
     wizard_to(&mut harness, "Next", Step::Summary);
     click_label(&mut harness, "Finish");
-    assert_eq!(fixture.db().get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(fixture.seal_folder_setting(), None);
 }
 
 #[test]
@@ -1388,7 +1656,7 @@ fn without_signing_the_wizard_leaves_out_key_and_seal_folder() {
     click_label(&mut harness, "Finish");
     let db = fixture.db();
     assert_eq!(db.get_setting(ACTIVE_KEY_SETTING).unwrap(), "");
-    assert_eq!(db.get_setting(SEAL_DIR_SETTING).unwrap(), "");
+    assert_eq!(fixture.seal_folder_setting(), None);
     assert_eq!(db.get_setting(ONBOARDING_SETTING).unwrap(), "1");
 }
 
@@ -1844,7 +2112,7 @@ fn cancel_adds_nothing() {
         replaces: Vec::new(),
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    harness.state_mut().start_add(id, vec![source], options, cancel);
+    harness.state_mut().start_add(id, vec![source], options, cancel, None);
     run_until(&mut harness, |h| h.state().add_job.is_none());
     assert_eq!(harness.state().factum().container(id).unwrap().adds.len(), 1);
     assert!(harness.query_by_label_contains("Nothing was added.").is_some());
@@ -1862,6 +2130,10 @@ fn add_status_line() {
     assert_eq!(
         containers::add_status(&progress, "FS01"),
         "Adding to \"FS01\": 1 / 3 files · 2.0 kB / 7.0 MB"
+    );
+    assert_eq!(
+        containers::recheck_status(&progress, "Adding to FS01"),
+        "Re-checking \"Adding to FS01\": 1 / 3 files · 2.0 kB / 7.0 MB"
     );
 }
 
@@ -2180,11 +2452,44 @@ fn verify_container_can_be_cancelled() {
     let (fixture, _, path) = Fixture::with_container();
     let mut harness = fixture.harness();
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    harness.state_mut().start_container_verification(path, cancel);
+    harness.state_mut().start_container_verification(path, None, cancel);
     run_until(&mut harness, |h| h.state().container_verify_job.is_none());
     harness.run_ok();
     assert!(harness.state().container_verify_windows.is_empty());
     assert!(harness.query_by_label("Verification cancelled.").is_some());
+}
+
+#[test]
+fn a_failed_verification_of_a_file_called_cancelled_is_no_cancel() {
+    let (fixture, _, path) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let named = path.with_file_name("cancelled.aff4l");
+    harness
+        .state_mut()
+        .start_container_verification(named, None, Default::default());
+    run_until(&mut harness, |h| h.state().container_verify_job.is_none());
+    harness.run_ok();
+    let text = message_text(&harness);
+    assert!(
+        text.starts_with("Verification failed: ") && text.contains("cancelled.aff4l"),
+        "{text}"
+    );
+}
+
+/// The Verify action of a container says which it is: what the file then says of itself decides nothing.
+#[test]
+fn verify_of_a_container_expects_that_container() {
+    let (fixture, id, _) = Fixture::with_container();
+    let other = fixture._dir.path().join("elsewhere.aff4l");
+    std::fs::write(&other, vec![0u8; 5000]).unwrap();
+    let mut harness = fixture.harness();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    harness
+        .state_mut()
+        .start_container_verification(other, Some(id), cancel);
+    run_until(&mut harness, |h| !h.state().container_verify_windows.is_empty());
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("should be container").is_some());
 }
 
 #[test]
@@ -2349,6 +2654,7 @@ fn images_that_cannot_be_shown_say_so() {
         if let Item::Note(card) = item
             && card.entry.id == note
         {
+            let card = Rc::make_mut(card);
             card.images = card
                 .images
                 .iter()
@@ -2389,7 +2695,7 @@ fn an_image_of_another_type_counts_as_missing() {
         {
             let mut images = card.images.to_vec();
             images[0].mime = "image/svg+xml".into();
-            card.images = images.into();
+            Rc::make_mut(card).images = images.into();
         }
     }
     harness.run_ok();
@@ -2955,7 +3261,7 @@ fn damaged_container_opens_the_dialog() {
     let mut harness = fixture.harness();
     close_from_menu(&mut harness, id);
     match harness.state().dialogs.last() {
-        Some(Dialog::Damaged { mismatches, .. }) => assert_eq!(mismatches.len(), 1),
+        Some(Dialog::Damaged { recheck, .. }) => assert_eq!(recheck.mismatches.len(), 1),
         _ => panic!("no damaged dialog"),
     }
     screenshot(&mut harness, "damaged_dialog");
@@ -3106,4 +3412,1079 @@ fn a_path_is_cut_between_graphemes() {
     let shown = widgets::elide_middle("Fotos/Ba\u{301}dfoto-Urlaub.png", "", |c| c == '/', 18.0, &width);
     assert!(!shown.contains("…\u{301}"), "{shown}");
     assert_eq!(shown, "…dfoto-Urlaub.png");
+}
+
+#[test]
+fn a_worker_that_panics_clears_its_job_and_says_so() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().verify_job = Some(VerifyJob {
+        worker: workers::Worker::spawn(&ctx, || panic!("verification panics (expected in this test)")),
+        progress: Arc::new(workers::Progress {
+            done: Default::default(),
+            total: Default::default(),
+        }),
+        started: Instant::now(),
+        then: AfterVerify::ShowReport,
+    });
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert!(harness.state().verify_job.is_none());
+    let Some(Dialog::Message { text, .. }) = harness.state_mut().dialogs.pop() else {
+        panic!("no message");
+    };
+    assert_eq!(text, format!("Verification failed: {}", workers::STOPPED));
+
+    harness.state_mut().add_job = Some(AddJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker: workers::Worker::spawn(&ctx, || panic!("addition panics (expected in this test)")),
+        progress: Default::default(),
+        cancel: Default::default(),
+    });
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    assert!(
+        harness.state().add_job.is_none(),
+        "the guard must not block the session"
+    );
+    let Some(Dialog::Message { text, .. }) = harness.state_mut().dialogs.pop() else {
+        panic!("no message");
+    };
+    assert_eq!(text, "The background task stopped unexpectedly");
+
+    harness.state_mut().close_job = Some(CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker: workers::Worker::spawn(&ctx, || panic!("re-check panics (expected in this test)")),
+        progress: Default::default(),
+        cancel: Default::default(),
+        then_archive: None,
+        refused: None,
+    });
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    assert!(harness.state().close_job.is_none());
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_non_ascii_hash_in_the_log_does_not_panic_the_view() {
+    let (fixture, id, _) = Fixture::with_container();
+    let sha256 = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let detail = Factum::with_seal_dir(&db, &signer, None).container(id).unwrap();
+        detail.adds[0].files[0].sha256.clone()
+    };
+    // 15 ASCII characters and a two-byte one: byte 16 falls inside it
+    let tampered = format!("{}é{}", "a".repeat(15), "b".repeat(48));
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE entries SET payload_json = replace(payload_json, ?, ?)",
+            [&sha256, &tampered],
+        )
+        .unwrap();
+    let mut harness = fixture.harness();
+    let evidence = container_evidence(&fixture, id);
+    harness.state_mut().select(None, Some(evidence));
+    harness.run_ok();
+    assert!(
+        harness
+            .query_by_label_contains(&format!("{}é", "a".repeat(15)))
+            .is_some()
+    );
+}
+
+/// The fixture's database in the state the signing paths need: an unsigned case.
+fn unsigned_ids(harness: &Harness<'_, FactumApp>) -> (i64, i64) {
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    let entries = factum.list_entries(case_id, &EntryFilter::notes()).unwrap();
+    (case_id, entries[0])
+}
+
+fn message_text(harness: &Harness<'_, FactumApp>) -> String {
+    match harness.state().dialogs.last() {
+        Some(Dialog::Message { text, .. }) => text.clone(),
+        _ => panic!("no message"),
+    }
+}
+
+#[test]
+fn signing_verifies_on_the_worker_and_signs_after_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, note) = unsigned_ids(&harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Sign(note), &ctx);
+    assert!(
+        harness.state().verify_job.is_some() && harness.state().dialogs.is_empty(),
+        "nothing happens on the GUI thread yet"
+    );
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    // the signing itself comes after the verification: here it reports the missing key
+    assert!(message_text(&harness).contains("No GPG key is active"));
+    harness.state_mut().dialogs.clear();
+
+    harness.state_mut().sign_all_unsigned(case_id);
+    assert!(harness.state().verify_job.is_some());
+    harness.state_mut().sign_all_unsigned(case_id);
+    assert_eq!(message_text(&harness), "A verification is already running.");
+    harness.state_mut().dialogs.clear();
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert!(message_text(&harness).contains("No GPG key is active"));
+}
+
+#[test]
+fn a_broken_log_stops_signing_after_the_worker() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (_, note) = unsigned_ids(&harness);
+    fixture
+        .db()
+        .conn
+        .execute("UPDATE entries SET text = 'tampered' WHERE id = ?", [note])
+        .unwrap();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Sign(note), &ctx);
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert!(message_text(&harness).contains("Nothing was signed"));
+}
+
+#[test]
+fn a_seal_is_signed_from_the_report_window_after_the_worker() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, _) = unsigned_ids(&harness);
+    harness.state().factum().seal(case_id, REASON_CHECKPOINT).unwrap();
+    harness.state_mut().verify_case(case_id);
+    run_until(&mut harness, |h| !h.state().verify_windows.is_empty());
+    assert!(harness.state().verify_job.is_none());
+    // shown under the pointer, on the seal's rows
+    harness.query_all_by_label_contains("Seal #").next().unwrap().hover();
+    harness.run_ok();
+    harness.query_all_by_label("Sign seal").next().unwrap().click();
+    // the frame of the click starts the worker; the next one is the earliest that can take its result
+    harness.step();
+    assert!(
+        harness.state().verify_job.is_some() && harness.state().dialogs.is_empty(),
+        "the worker verifies first"
+    );
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert!(message_text(&harness).contains("No GPG key is active"));
+}
+
+#[test]
+fn an_export_whose_verification_fails_leaves_only_its_seal() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, _) = unsigned_ids(&harness);
+    let folder = fixture.path.with_file_name("out");
+    let seals = |h: &Harness<'_, FactumApp>| h.state().factum().list_tree_heads(case_id).unwrap().len();
+    let before = seals(&harness);
+    let plan = harness
+        .state()
+        .factum()
+        .begin_export(case_id, &["html"], &folder)
+        .unwrap();
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 1, "the staging folder");
+    let ctx = harness.ctx.clone();
+    harness.state_mut().verify_job = Some(VerifyJob {
+        worker: workers::Worker::spawn(&ctx, || Err("no database".to_string())),
+        progress: Arc::new(workers::Progress {
+            done: Default::default(),
+            total: Default::default(),
+        }),
+        started: Instant::now(),
+        then: AfterVerify::Export(plan, folder.display().to_string()),
+    });
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert_eq!(message_text(&harness), "Verification failed: no database");
+    assert_eq!(std::fs::read_dir(&folder).unwrap().count(), 0, "nothing stays");
+    assert_eq!(seals(&harness), before + 1);
+}
+
+#[test]
+fn a_verified_status_covers_one_log_only() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    let report = harness.state().factum().verify_case(case_id, None).unwrap();
+    harness.state_mut().show_case_report(report);
+    harness.state_mut().verify_windows.clear();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    // unsigned entries fail
+    let shown = |h: &Harness<'_, FactumApp>| h.query_by_label_contains("verification failed").is_some();
+    assert!(shown(&harness));
+    // the same size, another log: what a new case with a reused id would have
+    harness.state_mut().verified.get_mut(&case_id).unwrap().root_hash = "another log".into();
+    harness.run_ok();
+    assert!(!shown(&harness));
+}
+
+#[test]
+fn a_deleted_case_leaves_no_verified_status() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state().factum().archive_case(case_id).unwrap();
+    let report = harness.state().factum().verify_case(case_id, None).unwrap();
+    harness.state_mut().show_case_report(report);
+    harness.state_mut().verify_windows.clear();
+    assert!(harness.state().verified.contains_key(&case_id));
+    let ctx = harness.ctx.clone();
+    let typed = "not the number".to_string();
+    harness
+        .state_mut()
+        .handle_dialog_result(DialogResult::TypedConfirmed { case_id, typed }, &ctx);
+    assert!(harness.state().verified.contains_key(&case_id), "not deleted");
+    harness.state_mut().dialogs.clear();
+    let typed = "C-1".to_string();
+    harness
+        .state_mut()
+        .handle_dialog_result(DialogResult::TypedConfirmed { case_id, typed }, &ctx);
+    assert!(!harness.state().verified.contains_key(&case_id));
+}
+
+/// Flips the CRC-32 the newest directory holds for `member`: the member's bytes stay.
+fn flip_directory_crc(path: &std::path::Path, member: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let bytes = std::fs::read(path).unwrap();
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let archive = crate::container::zip64::read_archive(&mut std::fs::File::open(path).unwrap(), bytes.len() as u64);
+    let crc32 = archive.unwrap().get(member).unwrap().crc32;
+    // the name as the directory has it: followed by the ZIP64 extra
+    let name = [member.as_bytes(), &[1, 0, 24, 0]].concat();
+    let at = bytes.windows(name.len()).rposition(|w| w == name).unwrap() as u64;
+    file.seek(SeekFrom::Start(at - 46 + 16)).unwrap();
+    file.write_all(&(crc32 ^ 1).to_le_bytes()).unwrap();
+}
+
+#[test]
+fn a_directory_fault_can_be_closed_as_damaged_from_the_dialog() {
+    let (fixture, id, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let length = std::fs::metadata(&path).unwrap().len();
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    let Some(Dialog::Damaged { recheck, add_again, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog: {}", message_text(&harness));
+    };
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
+    assert!(add_again.is_err(), "a container with a directory fault is not added to");
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("1 directory fault").is_some());
+    assert!(harness.query_by_label("version.txt").is_some());
+    click_label(&mut harness, "Close as Damaged");
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.damaged && !detail.summary.open && !detail.summary.signed);
+    assert_eq!(detail.damaged_closes[0].3, ["version.txt"]);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+}
+
+#[test]
+fn close_and_archive_goes_through_a_directory_fault() {
+    let (fixture, _, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness
+        .state_mut()
+        .carry_out(Pending::CloseContainersAndArchive(case_id));
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let Some(Dialog::Damaged { then_archive, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(*then_archive, Some(case_id));
+    click_label(&mut harness, "Close as Damaged");
+    let factum = harness.state().factum();
+    assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
+}
+
+#[test]
+fn an_addition_refused_for_a_directory_fault_offers_close_as_damaged() {
+    let (fixture, id, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let mut harness = fixture.harness();
+    let options = crate::container::volume::AddOptions::default();
+    let sources = vec![fixture._dir.path().join("mnt/notes.txt")];
+    assert!(
+        !harness
+            .state_mut()
+            .start_add(id, sources, options, Default::default(), None)
+    );
+    assert!(harness.state().close_job.is_some());
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_close_the_open_refuses_after_the_recheck_offers_close_as_damaged() {
+    let (fixture, id, path) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let clean = harness.state().factum().recheck_container(id).unwrap();
+    flip_directory_crc(&path, "version.txt");
+    let ctx = harness.ctx.clone();
+    let cancel = Arc::<std::sync::atomic::AtomicBool>::default();
+    let input = harness.state().factum().recheck_input(id).unwrap();
+    let (worker, progress) = workers::recheck(&ctx, input, cancel.clone());
+    let job = CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress,
+        cancel,
+        then_archive: None,
+        refused: None,
+    };
+    harness.state_mut().finish_close(job, Ok(clean));
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
+    harness.run_ok();
+    click_label(&mut harness, "Close as Damaged");
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.damaged && !detail.summary.open);
+    // the log holds the member, not the refusal's sentence
+    assert_eq!(detail.damaged_closes[0].3, ["version.txt"]);
+}
+
+#[test]
+fn a_refused_open_the_recheck_does_not_see_is_not_a_close() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let input = harness.state().factum().recheck_input(id).unwrap();
+    let clean = harness.state().factum().recheck_container(id).unwrap();
+    assert!(clean.directory_faults.is_empty() && clean.mismatches.is_empty());
+    let ctx = harness.ctx.clone();
+    let cancel = Arc::<std::sync::atomic::AtomicBool>::default();
+    let (worker, progress) = workers::recheck(&ctx, input, cancel.clone());
+    let job = CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress,
+        cancel,
+        then_archive: None,
+        refused: Some(FactumError::container_crc("refused when opened").with_member("version.txt")),
+    };
+    harness.state_mut().finish_close(job, Ok(clean));
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_refusal_that_names_no_member_says_what_the_format_says() {
+    assert_eq!(
+        refused_fault(&FactumError::container_crc("refused when opened")),
+        "the directory cannot be read"
+    );
+}
+
+/// A close job of the refused-addition route; the tests hand `finish_close` its outcome.
+fn refused_job(harness: &Harness<'_, FactumApp>, id: i64) -> CloseJob {
+    let input = harness.state().factum().recheck_input(id).unwrap();
+    let cancel = Arc::<std::sync::atomic::AtomicBool>::default();
+    let (worker, progress) = workers::recheck(&harness.ctx, input, cancel.clone());
+    CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress,
+        cancel,
+        then_archive: None,
+        refused: Some(FactumError::container_crc("The container was not opened.")),
+    }
+}
+
+#[test]
+fn a_recheck_is_cancelled_only_when_stopping_is_what_ended_it() {
+    let (fixture, id, path) = Fixture::with_container();
+    let harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    let mut input = harness.state().factum().recheck_input(id).unwrap();
+    assert!(!input.records.is_empty());
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let finish = |input: crate::containers::RecheckInput| {
+        let (mut worker, _) = workers::recheck(&ctx, input, cancelled.clone());
+        loop {
+            match worker.poll_result() {
+                Some(Err(e)) => return e,
+                Some(Ok(_)) => panic!("it ended as if nothing stopped it"),
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    };
+    assert!(finish(input.clone()).cancelled);
+    // asked to stop as well, but what ended it is that the file cannot be read
+    input.path = path.with_file_name("gone.aff4l");
+    let failed = finish(input);
+    assert!(
+        !failed.cancelled && failed.message.contains("cannot be read"),
+        "{}",
+        failed.message
+    );
+}
+
+#[test]
+fn a_recheck_after_a_refused_addition_that_ends_shows_the_refusal() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let job = refused_job(&harness, id);
+    let cancelled = Err(workers::CheckError {
+        message: "Re-check cancelled — the container was not closed.".into(),
+        cancelled: true,
+    });
+    harness.state_mut().finish_close(job, cancelled);
+    assert_eq!(message_text(&harness), "The container was not opened.");
+    let job = refused_job(&harness, id);
+    let failed = Err(workers::CheckError {
+        message: "the file cannot be read".into(),
+        cancelled: false,
+    });
+    harness.state_mut().finish_close(job, failed);
+    assert_eq!(
+        message_text(&harness),
+        "The container was not opened.\n\nThe file cannot be read"
+    );
+}
+
+#[test]
+fn close_and_archive_survives_an_add_again_refused_for_a_directory_fault() {
+    let (fixture, id, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    let ctx = harness.ctx.clone();
+    let plan = vec![(vec![fixture._dir.path().join("mnt/notes.txt")], Default::default())];
+    let again = DialogResult::AddAgain {
+        container_id: id,
+        plan,
+        then_archive: Some(case_id),
+    };
+    harness.state_mut().handle_dialog_result(again, &ctx);
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let Some(Dialog::Damaged { then_archive, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(*then_archive, Some(case_id));
+}
+
+#[test]
+fn a_directory_fault_with_nothing_to_read_back_says_the_files_were_not_checked() {
+    let (fixture, id, path) = Fixture::with_container();
+    close_container(&fixture, id);
+    let mut harness = fixture.harness();
+    harness.state().factum().reopen_container(id).unwrap();
+    flip_directory_crc(&path, "version.txt");
+    close_from_menu(&mut harness, id);
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert!(!recheck.ended_early && recheck.files == 0);
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("The files were not checked.").is_some());
+    click_label(&mut harness, "Close as Damaged");
+    let closes = harness.state().factum().container(id).unwrap().damaged_closes;
+    let entry = harness.state().factum().get_entry(closes[0].0).unwrap().unwrap();
+    assert!(entry.text.contains("files not checked"), "{}", entry.text);
+}
+
+/// Types into the search field the way the user does.
+fn type_search(harness: &mut Harness<'_, FactumApp>, text: &str) {
+    harness.state_mut().focus_search = true;
+    harness.run_ok();
+    harness.event(egui::Event::Text(text.to_string()));
+}
+
+fn first_card(harness: &Harness<'_, FactumApp>) -> Rc<Card> {
+    let cards = harness.state().view.items.iter().find_map(|item| match item {
+        Item::Note(card) => Some(card.clone()),
+        Item::System(_) => None,
+    });
+    cards.unwrap()
+}
+
+#[test]
+fn a_search_waits_for_the_field_to_rest_and_rebuilds_no_card() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let tree = harness.state().view.tree.clone();
+    let card = first_card(&harness);
+    type_search(&mut harness, "corrected");
+    harness.step();
+    assert!(harness.state().search_edited.is_some(), "not searched at once");
+    assert!(harness.state().view.items.len() > 1);
+    harness.run_ok();
+    assert!(harness.state().search_edited.is_none());
+    assert_eq!(harness.state().view.items.len(), 1);
+    assert!(Rc::ptr_eq(&harness.state().view.tree, &tree), "the tree stays");
+    assert!(Rc::ptr_eq(&first_card(&harness), &card), "the card stays");
+}
+
+#[test]
+fn what_changes_a_card_also_rebuilds_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let note = first_card(&harness).entry.id;
+    crate::tags::add_label(&fixture.db(), note, "reviewed").unwrap();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(first_card(&harness).tags.iter().any(|(tag, _)| tag == "reviewed"));
+    // a label and a pin the window makes itself, with a search waiting
+    type_search(&mut harness, "corrected");
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::TogglePin(note), &ctx);
+    harness.run_ok();
+    assert_eq!(harness.state().view.items.len(), 1);
+    assert!(first_card(&harness).entry.is_pinned);
+}
+
+#[test]
+fn a_container_event_that_cannot_be_read_leaves_the_rest_of_the_view() {
+    let (fixture, _, _) = Fixture::with_container();
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE entries SET payload_json = json_set(payload_json, '$.evidence_id', 'x') \
+             WHERE json_extract(payload_json, '$.event') = 'container_created'",
+            [],
+        )
+        .unwrap();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    assert!(harness.state().factum().list_containers(case_id).is_err());
+    harness.state_mut().select(Some(case_id), None);
+    harness.run_ok();
+    assert_eq!(harness.state().view.tree.len(), 1);
+    assert_eq!(harness.state().view.case.as_ref().map(|c| c.id), Some(case_id));
+    assert!(!harness.state().view.items.is_empty());
+    assert!(harness.state().view.tree[0].containers.is_empty());
+}
+
+#[test]
+fn the_view_takes_the_containers_from_the_tree() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let evidence = container_evidence(&fixture, id);
+    harness.state_mut().select(None, Some(evidence));
+    harness.run_ok();
+    assert_eq!(harness.state().view.containers.len(), 1);
+    // archived and hidden, the tree has no node for it
+    let case_id = harness.state().view.case.as_ref().unwrap().id;
+    close_container(&fixture, id);
+    {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        Factum::with_seal_dir(&db, &signer, None).archive_case(case_id).unwrap();
+    }
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert!(harness.state().view.tree.is_empty());
+    assert_eq!(harness.state().view.containers.len(), 1);
+}
+
+fn ask_window(case_id: i64, running: bool, request: u64) -> CompanionWindow {
+    CompanionWindow::Ask {
+        case_id,
+        question: "the newer question".into(),
+        answer: None,
+        error: None,
+        running,
+        request,
+        open: true,
+    }
+}
+
+#[test]
+fn a_stale_ask_result_is_ignored() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().companion_windows.push(ask_window(case_id, true, 2));
+    let ctx = harness.ctx.clone();
+    let answer = |text: &str| crate::companion::ask::Answer {
+        text: text.into(),
+        references: Vec::new(),
+        unsupported: Vec::new(),
+        abstained: false,
+    };
+    let stale = answer("to the older question");
+    let worker = workers::Worker::spawn(&ctx, move || Ok(stale));
+    harness.state_mut().ask_jobs.push((case_id, 1, worker));
+    run_until(&mut harness, |h| h.state().ask_jobs.is_empty());
+    let shown = |h: &Harness<'_, FactumApp>| match &h.state().companion_windows[0] {
+        CompanionWindow::Ask { answer, running, .. } => (answer.as_ref().map(|a| a.text.clone()), *running),
+        CompanionWindow::History { .. } => panic!("not the Ask window"),
+    };
+    assert_eq!(shown(&harness), (None, true));
+    let current = answer("to the newer question");
+    let worker = workers::Worker::spawn(&ctx, move || Ok(current));
+    harness.state_mut().ask_jobs.push((case_id, 2, worker));
+    run_until(&mut harness, |h| h.state().ask_jobs.is_empty());
+    assert_eq!(shown(&harness), (Some("to the newer question".into()), false));
+}
+
+#[test]
+fn the_question_is_read_only_while_it_runs() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().companion_windows.push(ask_window(case_id, true, 1));
+    harness.run_ok();
+    type_into(&mut harness, "Question", " changed");
+    let CompanionWindow::Ask { question, .. } = &harness.state().companion_windows[0] else {
+        panic!("not the Ask window");
+    };
+    assert_eq!(question, "the newer question");
+}
+
+#[test]
+fn the_focus_follows_a_correction() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let note = first_card(&harness).entry.id;
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Focus(note), &ctx);
+    let result = DialogResult::Correct {
+        entry_id: note,
+        text: "corrected here".into(),
+        images: Vec::new(),
+    };
+    harness.state_mut().handle_dialog_result(result, &ctx);
+    let corrected = harness.state().focused_card.unwrap();
+    assert_ne!(corrected, note);
+    harness.run_ok();
+    assert_eq!(first_card(&harness).entry.id, corrected);
+
+    // on the command line: seen when the view is rebuilt
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let newest = Factum::with_seal_dir(&db, &signer, None)
+        .correct_note(corrected, "corrected elsewhere")
+        .unwrap();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert_eq!(harness.state().focused_card, Some(newest));
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::TogglePin(newest), &ctx);
+    assert!(harness.state().factum().get_entry(newest).unwrap().unwrap().is_pinned);
+}
+
+#[test]
+fn the_case_menu_acts_on_the_case_it_shows() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // the selection goes, the view still shows the case for this frame: no panic, the case of the view is meant
+    let case_id = harness.state().view.case.as_ref().unwrap().id;
+    harness.get_by_label("Case actions").click();
+    harness.run_ok();
+    harness.state_mut().evidence_id = Some(i64::MAX);
+    harness.state_mut().case_id = None;
+    harness.get_by_label("Edit Case…").click();
+    harness.step();
+    assert!(
+        matches!(harness.state().dialogs.last(), Some(Dialog::EditCase { case_id: id, .. }) if *id == case_id),
+        "the button acted"
+    );
+}
+
+#[test]
+fn archiving_keeps_a_selection_that_moved_on() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let factum = Factum::with_seal_dir(&db, &signer, None);
+    let first = factum.list_cases(false).unwrap()[0];
+    let other = factum.create_case("C-2", "Other", "").unwrap();
+    let gone = factum.create_evidence(other, "gone", "", "").unwrap();
+    harness.state_mut().select(Some(other), None);
+    harness.state_mut().carry_out(Pending::Archive(first));
+    assert_eq!(harness.state().case_id, Some(other));
+
+    harness.state_mut().select(Some(other), Some(gone));
+    let kept = factum.create_evidence(other, "kept", "", "").unwrap();
+    harness.state_mut().select(Some(other), Some(kept));
+    harness.state_mut().carry_out(Pending::DeleteEvidence(gone));
+    assert_eq!(harness.state().evidence_id, Some(kept));
+
+    // a call that fails leaves it too
+    harness.state_mut().carry_out(Pending::DeleteEvidence(i64::MAX));
+    assert_eq!(harness.state().evidence_id, Some(kept));
+    harness.state_mut().dialogs.clear();
+
+    harness.state_mut().carry_out(Pending::DeleteEvidence(kept));
+    assert_eq!((harness.state().case_id, harness.state().evidence_id), (None, None));
+    harness.state_mut().select(Some(other), None);
+    harness.state_mut().carry_out(Pending::Archive(other));
+    assert_eq!(harness.state().case_id, None);
+}
+
+#[test]
+fn a_key_changed_on_the_command_line_is_picked_up() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (status, warning) = harness.state().gpg_status.clone();
+    assert!(warning, "{status}");
+    fixture.db().set_setting(ACTIVE_KEY_SETTING, "ABCD1234").unwrap();
+    harness.state_mut().last_poll = Instant::now() - Duration::from_secs(1);
+    harness.run_ok();
+    assert_eq!(harness.state().key_setting, "ABCD1234");
+}
+
+const KEY_A: &str = "AAAAAAAAAAAAAAAA";
+const KEY_B: &str = "BBBBBBBBBBBBBBBB";
+
+/// A window signing with key A, on a gpg (a script) that has keys A and B.
+#[cfg(unix)]
+fn harness_with_two_keys(fixture: &Fixture) -> Harness<'static, FactumApp> {
+    use std::os::unix::fs::PermissionsExt;
+    let gpg = fixture.path.with_file_name("gpg");
+    let line = |key: &str| format!("echo 'sec:u:255:22:{key}:1700000000:::u:::scESC:::+::ed25519:::0:'");
+    std::fs::write(&gpg, format!("#!/bin/sh\n{}\n{}\n", line(KEY_A), line(KEY_B))).unwrap();
+    std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.db().set_setting(ACTIVE_KEY_SETTING, KEY_A).unwrap();
+    let mut harness = fixture.harness();
+    let app = harness.state_mut();
+    app.signer = GnupgSigner::with_binary(gpg, None);
+    app.signer.reload_active_key(&app.db);
+    assert_eq!(app.signer.active_key().as_deref(), Some(KEY_A));
+    harness
+}
+
+/// Another connection writes `key` (none: removes it), and the window polls.
+#[cfg(unix)]
+fn set_key_elsewhere(fixture: &Fixture, harness: &mut Harness<'_, FactumApp>, key: Option<&str>) {
+    match key {
+        Some(key) => fixture.db().set_setting(ACTIVE_KEY_SETTING, key).unwrap(),
+        None => fixture.db().delete_setting(ACTIVE_KEY_SETTING).unwrap(),
+    }
+    harness.state_mut().last_poll = Instant::now() - Duration::from_secs(1);
+    harness.run_ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_chosen_here_then_changed_back_elsewhere_is_picked_up() {
+    let fixture = Fixture::new();
+    let mut harness = harness_with_two_keys(&fixture);
+    let ctx = harness.ctx.clone();
+    let chosen = DialogResult::KeySelected(KEY_B.to_string());
+    harness.state_mut().handle_dialog_result(chosen, &ctx);
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_B));
+    set_key_elsewhere(&fixture, &mut harness, Some(KEY_A));
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_A));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_set_by_the_wizard_then_removed_elsewhere_is_picked_up() {
+    let fixture = Fixture::new();
+    fixture.db().delete_setting(ACTIVE_KEY_SETTING).unwrap();
+    let mut harness = harness_with_two_keys(&fixture);
+    set_key_elsewhere(&fixture, &mut harness, None);
+    assert_eq!(harness.state().signer.active_key(), None);
+    let ctx = harness.ctx.clone();
+    let choices = WizardChoices {
+        key: Some(KEY_B.to_string()),
+        companion: None,
+        companion_off: false,
+        seal_folder: None,
+        theme: None,
+        x509: None,
+    };
+    harness.state_mut().finish_wizard(&ctx, choices);
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_B));
+    set_key_elsewhere(&fixture, &mut harness, None);
+    assert_eq!(harness.state().signer.active_key(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_cleared_here_then_set_again_elsewhere_is_picked_up() {
+    let fixture = Fixture::new();
+    let mut harness = harness_with_two_keys(&fixture);
+    click_label(&mut harness, "Settings");
+    click_label(&mut harness, "Clear Signing Key");
+    assert_eq!(harness.state().signer.active_key(), None);
+    set_key_elsewhere(&fixture, &mut harness, Some(KEY_A));
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_A));
+}
+
+#[test]
+fn a_close_being_rechecked_blocks_locate_and_close_without_file() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    let release = Arc::<std::sync::atomic::AtomicBool>::default();
+    let wait = release.clone();
+    let worker = workers::Worker::spawn(&ctx, move || {
+        while !wait.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err(workers::CheckError {
+            message: "Re-check cancelled — the container was not closed.".into(),
+            cancelled: true,
+        })
+    });
+    harness.state_mut().close_job = Some(CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress: Default::default(),
+        cancel: Default::default(),
+        then_archive: None,
+        refused: None,
+    });
+    for action in [ContainerAction::Locate(id), ContainerAction::CloseWithoutFile(id)] {
+        harness.state_mut().container_action(action, &ctx);
+        assert!(message_text(&harness).contains("is being re-checked"));
+        harness.state_mut().dialogs.clear();
+    }
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().archive(case_id);
+    assert!(message_text(&harness).contains("is being re-checked"));
+    harness.state_mut().dialogs.clear();
+    release.store(true, Ordering::Relaxed);
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+}
+
+/// One frame in which the window is asked to close; whether the close was held back.
+fn request_close(harness: &mut Harness<'_, FactumApp>) -> bool {
+    let root = egui::ViewportId::ROOT;
+    let info = harness.input_mut().viewports.entry(root).or_default();
+    info.events.push(egui::ViewportEvent::Close);
+    harness.step();
+    let commands = &harness.output().viewport_output[&root].commands;
+    commands.contains(&egui::ViewportCommand::CancelClose)
+}
+
+fn quit_question(harness: &Harness<'_, FactumApp>) -> String {
+    match harness.state().dialogs.last() {
+        Some(Dialog::Confirm {
+            message,
+            then: Pending::Quit,
+        }) => message.clone(),
+        _ => panic!("not asked"),
+    }
+}
+
+#[test]
+fn nothing_to_lose_quits_without_asking() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let evidence = evidence_named(&harness, "disk").id;
+    harness.state_mut().open_edit_evidence(evidence);
+    harness.run_ok();
+    // a dialog that holds what it opened with, and a blank note
+    harness.state_mut().composer = "  \n".into();
+    assert!(!request_close(&mut harness));
+    assert_eq!(harness.state().dialogs.len(), 1);
+}
+
+#[test]
+fn a_note_being_written_asks_before_quitting() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.state_mut().composer = "half a note".into();
+    assert!(request_close(&mut harness), "the window stays");
+    assert!(quit_question(&harness).contains("note being written"));
+    assert!(request_close(&mut harness));
+    assert_eq!(harness.state().dialogs.len(), 1, "asked once");
+    harness.run_ok();
+    assert!(harness.query_by_label("Quit anyway?").is_some());
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().dialogs.is_empty());
+    assert_eq!(harness.state().composer, "half a note");
+    assert!(!harness.state().quitting);
+}
+
+#[test]
+fn text_typed_into_a_dialog_asks_before_quitting() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let evidence = evidence_named(&harness, "disk").id;
+    harness.state_mut().open_edit_evidence(evidence);
+    harness.run_ok();
+    let Some(Dialog::EditEvidence { details, .. }) = harness.state_mut().dialogs.last_mut() else {
+        panic!("no dialog");
+    };
+    details.push_str("more");
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("open dialog"));
+}
+
+#[test]
+fn quitting_during_an_addition_cancels_it_and_waits_for_the_rewind() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let release = running_add_job(&mut harness, id);
+    harness
+        .state_mut()
+        .pending_adds
+        .push_back((Vec::new(), Default::default()));
+    harness.state_mut().close_after_adds = Some((id, None));
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("being added"));
+    harness.run_ok();
+    click_label(&mut harness, "Quit");
+    assert!(harness.state().quitting);
+    let cancelled = harness.state().add_job.as_ref().unwrap().cancel.load(Ordering::Relaxed);
+    assert!(cancelled);
+    assert!(harness.state().pending_adds.is_empty() && harness.state().close_after_adds.is_none());
+    // another request does not get past the worker, and does not ask again
+    assert!(request_close(&mut harness));
+    assert!(!matches!(harness.state().dialogs.last(), Some(Dialog::Confirm { .. })));
+    harness.step();
+    let root = egui::ViewportId::ROOT;
+    let sent = |h: &Harness<'_, FactumApp>| {
+        h.output().viewport_output[&root]
+            .commands
+            .contains(&egui::ViewportCommand::Close)
+    };
+    assert!(!sent(&harness), "the worker is still rewinding");
+    release.store(true, Ordering::Relaxed);
+    let mut closed = false;
+    for _ in 0..30 {
+        harness.step();
+        closed = sent(&harness);
+        if closed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(closed && harness.state().add_job.is_none());
+}
+
+/// A verification for `then` that runs until the flag it returns is set.
+fn held_verification(harness: &mut Harness<'_, FactumApp>, then: AfterVerify) -> Arc<std::sync::atomic::AtomicBool> {
+    let (case_id, _) = unsigned_ids(harness);
+    let report = harness.state().factum().verify_case(case_id, None).unwrap();
+    let release = Arc::<std::sync::atomic::AtomicBool>::default();
+    let wait = release.clone();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().verify_job = Some(VerifyJob {
+        worker: workers::Worker::spawn(&ctx, move || {
+            while !wait.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(report)
+        }),
+        progress: Arc::new(workers::Progress {
+            done: Default::default(),
+            total: Default::default(),
+        }),
+        // the progress dialog is up
+        started: Instant::now() - Duration::from_secs(1),
+        then,
+    });
+    release
+}
+
+#[test]
+fn a_verification_for_a_signature_or_an_export_asks_before_quitting() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (_, note) = unsigned_ids(&harness);
+    let release = held_verification(&mut harness, AfterVerify::SignEntry(note));
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("nothing is signed"));
+    harness.run_ok();
+    click_label(&mut harness, "Quit");
+    assert!(harness.state().quitting);
+    release.store(true, Ordering::Relaxed);
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    // given up: not the "No GPG key" of a signing that went on
+    assert!(
+        !harness
+            .state()
+            .dialogs
+            .iter()
+            .any(|d| matches!(d, Dialog::Message { .. }))
+    );
+
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, _) = unsigned_ids(&harness);
+    let folder = fixture.path.with_file_name("out");
+    let plan = harness
+        .state()
+        .factum()
+        .begin_export(case_id, &["html"], &folder)
+        .unwrap();
+    let release = held_verification(&mut harness, AfterVerify::Export(plan, folder.display().to_string()));
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("no files are written"));
+    release.store(true, Ordering::Relaxed);
+
+    // showing a report loses nothing
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let release = held_verification(&mut harness, AfterVerify::ShowReport);
+    release.store(true, Ordering::Relaxed);
+    let wait = harness.state_mut().verify_job.as_mut().unwrap();
+    wait.worker.wait();
+    assert!(harness.state().quit_reasons().is_empty());
+}
+
+#[test]
+fn quitting_during_a_recheck_gives_the_close_up() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness
+        .state_mut()
+        .container_action(ContainerAction::Close(id), &egui::Context::default());
+    assert!(harness.state().close_job.is_some());
+    harness.state_mut().carry_out(Pending::Quit);
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_finished_addition_is_logged_before_the_window_closes() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let source = fixture._dir.path().join("mnt/more.txt");
+    std::fs::write(&source, b"more").unwrap();
+    let options = crate::container::volume::AddOptions {
+        base: fixture._dir.path().join("mnt"),
+        keep_path: true,
+        ..Default::default()
+    };
+    assert!(
+        harness
+            .state_mut()
+            .start_add(id, vec![source], options, Default::default(), None)
+    );
+    while harness.state().add_job.as_ref().unwrap().worker.is_running() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // the frame's own poll ran before: a worker can finish after it, the close then does the logging
+    let ctx = harness.ctx.clone();
+    harness.state_mut().close_requested(&ctx);
+    assert!(harness.state().add_job.is_none());
+    assert_eq!(harness.state().factum().container(id).unwrap().adds.len(), 2);
 }

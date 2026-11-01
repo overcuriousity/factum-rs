@@ -367,13 +367,37 @@ fn label(image: &NoteImage) -> String {
     image.name.clone().unwrap_or_else(|| image.id.clone())
 }
 
+/// [`images::referenced_ids`] of the text, parsed again only when the text changed: it is asked every frame.
+fn shown_ids(ctx: &egui::Context, text: &str) -> Vec<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    let key = hasher.finish();
+    let id = Id::unique("thumbnail-shown-ids");
+    let mut cache: Vec<(u64, Vec<String>)> = ctx.data_mut(|data| data.get_temp(id)).unwrap_or_default();
+    if let Some((_, ids)) = cache.iter().find(|(k, _)| *k == key) {
+        return ids.clone();
+    }
+    let ids = images::referenced_ids(text);
+    // the composer and a dialog may both show thumbnails; a few texts are enough
+    cache.truncate(2);
+    cache.insert(0, (key, ids.clone()));
+    ctx.data_mut(|data| data.insert_temp(id, cache));
+    ids
+}
+
 /// The images that will be saved with the note, small, each with a button that takes it out (and its references).
 /// One the text does not show is marked: it would not be saved.
 pub fn thumbnails(ui: &mut egui::Ui, text: &mut String, images: &mut Vec<NoteImage>) {
     if images.is_empty() {
         return;
     }
-    let unshown: Vec<String> = unshown(text, images).iter().map(|image| image.id.clone()).collect();
+    let shown = shown_ids(ui.ctx(), text);
+    let unshown: Vec<String> = images
+        .iter()
+        .filter(|image| !shown.contains(&image.id))
+        .map(|image| image.id.clone())
+        .collect();
     let mut removed = None;
     egui::ScrollArea::horizontal()
         .id_salt("composer-thumbnails")

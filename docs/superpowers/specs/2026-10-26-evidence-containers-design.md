@@ -89,6 +89,7 @@ Events (payloads are canonical JSON, like the existing ones; `container_id` is t
 | `container_files_added` | one Add operation completes | `files`: list of `{arn, path, size, md5, sha1, sha256, metadata_only, excerpt}` for that operation; `not_added`: list of `{path, reason}` (unreadable, changed while read, special files); `added_utc` |
 | `container_closed`   | Close Container          | `turtle_sha256` (SHA-256 of `information.turtle` as signed), `file_count`, `signatures` (`gpg` fingerprint, `x509` fingerprint or null), `closed_utc` |
 | `container_closed` (file missing) | Close Without File, or Close and Archive with the file missing | `file_missing: true`, `missing_path`, `file_count`, `closed_utc`; nothing is signed or written, and it is not a closed state of the file |
+| `container_closed` (damaged) | Close as Damaged | `damaged` (paths that failed their hashes, may be empty), `directory_fault` (only when there are any: metadata members, or `path (member)` of files that matched their hashes, that differ from the directory's CRC-32, or a directory that cannot be read), `unchecked_files` (only when the re-check ended early: how many of the files it was to read it did not reach, which can be 0 when none were due), `file_count`, `closed_utc`; nothing is signed or written, and it is not a closed state of the file |
 | `container_reopened` | Reopen                   | `reopened_utc`                                                                            |
 
 `text` examples: `Container #2 "FS01 preserved" created (from evidence #1)`, `12 files added to container #2
@@ -133,6 +134,16 @@ URI left to the builder), which other readers ignore:
   original file) together with `factum:originalSize`. For an excerpt, `aff4:size` and the hashes describe the stored
   bytes; for a metadata-only file the original size is kept and the hashes are of the original content (factum
   reads the file to hash it, but does not store it).
+- on each file: `factum:sourcePath` (the path it was read from) and on each link `factum:symlinkTarget`, as text. A
+  path the text cannot hold (not valid UTF-8, or with control characters) shows U+FFFD in place of what is not
+  Unicode, and has its bytes beside it: `factum:sourcePathRaw`, `factum:symlinkTargetRaw` (Base64,
+  `xsd:base64Binary`). On Windows the bytes of a name are its UTF-16 as WTF-8, also for `aff4l:fileName` and
+  `aff4l:originalPathName` and their `*Raw` forms, so an unpaired surrogate survives.
+
+The file's IRIs follow the Turtle grammar. factum %-encodes what an IRI cannot hold when writing (it only ever writes
+`aff4://` ARNs and fixed namespaces, which are not changed by this), and when reading decodes `\uXXXX` and
+`\UXXXXXXXX` and refuses U+0000 to U+0020 or any of `<>"{}|^`, backtick and backslash, written directly or as such
+an escape.
 
 How a metadata-only file is represented so that pyaff4 opens the container without errors (e.g. a `FileImage` with
 no storage stream, or a zero-length stream marked by `factum:metadataOnly`) is left to the builder, to be decided
@@ -240,7 +251,15 @@ Findings use the existing pass / warning / fail vocabulary and symbols (✓ ⚠ 
 **X.509 trust**: a chain is trusted only if it ends at a root that gpgsm trusts on this machine (its `trustlist.txt`
 / keybox), never merely because the container carries the root. A valid signature whose root is not trusted is a
 **fail** ("untrusted root"), consistent with how untrusted GPG keys are treated today; the finding names the root's
-subject and fingerprint so the examiner can decide to trust it in gpgsm.
+subject and fingerprint so the examiner can decide to trust it in gpgsm. A certificate that has expired since keeps
+its signature good, with a **warning**: every certificate of the chain must have been valid at the time the signature
+states, and that time is what the signer stated, which nothing confirms.
+
+The certificate that made the signature must be the first one of the chain stored in the container
+(`information.turtle.factum.cer`); a difference is a **fail**, also below a trusted root, and a signature with no
+stored chain is a **warning**. This shows a file that is inconsistent, nothing more: whoever replaces the signature
+and the chain together passes it, with any certificate below a trusted root. Only the comparison with the certificate
+the case log records for that close (a **fail** too) defends against that, and only for a container of this database.
 
 **Containers from other tools** get the AFF4-L checks only, and only for AFF4-L v1.0 containers: ZipSegment and
 in-metadata streams, Map and ImageStream streams with stored or deflate compression (factum writes deflate
@@ -256,7 +275,60 @@ written by factum: stream hashes, metadata hash, GPG signature via the system `g
 own Turtle output, which factum writes in a fixed, simple layout for this purpose; it need not parse arbitrary
 Turtle. It checks the current state and every `factum/history/<n>/` state. X.509 checking in the script uses
 `openssl` with a root certificate the recipient passes (`--ca ROOT.pem`); without it, the script verifies the
-signature against the carried chain and says explicitly that the root was not checked against a trusted one.
+signature against the carried chain and says explicitly that the root was not checked against a trusted one. `gpg`
+and `openssl` run by absolute path, `gpgconf` from `gpg`'s folder; one found in the current folder, the container's or
+the script's is refused and nothing is checked, as Windows looks in the current folder
+first and what lies there comes from whoever made the container. The
+chain is checked at the signing time the signature states. The script reads the ZIP itself and gives factum's finding
+codes and, on a container factum wrote, factum's verdict without the case log. What remains different: it has no log,
+so every `replacedBy` stays a warning; it has no trust list, so an X.509 root is only checked against `--ca`; and it
+reads only factum's fixed Turtle layout, so valid Turtle in another layout (a comment, a list of objects, single quotes,
+a line over 1 MiB) fails; what ends a name in Turtle (whitespace, `;,<>"'()[]#`) is refused in one, so it never reads a line otherwise than
+factum does. It takes
+every file for factum's, so it is stricter on other files: what another tool's container may lack fails or warns where
+factum, which reads those, warns, and an older AFF4 file fails where factum warns. A `version.txt` other than AFF4-L
+v1.0 fails (`unsupported`) in both on factum's layout too, but the script stops there, where factum goes on to check
+the rest. It is not meant to pass anything
+factum fails, but for what only the log can tell. Neither calls an unsigned file good: `not_signed` is a warning in any
+format, and the script, which exits 0 as nothing failed, ends with `Result: NOT SIGNED` and not `OK`.
+
+Whether a container is factum's is decided by its layout (`factum/history/`, `factum/README.txt`, `verify_container.py`
+or root signatures), never by `version.txt`, which is not signed. In a factum container a stored file whose content
+cannot be hashed is a failure, not "not checked", as is a `version.txt` or `container.description` that is missing, a
+`container.description` that differs from the ZIP comment or from the `ZipVolume` the signed metadata describes, a
+member under `factum/history/` outside a close that was read, a root signature on a state that is not closed (from
+2.6.0 on every new state takes the root signatures away), a root `information.turtle.hashes` that does not match, and a
+secondary store that cannot be read. "Not checked" stays a warning for other tools' containers, and in any container
+for what is no stored file: an `information.hdt`, the other parts of a multi-part file.
+
+Against the case log, what a file says it is decides only when nothing is expected of it. A container verified from
+the case tree must be that container, and a file at a place the log records must be the container recorded there;
+otherwise it is a `log_mismatch`, whatever uuid it names, or none. A file at no logged place, picked by hand, may be any
+container.
+
+A check holds up to `clamp(128 × compressed size, 4 GiB, 16 GiB)` of metadata, all states and graphs together, in either
+verifier. The size counted is that of exactly the members it reads: the root `information.turtle` and
+`information.turtle.hashes`, and those of each `factum/history/<n>/`. So stored bytes nothing reads buy nothing, the
+factor leaves room for near-identical files, which compress to about 11:1 with factum's writer, and the ceiling caps a
+crafted file whichever way it is built. The limit is on what is charged, and a verifier can pass it by text that exists
+before it can be charged: the decoded text of one member and, in factum, up to two uncharged copies of a namespace
+while a triple is built. Measured on crafted files at a limit of 6.1 GiB: 6.1 GiB in factum and
+7.1 GiB in the script, whose decoded copy of 1 GiB of invalid bytes takes 2 GiB; at a limit of 4.0 GiB, 5.0 GiB in the
+script. A member is at most 1 GiB, so this is bounded and does not grow with the limit, but it can be up to two decoded texts; it was not
+measured at the ceiling.
+
+Each verifier counts the bytes of the members it holds and, for what it parses, 200 bytes for a triple, a subject or a
+prefix plus the text that one holds, expanded, and before it is held, so a parse stops at the limit whatever the shape
+of a statement. They measure the same thing but not the same way: factum also limits its tokens while it parses (96
+bytes each, with their text), and copies a subject into each of its triples, while the script charges the decoded text
+during the parse and what a str holds around its text, and holds a subject once. So on one file they arrive at somewhat
+different totals, most on repeated subjects, and close to the limit one can stop where the other does not. A check that
+runs out stops with one `too_large` finding, which says the limit and that it does not mean alteration: a failure on a
+factum layout, a warning on another tool's file, and it is no `log_mismatch` either. A signature or certificate chain is
+at most 4 MiB.
+
+The script and `factum/README.txt` are not signed, so nothing in a container vouches for them: `verify_container.py`
+prints its own SHA-256 when it starts, to compare with `factum --version` or the release notes.
 
 ### 4.7 GUI
 

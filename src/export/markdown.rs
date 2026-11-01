@@ -7,13 +7,24 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use super::html::{evidence_cells, technical_rows};
-use super::model::{ReportModel, grouped_findings, readable_utc, status_sentence, verification_summary};
+use super::model::{
+    ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence, verification_summary,
+};
 use crate::images::{self, NoteImage};
 use crate::markup::{self, Block, ImageTarget, Inline};
 use crate::verifier::Level;
 
 static SPECIAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([\\`*_\[\]<>#|&])").unwrap());
 static BACKTICKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`+").unwrap());
+/// What GitHub-style viewers link by themselves: an address with a scheme, www., mailto:, xmpp:, an e-mail address.
+/// Ends before a `|`, which inline code in a table cell would not hide, and before an angle bracket. `_` before the
+/// second kind counts as a word end, as it does for GitHub; group 1 leaves it out of the address.
+static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)[a-z][a-z0-9+.-]*://[^\s<>|]+|(?:\b|_)((?:www\.|mailto:|xmpp:)[^\s<>|]+)|[\w.+-]+@[\w-]+(?:\.[\w-]+)+",
+    )
+    .unwrap()
+});
 
 /// a code fence longer than any backtick run in the text, so note text is always shown literally
 pub fn fence(text: &str) -> String {
@@ -28,7 +39,21 @@ pub fn fence(text: &str) -> String {
 pub fn inline(text: &str) -> String {
     let flat = text.replace(['\r', '\n'], " ");
     // "&" too: otherwise an entity like "&amp;" in a name would render as "&"
-    SPECIAL.replace_all(&flat, r"\$1").into_owned()
+    let escaped = |text: &str| SPECIAL.replace_all(text, r"\$1").into_owned();
+    let mut out = String::new();
+    let mut at = 0;
+    // never clickable: an address is inline code, so no viewer turns it into a link
+    for found in ADDRESS.captures_iter(&flat) {
+        let address = found.get(1).or_else(|| found.get(0)).expect("a match has a group 0");
+        // what ends a sentence stays out of it
+        let shown = address
+            .as_str()
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '\'', '"']);
+        out += &escaped(&flat[at..address.start()]);
+        out += &code_span(shown);
+        at = address.start() + shown.len();
+    }
+    out + &escaped(&flat[at..])
 }
 
 /// Inline code that keeps backticks and edge spaces of its content.
@@ -186,6 +211,8 @@ fn blocks_markdown(blocks: &[Block], images: &[NoteImage], image_dir: &str, in_i
                 let marks = fence(code);
                 lines.push(marks.clone());
                 if !code.is_empty() {
+                    // a viewer ends a line at a lone \r too, and what follows would stand outside the quote or item
+                    let code = code.replace("\r\n", "\n").replace('\r', "\n");
                     lines.extend(code.split('\n').map(str::to_string));
                 }
                 lines.push(marks);
@@ -333,6 +360,8 @@ pub fn render_markdown(model: &ReportModel, image_dir: &str) -> String {
         String::new(),
         inline(&verification_summary(report)),
         String::new(),
+        inline(&seal_folder_line(report)),
+        String::new(),
     ]);
     let findings: Vec<String> = grouped_findings(report)
         .iter()
@@ -418,6 +447,65 @@ mod tests {
     #[test]
     fn inline_keeps_entities_literal() {
         assert_eq!(inline("R&D &amp; <b>"), "R\\&D \\&amp; \\<b\\>");
+    }
+
+    #[test]
+    fn addresses_become_inline_code() {
+        for (text, expected) in [
+            ("see https://x.test/a_b ok", "see `https://x.test/a_b` ok"),
+            ("ftp://x.test", "`ftp://x.test`"),
+            ("HTTP://X.TEST", "`HTTP://X.TEST`"),
+            ("www.x.test and WWW.y.test", "`www.x.test` and `WWW.y.test`"),
+            ("mail a.b+c@x.test now", "mail `a.b+c@x.test` now"),
+            ("mailto:a@x.test", "`mailto:a@x.test`"),
+            ("_www.x.test", r"\_`www.x.test`"),
+            ("a_www.x.test", r"a\_`www.x.test`"),
+            ("_mailto:a@x.test", r"\_`mailto:a@x.test`"),
+            ("_xmpp:a@x.test", r"\_`xmpp:a@x.test`"),
+            ("_a@x.test", "`_a@x.test`"),
+            ("(see https://x.test/a.)", "(see `https://x.test/a`.)"),
+            ("xmpp:a@x.test/r", "`xmpp:a@x.test/r`"),
+            ("<https://x.test>", r"\<`https://x.test`\>"),
+            ("https://x.test|b", r"`https://x.test`\|b"),
+            (
+                "two https://a.test https://b.test",
+                "two `https://a.test` `https://b.test`",
+            ),
+        ] {
+            assert_eq!(inline(text), expected, "{text}");
+        }
+        // no address: nothing changes
+        for text in ["version 1.2.3", "a@b", "http:/x", "C:\\x", "awww.x"] {
+            assert!(!inline(text).contains('`'), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_carriage_return_in_a_note_ends_no_line_of_the_report() {
+        for note in [
+            "x\ry",
+            "- ```\n  a\r  b\n  ```",
+            "> ```\n> a\r> b\n> ```",
+            "```\na\rb\n```",
+            "> ```\n> a\rb\n> ```",
+        ] {
+            let lines = markup_markdown(note, &[], "images");
+            assert!(!lines.concat().contains('\r'), "{note:?}: {lines:?}");
+        }
+        // code cannot leave the item it stands in
+        assert_eq!(
+            markup_markdown("- ```\n  a\r# b\n  ```", &[], "images"),
+            ["- ```", "  a", "  # b", "  ```"]
+        );
+    }
+
+    #[test]
+    fn links_and_autolinks_are_defanged() {
+        let line = |text: &str| markup_markdown(text, &[], "images").concat();
+        assert_eq!(line("<https://x.test/a>"), "`https://x.test/a`");
+        assert_eq!(line("[https://x.test](https://x.test)"), "`https://x.test`");
+        assert_eq!(line("[site](https://x.test)"), "site (`https://x.test`)");
+        assert_eq!(line("<a@x.test>"), "`a@x.test`");
     }
 
     #[test]

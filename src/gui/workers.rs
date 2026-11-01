@@ -8,13 +8,17 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use crate::companion::ask::Answer;
-use crate::companion::llm::Client;
+use crate::companion::llm::{Client, Learned};
 use crate::companion::{CompanionDb, Settings};
 use crate::container::volume::{AddOptions, AddProgress, Staged, Volume};
 use crate::db::Db;
+use crate::error::{ErrorKind, FactumError};
 use crate::services::Factum;
 use crate::signer::GnupgSigner;
 use crate::verifier::{CaseReport, SignatureCheck};
+
+/// Why a worker gave no result: it died (a panic takes its sender with it).
+pub const STOPPED: &str = "the background task stopped unexpectedly";
 
 pub struct Worker<T> {
     receiver: mpsc::Receiver<T>,
@@ -35,9 +39,13 @@ impl<T: Send + 'static> Worker<T> {
         }
     }
 
-    /// The result, once the work is done.
-    pub fn poll(&mut self) -> Option<T> {
-        let result = self.receiver.try_recv().ok()?;
+    /// The result, once the work is done; [`STOPPED`] when the worker died without one.
+    pub fn poll(&mut self) -> Option<Result<T, &'static str>> {
+        let result = match self.receiver.try_recv() {
+            Ok(result) => Ok(result),
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err(STOPPED),
+        };
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -56,6 +64,13 @@ impl<T: Send + 'static> Worker<T> {
     }
 }
 
+impl<T: Send + 'static, E: From<String> + Send + 'static> Worker<Result<T, E>> {
+    /// [`poll`](Self::poll) for work that fails with a message: a dead worker is one more failure.
+    pub fn poll_result(&mut self) -> Option<Result<T, E>> {
+        Some(self.poll()?.unwrap_or_else(|stopped| Err(stopped.to_string().into())))
+    }
+}
+
 pub struct Progress {
     pub done: AtomicUsize,
     pub total: AtomicUsize,
@@ -63,10 +78,12 @@ pub struct Progress {
 
 pub type VerifyResult = Result<CaseReport, String>;
 
+/// `seal_dir`: the seal folder the window uses (its [`Factum::env_seal_dir`]).
 pub fn verify_case(
     ctx: &egui::Context,
     db_path: PathBuf,
     gpg_home: Option<PathBuf>,
+    seal_dir: Option<PathBuf>,
     case_id: i64,
 ) -> (Worker<VerifyResult>, Arc<Progress>) {
     let progress = Arc::new(Progress {
@@ -78,7 +95,12 @@ pub fn verify_case(
     let worker = Worker::spawn(ctx, move || {
         let db = Db::open(&db_path).map_err(|e| e.to_string())?;
         let signer = GnupgSigner::without_key(gpg_home);
-        let factum = Factum::new(&db, &signer);
+        let factum = Factum {
+            db: &db,
+            signer: &signer,
+            seal_dir_override: None,
+            env_seal_dir: seal_dir,
+        };
         let mut report_progress = |done: usize, total: usize| {
             shared.done.store(done, Ordering::Relaxed);
             shared.total.store(total, Ordering::Relaxed);
@@ -136,6 +158,7 @@ pub fn ask(
     db_path: PathBuf,
     companion_path: PathBuf,
     settings: Settings,
+    learned: Learned,
     case_id: i64,
     question: String,
 ) -> Worker<AskResult> {
@@ -143,6 +166,7 @@ pub fn ask(
         let db = crate::companion::open_case_db(&db_path).map_err(|e| e.to_string())?;
         let cdb = CompanionDb::open(&companion_path).map_err(|e| e.to_string())?;
         let client = Client::new(settings);
+        client.learn(learned);
         crate::companion::ask::ask(&db, &cdb, &client, case_id, &question).map_err(|e| e.to_string())
     })
 }
@@ -170,7 +194,31 @@ pub fn add_to_container(
     (worker, progress)
 }
 
-pub type RecheckResult = Result<crate::container::volume::Recheck, String>;
+/// Why a re-check or a container verification gave no result; `cancelled` when it stopped because it was asked to.
+pub struct CheckError {
+    pub message: String,
+    pub cancelled: bool,
+}
+
+impl From<String> for CheckError {
+    fn from(message: String) -> Self {
+        CheckError {
+            message,
+            cancelled: false,
+        }
+    }
+}
+
+impl From<FactumError> for CheckError {
+    fn from(error: FactumError) -> Self {
+        CheckError {
+            cancelled: error.is(ErrorKind::Cancelled),
+            message: error.message,
+        }
+    }
+}
+
+pub type RecheckResult = Result<crate::container::volume::Recheck, CheckError>;
 
 /// Re-reads what a close checks, on a thread of its own (spec 5.2).
 pub fn recheck(
@@ -182,12 +230,12 @@ pub fn recheck(
     let shared = progress.clone();
     let worker = Worker::spawn(ctx, move || {
         crate::container::volume::recheck(&input.path, input.end, &input.records, &shared, &cancel)
-            .map_err(|e| e.to_string())
+            .map_err(CheckError::from)
     });
     (worker, progress)
 }
 
-pub type ContainerVerifyResult = Result<crate::container::verify::ContainerReport, String>;
+pub type ContainerVerifyResult = Result<crate::container::verify::ContainerReport, CheckError>;
 
 /// Verifies a container file on a thread of its own; progress in bytes.
 pub fn verify_container(
@@ -195,6 +243,7 @@ pub fn verify_container(
     db_path: PathBuf,
     gpg_home: Option<PathBuf>,
     path: PathBuf,
+    expected: Option<i64>,
     cancel: Arc<AtomicBool>,
 ) -> (Worker<ContainerVerifyResult>, Arc<Progress>) {
     let progress = Arc::new(Progress {
@@ -204,7 +253,7 @@ pub fn verify_container(
     let shared = progress.clone();
     let repaint = ctx.clone();
     let worker = Worker::spawn(ctx, move || {
-        let db = Db::open(&db_path).map_err(|e| e.to_string())?;
+        let db = Db::open(&db_path)?;
         let signer = GnupgSigner::without_key(gpg_home.clone());
         let factum = Factum::new(&db, &signer);
         let gpgsm = crate::container::x509::Gpgsm::new(gpg_home);
@@ -214,8 +263,8 @@ pub fn verify_container(
             repaint.request_repaint();
         };
         factum
-            .verify_container_file(&path, &gpgsm, &report_progress, &cancel)
-            .map_err(|e| e.to_string())
+            .verify_expected_container(&path, expected, &gpgsm, &report_progress, &cancel)
+            .map_err(CheckError::from)
     });
     (worker, progress)
 }

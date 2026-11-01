@@ -2,10 +2,14 @@
 
 mod common;
 
+use std::path::PathBuf;
+
 use common::{Fixture, add_case_row, add_raw_entry, system_events};
+use factum::config::{SEAL_DIR_KEY, file_seal_dir, set_dotenv_value};
 use factum::error::ErrorKind;
 use factum::log_service::{Append, entry_signed_payload};
 use factum::notes::EntryFilter;
+use factum::seals::{SEAL_DIR_SETTING, migrate_seal_dir_setting, seal_dir_migration_marker};
 use factum::signer::FakeSigner;
 use factum::{Db, Factum, iocs, merkle, tags};
 use serde_json::json;
@@ -283,6 +287,107 @@ fn failed_signature_leaves_no_case_behind() {
             .is(ErrorKind::Signing)
     );
     assert!(f.factum().list_cases(true).unwrap().is_empty());
+}
+
+#[test]
+fn a_case_created_while_signing_does_not_mismatch_the_id_in_the_payload() {
+    let f = Fixture::new();
+    let path = f.path().join("factum.db");
+    let once = std::cell::Cell::new(true);
+    let signatures = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = signatures.clone();
+    *f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        counted.set(counted.get() + 1);
+        if once.replace(false) {
+            // another process takes the id this case was prepared for
+            add_case_row(&Db::open(&path).unwrap(), "OTHER", false);
+        }
+    }));
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    assert_eq!(case_id, 2);
+    // the first signature was for a stale id, so it was made again
+    assert_eq!(signatures.get(), 2);
+    assert_eq!(system_events(&f.db, case_id)[0]["case_id"], json!(case_id));
+    assert_eq!(factum.require_case(case_id).unwrap().case_file, "C-1");
+    // the other case has no log entry (it was added raw), ours has exactly one
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries"), 1);
+}
+
+#[test]
+fn evidence_created_while_signing_keeps_the_id_in_its_payload() {
+    let f = Fixture::new();
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    let path = f.path().join("factum.db");
+    let once = std::cell::Cell::new(true);
+    *f.signer.before_sign.borrow_mut() = Some(Box::new(move || {
+        if once.replace(false) {
+            Db::open(&path)
+                .unwrap()
+                .conn
+                .execute(
+                    "INSERT INTO evidence (case_id, description, created_utc) VALUES (?, 'other', 'x')",
+                    [case_id],
+                )
+                .unwrap();
+        }
+    }));
+    let evidence_id = f.factum().create_evidence(case_id, "disk", "", "").unwrap();
+    assert_eq!(evidence_id, 2);
+    let events = system_events(&f.db, case_id);
+    assert_eq!(events.last().unwrap()["evidence_id"], json!(evidence_id));
+}
+
+#[test]
+fn failed_signature_leaves_no_evidence_behind() {
+    let f = Fixture::new();
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    f.signer.fail_next.set(true);
+    assert!(
+        f.factum()
+            .create_evidence(case_id, "disk", "", "")
+            .unwrap_err()
+            .is(ErrorKind::Signing)
+    );
+    assert_eq!(f.count("SELECT COUNT(*) FROM evidence"), 0);
+    assert_eq!(f.count("SELECT COUNT(*) FROM entries"), 1);
+}
+
+#[test]
+fn an_open_case_file_number_cannot_be_used_twice() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let first = factum.create_case("C-1", "One", "").unwrap();
+    let err = factum.create_case(" C-1 ", "Two", "").unwrap_err();
+    assert!(err.to_string().contains("already used"), "{err}");
+    assert_eq!(f.count("SELECT COUNT(*) FROM cases"), 1);
+    // exact and case-sensitive
+    let second = factum.create_case("c-1", "Lower", "").unwrap();
+    // an edit that keeps the own number is fine, one that takes another open case's number is not
+    factum.update_case(first, "C-1", "One, renamed", "").unwrap();
+    assert!(factum.update_case(second, "C-1", "Lower", "").is_err());
+    assert_eq!(factum.require_case(second).unwrap().case_file, "c-1");
+    // an archived case frees its number, but cannot take it back while another open case holds it
+    factum.archive_case(first).unwrap();
+    let third = factum.create_case("C-1", "Three", "").unwrap();
+    let err = factum.reopen_case(first).unwrap_err();
+    assert!(err.to_string().contains(&format!("#{third}")), "{err}");
+    assert!(factum.require_case(first).unwrap().is_archived());
+    factum.archive_case(third).unwrap();
+    factum.reopen_case(first).unwrap();
+}
+
+#[test]
+fn editing_a_case_whose_number_is_already_shared_by_an_older_database_still_works() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let one = factum.create_case("C-1", "One", "").unwrap();
+    add_case_row(&f.db, "C-1", false);
+    factum.update_case(one, "C-1", "One, renamed", "d").unwrap();
+    assert_eq!(factum.require_case(one).unwrap().case_name, "One, renamed");
+    // changing the number to a taken one is still refused
+    let other = factum.create_case("C-2", "Other", "").unwrap();
+    assert!(factum.update_case(other, "C-1", "Other", "").is_err());
 }
 
 #[test]
@@ -816,5 +921,102 @@ fn case_iocs_only_count_newest_versions() {
     assert_eq!(
         iocs::get_iocs_for_entry(&f.db.conn, original).unwrap(),
         vec![("ip".into(), "10.0.0.1".into())]
+    );
+}
+
+// --- the seal folder setting of factum up to 2.7.1
+
+#[test]
+fn seal_folder_setting_moves_to_the_user_config_once() {
+    let f = Fixture::new();
+    let env = f.path().join("config").join(".env");
+    f.db.set_setting(SEAL_DIR_SETTING, "/media/usb/seals").unwrap();
+    assert_eq!(
+        migrate_seal_dir_setting(&f.db, &env).unwrap().as_deref(),
+        Some("/media/usb/seals")
+    );
+    assert_eq!(file_seal_dir(&env), Some(PathBuf::from("/media/usb/seals")));
+    // reset to the default afterwards: opening the database again does not bring the old folder back
+    set_dotenv_value(&env, SEAL_DIR_KEY, None).unwrap();
+    assert_eq!(migrate_seal_dir_setting(&f.db, &env).unwrap(), None);
+    assert_eq!(file_seal_dir(&env), None);
+}
+
+#[test]
+fn seal_folder_in_the_user_config_wins_over_the_database_setting() {
+    let f = Fixture::new();
+    let env = f.path().join(".env");
+    std::fs::write(&env, "FACTUM_SEAL_DIR=/mine\n").unwrap();
+    f.db.set_setting(SEAL_DIR_SETTING, "/theirs").unwrap();
+    assert_eq!(migrate_seal_dir_setting(&f.db, &env).unwrap(), None);
+    assert_eq!(file_seal_dir(&env), Some(PathBuf::from("/mine")));
+    assert!(seal_dir_migration_marker(&env).exists());
+}
+
+#[test]
+fn after_the_first_start_no_database_is_consulted() {
+    // the marker lives in the user config, not in a database a tamperer controls
+    let f = Fixture::new();
+    let env = f.path().join("config").join(".env");
+    assert_eq!(migrate_seal_dir_setting(&f.db, &env).unwrap(), None);
+    assert!(seal_dir_migration_marker(&env).exists() && !env.exists());
+    let planted = Db::open(&f.path().join("planted.db")).unwrap();
+    planted.set_setting(SEAL_DIR_SETTING, "/tmp/empty").unwrap();
+    assert_eq!(migrate_seal_dir_setting(&planted, &env).unwrap(), None);
+    assert!(!env.exists());
+}
+
+#[test]
+fn a_correction_chain_that_loops_is_an_error_not_a_hang() {
+    let f = Fixture::new();
+    let case_id = add_case_row(&f.db, "C-1", false);
+    let a = add_raw_entry(&f.db, case_id, "a", None);
+    let b = add_raw_entry(&f.db, case_id, "b", Some(a));
+    f.exec(&format!("UPDATE entries SET corrects_id = {b} WHERE id = {a}"));
+    let factum = f.factum();
+    assert!(
+        factum
+            .latest_version_id(a)
+            .unwrap_err()
+            .to_string()
+            .contains("inconsistent")
+    );
+    assert!(factum.history(a).unwrap_err().to_string().contains("inconsistent"));
+    f.exec(&format!("UPDATE entries SET corrects_id = {a} WHERE id = {a}"));
+    assert!(factum.history(a).is_err());
+}
+
+#[test]
+fn url_fragments_are_not_tags_in_new_notes() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let note = factum
+        .create_note("see http://x/page#section, #real", None, case_id)
+        .unwrap();
+    let found: Vec<String> = tags::get_tags_for_entry(&f.db.conn, note)
+        .unwrap()
+        .into_iter()
+        .map(|(tag, _)| tag)
+        .collect();
+    assert_eq!(found, ["real"]);
+}
+
+#[test]
+fn tag_vocabulary_is_per_case() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let one = factum.create_case("C-1", "One", "").unwrap();
+    let two = factum.create_case("C-2", "Two", "").unwrap();
+    let note = factum.create_note("#alpha", None, one).unwrap();
+    tags::add_label(&f.db, note, "shared").unwrap();
+    factum.create_note("#beta #alpha", None, two).unwrap();
+    assert_eq!(
+        tags::tag_counts(&f.db.conn, one).unwrap(),
+        [("alpha".to_string(), 1), ("shared".to_string(), 1)]
+    );
+    assert_eq!(
+        tags::tag_counts(&f.db.conn, two).unwrap(),
+        [("alpha".to_string(), 1), ("beta".to_string(), 1)]
     );
 }

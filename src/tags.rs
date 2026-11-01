@@ -9,8 +9,8 @@ use rusqlite::{Connection, params};
 use crate::db::{Db, ensure_entry_case_open};
 use crate::error::Result;
 
-static TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#(\w+)").unwrap()); // words prefixed with #
-static TAG_AT_END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#(\w*)$").unwrap());
+static TAG_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[^\w/&#])#(\w+)").unwrap()); // words prefixed with #, not in URLs or after a word
+static TAG_AT_END: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[^\w/&#])#(\w*)$").unwrap());
 static WORD_AT_START: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w").unwrap());
 static TAG_NAME: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w+$").unwrap());
 
@@ -95,8 +95,16 @@ pub fn get_tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<(Strin
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn clean_label(label: &str) -> &str {
-    crate::pystr::strip(label).trim_start_matches('#')
+/// A label without the `#`s it was typed with: those and the blanks between them go until neither is left in front.
+pub fn clean_label(label: &str) -> &str {
+    let mut label = crate::pystr::strip(label);
+    loop {
+        let cleaned = crate::pystr::strip(label.trim_start_matches('#'));
+        if cleaned.len() == label.len() {
+            return cleaned;
+        }
+        label = cleaned;
+    }
 }
 
 pub fn add_label(db: &Db, entry_id: i64, label: &str) -> Result<usize> {
@@ -140,13 +148,14 @@ pub fn move_labels(conn: &Connection, from: i64, to: i64) -> Result<()> {
     Ok(())
 }
 
-/// Every tag and label in use, with the number of entries that carry it; the most used first.
-pub fn tag_counts(conn: &Connection) -> Result<Vec<(String, usize)>> {
+/// Every tag and label in use in the case, with the number of entries that carry it; the most used first.
+pub fn tag_counts(conn: &Connection, case_id: i64) -> Result<Vec<(String, usize)>> {
     let mut statement = conn.prepare(
         "SELECT t.tag_text, COUNT(*) FROM tags t JOIN entry_tag_map m ON t.id = m.tag_id \
+         JOIN entries e ON e.id = m.entry_id WHERE e.case_id = ? \
          GROUP BY t.id ORDER BY COUNT(*) DESC, t.tag_text",
     )?;
-    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as usize)))?;
+    let rows = statement.query_map([case_id], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as usize)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -253,6 +262,21 @@ mod tests {
     }
 
     #[test]
+    fn a_cleaned_label_has_nothing_left_to_clean() {
+        for (typed, cleaned) in [
+            ("#a", "a"),
+            ("  ## b ", "b"),
+            ("# #", ""),
+            ("##", ""),
+            ("# # c #", "c #"),
+            ("d", "d"),
+        ] {
+            assert_eq!(clean_label(typed), cleaned, "{typed:?}");
+            assert_eq!(clean_label(clean_label(typed)), cleaned, "{typed:?} again");
+        }
+    }
+
+    #[test]
     fn suggestions_rank_prefix_substring_then_typos() {
         let known: Vec<(String, usize)> = [
             ("malware", 5),
@@ -306,8 +330,10 @@ mod tests {
         assert_eq!(tag_before("found #", 7), Some(7..7));
         assert_eq!(tag_before("#Persistenz_ü", 13), Some(1..13));
         assert_eq!(tag_before("ä #ö", 4), Some(3..4));
-        // parse_tags finds #b in a#b, so it is completed too
-        assert_eq!(tag_before("a#b", 3), Some(2..3));
+        // not after a word or in a URL, like parse_tags
+        assert_eq!(tag_before("a#b", 3), None);
+        assert_eq!(tag_before("see http://x/page#sec", 21), None);
+        assert_eq!(tag_before("(#b", 3), Some(2..3));
         // in the middle of a name, after a space, or without #
         assert_eq!(tag_before("#malware", 4), None);
         assert_eq!(tag_before("#mal ", 5), None);
@@ -337,6 +363,14 @@ mod tests {
         assert!(!is_tag_name("for-report"));
         assert!(!is_tag_name("two words"));
         assert!(!is_tag_name(""));
+    }
+
+    #[test]
+    fn url_fragments_and_entities_are_no_tags() {
+        assert_eq!(
+            parse_tags("see http://x/page#section and a#b &#38; #ok, (#two) ##no\n#start"),
+            vec!["ok", "two", "start"]
+        );
     }
 
     #[test]

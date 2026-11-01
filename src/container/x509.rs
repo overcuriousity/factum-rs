@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use base64::Engine;
+use sha2::Digest;
+
 use crate::signer::{GpgOutput, gpg_error, run_program};
 
 /// gpgsm fingerprint of the certificate that signs containers
@@ -42,12 +45,16 @@ pub struct X509Check {
     pub valid: bool,
     /// the chain ends at a root this machine's gpgsm trusts
     pub trusted: bool,
+    /// the fingerprint of the certificate that made the signature
+    pub fingerprint: Option<String>,
     pub signer_subject: Option<String>,
     pub root_subject: Option<String>,
     pub root_fingerprint: Option<String>,
     pub signed_utc: Option<String>,
-    /// the signing certificate was valid when the signature was made
+    /// every certificate of the chain was valid at the time the signature states
     pub valid_at_signing: bool,
+    /// gpgsm says a certificate of the chain has expired by now
+    pub expired: bool,
     pub status: String,
 }
 
@@ -137,6 +144,48 @@ pub fn pem_blocks(text: &str) -> Vec<String> {
         }
     }
     blocks
+}
+
+/// The fingerprint, as gpgsm writes it, of the first certificate of a PEM chain: the signing certificate.
+pub fn first_fingerprint(chain: &str) -> Option<String> {
+    let block = pem_blocks(chain).into_iter().next()?;
+    let body: String = block.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = base64::engine::general_purpose::STANDARD.decode(body).ok()?;
+    Some(hex::encode_upper(sha1::Sha1::digest(der)))
+}
+
+/// What gpgsm's status lines say about a signature. gpgsm reports a good signature by a certificate that has expired
+/// by now as EXPKEYSIG with VALIDSIG and its trust as usual, also when the one expired is higher up the chain; whether
+/// it was valid when it signed is `valid_at_signing`.
+fn parse_verify_status(status: &[(String, Vec<String>)]) -> X509Check {
+    let has = |key: &str| status.iter().any(|(k, _)| k == key);
+    let value = |key: &str| status.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+    let valid = value("VALIDSIG");
+    let good = has("GOODSIG") || (has("EXPKEYSIG") && valid.is_some());
+    X509Check {
+        valid: good && !has("BADSIG") && !has("ERRSIG"),
+        trusted: has("TRUST_FULLY") || has("TRUST_ULTIMATE"),
+        expired: has("EXPKEYSIG"),
+        fingerprint: valid.and_then(|v| v.first().cloned()),
+        signer_subject: value("GOODSIG")
+            .or(value("EXPKEYSIG"))
+            .or(value("BADSIG"))
+            .map(|v| v.get(1..).unwrap_or_default().join(" ")),
+        signed_utc: valid
+            .and_then(|v| v.get(2))
+            .map(|t| colon_time(t))
+            .filter(|t| !t.is_empty()),
+        ..Default::default()
+    }
+}
+
+/// Whether every certificate of a chain was valid at `signed`; all of them, as an expired one anywhere is what breaks
+/// a chain.
+fn valid_when_signed(chain: &[X509Cert], signed: &str) -> bool {
+    !chain.is_empty()
+        && chain
+            .iter()
+            .all(|c| c.not_before.as_str() <= signed && (c.not_after.is_empty() || signed <= c.not_after.as_str()))
 }
 
 /// %XX escapes as gpgconf writes them.
@@ -450,19 +499,11 @@ impl Gpgsm {
             Ok(output) => output,
             Err(e) => return failed(e),
         };
-        let status = |key: &str| output.status.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-        let mut check = X509Check {
-            valid: output.has("GOODSIG") && !output.has("BADSIG") && !output.has("ERRSIG"),
-            trusted: output.has("TRUST_FULLY") || output.has("TRUST_ULTIMATE"),
-            signer_subject: status("GOODSIG").or(status("BADSIG")).map(|v| v[1..].join(" ")),
-            ..Default::default()
-        };
-        if let Some(valid) = status("VALIDSIG") {
-            check.signed_utc = valid.get(2).map(|t| colon_time(t)).filter(|t| !t.is_empty());
-            let chain = self.follow(Some(temp.path()), &valid[0]);
-            if let (Some(leaf), Some(signed)) = (chain.first(), &check.signed_utc) {
-                check.valid_at_signing =
-                    leaf.not_before <= *signed && (leaf.not_after.is_empty() || *signed <= leaf.not_after);
+        let mut check = parse_verify_status(&output.status);
+        if let Some(fingerprint) = check.fingerprint.clone() {
+            let chain = self.follow(Some(temp.path()), &fingerprint);
+            if let Some(signed) = &check.signed_utc {
+                check.valid_at_signing = valid_when_signed(&chain, signed);
             }
             if let Some(root) = chain.last().filter(|c| c.is_self_signed()) {
                 check.root_subject = Some(root.subject.clone());
@@ -484,7 +525,11 @@ impl Gpgsm {
             format!("good signature, but the root {root} is not trusted")
         } else {
             format!("good signature, root {root} trusted")
-        } + "; revocation not checked (offline)";
+        };
+        if check.valid && check.expired {
+            check.status += "; its certificate or one in its chain has expired";
+        }
+        check.status += "; revocation not checked (offline)";
         check
     }
 }
@@ -539,6 +584,90 @@ uid:u::::::::CN=Factum Test Root:::\n";
             pem_blocks(export),
             vec!["-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"]
         );
+    }
+
+    /// Status lines as gpgsm 2.4.9 writes them, as (keyword, fields).
+    fn status_lines(lines: &[&str]) -> Vec<(String, Vec<String>)> {
+        lines
+            .iter()
+            .map(|line| {
+                let mut fields = line.split(' ').map(str::to_string);
+                (fields.next().unwrap(), fields.collect())
+            })
+            .collect()
+    }
+
+    const FINGERPRINT: &str = "56A73E405BE7AB4845AC2A472C25FD703542B7F1";
+
+    #[test]
+    fn a_certificate_expired_since_is_a_good_signature() {
+        // captured: signed on 29 Oct, verified after the leaf expired that night
+        let check = parse_verify_status(&status_lines(&[
+            "NEWSIG",
+            "EXPKEYSIG 56A73E405BE7AB4845AC2A472C25FD703542B7F1 /CN=Examiner One/O=Lab",
+            "VALIDSIG 56A73E405BE7AB4845AC2A472C25FD703542B7F1 2026-10-29 20261029T114804 20261029T234804 0 0 1 8 00",
+            "TRUST_FULLY 0 shell",
+        ]));
+        assert!(check.valid && check.trusted && check.expired, "{check:?}");
+        assert_eq!(check.fingerprint.as_deref(), Some(FINGERPRINT));
+        assert_eq!(check.signer_subject.as_deref(), Some("/CN=Examiner One/O=Lab"));
+        assert_eq!(check.signed_utc.as_deref(), Some("2026-10-29T11:48:04Z"));
+    }
+
+    #[test]
+    fn an_expired_certificate_without_validsig_or_with_a_bad_signature_is_no_good_signature() {
+        let expired = "EXPKEYSIG 56A73E405BE7AB4845AC2A472C25FD703542B7F1 /CN=Examiner One/O=Lab";
+        assert!(!parse_verify_status(&status_lines(&["NEWSIG", expired])).valid);
+        let validsig = "VALIDSIG 56A73E405BE7AB4845AC2A472C25FD703542B7F1 2026-10-29 20261029T114804 0 0 0 1 8 00";
+        let bad = "BADSIG 56A73E405BE7AB4845AC2A472C25FD703542B7F1 /CN=Examiner One/O=Lab";
+        assert!(!parse_verify_status(&status_lines(&[expired, validsig, bad])).valid);
+    }
+
+    #[test]
+    fn goodsig_is_read_as_before() {
+        let check = parse_verify_status(&status_lines(&[
+            "GOODSIG 56A73E405BE7AB4845AC2A472C25FD703542B7F1 /CN=Examiner One/O=Lab",
+            "VALIDSIG 56A73E405BE7AB4845AC2A472C25FD703542B7F1 2026-10-27 20261027T211004 0 0 0 1 8 00",
+            "TRUST_UNDEFINED 0 shell",
+        ]));
+        assert!(check.valid && !check.trusted && !check.expired, "{check:?}");
+        assert_eq!(check.signer_subject.as_deref(), Some("/CN=Examiner One/O=Lab"));
+    }
+
+    #[test]
+    fn every_certificate_of_the_chain_must_have_been_valid_when_it_signed() {
+        let cert = |not_before: &str, not_after: &str| X509Cert {
+            not_before: not_before.into(),
+            not_after: not_after.into(),
+            ..Default::default()
+        };
+        let good = cert("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z");
+        let signed = "2026-06-01T00:00:00Z";
+        assert!(valid_when_signed(&[good.clone(), good.clone()], signed));
+        // no end date
+        assert!(valid_when_signed(&[cert("2026-01-01T00:00:00Z", "")], signed));
+        // expired or not yet valid: the leaf, an intermediate, the root
+        for bad in [
+            cert("2025-01-01T00:00:00Z", "2026-05-31T00:00:00Z"),
+            cert("2026-06-02T00:00:00Z", "2027-01-01T00:00:00Z"),
+        ] {
+            assert!(!valid_when_signed(&[bad.clone(), good.clone(), good.clone()], signed));
+            assert!(!valid_when_signed(&[good.clone(), bad.clone(), good.clone()], signed));
+            assert!(!valid_when_signed(&[good.clone(), good.clone(), bad.clone()], signed));
+        }
+        assert!(!valid_when_signed(&[], signed));
+    }
+
+    #[test]
+    fn the_first_certificate_of_a_chain_names_the_fingerprint() {
+        // sha1 of the bytes "abc"
+        let chain = "Issuer ...: /CN=x\n-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n\
+                     -----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
+        assert_eq!(
+            first_fingerprint(chain).as_deref(),
+            Some("A9993E364706816ABA3E25717850C26C9CD0D89D")
+        );
+        assert_eq!(first_fingerprint("no certificate"), None);
     }
 
     #[test]
