@@ -418,14 +418,16 @@ fn type_into(harness: &mut Harness<'_, FactumApp>, label: &str, text: &str) {
     harness.run_ok();
 }
 
-/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit); panics, naming the
-/// call, when it never does.
+/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit), then draws what that
+/// changed: `run_ok` gives up after a few frames while a worker repaints, and a window that came with the last of them
+/// has no labels before its next frame. Panics, naming the call, when `done` never holds.
 #[track_caller]
 fn run_until(harness: &mut Harness<'_, FactumApp>, done: impl Fn(&Harness<'_, FactumApp>) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         harness.run_ok();
         if done(harness) {
+            harness.run_ok();
             return;
         }
         assert!(
