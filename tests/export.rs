@@ -1959,6 +1959,21 @@ fn a_long_superseded_line_keeps_its_mark_where_the_pdf_wraps_it() {
 }
 
 #[test]
+fn only_the_reports_the_formats_need_are_built() {
+    let f = Fixture::new();
+    let model = model(&f);
+    let built = |formats: &[&str]| {
+        let rendered = factum::export::render_needed(&model, formats);
+        (!rendered.html.is_empty(), !rendered.pdf.is_empty())
+    };
+    assert_eq!(built(&["pdf"]), (false, true));
+    assert_eq!(built(&["html"]), (true, false));
+    assert_eq!(built(&["md"]), (false, false));
+    assert_eq!(built(&["md", "pdf"]), (false, true));
+    assert_eq!(built(&["bundle"]), (true, true));
+}
+
+#[test]
 fn the_timeline_flags_a_note_when_an_earlier_version_failed() {
     let f = Fixture::new();
     let factum = f.factum();

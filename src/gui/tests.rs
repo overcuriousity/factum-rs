@@ -76,6 +76,31 @@ impl Fixture {
     }
 }
 
+#[test]
+fn export_finished_names_what_the_pdf_cannot_show() {
+    let fixture = Fixture::empty();
+    let db = fixture.db();
+    let signer = crate::signer::FakeSigner::new(true);
+    let factum = crate::services::Factum::new(&db, &signer);
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("案件", None, case_id).unwrap();
+    let mut harness = fixture.harness();
+    let folder = fixture.path.with_file_name("out");
+    harness.state_mut().carry_out(Pending::Export {
+        case_id,
+        formats: vec!["pdf".to_string()],
+        folder: folder.display().to_string(),
+    });
+    let Some(Dialog::Message { title, text }) = harness.state().dialogs.last() else {
+        panic!("no message");
+    };
+    assert_eq!(title, "Export finished");
+    assert!(
+        text.contains("Written:\n") && text.contains("The PDF cannot show 2 character(s)"),
+        "{text}"
+    );
+}
+
 fn screenshot(harness: &mut Harness<'_, FactumApp>, name: &str) {
     let Ok(folder) = std::env::var("FACTUM_SCREENSHOTS") else {
         return;

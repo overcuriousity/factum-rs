@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::canonical::{compact_utc, utc_now};
 use crate::error::{FactumError, Result};
+use crate::export::model::ReportModel;
 use crate::files::safe_filename_capped;
 use crate::seals::REASON_EXPORT;
 use crate::services::Factum;
@@ -30,9 +31,29 @@ pub struct Exported {
     pub warnings: Vec<String>,
 }
 
-/// Whether a report has to be rendered for the formats: the bundle carries all of them.
-fn rendered(report: &str, formats: &[&str]) -> bool {
-    formats.contains(&report) || formats.contains(&"bundle")
+/// The reports an export needs; one no format asks for stays empty. The HTML holds the images as base64.
+#[derive(Debug)]
+pub struct Rendered {
+    pub html: Vec<u8>,
+    pub pdf: Vec<u8>,
+    /// the characters no font of the PDF has
+    pub unsupported: Vec<char>,
+}
+
+/// Renders what the formats need: the bundle carries all reports.
+pub fn render_needed(model: &ReportModel, formats: &[&str]) -> Rendered {
+    let needed = |report: &str| formats.contains(&report) || formats.contains(&"bundle");
+    let html = if needed("html") {
+        html::render_html(model, false).into_bytes()
+    } else {
+        Vec::new()
+    };
+    let (pdf, unsupported) = if needed("pdf") {
+        pdf::render_pdf_checked(model)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Rendered { html, pdf, unsupported }
 }
 
 /// Moves the outputs from the staging folder into the target folder, all of them or none.
@@ -91,19 +112,10 @@ impl Factum<'_> {
             safe_filename_capped(&model.case.case_file, NAME_MAX_BYTES),
             compact_utc(&exported_utc)
         );
-        let html = if rendered("html", &unique) {
-            html::render_html(&model, false).into_bytes()
-        } else {
-            Vec::new()
-        };
+        let Rendered { html, pdf, unsupported } = render_needed(&model, &unique);
         // borrowed from the model: nothing is copied for formats that do not write image files
         let images = markdown::image_files(&model);
         let image_dir = format!("{stem}_images");
-        let (pdf, unsupported) = if rendered("pdf", &unique) {
-            pdf::render_pdf_checked(&model)
-        } else {
-            (Vec::new(), Vec::new())
-        };
         // what goes into out_dir, and the files that makes for the caller
         let mut outputs = Vec::new();
         let mut written = Vec::new();
@@ -154,13 +166,6 @@ impl Factum<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_what_the_formats_contain_is_rendered() {
-        assert!(rendered("pdf", &["pdf"]) && !rendered("html", &["pdf"]));
-        assert!(!rendered("pdf", &["md", "html"]));
-        assert!(rendered("html", &["pdf", "bundle"]) && rendered("pdf", &["bundle"]));
-    }
 
     #[test]
     fn a_failed_rename_takes_back_what_was_moved() {
