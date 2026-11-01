@@ -270,6 +270,28 @@ enum Token {
     Directive(String),
 }
 
+/// Crafted text in an error message is cut before it is formatted, so the message stays small.
+const EXCERPT: usize = 60;
+
+fn cut(text: &str) -> String {
+    match text.char_indices().nth(EXCERPT) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// What the parser found instead of what it expected, with its text cut.
+fn found(token: Option<Token>) -> String {
+    let token = token.map(|token| match token {
+        Token::Iri(text) => Token::Iri(cut(&text)),
+        Token::Name(text) => Token::Name(cut(&text)),
+        Token::Str(text) => Token::Str(cut(&text)),
+        Token::Directive(text) => Token::Directive(cut(&text)),
+        other => other,
+    });
+    format!("{token:?}")
+}
+
 impl Token {
     fn text_len(&self) -> u64 {
         match self {
@@ -472,7 +494,7 @@ impl Parser {
     fn expect(&mut self, token: Token, what: &str) -> Result<(), String> {
         match self.next() {
             Some(found) if found == token => Ok(()),
-            found => Err(format!("expected {what}, found {found:?}")),
+            other => Err(format!("expected {what}, found {}", found(other))),
         }
     }
 
@@ -482,11 +504,11 @@ impl Parser {
         }
         let (prefix, local) = name
             .split_once(':')
-            .ok_or_else(|| format!("'{name}' is neither an IRI nor a prefixed name"))?;
+            .ok_or_else(|| format!("'{}' is neither an IRI nor a prefixed name", cut(name)))?;
         let namespace = self
             .prefixes
             .get(prefix)
-            .ok_or_else(|| format!("unknown prefix '{prefix}:'"))?;
+            .ok_or_else(|| format!("unknown prefix '{}:'", cut(prefix)))?;
         // it exists before its triple is charged, and one prefix can make any number of them
         if (namespace.len() + local.len()) as u64 > self.left {
             return Err(TOO_MUCH.into());
@@ -501,7 +523,7 @@ impl Parser {
             Some(Token::Name(name)) => self.resolve(&name),
             Some(Token::Open('[')) => Err("blank node ([ … ]) is not supported".into()),
             Some(Token::Open('(')) => Err("collections are not supported".into()),
-            found => Err(format!("expected {what}, found {found:?}")),
+            other => Err(format!("expected {what}, found {}", found(other))),
         }
     }
 
@@ -561,7 +583,7 @@ impl Parser {
                 self.prefix_declaration()?;
                 self.expect(Token::Dot, "'.' after @prefix")
             }
-            Some(Token::Directive(word)) => Err(format!("@{word} is not supported")),
+            Some(Token::Directive(word)) => Err(format!("@{} is not supported", cut(word))),
             Some(Token::Name(word)) if word.eq_ignore_ascii_case("prefix") => {
                 self.at += 1;
                 self.prefix_declaration()
@@ -676,6 +698,32 @@ mod tests {
         // a few bytes make a token each
         let mut budget = 1 << 20;
         assert_eq!(parse_within(&";".repeat(1 << 19), &mut budget).unwrap_err(), TOO_MUCH);
+    }
+
+    #[test]
+    fn an_error_holds_an_excerpt_of_crafted_text() {
+        let long = "\x7f".repeat(1 << 20);
+        let words = "w".repeat(1 << 20);
+        for text in [
+            // expect: a long token where the dot belongs
+            format!("@prefix p: <a> {words}"),
+            // iri: a long token where a subject belongs
+            format!("\"{long}\" <b> <c> ."),
+            // resolve: no colon, and an unknown prefix
+            format!("{words} <b> <c> ."),
+            format!("{words}:x <b> <c> ."),
+            // a directive
+            format!("@{words} ."),
+        ] {
+            let message = parse_within(&text, &mut (64 << 20)).unwrap_err();
+            assert!(message.chars().count() < 600, "{}", message.chars().count());
+        }
+        // a short token reads as before, and a cut falls on a character boundary
+        let message = parse_within("\"s\" <b> <c> .", &mut (1 << 20)).unwrap_err();
+        assert_eq!(message, "expected subject, found Some(Str(\"s\"))");
+        let wide = "é".repeat(100);
+        assert_eq!(cut(&wide), format!("{}…", "é".repeat(EXCERPT)));
+        assert_eq!(cut(&wide[..2 * EXCERPT]), "é".repeat(EXCERPT));
     }
 
     #[test]
