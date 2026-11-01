@@ -1134,7 +1134,9 @@ fn a_seal_changed_after_the_verification_is_not_signed() {
         f.exec(&format!("UPDATE tree_heads SET {change} WHERE id = {tree_head_id}"));
         let error = factum.sign_tree_head_checked(&report, tree_head_id).unwrap_err();
         assert!(
-            error.message.contains("the seal changed since the verification; verify again"),
+            error
+                .message
+                .contains("the seal changed since the verification; verify again"),
             "{change}: {error}"
         );
         assert_eq!(f.count("SELECT COUNT(*) FROM late_signatures"), 0, "{change}");

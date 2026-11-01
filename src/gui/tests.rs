@@ -3820,7 +3820,8 @@ fn a_recheck_is_cancelled_only_when_stopping_is_what_ended_it() {
         let (mut worker, _) = workers::recheck(&ctx, input, cancelled.clone());
         loop {
             match worker.poll_result() {
-                Some(result) => return result.err().expect("no re-check to do"),
+                Some(Err(e)) => return e,
+                Some(Ok(_)) => panic!("it ended as if nothing stopped it"),
                 None => std::thread::sleep(Duration::from_millis(10)),
             }
         }
