@@ -3443,6 +3443,36 @@ fn an_addition_refused_for_a_directory_fault_offers_close_as_damaged() {
 }
 
 #[test]
+fn a_close_the_open_refuses_after_the_recheck_offers_close_as_damaged() {
+    let (fixture, id, path) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let clean = harness.state().factum().recheck_container(id).unwrap();
+    flip_directory_crc(&path, "version.txt");
+    let ctx = harness.ctx.clone();
+    let cancel = Arc::<std::sync::atomic::AtomicBool>::default();
+    let input = harness.state().factum().recheck_input(id).unwrap();
+    let (worker, progress) = workers::recheck(&ctx, input, cancel.clone());
+    let job = CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress,
+        cancel,
+        then_archive: None,
+        refused: None,
+    };
+    harness.state_mut().finish_close(job, Ok(clean));
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert!(recheck.directory_faults[0].contains("version.txt"));
+    harness.run_ok();
+    click_label(&mut harness, "Close as Damaged");
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.damaged && !detail.summary.open);
+}
+
+#[test]
 fn a_refused_open_the_recheck_does_not_see_is_not_a_close() {
     let (fixture, id, _) = Fixture::with_container();
     let mut harness = fixture.harness();

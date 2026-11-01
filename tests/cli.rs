@@ -159,6 +159,18 @@ fn checkpoint_without_key_and_sign_unsigned_signs() {
 }
 
 #[test]
+fn sign_unsigned_that_stops_is_an_error() {
+    let f = Fixture::with_signer(FakeSigner::new(false));
+    let case_id = f.factum().create_case("C-1", "Case", "").unwrap();
+    f.factum().create_note("a note", None, case_id).unwrap();
+    f.signer.set_active(true);
+    f.signer.fail_text_after.set(Some(1));
+    let (code, out) = run(&f, &f.signer, &["--sign-unsigned", "C-1"]);
+    assert_eq!(code, 2);
+    assert!(!out.contains("item(s)"), "{out}");
+}
+
+#[test]
 fn cli_export() {
     let f = Fixture::new();
     let factum = f.factum();
