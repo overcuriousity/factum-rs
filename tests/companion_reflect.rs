@@ -197,9 +197,8 @@ fn diff_pass_cut_new_entries_are_covered_next_time() {
         e.f.factum().create_note(&text, None, e.case).unwrap();
     }
     let mut settings = e.client.settings().clone();
-    settings.context_window = Some(5000);
+    settings.context_window = Some(7000);
     let small = Client::with_retry_delay(settings, Duration::ZERO);
-    e.fake.push(200, &ok("[]")); // at this window enrichment needs two batches
     script(&e, json!({"questions": []}));
     let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).unwrap();
     let seen = e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id;

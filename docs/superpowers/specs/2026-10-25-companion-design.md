@@ -220,7 +220,8 @@ frame, what must be answered. Sent verbatim.
 
 Every model call is built from sections in a fixed order with a token budget per section. Token estimates: chars/3.0
 for prose, chars/2.4 for JSON and identifier-heavy text; when a response carries usage counts, the ratio is
-recalibrated from them for the session. Budget: `0.8 × context_window − output_reserve`, where `context_window` is
+recalibrated from them for the session (a lower ratio at once, a higher one by a fifth of the difference, the dense
+ratio never above 2.4). Budget: `0.8 × context_window − output_reserve`, where `context_window` is
 the setting; else, for the Anthropic protocol, the `max_input_tokens` field of the chosen model from the models
 listing; else 16k, so an unknown endpoint never overflows. `output_reserve` is 1 500 tokens for a reflection pass, 800 for enrichment, 1 000 for Ask. A call
 that still overflows after the cuts below falls back to shortening the fixed sections (last resort, after section 6);
