@@ -279,13 +279,13 @@ signature against the carried chain and says explicitly that the root was not ch
 chain is checked at the signing time the signature states. The script reads the ZIP itself and gives factum's finding
 codes and, on a container factum wrote, factum's verdict without the case log. What remains different: it has no log,
 so every `replacedBy` stays a warning; it has no trust list, so an X.509 root is only checked against `--ca`; and it
-reads only factum's fixed Turtle layout, so valid Turtle in another layout (a comment, a list of objects, single quotes)
-fails; what ends a name in Turtle (whitespace, `;,<>"'()[]#`) is refused in one, so it never reads a line otherwise than
+reads only factum's fixed Turtle layout, so valid Turtle in another layout (a comment, a list of objects, single quotes,
+a line over 1 MiB) fails; what ends a name in Turtle (whitespace, `;,<>"'()[]#`) is refused in one, so it never reads a line otherwise than
 factum does. It takes
 every file for factum's, so it is stricter on other files: what another tool's container may lack fails or warns where
 factum, which reads those, warns, and an older AFF4 file fails where factum warns. It is not meant to pass anything
 factum fails, but for what only the log can tell. Neither calls an unsigned file good: `not_signed` is a warning in any
-format.
+format, and the script, which exits 0 as nothing failed, ends with `Result: NOT SIGNED` and not `OK`.
 
 Whether a container is factum's is decided by its layout (`factum/history/`, `factum/README.txt`, `verify_container.py`
 or root signatures), never by `version.txt`, which is not signed. In a factum container a stored file whose content
@@ -301,11 +301,19 @@ the case tree must be that container, and a file at a place the log records must
 otherwise it is a `log_mismatch`, whatever uuid it names, or none. A file at no logged place, picked by hand, may be any
 container.
 
-A check holds up to `max(4 GiB, 64 × the compressed size of the metadata members)` of metadata, all states and graphs
-together, in either verifier: what stored bytes can inflate to gains an attacker almost nothing, and a real large
-container scales. It counts the bytes of members held and 300 bytes for each line parsed, alike in both verifiers. A
-check that runs out stops with one `too_large` finding, which says the limit and that it does not mean alteration: a
-failure on a factum layout, a warning on another tool's file. A signature or certificate chain is at most 4 MiB.
+A check holds up to `clamp(128 × compressed size, 4 GiB, 16 GiB)` of metadata, all states and graphs together, in
+either verifier. The size counted is that of exactly the members it reads: the root `information.turtle` and
+`information.turtle.hashes`, and those of each `factum/history/<n>/`. So stored bytes nothing reads buy nothing, the
+factor leaves room for near-identical files, which compress to about 11:1 with factum's writer, and the ceiling caps a
+crafted file whichever way it is built: such a file can take the verifier up to that ceiling, not beyond it.
+
+Each verifier counts the bytes of the members it holds and, for what it parses, 200 bytes a line plus the text the
+line holds. They measure the same thing but not the same way: factum also limits its tokens while it parses (96 bytes
+each, with their text), and copies a subject into each of its triples, while the script charges the decoded text during
+the parse and holds a subject once. So on one file they arrive at somewhat different totals, most on repeated subjects,
+and close to the limit one can stop where the other does not. A check that runs out stops with one `too_large` finding,
+which says the limit and that it does not mean alteration: a failure on a factum layout, a warning on another tool's file,
+and it is no `log_mismatch` either. A signature or certificate chain is at most 4 MiB.
 
 The script and `factum/README.txt` are not signed, so nothing in a container vouches for them: `verify_container.py`
 prints its own SHA-256 when it starts, to compare with `factum --version` or the release notes.

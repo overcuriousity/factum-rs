@@ -58,10 +58,12 @@ All notable changes to this project are documented here. The format follows
   the root `information.turtle.hashes` of a closed state is checked; a secondary store that cannot be read fails
 - Containers: crafted files can no longer stop verification: a stray `>` in Turtle hung the parser, a search through
   end records has a limit linear in the file, an ImageStream index that repeats a chunk is damage, a signature or
-  chain is at most 4 MiB, and metadata has a limit of 4 GiB or 64 times what the file stores of it, in factum and in
-  `verify_container.py`. A check that runs out stops with one `too_large` finding, which does not mean alteration
+  chain is at most 4 MiB, and metadata has a limit of 128 times what the file stores of the members read, from 4 GiB
+  to 16 GiB, in factum and in `verify_container.py`. A check that runs out stops with one `too_large` finding, which does
+  not mean alteration and is no `log_mismatch`
 - `verify_container.py` prints its own SHA-256 when it starts, and the container's README says to run a trusted copy or
-  to compare that hash with `factum --version` or the release notes; neither is signed
+  to compare that hash with `factum --version` or the release notes; neither is signed. It ends with `Result: NOT SIGNED`
+  rather than `OK` when the state it checked is not signed; the exit code stays 0
 - Containers: a source is opened without following a link or waiting on a FIFO, must still be the regular file of the
   same size that was listed (otherwise it is reported as changed, not added), and is read no further than one byte
   past that size
