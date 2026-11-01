@@ -1703,6 +1703,7 @@ mod tests {
         next_failure(&FAIL_READ)
     }
 
+    #[cfg(unix)]
     fn eio() -> io::Error {
         io::Error::from_raw_os_error(libc::EIO)
     }
