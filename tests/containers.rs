@@ -3058,7 +3058,9 @@ mod script {
             "{:?}",
             report.findings
         );
-        assert_eq!(script.unwrap().0, Level::Warn);
+        let (level, output) = script.unwrap();
+        assert_eq!(level, Level::Warn);
+        assert!(output.contains("Result: NOT SIGNED"), "{output}");
         // Turtle that is not factum's layout, though valid: a comment
         let text = format!("# a comment\n{}", turtle_text(&s.container_path()));
         write_turtle(&s.container_path(), &text);
@@ -3103,7 +3105,7 @@ mod script {
         std::fs::write(&script, VERIFY_CONTAINER_PY).unwrap();
         let code = format!(
             "import importlib.util as u, sys\ns = u.spec_from_file_location('v', sys.argv[1])\nv = u.module_from_spec(s)\n\
-             s.loader.exec_module(v)\nv.MAX_TOTAL_IN_MEMORY = {limit}\nv.MAX_METADATA_PER_STORED_BYTE = 0\n\
+             s.loader.exec_module(v)\nv.MIN_METADATA_BUDGET = {limit}\nv.METADATA_BUDGET_PER_STORED_BYTE = 0\n\
              sys.exit(v.main(sys.argv[2:]))\n"
         );
         let output = Command::new(which::which("python3").ok()?)
@@ -3137,6 +3139,91 @@ mod script {
             !output.contains("not signed") && !output.contains("never closed"),
             "{output}"
         );
+    }
+
+    /// Exit 0, as nothing failed, and the words for what that means.
+    #[test]
+    fn the_script_says_ok_only_of_what_is_signed() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let Some((code, output)) = run(&s.container_path(), &[], None) else {
+            return;
+        };
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("Result: NOT SIGNED"), "{output}");
+        assert!(!output.contains("Result: OK"), "{output}");
+        let home = gpg_or_skip!();
+        let dir = tempfile::tempdir().unwrap();
+        let path = signed_container(&dir, &home);
+        let (code, output) = run(&path, &[], Some(&home.path())).unwrap();
+        assert_eq!(code, 0, "{output}");
+        assert!(output.contains("Result: OK"), "{output}");
+    }
+
+    #[test]
+    fn the_script_refuses_a_line_factum_never_writes() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let path = s.container_path();
+        let long = format!("x{}", "y".repeat(2 << 20));
+        write_turtle(&path, &turtle_text(&path).replacen("a.txt", &long, 1));
+        let Some((code, output)) = run_script(VERIFY_CONTAINER_PY, &path, &[], None) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(
+            output.contains("[turtle_hash]") && output.contains("a line of"),
+            "{output}"
+        );
+        // factum reads it: another difference that only ever fails
+        let report = verify_file(
+            &path,
+            &FakeSigner::new(false),
+            &Gpgsm::unavailable(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        );
+        assert!(!report.unwrap().findings.iter().any(|f| f.code == "turtle_hash"));
+    }
+
+    #[test]
+    fn the_end_of_a_search_is_not_called_not_a_zip() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let path = s.container_path();
+        append(&path, &b"PK\x05\x06".repeat(1 << 16));
+        let report = verify_file(
+            &path,
+            &FakeSigner::new(false),
+            &Gpgsm::unavailable(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(report.overall(), Level::Fail);
+        assert!(
+            report.findings[0].message.contains("stopped at its limit"),
+            "{:?}",
+            report.findings
+        );
+        let through_log =
+            s.f.factum()
+                .verify_container_file(&path, &Gpgsm::unavailable(), &|_, _| {}, &AtomicBool::new(false))
+                .unwrap();
+        let log = through_log
+            .findings
+            .iter()
+            .find(|f| f.code == "log_mismatch")
+            .expect("a log finding");
+        assert!(log.message.contains("nothing could be read"), "{}", log.message);
+        let Some((code, output)) = run_script(VERIFY_CONTAINER_PY, &path, &[], None) else {
+            return;
+        };
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("stopped at its limit"), "{output}");
     }
 
     #[test]

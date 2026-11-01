@@ -41,16 +41,20 @@ MAX_CHUNKS_PER_SEGMENT = 1 << 20
 U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
 MAX_IN_MEMORY = 1 << 30  # of one member
-# of a container's metadata, all its states and their graphs together, at least: a few MiB of file can inflate to many
-# members; and at most this much for each byte of it the file stores: what a real large container takes, and little
-# more than nothing to one whose metadata is mostly air
-MAX_TOTAL_IN_MEMORY = 4 << 30
-MAX_METADATA_PER_STORED_BYTE = 64
+# of a container's metadata, all its states and their graphs together: this much for each byte the file stores of the
+# members it reads, as near-identical files compress to about 11.5:1 with factum's writer ...
+METADATA_BUDGET_PER_STORED_BYTE = 128
+# ... and never less than this, as what is small always fits ...
+MIN_METADATA_BUDGET = 4 << 30
+# ... nor more than this, which caps a crafted file whichever way it is built
+MAX_METADATA_BUDGET = 16 << 30
 # of a signature or a certificate chain: no reason to be more, and openssl makes many times that of it when it prints it
 MAX_SIGNATURE_MEMBER = 4 << 20
-# what a parsed line holds in memory (a triple, a subject, a prefix), as measured on 200,000 files; factum charges the
-# same, so that neither fails a file the other takes
-LINE_COST = 300
+# what a parsed line holds in memory, its text apart (a triple, a subject, a prefix), as measured on large containers;
+# factum charges the same
+LINE_COST = 200
+# factum writes no line near this, and the regular expressions below take many times a line's length to match it
+MAX_LINE = 1 << 20
 FAILS = []
 WARNINGS = []
 
@@ -79,7 +83,7 @@ def fail(code, message):
 
 
 class Memory(object):
-    left = limit = MAX_TOTAL_IN_MEMORY
+    left = limit = MIN_METADATA_BUDGET
 
 
 class TooLarge(Exception):
@@ -175,9 +179,13 @@ def parse_turtle(text):
             raise ValueError("unknown prefix " + prefix)
         return prefixes[prefix] + local
 
+    # bytes a character takes in this str, its header apart: what a line's text holds in the graph
+    width = max((sys.getsizeof(text) - sys.getsizeof("")) // max(len(text), 1), 1)
     for content in CONTENT_LINE.finditer(text):
         line = content.group().rstrip("\r")
-        take_memory(LINE_COST)
+        if len(line) > MAX_LINE:
+            raise ValueError("not factum's Turtle layout: a line of %d characters" % len(line))
+        take_memory(LINE_COST + len(line) * width)
         match = PREFIX.match(line)
         if match and subject is None:
             prefixes[match.group(1)] = iri_value(match.group(2))
@@ -207,7 +215,7 @@ def parse_metadata(data):
     here, as in factum: the hashes and signatures say what they are worth."""
     text = data.decode("utf-8", "replace")
     size = sys.getsizeof(text)
-    take_memory(size)  # only while it is parsed
+    take_memory(size)  # only while it is parsed; what the graph keeps of it is charged by the line
     graph = parse_turtle(text)
     Memory.left += size
     return graph
@@ -290,6 +298,8 @@ EOCD_SIG = b"PK\x05\x06"
 EOCD64_SIG = b"PK\x06\x06"
 LOCATOR_SIG = b"PK\x06\x07"
 HISTORY = b"factum/history/"
+# the members the check reads as a state's metadata: the root's, or those of a close
+READ_METADATA = re.compile(rb"(?:factum/history/[1-9][0-9]{0,9}/)?information\.turtle(?:\.hashes)?")
 EOCD_LEN = 22
 LOCATOR_LEN = 20
 EOCD64_LEN = 56
@@ -511,6 +521,14 @@ def search_back(handle, start, length, search, visit):
             break
         block_end = block_start + 3
     return None
+
+
+def search_gave_up(handle, length):
+    """Whether a search through this file that found no state stopped at its limit, not at the start of the file: then
+    that it found none says nothing about what the file is."""
+    search = Search(length)
+    search_back(handle, 0, length, search, lambda eocd, end: end if is_state_at(handle, eocd, end, search) else None)
+    return search.left < SEARCH_TRY
 
 
 def find_last_end(handle, length):
@@ -756,10 +774,10 @@ def read_signature(archive, name, code):
 
 
 def metadata_budget(archive, length):
-    """For a file of `length` bytes: a directory can claim any compressed size, the file holds no more than it holds."""
-    stored = sum(entry.compressed for entry in archive.entries
-                 if entry.name.rpartition(b"/")[2].startswith(TURTLE.encode()))
-    return max(MAX_TOTAL_IN_MEMORY, min(stored, length) * MAX_METADATA_PER_STORED_BYTE)
+    """For a file of `length` bytes: a directory can claim any compressed size, the file holds no more than it holds.
+    What counts is what the check reads, so stored bytes that nothing reads buy nothing."""
+    stored = sum(entry.compressed for entry in archive.entries if READ_METADATA.fullmatch(entry.name))
+    return max(MIN_METADATA_BUDGET, min(min(stored, length) * METADATA_BUDGET_PER_STORED_BYTE, MAX_METADATA_BUDGET))
 
 
 # --- content
@@ -1318,7 +1336,11 @@ def open_container(path):
     length = handle.seek(0, 2)
     end = find_last_end(handle, length)
     if end is None:
-        fail("not_aff4", "%s is not a ZIP (AFF4) container." % path)
+        if search_gave_up(handle, length):
+            fail("not_aff4", "No complete state was found in %s: the search through its end records stopped at its "
+                             "limit, so this does not say what the file is." % path)
+        else:
+            fail("not_aff4", "%s is not a ZIP (AFF4) container." % path)
         return None
     if end < length:
         try:
@@ -1354,9 +1376,10 @@ def main(argv=None):
         return check_container(argv)
     except (TooLarge, MemoryError):
         # what is left unread stays unjudged: no rule may read anything into it
-        fail("too_large", "The metadata of this container needs more memory than this check sets aside (%d GiB in all, "
-                          "%d GiB for one member), so the check stopped here and did not finish. That alone does not "
-                          "mean the container was altered." % (Memory.limit >> 30, MAX_IN_MEMORY >> 30))
+        gib = float(1 << 30)
+        fail("too_large", "The metadata of this container needs more memory than this check sets aside (%.1f GiB in "
+                          "all, %.1f GiB for one member), so the check stopped here and did not finish. That alone "
+                          "does not mean the container was altered." % (Memory.limit / gib, MAX_IN_MEMORY / gib))
         print("Result: FAIL — %d failure(s), %d warning(s)" % (len(FAILS), len(WARNINGS)))
         return 1
 
@@ -1421,6 +1444,7 @@ def check_container(argv):
         states.append(("current (open)", None, current, read(archive, HASHES, "turtle_hash"), True))
     gpg = Gpg(args.use_carried_key)
     workdir = tempfile.mkdtemp(prefix="fc-")
+    unsigned = False
     try:
         graphs = []  # (label, the close it is, graph) of the states whose metadata could be read
         for label, close, turtle, hashes, is_current in states:
@@ -1476,6 +1500,7 @@ def check_container(argv):
                              % (display(graph, arn), label))
             ok("%d file(s) checked against their hashes." % check_files(archive, newest))
             if newest_close is None:
+                unsigned = True
                 closed = [len(file_images(graph)) for _, close, graph in graphs if close is not None]
                 if closed:
                     warn("not_signed", "%d file(s) added after the last close are not signed yet."
@@ -1494,7 +1519,9 @@ def check_container(argv):
             print("GPG signers:")
         for fingerprint, user in sorted(gpg.signers.items()):
             print("  %s  %s" % (fingerprint, user))
-    print("Result: %s — %d failure(s), %d warning(s)" % ("FAIL" if FAILS else "OK", len(FAILS), len(WARNINGS)))
+    # exit 0, as nothing failed; but nothing here says it is what was signed, and OK would
+    result = "FAIL" if FAILS else "NOT SIGNED" if unsigned else "OK"
+    print("Result: %s — %d failure(s), %d warning(s)" % (result, len(FAILS), len(WARNINGS)))
     return 1 if FAILS else 0
 
 
