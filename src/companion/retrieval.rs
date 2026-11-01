@@ -111,18 +111,21 @@ fn age_days(created: &str, newest: &str) -> Option<f32> {
     Some((newest - created).num_milliseconds().max(0) as f32 / 86_400_000.0)
 }
 
-/// BM25 top candidates, normalised by the best score, with a small boost for importance and recency.
+/// BM25 top candidates besides the excluded entries, normalised by the best score, with a small boost for importance
+/// and recency.
 pub fn retrieve(
     db: &CompanionDb,
     importance: &HashMap<i64, u8>,
     created: &HashMap<i64, String>,
     q: &RetrievalQuery,
 ) -> Result<Vec<Hit>> {
-    let candidates = bm25(db, q.case_id, &fts_query(q.text), CANDIDATES)?;
+    // excluded entries must not use up the candidates
+    let candidates = bm25(db, q.case_id, &fts_query(q.text), CANDIDATES + q.exclude.len())?;
     let best = candidates.iter().map(|c| c.1).fold(0.0_f32, f32::max);
     let mut hits: Vec<Hit> = candidates
         .into_iter()
         .filter(|(id, _)| !q.exclude.contains(id))
+        .take(CANDIDATES)
         .map(|(entry_id, score)| {
             let normalised = if best > 0.0 { score / best } else { 0.0 };
             let importance = f32::from(importance.get(&entry_id).copied().unwrap_or(0)) / 10.0;
@@ -367,6 +370,29 @@ mod tests {
         assert_eq!(rest.len(), 1);
         assert_ne!(rest[0].entry_id, 1);
         assert_eq!(rest[0].entry_id, all[1].entry_id);
+    }
+
+    #[test]
+    fn excluded_entries_do_not_use_up_the_candidates() {
+        let (_dir, db) = temp_db();
+        // the new entries match best; the older related one has only the one word
+        for id in 1..=40 {
+            index(&db, id, "webshell webshell webshell");
+        }
+        index(
+            &db,
+            41,
+            "webshell mentioned once in a long note about something else entirely",
+        );
+        let exclude: HashSet<i64> = (1..=40).collect();
+        let hits = retrieve(
+            &db,
+            &HashMap::new(),
+            &HashMap::new(),
+            &query("webshell", &exclude, 5, "2026-10-01T10:00:00.000Z"),
+        )
+        .unwrap();
+        assert_eq!(hits.iter().map(|h| h.entry_id).collect::<Vec<_>>(), vec![41]);
     }
 
     #[test]
