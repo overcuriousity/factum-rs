@@ -330,7 +330,7 @@ struct FactumApp {
     focus_search: bool,
     focus_composer: bool,
     gpg_status: (String, bool),
-    /// ACTIVE_KEY_SETTING as last read: the command line can change it
+    /// ACTIVE_KEY_SETTING as of the last update_gpg_status: the command line can change it
     key_setting: String,
     // None until the companion is first configured (the file is created on first use), or when it cannot be opened
     companion_db: Option<CompanionDb>,
@@ -368,7 +368,6 @@ impl FactumApp {
             .unwrap_or(DEFAULT_COMPOSER_HEIGHT);
         theme::apply(ctx, &theme);
         let data_version = db.data_version().unwrap_or_default();
-        let key_setting = setting(ACTIVE_KEY_SETTING);
         // created on first use, by saving its settings: an unconfigured companion leaves no file behind
         let companion_path = companion_db_path(&db.path);
         let companion_db = companion_path
@@ -452,7 +451,7 @@ impl FactumApp {
             focus_search: false,
             focus_composer: false,
             gpg_status: (String::new(), false),
-            key_setting,
+            key_setting: String::new(),
             companion_db,
             companion_db_failed,
             companion_settings,
@@ -634,7 +633,10 @@ impl FactumApp {
         }
     }
 
+    /// After every change of the key, here or elsewhere: this window's own writes do not move data_version, so what it
+    /// last knew of the setting has to be kept here for `reload_active_key` to see the next change.
     fn update_gpg_status(&mut self) {
+        self.key_setting = self.db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default();
         self.gpg_status = if !self.signer.available() {
             ("GPG not installed".into(), true)
         } else if let Some(key) = self.signer.active_key() {
@@ -646,9 +648,7 @@ impl FactumApp {
 
     /// `factum --set-active gpg`: a key chosen elsewhere is the one notes are signed with from now on.
     fn reload_active_key(&mut self) {
-        let key = self.db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default();
-        if key != self.key_setting {
-            self.key_setting = key;
+        if self.db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default() != self.key_setting {
             self.signer.reload_active_key(&self.db);
             self.update_gpg_status();
         }

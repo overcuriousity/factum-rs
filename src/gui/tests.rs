@@ -3750,6 +3750,85 @@ fn a_key_changed_on_the_command_line_is_picked_up() {
     assert_eq!(harness.state().key_setting, "ABCD1234");
 }
 
+const KEY_A: &str = "AAAAAAAAAAAAAAAA";
+const KEY_B: &str = "BBBBBBBBBBBBBBBB";
+
+/// A window signing with key A, on a gpg (a script) that has keys A and B.
+#[cfg(unix)]
+fn harness_with_two_keys(fixture: &Fixture) -> Harness<'static, FactumApp> {
+    use std::os::unix::fs::PermissionsExt;
+    let gpg = fixture.path.with_file_name("gpg");
+    let line = |key: &str| format!("echo 'sec:u:255:22:{key}:1700000000:::u:::scESC:::+::ed25519:::0:'");
+    std::fs::write(&gpg, format!("#!/bin/sh\n{}\n{}\n", line(KEY_A), line(KEY_B))).unwrap();
+    std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fixture.db().set_setting(ACTIVE_KEY_SETTING, KEY_A).unwrap();
+    let mut harness = fixture.harness();
+    let app = harness.state_mut();
+    app.signer = GnupgSigner::with_binary(gpg, None);
+    app.signer.reload_active_key(&app.db);
+    assert_eq!(app.signer.active_key().as_deref(), Some(KEY_A));
+    harness
+}
+
+/// Another connection writes `key` (none: removes it), and the window polls.
+#[cfg(unix)]
+fn set_key_elsewhere(fixture: &Fixture, harness: &mut Harness<'_, FactumApp>, key: Option<&str>) {
+    match key {
+        Some(key) => fixture.db().set_setting(ACTIVE_KEY_SETTING, key).unwrap(),
+        None => fixture.db().delete_setting(ACTIVE_KEY_SETTING).unwrap(),
+    }
+    harness.state_mut().last_poll = Instant::now() - Duration::from_secs(1);
+    harness.run_ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_chosen_here_then_changed_back_elsewhere_is_picked_up() {
+    let fixture = Fixture::new();
+    let mut harness = harness_with_two_keys(&fixture);
+    let ctx = harness.ctx.clone();
+    let chosen = DialogResult::KeySelected(KEY_B.to_string());
+    harness.state_mut().handle_dialog_result(chosen, &ctx);
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_B));
+    set_key_elsewhere(&fixture, &mut harness, Some(KEY_A));
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_A));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_set_by_the_wizard_then_removed_elsewhere_is_picked_up() {
+    let fixture = Fixture::new();
+    fixture.db().delete_setting(ACTIVE_KEY_SETTING).unwrap();
+    let mut harness = harness_with_two_keys(&fixture);
+    set_key_elsewhere(&fixture, &mut harness, None);
+    assert_eq!(harness.state().signer.active_key(), None);
+    let ctx = harness.ctx.clone();
+    let choices = WizardChoices {
+        key: Some(KEY_B.to_string()),
+        companion: None,
+        companion_off: false,
+        seal_folder: None,
+        theme: None,
+        x509: None,
+    };
+    harness.state_mut().finish_wizard(&ctx, choices);
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_B));
+    set_key_elsewhere(&fixture, &mut harness, None);
+    assert_eq!(harness.state().signer.active_key(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_cleared_here_then_set_again_elsewhere_is_picked_up() {
+    let fixture = Fixture::new();
+    let mut harness = harness_with_two_keys(&fixture);
+    click_label(&mut harness, "Settings");
+    click_label(&mut harness, "Clear Signing Key");
+    assert_eq!(harness.state().signer.active_key(), None);
+    set_key_elsewhere(&fixture, &mut harness, Some(KEY_A));
+    assert_eq!(harness.state().signer.active_key().as_deref(), Some(KEY_A));
+}
+
 #[test]
 fn a_close_being_rechecked_blocks_locate_and_close_without_file() {
     let (fixture, id, _) = Fixture::with_container();
