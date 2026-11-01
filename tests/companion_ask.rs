@@ -8,7 +8,8 @@ use common::Fixture;
 use common::fake_llm::{FakeLlm, openai_chat};
 use factum::companion::ask::ask;
 use factum::companion::enrich::index_unindexed;
-use factum::companion::llm::Client;
+use factum::companion::llm::{Client, Learned};
+use factum::companion::tokens::Calibration;
 use factum::companion::{CompanionDb, Protocol, Settings};
 use serde_json::Value;
 
@@ -101,6 +102,88 @@ fn ask_builds_numbered_excerpts_and_maps_references() {
     assert_eq!(answer.references, vec![(2, e.notes[2])]);
     assert!(!answer.abstained);
     assert!(answer.unsupported.is_empty());
+}
+
+#[test]
+fn big_pinned_notes_leave_room_for_the_hits() {
+    let e = env();
+    for n in 1..=8 {
+        let text = format!("Pinned finding {n}: {}", "registry run key persistence ".repeat(70));
+        let id = e.f.factum().create_note(&text, None, e.case).unwrap();
+        e.f.factum().pin_note(id).unwrap();
+    }
+    let hit = format!("Timeline filters: {}", "timeline filter settings ".repeat(45));
+    e.f.factum().create_note(&hit, None, e.case).unwrap();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(4000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    e.fake.push(200, &openai_chat("plaso [1]", "stop", 100));
+    ask(&e.f.db, &e.cdb, &small, e.case, "Which tool built the timeline?").unwrap();
+    let prompt = sent_prompt(&e);
+    assert!(prompt.contains("Timeline built with plaso"), "{prompt}");
+    assert!(prompt.contains(&hit), "{prompt}");
+    assert!(
+        prompt.contains("Pinned finding 1"),
+        "pinned notes keep their part of the room"
+    );
+}
+
+#[test]
+fn pinned_notes_are_shortened_and_no_excerpt_stops_the_others() {
+    let e = env();
+    let long = format!("Pinned finding: {}", "registry run key persistence ".repeat(70));
+    let pinned = e.f.factum().create_note(&long, None, e.case).unwrap();
+    e.f.factum().pin_note(pinned).unwrap();
+    // ranks first and does not fit; the short hit after it does
+    let big = format!("carved fragment {}", "carved fragment ".repeat(120));
+    e.f.factum().create_note(&big, None, e.case).unwrap();
+    let short = e.f.factum().create_note("carved fragment", None, e.case).unwrap();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(2200);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    e.fake.push(200, &openai_chat("Seen once [1].", "stop", 100));
+    let answer = ask(&e.f.db, &e.cdb, &small, e.case, "carved fragment").unwrap();
+    assert!(!answer.abstained);
+    let prompt = sent_prompt(&e);
+    assert!(prompt.contains(&format!("#{short} · ")), "{prompt}");
+    assert!(!prompt.contains(&big));
+    assert!(prompt.contains("Pinned finding: registry"), "{prompt}");
+    assert!(!prompt.contains(&"registry run key persistence ".repeat(20)));
+    assert!(prompt.contains('…'));
+}
+
+#[test]
+fn a_pinned_note_that_is_a_hit_stays_whole() {
+    let e = env();
+    let text = format!("Pinned finding: plaso {}", "registry run key persistence ".repeat(40));
+    let id = e.f.factum().create_note(&text, None, e.case).unwrap();
+    e.f.factum().pin_note(id).unwrap();
+    // it fits the room, not the part of it for pinned notes
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(2600);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    e.fake.push(200, &openai_chat("plaso [1]", "stop", 100));
+    ask(&e.f.db, &e.cdb, &small, e.case, "plaso").unwrap();
+    assert!(sent_prompt(&e).contains(&text));
+}
+
+#[test]
+fn ask_budgets_with_what_the_companion_learned() {
+    let e = env();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = None;
+    // the default window and ratio would hold the note, the learned ones do not
+    let client = Client::with_retry_delay(settings, Duration::ZERO);
+    client.learn(Learned {
+        context_window: Some(2000),
+        calibration: Calibration { chars_per_token: 1.5 },
+    });
+    let text = format!("plaso {}", "registry run key persistence ".repeat(30));
+    e.f.factum().create_note(&text, None, e.case).unwrap();
+    assert_eq!(client.window(), 2000);
+    e.fake.push(200, &openai_chat("plaso [1]", "stop", 100));
+    ask(&e.f.db, &e.cdb, &client, e.case, "plaso").unwrap();
+    assert!(!sent_prompt(&e).contains(&text));
 }
 
 #[test]

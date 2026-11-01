@@ -2302,6 +2302,7 @@ impl FactumApp {
                     self.db.path.clone(),
                     cdb.path.clone(),
                     self.companion_settings.clone(),
+                    self.companion.as_ref().map(|c| c.status().learned).unwrap_or_default(),
                     case_id,
                     question,
                 );

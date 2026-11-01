@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::enrich::{enrich, index_unindexed};
-use super::llm::{Client, Epochs, LlmError, Stop, probe};
+use super::llm::{Client, Epochs, Learned, LlmError, Stop, probe};
 use super::reflect::{PassError, choose_kind, run_pass};
 use super::schedule::Scheduler;
 use super::store::{CompanionDb, Protocol, Settings};
@@ -70,6 +70,8 @@ pub struct Status {
     pub model: String,
     /// when the last successful pass of a case finished
     pub last_pass_utc: HashMap<i64, String>,
+    /// for Ask, which has a client of its own
+    pub learned: Learned,
 }
 
 impl Status {
@@ -241,6 +243,7 @@ fn run(
             });
         }
         companion.guarded(Companion::tick);
+        companion.publish_learned();
     }
 }
 
@@ -292,6 +295,12 @@ impl Companion {
     /// switch-off the check missed still sets it.
     fn stop(&self, case_id: i64) -> Stop {
         self.epochs.stop(case_id, self.global_epoch)
+    }
+
+    fn publish_learned(&self) {
+        if let Some(client) = &self.client {
+            lock(&self.status).learned = client.learned();
+        }
     }
 
     fn end_indexing(&self) {

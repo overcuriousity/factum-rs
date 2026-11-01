@@ -406,8 +406,10 @@ increments. No further input is asked for.
 
 ### 4.9 Ask
 
-Input: one question. Retrieval as 4.6 with k = 8 and no exclusion, plus every pinned note; packed greedily by rank
-into the budget as numbered excerpts `[n] #id · timestamp · text`. One call, prose output. The instruction: answer
+Input: one question. Retrieval as 4.6 with k = 8 and no exclusion, plus every pinned note not retrieved. Those pinned
+notes come first and leave half of the budget to the hits, as far as the hits need it; one that does not fit is cut to
+300 characters, then left out. The hits follow by rank, whole; one that does not fit is left out. They are numbered
+excerpts `[n] #id · timestamp · text`. One call, prose output. The instruction: answer
 only from the excerpts, cite as `[n]`, quote paths and values exactly, answer partially if only part is covered, and
 start with exactly "Not in the case log." when no excerpt mentions any part of the subject. After the answer, a
 check without a model call flags paths, hashes, numbers and commands in the answer that occur in no excerpt and

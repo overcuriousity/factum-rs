@@ -191,6 +191,9 @@ All notable changes to this project are documented here. The format follows
 - Companion: token estimates follow the server's counts more carefully, so an identifier-heavy prompt no longer overflows
   the window after a prose-heavy one
 - Companion: a huge or malformed model reply can no longer hang the repair of its JSON
+- Ask: large pinned notes no longer crowd out the retrieved entries or end in "Not in the case log." without asking the
+  model: they are shortened when they do not fit, half of the room is kept for the retrieved entries, and an excerpt
+  that does not fit no longer stops the ones after it. Ask uses the model's window and token ratio the companion found
 
 ## [2.7.1] - 2026-10-29
 

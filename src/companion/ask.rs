@@ -10,7 +10,7 @@ use super::prompts::{ABSTAIN_PREFIX, ask_system, entry_line};
 use super::reflect::{PassError, load_case};
 use super::retrieval::{RetrievalQuery, retrieve};
 use super::store::CompanionDb;
-use super::tokens::{TextKind, budget, estimate_tokens};
+use super::tokens::{TextKind, budget, truncate};
 use crate::db::Db;
 use crate::notes::Entry;
 
@@ -19,6 +19,8 @@ const TIMEOUT: Duration = Duration::from_secs(60);
 /// Entries retrieved for the question, besides the pinned ones.
 const K: usize = 8;
 const SEPARATOR: &str = "\n\n---\n\n";
+/// A pinned note that does not fit at full length is cut to this many characters.
+const PINNED_SHORT: usize = 300;
 
 /// A model answer with the entries it cites and the literals the excerpts do not support.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,32 +64,58 @@ pub fn ask(
         .iter()
         .map(|item| (item.id, item.description.as_str()))
         .collect();
-    // pinned notes first, then the hits by rank
-    let mut seen = HashSet::new();
-    let ranked: Vec<&Entry> = data
+    let line = |entry: &Entry| {
+        let label = entry.evidence_id.and_then(|id| labels.get(&id).copied());
+        (entry.id, entry_line(entry, label))
+    };
+    let retrieved: Vec<(i64, String)> = hits
+        .iter()
+        .filter_map(|hit| by_id.get(&hit.entry_id).map(|entry| line(entry)))
+        .collect();
+    // the pinned notes not retrieved anyway
+    let pinned: Vec<(i64, String)> = data
         .entries
         .iter()
-        .filter(|e| e.is_pinned)
-        .chain(hits.iter().filter_map(|hit| by_id.get(&hit.entry_id).copied()))
-        .filter(|e| seen.insert(e.id))
+        .filter(|e| e.is_pinned && !retrieved.iter().any(|(id, _)| *id == e.id))
+        .map(line)
         .collect();
 
     let system = ask_system();
-    let room = budget(client.window(), OUTPUT_RESERVE);
+    let calibration = client.calibration();
     // the system prompt and the question are sent as well
-    let mut used = estimate_tokens(&system, TextKind::Prose) + estimate_tokens(&prompt(question, &[]), TextKind::Prose);
-    let mut excerpts: Vec<String> = Vec::new();
-    let mut ids: Vec<i64> = Vec::new();
-    for entry in ranked {
-        let label = entry.evidence_id.and_then(|id| labels.get(&id).copied());
-        let line = format!("[{}] {}", excerpts.len() + 1, entry_line(entry, label));
-        used += estimate_tokens(&line, TextKind::Dense) + estimate_tokens(SEPARATOR, TextKind::Prose);
-        if used > room {
-            break;
+    let sent =
+        calibration.estimate(&system, TextKind::Prose) + calibration.estimate(&prompt(question, &[]), TextKind::Prose);
+    let room = budget(client.window(), OUTPUT_RESERVE).saturating_sub(sent);
+    let frame = calibration.estimate(&format!("{SEPARATOR}[99] "), TextKind::Prose);
+    let cost = |line: &str| calibration.estimate(line, TextKind::Dense) + frame;
+    // half of the room is kept for the hits, as far as they need it
+    let wanted: usize = retrieved.iter().map(|(_, line)| cost(line)).sum();
+    let pinned_room = room - wanted.min(room / 2);
+    let mut used = 0;
+    let mut kept: Vec<(i64, String)> = Vec::new();
+    for (id, line) in pinned {
+        let line = if used + cost(&line) <= pinned_room {
+            line
+        } else {
+            truncate(&line, PINNED_SHORT)
+        };
+        if used + cost(&line) <= pinned_room {
+            used += cost(&line);
+            kept.push((id, line));
         }
-        excerpts.push(line);
-        ids.push(entry.id);
     }
+    for (id, line) in retrieved {
+        if used + cost(&line) <= room {
+            used += cost(&line);
+            kept.push((id, line));
+        }
+    }
+    let ids: Vec<i64> = kept.iter().map(|(id, _)| *id).collect();
+    let excerpts: Vec<String> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, (_, line))| format!("[{}] {line}", i + 1))
+        .collect();
 
     if excerpts.is_empty() {
         return Ok(Answer {

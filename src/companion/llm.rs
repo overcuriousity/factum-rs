@@ -333,6 +333,13 @@ impl Stop {
     }
 }
 
+/// What a client has found out about the model, for another client of the same endpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Learned {
+    pub context_window: Option<u32>,
+    pub calibration: Calibration,
+}
+
 /// Used from one thread at a time.
 pub struct Client {
     settings: Settings,
@@ -372,6 +379,19 @@ impl Client {
 
     pub fn calibration(&self) -> Calibration {
         self.calibration.get()
+    }
+
+    pub fn learned(&self) -> Learned {
+        Learned {
+            context_window: self.context_window.get(),
+            calibration: self.calibration.get(),
+        }
+    }
+
+    /// Starts from what another client found out.
+    pub fn learn(&self, learned: Learned) {
+        self.context_window.set(learned.context_window);
+        self.calibration.set(learned.calibration);
     }
 
     /// From now on no request goes out once `stop` is set.

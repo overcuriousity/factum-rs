@@ -8,7 +8,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 use crate::companion::ask::Answer;
-use crate::companion::llm::Client;
+use crate::companion::llm::{Client, Learned};
 use crate::companion::{CompanionDb, Settings};
 use crate::container::volume::{AddOptions, AddProgress, Staged, Volume};
 use crate::db::Db;
@@ -136,6 +136,7 @@ pub fn ask(
     db_path: PathBuf,
     companion_path: PathBuf,
     settings: Settings,
+    learned: Learned,
     case_id: i64,
     question: String,
 ) -> Worker<AskResult> {
@@ -143,6 +144,7 @@ pub fn ask(
         let db = crate::companion::open_case_db(&db_path).map_err(|e| e.to_string())?;
         let cdb = CompanionDb::open(&companion_path).map_err(|e| e.to_string())?;
         let client = Client::new(settings);
+        client.learn(learned);
         crate::companion::ask::ask(&db, &cdb, &client, case_id, &question).map_err(|e| e.to_string())
     })
 }

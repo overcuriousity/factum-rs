@@ -4,7 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::fake_llm::{FakeLlm, FakeRequest, openai_chat, openai_models};
+use common::fake_llm::{FakeLlm, FakeRequest, anthropic_models, openai_chat, openai_models};
 use common::{Fixture, add_case_row};
 use factum::companion::thread::{Command, CompanionHandle, State, Status};
 use factum::companion::{CompanionDb, Protocol, Settings, companion_db_path};
@@ -244,6 +244,21 @@ fn opting_out_stops_the_backlog_between_its_calls() {
     handle.send(Command::CaseToggled(case));
     std::thread::sleep(Duration::from_millis(2000));
     assert_eq!(chats(&fake).len(), 5);
+    handle.shutdown();
+}
+
+#[test]
+fn what_the_client_learned_is_published_for_ask() {
+    let f = Fixture::new();
+    let fake = FakeLlm::start();
+    let mut anthropic = settings(&fake.url);
+    anthropic.protocol = Protocol::Anthropic;
+    anthropic.context_window = None;
+    anthropic.save(&CompanionDb::open_for(&f.db.path).unwrap()).unwrap();
+    fake.push(200, &anthropic_models(&[("m", 200_000)]));
+    let handle = start(&f);
+    let status = wait_for(&handle, Duration::from_secs(5), |s| s.learned.context_window.is_some());
+    assert_eq!(status.learned.context_window, Some(200_000));
     handle.shutdown();
 }
 
