@@ -326,14 +326,7 @@ fn verification_runs_in_the_background_and_opens_a_report() {
     select_case(&mut harness);
     let case_id = harness.state().case_id.unwrap();
     harness.state_mut().verify_case(case_id);
-    for _ in 0..200 {
-        harness.step();
-        if !harness.state().verify_windows.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    harness.run_ok();
+    run_until(&mut harness, |h| !h.state().verify_windows.is_empty());
     assert_eq!(harness.state().verify_windows.len(), 1);
     assert!(harness.query_by_label_contains("Failures ").is_some());
     screenshot(&mut harness, "verify");
@@ -425,13 +418,21 @@ fn type_into(harness: &mut Harness<'_, FactumApp>, label: &str, text: &str) {
     harness.run_ok();
 }
 
-/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit).
+/// Steps the GUI for up to 3 s until `done` holds (the listing waits 600 ms after the last edit); panics, naming the
+/// call, when it never does.
+#[track_caller]
 fn run_until(harness: &mut Harness<'_, FactumApp>, done: impl Fn(&Harness<'_, FactumApp>) -> bool) {
-    for _ in 0..30 {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
         harness.run_ok();
         if done(harness) {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "run_until at {}: the condition did not hold within 3 s",
+            std::panic::Location::caller()
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -1220,6 +1221,124 @@ fn escape_closes_a_dialog_until_text_is_typed_into_it() {
     assert!(harness.state().dialogs.is_empty());
 }
 
+/// One click on the backdrop, far from the dialog.
+fn click_backdrop(harness: &mut Harness<'_, FactumApp>) {
+    let at = egui::pos2(4.0, 4.0);
+    harness.event(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.run_ok();
+}
+
+#[test]
+fn a_backdrop_click_closes_a_dialog_until_text_is_typed_into_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let goal = |goal: &str| Dialog::CaseGoal {
+        case_id: 1,
+        goal: goal.into(),
+    };
+    harness.state_mut().dialogs.push(goal(""));
+    harness.run_ok();
+    click_backdrop(&mut harness);
+    assert!(harness.state().dialogs.is_empty());
+    harness.state_mut().dialogs.push(goal(""));
+    harness.run_ok();
+    type_into(&mut harness, "Case goal", "find the dropper");
+    click_backdrop(&mut harness);
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::CaseGoal { .. })));
+}
+
+#[test]
+fn escape_leaves_the_typing_field_focused() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::CaseGoal {
+        case_id: 1,
+        goal: String::new(),
+    });
+    harness.run_ok();
+    type_into(&mut harness, "Case goal", "find");
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(harness.get_by_label("Case goal").is_focused());
+    harness.get_by_label("Case goal").type_text(" it");
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::CaseGoal { goal, .. }) => assert_eq!(goal, "find it"),
+        _ => panic!("the dialog closed"),
+    }
+}
+
+#[test]
+fn the_wizard_survives_escape_and_a_backdrop_click_once_text_is_typed() {
+    let fixture = Fixture::empty();
+    let mut harness = fixture.harness();
+    wizard_to(&mut harness, "Next", Step::Gpg);
+    wizard_to(&mut harness, "Skip", Step::Companion);
+    click_label(&mut harness, "Use the AI companion");
+    type_into(&mut harness, "Endpoint URL", "http://127.0.0.1:9/v1");
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    click_backdrop(&mut harness);
+    assert!(wizard_open(&harness));
+    assert_eq!(fixture.db().get_setting(ONBOARDING_SETTING).unwrap(), "");
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().dialogs.is_empty());
+    assert_eq!(fixture.db().get_setting(ONBOARDING_SETTING).unwrap(), "1");
+}
+
+/// Opens the correction of `note` through the card's action, as the button does.
+fn open_correction(harness: &mut Harness<'_, FactumApp>, note: i64) {
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Correct(note), &ctx);
+    harness.run_ok();
+}
+
+#[test]
+fn undo_in_a_correction_does_not_bring_back_another_notes_text() {
+    let fixture = Fixture::new();
+    let a = add_note(&fixture, "alpha note", &[]);
+    let b = add_note(&fixture, "bravo note", &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    open_correction(&mut harness, a);
+    let field = format!("Correct Note #{a}");
+    type_into(&mut harness, &field, " with more words");
+    harness.run_ok();
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().dialogs.is_empty());
+    open_correction(&mut harness, b);
+    harness.get_by_label(&format!("Correct Note #{b}")).focus();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    harness.run_ok();
+    match harness.state().dialogs.last() {
+        Some(Dialog::Correct { text, .. }) => assert_eq!(text, "bravo note"),
+        _ => panic!("no correction dialog"),
+    }
+}
+
+#[test]
+fn a_long_note_keeps_the_correction_buttons_in_the_window() {
+    let fixture = Fixture::new();
+    let long = (0..300).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+    let note = add_note(&fixture, &long, &[]);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    open_correction(&mut harness, note);
+    harness.run_ok();
+    let window = harness.ctx.content_rect();
+    let button = harness.get_by_label("Add corrected version").rect();
+    assert!(window.contains_rect(button), "{button:?} is not in {window:?}");
+}
+
 #[test]
 fn each_correction_dialog_has_its_own_text_field() {
     let id = |dialog: Dialog| match dialog {
@@ -1230,6 +1349,32 @@ fn each_correction_dialog_has_its_own_text_field() {
     let b = id(Dialog::correct(2, "b".into(), Vec::new()));
     let a_again = id(Dialog::correct(1, "a".into(), Vec::new()));
     assert!(a != b && a != a_again && b != a_again);
+}
+
+#[test]
+fn the_verify_windows_ok_entries_list_lays_out_only_the_rows_in_view() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    harness.state_mut().verify_case(case_id);
+    run_until(&mut harness, |h| !h.state().verify_windows.is_empty());
+    // the fixture's notes are unsigned, which warns: take the findings away, and make the report long
+    let mut report = harness.state().verify_windows[0].report.clone();
+    report.findings.clear();
+    for result in &mut report.entries {
+        result.findings.clear();
+    }
+    let entries = report.entries.clone();
+    report.entries = entries.iter().cycle().take(500).cloned().collect();
+    harness.state_mut().verify_windows = vec![dialogs::VerifyWindow::new(1, report)];
+    harness.run_ok();
+    let rows = |h: &Harness<'_, FactumApp>| h.query_all_by_label_contains(" leaf ").count();
+    assert_eq!(rows(&harness), 0, "closed");
+    harness.get_by_label_contains("Entries OK").click();
+    harness.run_ok();
+    let shown = rows(&harness);
+    assert!((1..100).contains(&shown), "{shown} of 500 rows laid out");
 }
 
 #[test]
@@ -3402,7 +3547,7 @@ fn a_seal_is_signed_from_the_report_window_after_the_worker() {
     harness.query_all_by_label_contains("Seal #").next().unwrap().hover();
     harness.run_ok();
     harness.query_all_by_label("Sign seal").next().unwrap().click();
-    harness.step();
+    // the frame of the click starts the worker; the next one is the earliest that can take its result
     harness.step();
     assert!(
         harness.state().verify_job.is_some() && harness.state().dialogs.is_empty(),
