@@ -4213,6 +4213,9 @@ fn a_file_without_the_logged_state_says_what_to_do() {
         "{error}"
     );
     assert!(!error.to_string().contains("Close as Damaged"), "{error}");
+    // a re-check needs no open file, so the container can still be closed as damaged
+    let recheck = factum.recheck_container(id).unwrap();
+    factum.close_container_damaged(id, &recheck).unwrap();
 }
 
 #[test]
