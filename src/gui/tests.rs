@@ -1191,6 +1191,83 @@ fn a_notes_actions_show_under_the_pointer() {
 }
 
 #[test]
+fn escape_closes_a_dialog_until_text_is_typed_into_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::CaseGoal {
+        case_id: 1,
+        goal: String::new(),
+    });
+    harness.run_ok();
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+    harness.state_mut().dialogs.push(Dialog::CaseGoal {
+        case_id: 1,
+        goal: String::new(),
+    });
+    harness.run_ok();
+    if let Some(Dialog::CaseGoal { goal, .. }) = harness.state_mut().dialogs.last_mut() {
+        goal.push_str("find the dropper");
+    }
+    harness.run_ok();
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::CaseGoal { .. })));
+    // Cancel still closes it
+    harness.get_by_label("Cancel").click();
+    harness.run_ok();
+    assert!(harness.state().dialogs.is_empty());
+}
+
+#[test]
+fn each_correction_dialog_has_its_own_text_field() {
+    let id = |dialog: Dialog| match dialog {
+        Dialog::Correct { editor, .. } => editor,
+        _ => unreachable!(),
+    };
+    let a = id(Dialog::correct(1, "a".into(), Vec::new()));
+    let b = id(Dialog::correct(2, "b".into(), Vec::new()));
+    let a_again = id(Dialog::correct(1, "a".into(), Vec::new()));
+    assert!(a != b && a != a_again && b != a_again);
+}
+
+#[test]
+fn a_seal_folder_that_does_not_exist_is_refused() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    harness.state_mut().dialogs.push(Dialog::SealFolder {
+        folder: "relative/seals".into(),
+        default: "/nowhere/default".into(),
+        error: None,
+    });
+    harness.run_ok();
+    harness.get_by_label("Use this folder").click();
+    harness.run_ok();
+    assert!(matches!(
+        harness.state().dialogs.last(),
+        Some(Dialog::SealFolder { error: Some(_), .. })
+    ));
+}
+
+#[test]
+fn a_label_of_only_hashes_cannot_be_added() {
+    let fixture = Fixture::new();
+    let (_, versions) = first_note_versions(&fixture);
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let ctx = harness.ctx.clone();
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::AddLabel(versions[1]), &ctx);
+    harness.run_ok();
+    type_into(&mut harness, "Label", "##");
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::AddLabel { .. })));
+}
+
+#[test]
 fn a_label_is_completed_from_the_tags_in_use() {
     let fixture = Fixture::new();
     let (case_id, versions) = first_note_versions(&fixture);

@@ -206,10 +206,10 @@ impl Wizard {
             Step::SealFolder if self.seal_env.is_none() => {
                 // the default folder is created with the first seal; another one has to exist
                 let folder = self.chosen_seal_folder();
-                if folder.is_empty() || std::path::Path::new(&folder).is_dir() {
+                if folder.is_empty() {
                     Ok(())
                 } else {
-                    Err("The folder does not exist.".into())
+                    super::dialogs::check_seal_folder(&folder)
                 }
             }
             _ => Ok(()),

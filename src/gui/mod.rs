@@ -1962,11 +1962,7 @@ impl FactumApp {
             }
         }
         self.next_window_id += 1;
-        self.verify_windows.push(VerifyWindow {
-            id: self.next_window_id,
-            report,
-            open: true,
-        });
+        self.verify_windows.push(VerifyWindow::new(self.next_window_id, report));
     }
 
     fn archive(&mut self, case_id: i64) {
@@ -2243,13 +2239,8 @@ impl FactumApp {
             CardAction::Correct(entry_id) => {
                 let factum = self.factum();
                 if let Ok(Some(newest)) = factum.latest_version_id(entry_id).and_then(|id| factum.get_entry(id)) {
-                    self.dialogs.push(Dialog::Correct {
-                        entry_id: newest.id,
-                        original: newest.text.clone(),
-                        images: newest.images(),
-                        text: newest.text,
-                        error: None,
-                    });
+                    let images = newest.images();
+                    self.dialogs.push(Dialog::correct(newest.id, newest.text, images));
                 }
             }
             CardAction::CopySignature(entry_id) => match self.factum().get_entry(entry_id) {
@@ -2667,7 +2658,12 @@ impl FactumApp {
             return;
         }
         let folder = self.factum().seal_dir().display().to_string();
-        self.dialogs.push(Dialog::SealFolder { folder });
+        let default = self.factum().default_seal_dir().display().to_string();
+        self.dialogs.push(Dialog::SealFolder {
+            folder,
+            default,
+            error: None,
+        });
     }
 
     fn set_theme(&mut self, ctx: &egui::Context, theme: &str) {
@@ -4251,7 +4247,7 @@ impl eframe::App for FactumApp {
         }
         self.dialog_starts.truncate(self.dialogs.len());
         if let Some(dialog) = self.dialogs.last_mut()
-            && let Some(result) = dialog.show(&ctx)
+            && let Some(result) = dialog.show(&ctx, self.dialog_starts.last().map_or("", String::as_str))
         {
             let closed = self.dialogs.pop();
             self.dialog_starts.truncate(self.dialogs.len());

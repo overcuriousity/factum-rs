@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- GUI: once text is typed into a dialog (Correct, case goal, new case or evidence, companion settings, setup), Escape
+  and a click outside no longer close it; Cancel does. The Correct dialog's text field scrolls, so the buttons stay in
+  view, and has its own undo history per dialog. The Seal Folder dialog and the setup refuse a folder that is not an
+  existing absolute path. A container's file name may not hold a path and gets `.aff4l`. Add Label is off for a label
+  that is only `#`. A key missing or not trusted shows as failed (✗), like the verifier rates it, and the signature
+  line says "key not trusted". The verify window lays out only the OK entries in view.
 - `verify.py` prints its own SHA-256 when it starts; `factum --version` prints the SHA-256 of the embedded `verify.py`
   and `verify_container.py` (`-V` stays one line), the release notes list both, and the bundle README says to run a
   trusted copy or compare the hash

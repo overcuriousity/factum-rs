@@ -95,7 +95,7 @@ pub fn get_tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<(Strin
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-fn clean_label(label: &str) -> &str {
+pub fn clean_label(label: &str) -> &str {
     crate::pystr::strip(label).trim_start_matches('#')
 }
 
