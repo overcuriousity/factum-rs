@@ -1262,7 +1262,7 @@ fn check_file(
         progress(0, total);
         for record in &stored {
             if cancel.load(Ordering::Relaxed) {
-                return Err(FactumError::general("Verification cancelled."));
+                return Err(FactumError::cancelled("Verification cancelled."));
             }
             let name = if record.path.is_empty() {
                 record.arn.clone()
@@ -1275,7 +1275,7 @@ fn check_file(
             let report_progress = |read: u64| progress((done + read).min(total), total);
             match hash_content(&mut file, &archive, graph, &record.arn, &report_progress, cancel) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    return Err(FactumError::general("Verification cancelled."));
+                    return Err(FactumError::cancelled("Verification cancelled."));
                 }
                 Err(e) => report.finding(
                     Level::Fail,

@@ -1136,8 +1136,8 @@ impl FactumApp {
                         open: true,
                     });
                 }
-                Err(message) if message.contains("cancelled") => self.message("Factum", "Verification cancelled."),
-                Err(message) => self.message("Factum", format!("Verification failed: {message}")),
+                Err(e) if e.cancelled => self.message("Factum", "Verification cancelled."),
+                Err(e) => self.message("Factum", format!("Verification failed: {}", e.message)),
             }
         }
         if let Some(job) = self.add_job.as_mut() {

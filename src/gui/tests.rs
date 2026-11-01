@@ -2457,6 +2457,23 @@ fn verify_container_can_be_cancelled() {
     assert!(harness.query_by_label("Verification cancelled.").is_some());
 }
 
+#[test]
+fn a_failed_verification_of_a_file_called_cancelled_is_no_cancel() {
+    let (fixture, _, path) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let named = path.with_file_name("cancelled.aff4l");
+    harness
+        .state_mut()
+        .start_container_verification(named, None, Default::default());
+    run_until(&mut harness, |h| h.state().container_verify_job.is_none());
+    harness.run_ok();
+    let text = message_text(&harness);
+    assert!(
+        text.starts_with("Verification failed: ") && text.contains("cancelled.aff4l"),
+        "{text}"
+    );
+}
+
 /// The Verify action of a container says which it is: what the file then says of itself decides nothing.
 #[test]
 fn verify_of_a_container_expects_that_container() {
@@ -3792,18 +3809,46 @@ fn refused_job(harness: &Harness<'_, FactumApp>, id: i64) -> CloseJob {
 }
 
 #[test]
+fn a_recheck_is_cancelled_only_when_stopping_is_what_ended_it() {
+    let (fixture, id, path) = Fixture::with_container();
+    let harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    let mut input = harness.state().factum().recheck_input(id).unwrap();
+    assert!(!input.records.is_empty());
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let finish = |input: crate::containers::RecheckInput| {
+        let (mut worker, _) = workers::recheck(&ctx, input, cancelled.clone());
+        loop {
+            match worker.poll_result() {
+                Some(result) => return result.err().expect("no re-check to do"),
+                None => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    };
+    assert!(finish(input.clone()).cancelled);
+    // asked to stop as well, but what ended it is that the file cannot be read
+    input.path = path.with_file_name("gone.aff4l");
+    let failed = finish(input);
+    assert!(
+        !failed.cancelled && failed.message.contains("cannot be read"),
+        "{}",
+        failed.message
+    );
+}
+
+#[test]
 fn a_recheck_after_a_refused_addition_that_ends_shows_the_refusal() {
     let (fixture, id, _) = Fixture::with_container();
     let mut harness = fixture.harness();
     let job = refused_job(&harness, id);
-    let cancelled = Err(workers::RecheckError {
+    let cancelled = Err(workers::CheckError {
         message: "Re-check cancelled — the container was not closed.".into(),
         cancelled: true,
     });
     harness.state_mut().finish_close(job, cancelled);
     assert_eq!(message_text(&harness), "The container was not opened.");
     let job = refused_job(&harness, id);
-    let failed = Err(workers::RecheckError {
+    let failed = Err(workers::CheckError {
         message: "the file cannot be read".into(),
         cancelled: false,
     });
@@ -4196,7 +4241,7 @@ fn a_close_being_rechecked_blocks_locate_and_close_without_file() {
         while !wait.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        Err(workers::RecheckError {
+        Err(workers::CheckError {
             message: "Re-check cancelled — the container was not closed.".into(),
             cancelled: true,
         })

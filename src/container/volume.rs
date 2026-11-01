@@ -553,7 +553,7 @@ pub fn recheck(
         .store(records.iter().map(|r| r.size).sum(), Ordering::Relaxed);
     progress.files.store(0, Ordering::Relaxed);
     progress.bytes.store(0, Ordering::Relaxed);
-    let cancelled = || FactumError::general("Re-check cancelled — the container was not closed.");
+    let cancelled = || FactumError::cancelled("Re-check cancelled — the container was not closed.");
     for record in records {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());

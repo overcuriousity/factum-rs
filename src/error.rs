@@ -17,6 +17,8 @@ pub enum ErrorKind {
     /// a container member differs from the CRC-32 of the directory, so the container is not opened; Verify tells
     /// whether its content is intact
     ContainerCrc,
+    /// the user asked a running check to stop
+    Cancelled,
     /// a database or file system error that is not a user error
     Internal,
 }
@@ -94,4 +96,5 @@ constructors! {
     confirmation => Confirmation,
     log_broken => LogBroken,
     container_crc => ContainerCrc,
+    cancelled => Cancelled,
 }

@@ -12,6 +12,7 @@ use crate::companion::llm::{Client, Learned};
 use crate::companion::{CompanionDb, Settings};
 use crate::container::volume::{AddOptions, AddProgress, Staged, Volume};
 use crate::db::Db;
+use crate::error::{ErrorKind, FactumError};
 use crate::services::Factum;
 use crate::signer::GnupgSigner;
 use crate::verifier::{CaseReport, SignatureCheck};
@@ -193,22 +194,31 @@ pub fn add_to_container(
     (worker, progress)
 }
 
-/// Why a re-check gave no result; `cancelled` when it was asked to stop.
-pub struct RecheckError {
+/// Why a re-check or a container verification gave no result; `cancelled` when it stopped because it was asked to.
+pub struct CheckError {
     pub message: String,
     pub cancelled: bool,
 }
 
-impl From<String> for RecheckError {
+impl From<String> for CheckError {
     fn from(message: String) -> Self {
-        RecheckError {
+        CheckError {
             message,
             cancelled: false,
         }
     }
 }
 
-pub type RecheckResult = Result<crate::container::volume::Recheck, RecheckError>;
+impl From<FactumError> for CheckError {
+    fn from(error: FactumError) -> Self {
+        CheckError {
+            cancelled: error.is(ErrorKind::Cancelled),
+            message: error.message,
+        }
+    }
+}
+
+pub type RecheckResult = Result<crate::container::volume::Recheck, CheckError>;
 
 /// Re-reads what a close checks, on a thread of its own (spec 5.2).
 pub fn recheck(
@@ -219,17 +229,13 @@ pub fn recheck(
     let progress = Arc::new(AddProgress::default());
     let shared = progress.clone();
     let worker = Worker::spawn(ctx, move || {
-        crate::container::volume::recheck(&input.path, input.end, &input.records, &shared, &cancel).map_err(|e| {
-            RecheckError {
-                message: e.to_string(),
-                cancelled: cancel.load(Ordering::Relaxed),
-            }
-        })
+        crate::container::volume::recheck(&input.path, input.end, &input.records, &shared, &cancel)
+            .map_err(CheckError::from)
     });
     (worker, progress)
 }
 
-pub type ContainerVerifyResult = Result<crate::container::verify::ContainerReport, String>;
+pub type ContainerVerifyResult = Result<crate::container::verify::ContainerReport, CheckError>;
 
 /// Verifies a container file on a thread of its own; progress in bytes.
 pub fn verify_container(
@@ -247,7 +253,7 @@ pub fn verify_container(
     let shared = progress.clone();
     let repaint = ctx.clone();
     let worker = Worker::spawn(ctx, move || {
-        let db = Db::open(&db_path).map_err(|e| e.to_string())?;
+        let db = Db::open(&db_path)?;
         let signer = GnupgSigner::without_key(gpg_home.clone());
         let factum = Factum::new(&db, &signer);
         let gpgsm = crate::container::x509::Gpgsm::new(gpg_home);
@@ -258,7 +264,7 @@ pub fn verify_container(
         };
         factum
             .verify_expected_container(&path, expected, &gpgsm, &report_progress, &cancel)
-            .map_err(|e| e.to_string())
+            .map_err(CheckError::from)
     });
     (worker, progress)
 }
