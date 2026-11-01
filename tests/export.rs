@@ -464,7 +464,8 @@ fn run_verify(bundle: &Path, gnupg_home: Option<&Path>, flags: &[&str]) -> Optio
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    Some((output.status.code().unwrap_or(-1), text))
+    // Python's text output on Windows
+    Some((output.status.code().unwrap_or(-1), text.replace("\r\n", "\n")))
 }
 
 #[test]
