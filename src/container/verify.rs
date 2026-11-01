@@ -1829,6 +1829,8 @@ mod crafted {
             "factum/history/0/information.turtle",
             "factum/history/1/x/information.turtle",
             "factum/history/1/information.turtle.asc",
+            "factum/history/4294967296/information.turtle",
+            "factum/history/5000000000/information.turtle",
         ] {
             let padded = archive(vec![entry(TURTLE, 3 << 20), entry(pad, 1 << 30)]);
             assert_eq!(
@@ -1889,6 +1891,7 @@ mod crafted {
         let path = foreign(&dir, &graph, &mut |_| {}, V21);
         BUDGET.with(|budget| budget.set(Some(10)));
         let report = check(&path);
+        assert_eq!(codes(&report, Level::Warn), vec!["too_large"], "{:?}", report.findings);
         assert!(!report.stopped_on_budget(), "{:?}", report.findings);
     }
 
