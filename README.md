@@ -114,6 +114,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
   bundle it checks: run a copy you trust, or compare the SHA-256 it prints when it starts with `factum --version` or
   the release notes
 - Exporting seals the case first; a case that fails verification is still exported, with the failures on top
+- All files of an export appear together when the last one is complete; a failed export leaves none
+- The PDF embeds its own fonts, which have no CJK, Arabic, emoji and the like: such characters are drawn as `�`, copy
+  and search still give the real text, and the export warns that the HTML report shows them
 
 ### IOC extraction
 - IPv4 addresses, domains, URLs, emails, MD5/SHA-1/SHA-256/SHA-512 hashes, grouped by type in the side panel

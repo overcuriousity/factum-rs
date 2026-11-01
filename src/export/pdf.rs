@@ -35,6 +35,8 @@ const CONTENT_WIDTH: f32 = PAGE_WIDTH - 2.0 * MARGIN_X;
 const MAX_INDENT: f32 = CONTENT_WIDTH * 0.6;
 /// Space around the text of a block with a background.
 const CODE_PADDING: f32 = 5.0;
+/// What is drawn for a character no embedded font has. The monospace font has it.
+const PLACEHOLDER: char = '\u{FFFD}';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FontId {
@@ -97,17 +99,25 @@ struct Font {
     face: Face<'static>,
     data: &'static [u8],
     name: &'static str,
-    /// glyph id -> the character it was used for (for the ToUnicode map)
+    /// CID -> the character it was used for (for the ToUnicode map); a CID within the font is its glyph id
     used: BTreeMap<u16, char>,
+    /// the glyph of `PLACEHOLDER`
+    placeholder: u16,
+    /// characters no embedded font has -> their CID: each has one of its own behind the font's glyphs, so ToUnicode
+    /// gives the real character although they all draw the placeholder
+    missing: BTreeMap<char, u16>,
 }
 
 impl Font {
     fn new(data: &'static [u8], name: &'static str) -> Self {
+        let face = Face::parse(data, 0).expect("embedded fonts are valid");
         Self {
-            face: Face::parse(data, 0).expect("embedded fonts are valid"),
+            placeholder: face.glyph_index(PLACEHOLDER).map_or(0, |glyph| glyph.0),
+            face,
             data,
             name,
             used: BTreeMap::new(),
+            missing: BTreeMap::new(),
         }
     }
 
@@ -115,8 +125,22 @@ impl Font {
         1000.0 / self.face.units_per_em() as f32
     }
 
-    fn advance(&self, glyph: u16) -> f32 {
-        self.face.glyph_hor_advance(GlyphId(glyph)).unwrap_or(0) as f32 * self.scale()
+    fn glyph_of(&self, cid: u16) -> u16 {
+        if cid < self.face.number_of_glyphs() {
+            cid
+        } else {
+            self.placeholder
+        }
+    }
+
+    fn advance(&self, cid: u16) -> f32 {
+        self.face.glyph_hor_advance(GlyphId(self.glyph_of(cid))).unwrap_or(0) as f32 * self.scale()
+    }
+
+    /// The content of a CIDToGIDMap stream up to the highest CID used.
+    fn cid_to_gid(&self) -> Vec<u8> {
+        let last = self.used.keys().next_back().copied().unwrap_or(0);
+        (0..=last).flat_map(|cid| self.glyph_of(cid).to_be_bytes()).collect()
     }
 }
 
@@ -322,15 +346,31 @@ impl Writer {
     }
 
     /// The glyph for c in the style's font, falling back to the monospace font for symbols like ✓ ✗ ⚠.
-    fn glyph(&self, font: FontId, c: char) -> (FontId, u16) {
+    fn font_glyph(&self, font: FontId, c: char) -> Option<(FontId, u16)> {
         let c = if c == '\t' { ' ' } else { c };
         if let Some(glyph) = self.fonts[font as usize].face.glyph_index(c) {
-            return (font, glyph.0);
+            return Some((font, glyph.0));
         }
-        if let Some(glyph) = self.fonts[FontId::Mono as usize].face.glyph_index(c) {
-            return (FontId::Mono, glyph.0);
-        }
-        (font, 0)
+        let glyph = self.fonts[FontId::Mono as usize].face.glyph_index(c)?;
+        Some((FontId::Mono, glyph.0))
+    }
+
+    /// `font_glyph`; a character no embedded font has takes the room of the placeholder.
+    fn glyph(&self, font: FontId, c: char) -> (FontId, u16) {
+        let mono = &self.fonts[FontId::Mono as usize];
+        self.font_glyph(font, c).unwrap_or((FontId::Mono, mono.placeholder))
+    }
+
+    /// The CID that draws c, which no embedded font has. The CIDs can run out, on a note made to do that: what comes
+    /// after them is the placeholder for copy and search too.
+    fn missing_cid(&mut self, c: char) -> u16 {
+        let mono = &mut self.fonts[FontId::Mono as usize];
+        let next = usize::from(mono.face.number_of_glyphs()) + mono.missing.len();
+        let placeholder = mono.placeholder;
+        *mono
+            .missing
+            .entry(c)
+            .or_insert(u16::try_from(next).unwrap_or(placeholder))
     }
 
     fn char_width(&self, style: &Style, c: char) -> f32 {
@@ -393,11 +433,15 @@ impl Writer {
     fn runs(&mut self, style: &Style, text: &str) -> Vec<Run> {
         let mut runs: Vec<Run> = Vec::new();
         for c in text.chars() {
-            let (font, glyph) = self.glyph(style.font, c);
-            self.fonts[font as usize]
-                .used
-                .entry(glyph)
-                .or_insert(if c == '\t' { ' ' } else { c });
+            let (font, glyph, text) = match self.font_glyph(style.font, c) {
+                Some((font, glyph)) => (font, glyph, if c == '\t' { ' ' } else { c }),
+                None => {
+                    let cid = self.missing_cid(c);
+                    let placeholder = cid == self.fonts[FontId::Mono as usize].placeholder;
+                    (FontId::Mono, cid, if placeholder { PLACEHOLDER } else { c })
+                }
+            };
+            self.fonts[font as usize].used.entry(glyph).or_insert(text);
             match runs.last_mut() {
                 Some(run) if run.font == font => run.glyphs.push(glyph),
                 _ => runs.push(Run {
@@ -834,7 +878,7 @@ impl Writer {
         }
     }
 
-    /// A bordered table; each row keeps together on one page.
+    /// A bordered table. A row keeps together on one page; one that cannot continues on the next page, line by line.
     fn grid(&mut self, header: &[&str], rows: &[Vec<String>], fractions: &[f32]) {
         let size = 9.0;
         let padding = 4.0;
@@ -856,25 +900,45 @@ impl Writer {
                 (style, wrapped, line_count as f32 * style.line_height() + 2.0 * padding)
             })
             .collect();
+        // the first row shares its page with the header row, which never stays behind alone
+        let header_height = laid_out[0].2;
+        let page_height = PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM;
+        let splits = |index: usize| match index {
+            0 => false,
+            1 => header_height + laid_out[1].2 > page_height,
+            _ => laid_out[index].2 > page_height,
+        };
+        let first_line = cell_style.line_height() + 2.0 * padding;
         for (index, (style, wrapped, height)) in laid_out.iter().enumerate() {
-            let (style, height) = (*style, *height);
-            // the header row never stays behind alone at the bottom of a page
-            let keep = if index == 0 {
-                laid_out.get(1).map_or(0.0, |row| row.2)
-            } else {
-                0.0
+            let line_height = style.line_height();
+            let keep = match laid_out.get(1) {
+                Some(_) if index == 0 && splits(1) => first_line,
+                Some(row) if index == 0 => row.2,
+                _ => 0.0,
             };
-            self.ensure(height + keep);
-            let mut x = MARGIN_X;
-            for (lines, width) in wrapped.iter().zip(&widths) {
-                self.stroke_rect(BORDER, x, self.y - height, *width, height);
-                for (number, line) in lines.iter().enumerate() {
-                    let baseline = self.y - padding - number as f32 * style.line_height() - size * 1.05;
-                    self.draw_text(&style, line, x + padding, baseline);
+            let split = splits(index);
+            self.ensure(if split { first_line } else { *height + keep });
+            let lines = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+            let mut start = 0;
+            while start < lines {
+                if start > 0 {
+                    self.new_page();
                 }
-                x += width;
+                let room = ((self.y - MARGIN_BOTTOM - 2.0 * padding) / line_height) as usize;
+                let count = if split { room.clamp(1, lines - start) } else { lines };
+                let box_height = count as f32 * line_height + 2.0 * padding;
+                let mut x = MARGIN_X;
+                for (cell, width) in wrapped.iter().zip(&widths) {
+                    self.stroke_rect(BORDER, x, self.y - box_height, *width, box_height);
+                    for (number, line) in cell.iter().skip(start).take(count).enumerate() {
+                        let baseline = self.y - padding - number as f32 * line_height - size * 1.05;
+                        self.draw_text(style, line, x + padding, baseline);
+                    }
+                    x += width;
+                }
+                self.y -= box_height;
+                start += count;
             }
-            self.y -= height;
         }
     }
 
@@ -1100,6 +1164,7 @@ fn serialize(fonts: &[Font], images: &[PdfImage], pages: &[String], title: &str)
             objects.reserve(),
             objects.reserve(),
         );
+        let cid_to_gid = (!font.missing.is_empty()).then(|| objects.reserve());
         let _ = write!(font_refs, "/F{index} {type0} 0 R ");
         let face = &font.face;
         let scale = font.scale();
@@ -1123,8 +1188,9 @@ fn serialize(fonts: &[Font], images: &[PdfImage], pages: &[String], title: &str)
             cid,
             format!(
                 "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{} /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
-                 /FontDescriptor {descriptor} 0 R /CIDToGIDMap /Identity /DW 1000 /W [{widths}] >>",
-                font.name
+                 /FontDescriptor {descriptor} 0 R /CIDToGIDMap {} /DW 1000 /W [{widths}] >>",
+                font.name,
+                cid_to_gid.map_or("/Identity".to_string(), |map| format!("{map} 0 R"))
             )
             .as_bytes(),
         );
@@ -1148,6 +1214,9 @@ fn serialize(fonts: &[Font], images: &[PdfImage], pages: &[String], title: &str)
         );
         objects.stream(file, &format!("/Length1 {}", font.data.len()), font.data);
         objects.stream(unicode, "", to_unicode(&font.used).as_bytes());
+        if let Some(map) = cid_to_gid {
+            objects.stream(map, "", &font.cid_to_gid());
+        }
     }
 
     let mut xobjects = String::new();
@@ -1230,6 +1299,40 @@ fn serialize(fonts: &[Font], images: &[PdfImage], pages: &[String], title: &str)
 
 /// The PDF report of a case.
 pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
+    render_pdf_checked(model).0
+}
+
+/// The warning to give when a report has characters no embedded font has; `characters` as `render_pdf_checked` gives
+/// them. Only letters are shown as they are: the rest may not print, or do something to a terminal.
+pub fn unsupported_warning(characters: &[char]) -> Option<String> {
+    const SHOWN: usize = 10;
+    let listed: Vec<String> = characters
+        .iter()
+        .take(SHOWN)
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_string()
+            } else {
+                format!("U+{:04X}", u32::from(*c))
+            }
+        })
+        .collect();
+    let more = match characters.len().saturating_sub(SHOWN) {
+        0 => String::new(),
+        more => format!(" and {more} more"),
+    };
+    (!characters.is_empty()).then(|| {
+        format!(
+            "The PDF cannot show {} character(s) of this case ({}{more}): it draws {PLACEHOLDER} instead, copy and \
+             search still give the real text, and the HTML report shows them.",
+            characters.len(),
+            listed.join(", ")
+        )
+    })
+}
+
+/// [`render_pdf`], with the characters no embedded font has, which it drew as placeholders.
+pub fn render_pdf_checked(model: &ReportModel) -> (Vec<u8>, Vec<char>) {
     let (case, report) = (&model.case, &model.report);
     let overall = report.overall();
     let mut pdf = Writer::new();
@@ -1373,7 +1476,8 @@ pub fn render_pdf(model: &ReportModel) -> Vec<u8> {
 
     let title = format!("Case report {}", case.case_file);
     pdf.footer(&title);
-    pdf.finish(&title)
+    let unsupported = pdf.fonts[FontId::Mono as usize].missing.keys().copied().collect();
+    (pdf.finish(&title), unsupported)
 }
 
 #[cfg(test)]
@@ -1396,6 +1500,153 @@ mod tests {
         let writer = Writer::new();
         assert_eq!(writer.glyph(FontId::Sans, '✓').0, FontId::Mono);
         assert_eq!(writer.glyph(FontId::Sans, 'ü').0, FontId::Sans);
+    }
+
+    #[test]
+    fn characters_no_font_has_keep_their_text_and_draw_a_placeholder() {
+        let mut writer = Writer::new();
+        let style = Style::new(FontId::Sans, 11.0, TEXT);
+        writer.paragraph(style, "a案件案🦊", 0.0);
+        let mono = &writer.fonts[FontId::Mono as usize];
+        let first = mono.face.number_of_glyphs();
+        assert_eq!(mono.missing.keys().copied().collect::<String>(), "件案🦊");
+        // one CID per character, none of them glyph 0, each named in ToUnicode
+        assert_eq!(mono.used.len(), 3);
+        assert!(mono.used.keys().all(|cid| *cid >= first));
+        assert!(!writer.fonts.iter().any(|font| font.used.contains_key(&0)));
+        let cmap = to_unicode(&mono.used);
+        assert!(cmap.contains(&format!("<{first:04X}> <6848>")), "{cmap}");
+        assert!(cmap.contains(&format!("<{:04X}> <D83EDD8A>", first + 2)), "{cmap}");
+        // the map sends the new CIDs to the placeholder and leaves the font's own alone
+        let map = mono.cid_to_gid();
+        assert_eq!(map.len(), (usize::from(first) + 3) * 2);
+        let gid = |cid: usize| u16::from_be_bytes([map[cid * 2], map[cid * 2 + 1]]);
+        assert_eq!((gid(5), gid(usize::from(first) + 2)), (5, mono.placeholder));
+        assert_ne!(mono.placeholder, 0);
+        assert_eq!(mono.advance(first), mono.advance(mono.placeholder));
+    }
+
+    #[test]
+    fn a_real_replacement_character_is_no_missing_one() {
+        let mut writer = Writer::new();
+        writer.paragraph(Style::new(FontId::Sans, 11.0, TEXT), "\u{FFFD}", 0.0);
+        assert!(writer.fonts[FontId::Mono as usize].missing.is_empty());
+    }
+
+    #[test]
+    fn when_the_cids_run_out_the_text_is_the_placeholder() {
+        let mut writer = Writer::new();
+        let style = Style::new(FontId::Sans, 11.0, TEXT);
+        let mono = FontId::Mono as usize;
+        let room = 0x1_0000 - usize::from(writer.fonts[mono].face.number_of_glyphs());
+        let filler = (0x20000..).filter_map(char::from_u32).take(room);
+        writer.fonts[mono].missing = filler.enumerate().map(|(n, c)| (c, n as u16)).collect();
+        writer.paragraph(style, "案", 0.0);
+        let font = &writer.fonts[mono];
+        assert_eq!(font.used[&font.placeholder], PLACEHOLDER);
+    }
+
+    #[test]
+    fn the_warning_names_characters_safely_and_stops_after_a_few() {
+        assert_eq!(unsupported_warning(&[]), None);
+        let warning = unsupported_warning(&['案', '\u{1b}', '🦊']).unwrap();
+        assert!(
+            warning.contains("3 character(s) of this case (案, U+001B, U+1F98A)"),
+            "{warning}"
+        );
+        assert!(!warning.contains('\u{1b}') && warning.contains("HTML report"));
+        let many: Vec<char> = "abcdefghijklm".chars().collect();
+        assert!(unsupported_warning(&many).unwrap().contains("i, j and 3 more"));
+    }
+
+    fn cells(lines: usize) -> Vec<String> {
+        let text: Vec<String> = (0..lines).map(|n| format!("line{n}")).collect();
+        vec![text.join("\n"), "short".to_string()]
+    }
+
+    fn grid_text(writer: &Writer) -> Vec<Vec<String>> {
+        // what each page draws, in the glyphs of the cell style
+        let style = Style::new(FontId::Sans, 9.0, TEXT);
+        let mut probe = Writer::new();
+        let names: HashMap<String, String> = (0..200)
+            .map(|n| format!("line{n}"))
+            .chain(["short".to_string(), "H".to_string()])
+            .map(|text| {
+                let glyphs = probe.runs(&style, &text).remove(0).glyphs;
+                (glyphs.iter().map(|glyph| format!("{glyph:04X}")).collect(), text)
+            })
+            .collect();
+        writer
+            .pages
+            .iter()
+            .map(|page| {
+                page.lines()
+                    .filter_map(|line| line.split('<').nth(1)?.split('>').next())
+                    .filter_map(|hex| names.get(hex).cloned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Nothing of a page goes below the bottom margin.
+    fn assert_inside(writer: &Writer) {
+        for page in &writer.pages {
+            for line in page.lines() {
+                let numbers: Vec<f32> = line.split(' ').filter_map(|n| n.parse().ok()).collect();
+                if line.ends_with(" re S") {
+                    let (y, height) = (numbers[numbers.len() - 3], numbers[numbers.len() - 1]);
+                    assert!(y >= MARGIN_BOTTOM - 0.01 && height > 0.0, "{line}");
+                } else if line.starts_with("BT ") {
+                    assert!(numbers[numbers.len() - 1] >= MARGIN_BOTTOM, "{line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_taller_than_a_page_continues_line_by_line() {
+        let mut writer = Writer::new();
+        writer.grid(&["H", "H"], &[cells(5), cells(150), cells(3)], &[0.5, 0.5]);
+        assert_eq!(writer.pages.len(), 3);
+        assert_inside(&writer);
+        let text = grid_text(&writer).concat();
+        for n in 0..150 {
+            // the lines of the other two rows have the same names
+            let rows = 1 + usize::from(n < 5) + usize::from(n < 3);
+            assert_eq!(
+                text.iter().filter(|line| **line == format!("line{n}")).count(),
+                rows,
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_that_fits_on_a_page_keeps_together() {
+        let mut writer = writer_near_the_bottom(120.0);
+        writer.grid(&["H", "H"], &[cells(2), cells(20)], &[0.5, 0.5]);
+        assert_eq!(writer.pages.len(), 2);
+        let text = grid_text(&writer);
+        assert!(text[0].contains(&"line1".to_string()) && !text[0].contains(&"line2".to_string()));
+        assert!(text[1].contains(&"line0".to_string()) && text[1].contains(&"line19".to_string()));
+        assert_inside(&writer);
+    }
+
+    #[test]
+    fn the_header_is_never_left_alone() {
+        // the first row is taller than a page: at least its first line goes with the header
+        let mut writer = writer_near_the_bottom(30.0);
+        writer.grid(&["H", "H"], &[cells(150)], &[0.5, 0.5]);
+        assert!(writer.pages[0].is_empty(), "{}", writer.pages[0]);
+        let mut writer = writer_near_the_bottom(60.0);
+        writer.grid(&["H", "H"], &[cells(150)], &[0.5, 0.5]);
+        assert!(grid_text(&writer)[0].contains(&"line0".to_string()));
+        // the first row fills a page, so it does not fit under the header on any page
+        let page_lines = ((PAGE_HEIGHT - MARGIN_TOP - MARGIN_BOTTOM - 8.0) / 12.6) as usize;
+        let mut writer = Writer::new();
+        writer.grid(&["H", "H"], &[cells(page_lines)], &[0.5, 0.5]);
+        assert!(grid_text(&writer)[0].contains(&"line0".to_string()));
+        assert_inside(&writer);
     }
 
     fn rgba_image(width: u32, height: u32, alpha: u8) -> NoteImage {

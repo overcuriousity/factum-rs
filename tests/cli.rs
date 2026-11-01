@@ -242,6 +242,24 @@ fn run_binary(home: &std::path::Path, cwd: &std::path::Path, argv: &[&str]) -> s
 
 #[cfg(target_os = "linux")]
 #[test]
+fn export_warns_of_characters_the_pdf_cannot_show() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out");
+    assert_eq!(
+        run_binary(dir.path(), dir.path(), &["--new-case", "C-1", "Case"])
+            .status
+            .code(),
+        Some(0)
+    );
+    assert_eq!(run_binary(dir.path(), dir.path(), &["案件"]).status.code(), Some(0));
+    let argv = ["--export", "--format", "pdf", "--out", out.to_str().unwrap()];
+    let stderr = String::from_utf8(run_binary(dir.path(), dir.path(), &argv).stderr).unwrap();
+    assert!(stderr.contains("The PDF cannot show 2 character(s)"), "{stderr}");
+    assert!(stderr.contains("the HTML report shows them"), "{stderr}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_dotenv_in_the_current_directory_is_not_read() {
     let home = tempfile::tempdir().unwrap();
     let work = home.path().join("work");

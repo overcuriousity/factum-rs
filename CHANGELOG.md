@@ -165,6 +165,15 @@ All notable changes to this project are documented here. The format follows
   number no longer exhausts memory (one finding per gap) and a container cannot be closed past the highest number
 - `verify.py` fails on ZIP member names read differently by other tools: repeated names (Python reads the last copy,
   unzip the first), absolute names, `..`, a backslash, names differing only in case
+- A table row taller than a page in the PDF report (a long evidence description, a long container path) continues on
+  the next page instead of running off the bottom and being lost, and a table header no longer stays alone
+- Characters neither PDF font has are drawn as a visible `�`, and copy and search give the real character (glyph 0
+  was mapped to the first such character in the whole report); the export warns about them and says the HTML report
+  shows them
+- An export that fails leaves no files behind: all are written to a temporary folder in the target folder and renamed
+  at the end, so reports no longer stay behind when the bundle fails
+- Export file names are shortened: 80 CJK characters in a case file number failed with "file name too long"
+- Export builds only the requested formats, so PDF or Markdown alone no longer build the HTML with its embedded images
 
 ## [2.7.1] - 2026-10-29
 

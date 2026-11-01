@@ -1622,11 +1622,15 @@ impl FactumApp {
                 folder,
             } => {
                 let formats: Vec<&str> = formats.iter().map(String::as_str).collect();
-                let result = self.factum().export(case_id, &formats, &PathBuf::from(&folder));
-                if let Some(paths) = self.run(result) {
+                let result = self.factum().export_checked(case_id, &formats, &PathBuf::from(&folder));
+                if let Some(exported) = self.run(result) {
                     let _ = self.db.set_setting(EXPORT_DIR_SETTING, &folder);
-                    let written: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                    self.message("Export finished", format!("Written:\n{}", written.join("\n")));
+                    let written: Vec<String> = exported.paths.iter().map(|p| p.display().to_string()).collect();
+                    let mut text = format!("Written:\n{}", written.join("\n"));
+                    for warning in &exported.warnings {
+                        text += &format!("\n\n{warning}");
+                    }
+                    self.message("Export finished", text);
                 }
             }
         }

@@ -436,11 +436,14 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         let case_id = resolve_case(factum, query)?;
         warn_unsigned(factum.signer);
         let formats: Vec<&str> = args.format.split(',').map(strip).filter(|f| !f.is_empty()).collect();
-        let (paths, verdict) = factum.export_checked(case_id, &formats, &args.out)?;
-        for path in paths {
+        let exported = factum.export_checked(case_id, &formats, &args.out)?;
+        for path in exported.paths {
             writeln!(out, "{}", path.display())?;
         }
-        if verdict == Level::Fail {
+        for warning in exported.warnings {
+            log::warn!("{warning}");
+        }
+        if exported.verdict == Level::Fail {
             log::warn!("The case fails verification: the exported files document a log that does not verify.");
             return Ok(1);
         }

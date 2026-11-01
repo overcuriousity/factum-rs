@@ -312,6 +312,53 @@ fn failing_case_is_still_exported() {
 }
 
 #[test]
+fn a_failed_export_leaves_nothing_behind() {
+    let f = Fixture::with_signer(FakeSigner::new(true));
+    let factum = f.factum();
+    let case_id = export_case(&factum);
+    let image = small_image();
+    factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let out = f.path().join("out");
+    // the bundle is the last output, and its manifest cannot be signed
+    f.signer.fail_detached_after.set(Some(0));
+    let formats = ["html", "pdf", "md", "bundle"];
+    assert!(factum.export(case_id, &formats, &out).is_err());
+    let left: Vec<_> = std::fs::read_dir(&out).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+    // nothing stays behind after a good one either, and all outputs are there
+    let paths = factum.export(case_id, &formats, &out).unwrap();
+    assert!(paths.iter().all(|path| path.is_file()), "{paths:?}");
+    let mut names: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 5, "{names:?}"); // four files and the image folder
+    assert!(names.iter().all(|name| !name.starts_with('.')), "{names:?}");
+}
+
+#[test]
+fn long_case_file_numbers_make_short_file_names() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case(&"案".repeat(80), "Case", "").unwrap();
+    let image = small_image();
+    factum
+        .create_note_with_images(&image.reference("x"), std::slice::from_ref(&image), None, case_id)
+        .unwrap();
+    let paths = factum
+        .export(case_id, &["html", "pdf", "md", "bundle"], &f.path().join("out"))
+        .unwrap();
+    assert_eq!(paths.len(), 5);
+    for path in paths {
+        assert!(path.is_file(), "{path:?}");
+        assert!(path.file_name().unwrap().len() <= 143, "{path:?}");
+    }
+}
+
+#[test]
 fn unknown_format_is_refused() {
     let f = Fixture::new();
     let factum = f.factum();
@@ -867,7 +914,10 @@ fn verify_py_refuses_a_gpg_beside_the_bundle_or_in_the_current_folder() {
             .unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
         assert_eq!(output.status.code(), Some(1), "{text}");
-        assert!(text.contains("Refusing ") && text.contains("Nothing was checked."), "{text}");
+        assert!(
+            text.contains("Refusing ") && text.contains("Nothing was checked."),
+            "{text}"
+        );
         assert!(!text.contains("Result:"), "{text}");
         assert!(!ran.exists(), "{text}");
     }
@@ -1748,6 +1798,73 @@ fn pdf_marks_missing_external_and_undecodable_images() {
             assert!(flat.contains(&expected), "{expected:?} in {flat}");
         }
     }
+}
+
+#[test]
+fn pdf_keeps_a_table_row_taller_than_a_page() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let words: Vec<String> = (0..4000).map(|n| format!("w{n}.")).collect();
+    factum.create_evidence(case_id, "disk", "", &words.join(" ")).unwrap();
+    let [path] = factum
+        .export(case_id, &["pdf"], &f.path().join("out"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let pdf = std::fs::read(path).unwrap();
+    assert!(String::from_utf8_lossy(&pdf).contains("/CIDToGIDMap /Identity"));
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        for word in words {
+            assert!(extracted.contains(&word), "{word} is lost");
+        }
+    }
+}
+
+#[test]
+fn pdf_gives_the_text_of_characters_it_cannot_show_and_warns() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("Fall 案件 مرحبا 🦊 Ende ✓", None, case_id).unwrap();
+    let out = f.path().join("out");
+    for formats in [&["pdf"][..], &["bundle"]] {
+        let exported = factum.export_checked(case_id, formats, &out).unwrap();
+        assert_eq!(exported.warnings.len(), 1, "{formats:?}");
+        assert!(exported.warnings[0].contains("件, 案"), "{:?}", exported.warnings);
+        assert!(exported.warnings[0].contains("HTML report"), "{:?}", exported.warnings);
+        assert!(exported.warnings[0].contains("U+1F98A"), "{:?}", exported.warnings);
+    }
+    assert!(
+        factum
+            .export_checked(case_id, &["md"], &out)
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
+    let pdf = std::fs::read(factum.export(case_id, &["pdf"], &out).unwrap().remove(0)).unwrap();
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        // the right-to-left word changes the order pdftotext gives
+        for expected in ["Fall 案件", "🦊", "ابحرم", "Ende ✓"] {
+            assert!(extracted.contains(expected), "{expected} in {extracted}");
+        }
+    }
+}
+
+#[test]
+fn pdf_has_no_warning_for_characters_its_fonts_have() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    factum.create_note("Müller ✓ Привет", None, case_id).unwrap();
+    let out = f.path().join("out");
+    assert!(
+        factum
+            .export_checked(case_id, &["pdf"], &out)
+            .unwrap()
+            .warnings
+            .is_empty()
+    );
 }
 
 #[test]
