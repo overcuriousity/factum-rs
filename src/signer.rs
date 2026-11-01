@@ -425,6 +425,12 @@ impl GnupgSigner {
         }
     }
 
+    /// Reads the remembered signing key again: another process may have changed or removed it.
+    pub fn reload_active_key(&self, db: &Db) {
+        *self.active_key_id.borrow_mut() = None;
+        self.load_active_key_from_settings(db);
+    }
+
     fn load_active_key_from_settings(&self, db: &Db) {
         let key_id = db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default();
         if key_id.is_empty() {
@@ -1122,6 +1128,26 @@ mod tests {
             let listing = format!("sec:e:255:22:AAAABBBBCCCCDDDD:1700000000:::u:::{cap}:::+::ed25519:::0:\n");
             assert!(!parse_key_listing(&listing)[0].can_sign(), "{cap}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_remembered_key_is_read_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("f.db")).unwrap();
+        let gpg = dir.path().join("gpg");
+        let listing = "sec:u:255:22:AAAABBBBCCCCDDDD:1700000000:::u:::scESC:::+::ed25519:::0:";
+        std::fs::write(&gpg, format!("#!/bin/sh\necho '{listing}'\n")).unwrap();
+        std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let service = GnupgSigner::with_binary(gpg, None);
+        assert_eq!(service.active_key(), None);
+        db.set_setting(ACTIVE_KEY_SETTING, "AAAABBBBCCCCDDDD").unwrap();
+        service.reload_active_key(&db);
+        assert_eq!(service.active_key().as_deref(), Some("AAAABBBBCCCCDDDD"));
+        db.delete_setting(ACTIVE_KEY_SETTING).unwrap();
+        service.reload_active_key(&db);
+        assert_eq!(service.active_key(), None);
     }
 
     #[test]

@@ -211,6 +211,12 @@ All notable changes to this project are documented here. The format follows
   longer re-reads and re-parses everything on every keystroke
 - GUI: a container event that cannot be read no longer stops the whole window from filling; it is logged and the
   case shows without those containers
+- GUI: Ask shows only the answer to the newest question, and the question field is read-only while it runs
+- GUI: after a correction the focus moves to the new version, so P pins the note you see
+- GUI: the Case menu acts on the case it shows, and no longer panics when the selection went away
+- GUI: archiving or deleting evidence clears the selection only when it still points there and the call worked
+- GUI: a signing key changed on the command line is picked up while the window is open
+- GUI: Locate and Close Without File wait for a running addition or re-check, and so does archiving for a re-check
 
 ## [2.7.1] - 2026-10-29
 

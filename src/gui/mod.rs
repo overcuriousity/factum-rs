@@ -312,8 +312,9 @@ struct FactumApp {
     dialogs: Vec<Dialog>,
     verify_windows: Vec<VerifyWindow>,
     companion_windows: Vec<CompanionWindow>,
-    // running Ask calls, by case
-    ask_jobs: Vec<(i64, workers::Worker<workers::AskResult>)>,
+    // running Ask calls: (case, request number, worker)
+    ask_jobs: Vec<(i64, u64, workers::Worker<workers::AskResult>)>,
+    next_ask_request: u64,
     next_window_id: u64,
     gpg_help_prompted: bool,
     // asked once per GUI session before sealing without a key
@@ -325,6 +326,8 @@ struct FactumApp {
     focus_search: bool,
     focus_composer: bool,
     gpg_status: (String, bool),
+    /// ACTIVE_KEY_SETTING as last read: the command line can change it
+    key_setting: String,
     // None until the companion is first configured (the file is created on first use), or when it cannot be opened
     companion_db: Option<CompanionDb>,
     // the companion database exists but cannot be opened: its settings cannot be edited either
@@ -361,6 +364,7 @@ impl FactumApp {
             .unwrap_or(DEFAULT_COMPOSER_HEIGHT);
         theme::apply(ctx, &theme);
         let data_version = db.data_version().unwrap_or_default();
+        let key_setting = setting(ACTIVE_KEY_SETTING);
         // created on first use, by saving its settings: an unconfigured companion leaves no file behind
         let companion_path = companion_db_path(&db.path);
         let companion_db = companion_path
@@ -432,6 +436,7 @@ impl FactumApp {
             verify_windows: Vec::new(),
             companion_windows: Vec::new(),
             ask_jobs: Vec::new(),
+            next_ask_request: 0,
             next_window_id: 0,
             gpg_help_prompted: false,
             no_gpg_key_prompted: false,
@@ -441,6 +446,7 @@ impl FactumApp {
             focus_search: false,
             focus_composer: false,
             gpg_status: (String::new(), false),
+            key_setting,
             companion_db,
             companion_db_failed,
             companion_settings,
@@ -632,6 +638,16 @@ impl FactumApp {
         };
     }
 
+    /// `factum --set-active gpg`: a key chosen elsewhere is the one notes are signed with from now on.
+    fn reload_active_key(&mut self) {
+        let key = self.db.get_setting(ACTIVE_KEY_SETTING).unwrap_or_default();
+        if key != self.key_setting {
+            self.key_setting = key;
+            self.signer.reload_active_key(&self.db);
+            self.update_gpg_status();
+        }
+    }
+
     fn current_case_id(&self) -> Option<i64> {
         if self.case_id.is_some() {
             return self.case_id;
@@ -675,6 +691,10 @@ impl FactumApp {
             .chain(self.view.pinned.iter().map(|card| card.entry.id))
             .collect();
         self.note_images.borrow_mut().retain(|id, _| shown.contains(id));
+        // a correction, here or on the command line: the focus stays on the note, in its newest version
+        if let Some(entry_id) = self.focused_card {
+            self.focused_card = self.factum().latest_version_id(entry_id).ok().or(self.focused_card);
+        }
         self.reload_history();
         self.notify_companion();
         self.check_shown_signatures(ctx);
@@ -1132,15 +1152,19 @@ impl FactumApp {
         }
         let mut finished = Vec::new();
         self.ask_jobs
-            .retain_mut(|(case_id, worker)| match worker.poll_result() {
+            .retain_mut(|(case_id, request, worker)| match worker.poll_result() {
                 Some(result) => {
-                    finished.push((*case_id, result));
+                    finished.push((*case_id, *request, result));
                     false
                 }
                 None => true,
             });
-        for (case_id, result) in finished {
-            self.set_ask_state(case_id, |answer, error, running| {
+        for (case_id, finished_request, result) in finished {
+            self.set_ask_state(case_id, |request, answer, error, running| {
+                // a window closed and opened again meanwhile asks its own questions
+                if *request != finished_request {
+                    return;
+                }
                 *running = false;
                 match result {
                     Ok(a) => *answer = Some(a),
@@ -1166,6 +1190,7 @@ impl FactumApp {
                 self.dirty = true;
                 // another connection wrote: decode afresh what is shown, whatever it changed
                 self.note_images.borrow_mut().clear();
+                self.reload_active_key();
             }
         }
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -1515,13 +1540,16 @@ impl FactumApp {
 
     fn container_action(&mut self, action: ContainerAction, _ctx: &egui::Context) {
         let summary = |app: &Self, id: i64| app.factum().container(id).ok().map(|d| d.summary);
-        // a running addition holds the container's lock: changing it has to wait
+        // a running addition holds the container's lock, and a close goes on from what its re-check read: changing
+        // the container or where its file is has to wait (Locate takes no lock)
         let changes = matches!(
             action,
             ContainerAction::AddFiles(_)
                 | ContainerAction::AddFolder(_)
                 | ContainerAction::Close(_)
+                | ContainerAction::CloseWithoutFile(_)
                 | ContainerAction::Reopen(_)
+                | ContainerAction::Locate(_)
         );
         if let Some(job) = self.add_job.as_ref().filter(|_| changes) {
             let message = format!(
@@ -1714,7 +1742,10 @@ impl FactumApp {
             Pending::Archive(case_id) => {
                 let result = self.factum().archive_case(case_id);
                 self.run(result); // the case is archived even when sealing failed
-                self.select(None, None);
+                let archived = self.factum().get_case(case_id).ok().flatten();
+                if archived.is_some_and(|c| c.is_archived()) && self.current_case_id() == Some(case_id) {
+                    self.select(None, None);
+                }
             }
             Pending::CloseContainersAndArchive(case_id) => self.close_next_and_archive(case_id),
             Pending::CloseContainerWithoutFile(id) => {
@@ -1723,8 +1754,9 @@ impl FactumApp {
             }
             Pending::DeleteEvidence(evidence_id) => {
                 let result = self.factum().delete_evidence(evidence_id);
-                self.run(result);
-                self.select(None, None);
+                if self.run(result).is_some() && self.evidence_id == Some(evidence_id) {
+                    self.select(None, None);
+                }
             }
             Pending::Seal(case_id) => {
                 let result = self.factum().seal(case_id, REASON_CHECKPOINT).and_then(|id| {
@@ -1921,6 +1953,18 @@ impl FactumApp {
         {
             let message = format!(
                 "Files are being added to \"{}\" in this case. Wait for it, or cancel it in the status bar.",
+                job.name
+            );
+            self.message("Factum", message);
+            return;
+        }
+        if let Some(job) = self
+            .close_job
+            .as_ref()
+            .filter(|job| open.iter().any(|c| c.id == job.container_id))
+        {
+            let message = format!(
+                "\"{}\" is being re-checked. Wait for it, or cancel it in the status bar.",
                 job.name
             );
             self.message("Factum", message);
@@ -2365,7 +2409,11 @@ impl FactumApp {
             }
             DialogResult::Correct { entry_id, text, images } => {
                 let result = self.factum().correct_note_with_images(entry_id, &text, &images);
-                self.run(result);
+                if let Some(corrected) = self.run(result)
+                    && self.focused_card == Some(entry_id)
+                {
+                    self.focused_card = Some(corrected);
+                }
             }
             DialogResult::Export {
                 case_id,
@@ -2468,6 +2516,7 @@ impl FactumApp {
                         answer: None,
                         error: None,
                         running: false,
+                        request: 0,
                         open: true,
                     });
                 }
@@ -2518,8 +2567,11 @@ impl FactumApp {
                     case_id,
                     question,
                 );
-                self.ask_jobs.push((case_id, worker));
-                self.set_ask_state(case_id, |answer, error, running| {
+                self.next_ask_request += 1;
+                let asked = self.next_ask_request;
+                self.ask_jobs.push((case_id, asked, worker));
+                self.set_ask_state(case_id, |request, answer, error, running| {
+                    *request = asked;
                     *answer = None;
                     *error = None;
                     *running = true;
@@ -2530,18 +2582,23 @@ impl FactumApp {
     }
 
     /// Updates the Ask window of the case, if it is still open.
-    fn set_ask_state(&mut self, case: i64, f: impl FnOnce(&mut Option<Answer>, &mut Option<String>, &mut bool)) {
+    fn set_ask_state(
+        &mut self,
+        case: i64,
+        f: impl FnOnce(&mut u64, &mut Option<Answer>, &mut Option<String>, &mut bool),
+    ) {
         for window in &mut self.companion_windows {
             if let CompanionWindow::Ask {
                 case_id,
                 answer,
                 error,
                 running,
+                request,
                 ..
             } = window
                 && *case_id == case
             {
-                f(answer, error, running);
+                f(request, answer, error, running);
                 return;
             }
         }
@@ -2714,8 +2771,8 @@ impl FactumApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let case_id = self.current_case_id();
         let case = self.view.case.clone();
+        let case_id = case.as_ref().map(|c| c.id);
         let is_open = case.as_ref().is_some_and(|c| !c.is_archived());
         let archived = case.as_ref().is_some_and(|c| c.is_archived());
         let p = *theme::current(&ctx);
@@ -2727,8 +2784,9 @@ impl FactumApp {
                         egui::Button::new("Export Case…").shortcut_text(ctx.format_shortcut(&EXPORT)),
                     )
                     .clicked()
+                    && let Some(case_id) = case_id
                 {
-                    self.export(case_id.unwrap());
+                    self.export(case_id);
                 }
                 ui.separator();
                 if ui
@@ -2858,8 +2916,10 @@ impl FactumApp {
 
     /// The Case menu; also opens from the "⋯" button above the case tree.
     fn case_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let case_id = self.current_case_id();
         let case = self.view.case.clone();
+        // what the buttons are enabled from is what they act on
+        let case_id = case.as_ref().map(|c| c.id);
+        let evidence_id = self.evidence_id;
         let is_open = case.as_ref().is_some_and(|c| !c.is_archived());
         let archived = case.as_ref().is_some_and(|c| c.is_archived());
         if ui
@@ -2877,20 +2937,22 @@ impl FactumApp {
         {
             self.open_new_evidence();
         }
-        if ui.add_enabled(is_open, egui::Button::new("Edit Case…")).clicked() {
-            self.open_edit_case(case_id.unwrap());
+        if ui.add_enabled(is_open, egui::Button::new("Edit Case…")).clicked()
+            && let Some(case_id) = case_id
+        {
+            self.open_edit_case(case_id);
         }
         if ui
-            .add_enabled(
-                is_open && self.evidence_id.is_some(),
-                egui::Button::new("Edit Evidence…"),
-            )
+            .add_enabled(is_open && evidence_id.is_some(), egui::Button::new("Edit Evidence…"))
             .clicked()
+            && let Some(evidence_id) = evidence_id
         {
-            self.open_edit_evidence(self.evidence_id.unwrap());
+            self.open_edit_evidence(evidence_id);
         }
-        if ui.add_enabled(is_open, egui::Button::new("New Container…")).clicked() {
-            self.open_new_container(case_id.unwrap());
+        if ui.add_enabled(is_open, egui::Button::new("New Container…")).clicked()
+            && let Some(case_id) = case_id
+        {
+            self.open_new_container(case_id);
         }
         ui.separator();
         if ui
@@ -2899,8 +2961,9 @@ impl FactumApp {
                 egui::Button::new("Verify Case").shortcut_text(ctx.format_shortcut(&VERIFY_CASE)),
             )
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.verify_case(case_id.unwrap());
+            self.verify_case(case_id);
         }
         if ui.button("Verify Container…").clicked()
             && let Some(path) = rfd::FileDialog::new()
@@ -2912,14 +2975,16 @@ impl FactumApp {
         if ui
             .add_enabled(case_id.is_some(), egui::Button::new("Seal Now"))
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.with_key_check(Pending::Seal(case_id.unwrap()));
+            self.with_key_check(Pending::Seal(case_id));
         }
         if ui
             .add_enabled(case_id.is_some(), egui::Button::new("Sign All Unsigned"))
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.sign_all_unsigned(case_id.unwrap());
+            self.sign_all_unsigned(case_id);
         }
         if ui
             .add_enabled(
@@ -2927,8 +2992,9 @@ impl FactumApp {
                 egui::Button::new("Export Case…").shortcut_text(ctx.format_shortcut(&EXPORT)),
             )
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.export(case_id.unwrap());
+            self.export(case_id);
         }
         let cli_text = if self.evidence_id.is_some() {
             "Set Evidence as CLI Active"
@@ -2943,11 +3009,15 @@ impl FactumApp {
             }
         }
         ui.separator();
-        if ui.add_enabled(is_open, egui::Button::new("Archive Case…")).clicked() {
-            self.archive(case_id.unwrap());
+        if ui.add_enabled(is_open, egui::Button::new("Archive Case…")).clicked()
+            && let Some(case_id) = case_id
+        {
+            self.archive(case_id);
         }
-        if ui.add_enabled(archived, egui::Button::new("Reopen Case")).clicked() {
-            let result = self.factum().reopen_case(case_id.unwrap());
+        if ui.add_enabled(archived, egui::Button::new("Reopen Case")).clicked()
+            && let Some(case_id) = case_id
+        {
+            let result = self.factum().reopen_case(case_id);
             self.run(result);
             self.select(None, None);
         }
@@ -2955,14 +3025,17 @@ impl FactumApp {
         let delete = ui
             .add_enabled(deletable, egui::Button::new("Delete Evidence…"))
             .on_disabled_hover_text("Only evidence without notes");
-        if delete.clicked() {
-            self.delete_evidence(self.evidence_id.unwrap());
+        if delete.clicked()
+            && let Some(evidence_id) = evidence_id
+        {
+            self.delete_evidence(evidence_id);
         }
         if ui
             .add_enabled(archived, egui::Button::new("Delete Case Permanently…"))
             .clicked()
+            && let Some(case_id) = case_id
         {
-            self.delete_case(case_id.unwrap());
+            self.delete_case(case_id);
         }
         if self.companion_db.is_some() && self.companion_settings.is_configured() {
             ui.separator();
@@ -4091,7 +4164,6 @@ impl eframe::App for FactumApp {
         if ctx.input(|i| i.viewport().close_requested()) {
             self.quit();
         }
-        let _ = ACTIVE_KEY_SETTING;
     }
 }
 

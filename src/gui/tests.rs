@@ -3567,3 +3567,190 @@ fn the_view_takes_the_containers_from_the_tree() {
     assert!(harness.state().view.tree.is_empty());
     assert_eq!(harness.state().view.containers.len(), 1);
 }
+
+fn ask_window(case_id: i64, running: bool, request: u64) -> CompanionWindow {
+    CompanionWindow::Ask {
+        case_id,
+        question: "the newer question".into(),
+        answer: None,
+        error: None,
+        running,
+        request,
+        open: true,
+    }
+}
+
+#[test]
+fn a_stale_ask_result_is_ignored() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().companion_windows.push(ask_window(case_id, true, 2));
+    let ctx = harness.ctx.clone();
+    let answer = |text: &str| crate::companion::ask::Answer {
+        text: text.into(),
+        references: Vec::new(),
+        unsupported: Vec::new(),
+        abstained: false,
+    };
+    let stale = answer("to the older question");
+    let worker = workers::Worker::spawn(&ctx, move || Ok(stale));
+    harness.state_mut().ask_jobs.push((case_id, 1, worker));
+    run_until(&mut harness, |h| h.state().ask_jobs.is_empty());
+    let shown = |h: &Harness<'_, FactumApp>| match &h.state().companion_windows[0] {
+        CompanionWindow::Ask { answer, running, .. } => (answer.as_ref().map(|a| a.text.clone()), *running),
+        CompanionWindow::History { .. } => panic!("not the Ask window"),
+    };
+    assert_eq!(shown(&harness), (None, true));
+    let current = answer("to the newer question");
+    let worker = workers::Worker::spawn(&ctx, move || Ok(current));
+    harness.state_mut().ask_jobs.push((case_id, 2, worker));
+    run_until(&mut harness, |h| h.state().ask_jobs.is_empty());
+    assert_eq!(shown(&harness), (Some("to the newer question".into()), false));
+}
+
+#[test]
+fn the_question_is_read_only_while_it_runs() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().companion_windows.push(ask_window(case_id, true, 1));
+    harness.run_ok();
+    type_into(&mut harness, "Question", " changed");
+    let CompanionWindow::Ask { question, .. } = &harness.state().companion_windows[0] else {
+        panic!("not the Ask window");
+    };
+    assert_eq!(question, "the newer question");
+}
+
+#[test]
+fn the_focus_follows_a_correction() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let note = first_card(&harness).entry.id;
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Focus(note), &ctx);
+    let result = DialogResult::Correct {
+        entry_id: note,
+        text: "corrected here".into(),
+        images: Vec::new(),
+    };
+    harness.state_mut().handle_dialog_result(result, &ctx);
+    let corrected = harness.state().focused_card.unwrap();
+    assert_ne!(corrected, note);
+    harness.run_ok();
+    assert_eq!(first_card(&harness).entry.id, corrected);
+
+    // on the command line: seen when the view is rebuilt
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let newest = Factum::with_seal_dir(&db, &signer, None)
+        .correct_note(corrected, "corrected elsewhere")
+        .unwrap();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    assert_eq!(harness.state().focused_card, Some(newest));
+    harness
+        .state_mut()
+        .handle_card_action(CardAction::TogglePin(newest), &ctx);
+    assert!(harness.state().factum().get_entry(newest).unwrap().unwrap().is_pinned);
+}
+
+#[test]
+fn the_case_menu_acts_on_the_case_it_shows() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    // the selection goes, the view still shows the case for this frame: no panic, the case of the view is meant
+    let case_id = harness.state().view.case.as_ref().unwrap().id;
+    harness.get_by_label("Case actions").click();
+    harness.run_ok();
+    harness.state_mut().evidence_id = Some(i64::MAX);
+    harness.state_mut().case_id = None;
+    harness.get_by_label("Edit Case…").click();
+    harness.step();
+    assert!(
+        matches!(harness.state().dialogs.last(), Some(Dialog::EditCase { case_id: id, .. }) if *id == case_id),
+        "the button acted"
+    );
+}
+
+#[test]
+fn archiving_keeps_a_selection_that_moved_on() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let db = fixture.db();
+    let signer = FakeSigner::new(false);
+    let factum = Factum::with_seal_dir(&db, &signer, None);
+    let first = factum.list_cases(false).unwrap()[0];
+    let other = factum.create_case("C-2", "Other", "").unwrap();
+    let gone = factum.create_evidence(other, "gone", "", "").unwrap();
+    harness.state_mut().select(Some(other), None);
+    harness.state_mut().carry_out(Pending::Archive(first));
+    assert_eq!(harness.state().case_id, Some(other));
+
+    harness.state_mut().select(Some(other), Some(gone));
+    let kept = factum.create_evidence(other, "kept", "", "").unwrap();
+    harness.state_mut().select(Some(other), Some(kept));
+    harness.state_mut().carry_out(Pending::DeleteEvidence(gone));
+    assert_eq!(harness.state().evidence_id, Some(kept));
+
+    // a call that fails leaves it too
+    harness.state_mut().carry_out(Pending::DeleteEvidence(i64::MAX));
+    assert_eq!(harness.state().evidence_id, Some(kept));
+    harness.state_mut().dialogs.clear();
+
+    harness.state_mut().carry_out(Pending::DeleteEvidence(kept));
+    assert_eq!((harness.state().case_id, harness.state().evidence_id), (None, None));
+    harness.state_mut().select(Some(other), None);
+    harness.state_mut().carry_out(Pending::Archive(other));
+    assert_eq!(harness.state().case_id, None);
+}
+
+#[test]
+fn a_key_changed_on_the_command_line_is_picked_up() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (status, warning) = harness.state().gpg_status.clone();
+    assert!(warning, "{status}");
+    fixture.db().set_setting(ACTIVE_KEY_SETTING, "ABCD1234").unwrap();
+    harness.state_mut().last_poll = Instant::now() - Duration::from_secs(1);
+    harness.run_ok();
+    assert_eq!(harness.state().key_setting, "ABCD1234");
+}
+
+#[test]
+fn a_close_being_rechecked_blocks_locate_and_close_without_file() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    let release = Arc::<std::sync::atomic::AtomicBool>::default();
+    let wait = release.clone();
+    let worker = workers::Worker::spawn(&ctx, move || {
+        while !wait.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err("Re-check cancelled — the container was not closed.".to_string())
+    });
+    harness.state_mut().close_job = Some(CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress: Default::default(),
+        cancel: Default::default(),
+        then_archive: None,
+        refused: None,
+    });
+    for action in [ContainerAction::Locate(id), ContainerAction::CloseWithoutFile(id)] {
+        harness.state_mut().container_action(action, &ctx);
+        assert!(message_text(&harness).contains("is being re-checked"));
+        harness.state_mut().dialogs.clear();
+    }
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state_mut().archive(case_id);
+    assert!(message_text(&harness).contains("is being re-checked"));
+    harness.state_mut().dialogs.clear();
+    release.store(true, Ordering::Relaxed);
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+}
