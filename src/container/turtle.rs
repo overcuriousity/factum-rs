@@ -58,12 +58,6 @@ pub struct Triple {
     pub object: Term,
 }
 
-impl Triple {
-    fn text_len(&self) -> u64 {
-        (self.subject.len() + self.predicate.len()) as u64 + self.object.text_len()
-    }
-}
-
 /// Triples in the order they were added, with an index by subject (lookups stay fast in graphs of many files).
 #[derive(Debug, Clone, Default)]
 pub struct Graph {
@@ -305,7 +299,9 @@ pub const TOO_MUCH: &str = "more metadata than fits the memory set aside for it"
 
 /// `at` walks the text by bytes and stays on character boundaries: what delimits a token is ASCII, which is never a
 /// part of another character.
-fn tokenize(text: &str, budget: u64) -> Result<Vec<Token>, String> {
+///
+/// Returns the tokens and what they hold in memory, as they stay held while the graph is built from them.
+fn tokenize(text: &str, budget: u64) -> Result<(Vec<Token>, u64), String> {
     let bytes = text.as_bytes();
     let char_at = |at: usize| text[at..].chars().next();
     let mut tokens: Vec<Token> = Vec::new();
@@ -314,13 +310,6 @@ fn tokenize(text: &str, budget: u64) -> Result<Vec<Token>, String> {
     // what the tokens so far hold: each owns its text
     let (mut counted, mut held) = (0, 0);
     while let Some(c) = char_at(at) {
-        if tokens.len() != counted {
-            counted = tokens.len();
-            held += TOKEN_COST + tokens.last().map_or(0, Token::text_len);
-            if held > budget {
-                return Err(TOO_MUCH.into());
-            }
-        }
         if c.is_whitespace() {
             at += c.len_utf8();
         } else if c == '#' {
@@ -435,8 +424,15 @@ fn tokenize(text: &str, budget: u64) -> Result<Vec<Token>, String> {
             tokens.push(Token::Name(word));
             tokens.extend(std::iter::repeat_n(Token::Dot, dots.min(1)));
         }
+        for token in &tokens[counted..] {
+            held += TOKEN_COST + token.text_len();
+        }
+        counted = tokens.len();
+        if held > budget {
+            return Err(TOO_MUCH.into());
+        }
     }
-    Ok(tokens)
+    Ok((tokens, held))
 }
 
 struct Parser {
@@ -444,9 +440,16 @@ struct Parser {
     at: usize,
     prefixes: HashMap<String, String>,
     graph: Graph,
+    /// what may still be held: each text comes out of it before it is, as one statement can hold any number of copies
+    left: u64,
 }
 
 impl Parser {
+    fn hold(&mut self, count: u64) -> Result<(), String> {
+        self.left = self.left.checked_sub(count).ok_or(TOO_MUCH)?;
+        Ok(())
+    }
+
     fn next(&mut self) -> Option<Token> {
         let token = self.tokens.get(self.at).cloned();
         self.at += 1;
@@ -552,10 +555,15 @@ impl Parser {
             }
             _ => {
                 let subject = self.iri("subject")?;
+                // the index has a copy of its own
+                if !self.graph.by_subject.contains_key(&subject) {
+                    self.hold(LINE_COST + subject.len() as u64)?;
+                }
                 loop {
                     let predicate = self.iri("predicate")?;
                     loop {
                         let object = self.object()?;
+                        self.hold(LINE_COST + (subject.len() + predicate.len()) as u64 + object.text_len())?;
                         self.graph.add(&subject, &predicate, object);
                         if self.peek() == Some(&Token::Comma) {
                             self.at += 1;
@@ -586,6 +594,7 @@ impl Parser {
         let Some(Token::Iri(namespace)) = self.next() else {
             return Err("expected the prefix's IRI".into());
         };
+        self.hold(LINE_COST + (prefix.len() + namespace.len()) as u64)?;
         self.prefixes.insert(prefix, namespace);
         Ok(())
     }
@@ -597,28 +606,22 @@ pub fn parse(text: &str) -> Result<Graph, String> {
     parse_within(text, &mut unlimited)
 }
 
-/// Like `parse`, for what a container claims: takes what its graph holds in memory from `budget`, and refuses what does
-/// not fit: a short text can make many lines, and each triple has a copy of the text of its subject and predicate.
+/// Like `parse`, for what a container claims: takes what its graph holds in memory from `budget` as the graph grows, and
+/// refuses what does not fit before it is held: a short text can make many lines, and each triple has a copy of the text
+/// of its subject, its predicate and of any prefix. The tokens count only while they are there.
 pub fn parse_within(text: &str, budget: &mut u64) -> Result<Graph, String> {
+    let (tokens, held) = tokenize(text, *budget)?;
     let mut parser = Parser {
-        tokens: tokenize(text, *budget)?,
+        tokens,
         at: 0,
         prefixes: HashMap::new(),
         graph: Graph::default(),
+        left: *budget - held,
     };
-    let (mut counted, mut triples, mut held) = (0, 0, 0);
     while parser.peek().is_some() {
         parser.statement()?;
-        for triple in &parser.graph.triples[counted..] {
-            triples += LINE_COST + triple.text_len();
-        }
-        counted = parser.graph.triples.len();
-        held = triples + (parser.graph.by_subject.len() + parser.prefixes.len()) as u64 * LINE_COST;
-        if held > *budget {
-            return Err(TOO_MUCH.into());
-        }
     }
-    *budget -= held;
+    *budget = parser.left + held;
     Ok(parser.graph)
 }
 
@@ -649,11 +652,13 @@ mod tests {
     #[test]
     fn what_is_refused_in_a_budget_is_refused_before_it_is_held() {
         let text = "<a> <b> <c> .\n";
-        // a triple and its subject, the two lines factum writes for it, and the text of the triple
-        let mut budget = 2 * LINE_COST + 3;
+        // a triple and its subject, the two lines factum writes for it, the text of both, and the tokens meanwhile
+        let graph = 2 * LINE_COST + 3 + 1;
+        let tokens = 4 * TOKEN_COST + 3;
+        let mut budget = graph + tokens;
         parse_within(text, &mut budget).unwrap();
-        assert_eq!(budget, 0);
-        let mut budget = 2 * LINE_COST + 2;
+        assert_eq!(budget, tokens);
+        let mut budget = graph + tokens - 1;
         assert_eq!(parse_within(text, &mut budget).unwrap_err(), TOO_MUCH);
         // a few bytes make a token each
         let mut budget = 1 << 20;
@@ -664,7 +669,11 @@ mod tests {
     fn tokens_count_for_their_text_while_they_are_held() {
         let text = format!("\"{}\" ", "x".repeat(1 << 16));
         assert_eq!(tokenize(&text.repeat(2), 1 << 16).unwrap_err(), TOO_MUCH);
-        assert_eq!(tokenize(&text.repeat(2), (2 << 16) + 2 * TOKEN_COST).unwrap().len(), 2);
+        let (tokens, held) = tokenize(&text.repeat(2), (2 << 16) + 2 * TOKEN_COST).unwrap();
+        assert_eq!((tokens.len(), held), (2, (2 << 16) + 2 * TOKEN_COST));
+        // one step of the text can make two tokens, and the last step counts too
+        assert_eq!(tokenize("xxx.", 2 * TOKEN_COST + 3).unwrap().1, 2 * TOKEN_COST + 3);
+        assert_eq!(tokenize("xxx.", 2 * TOKEN_COST + 2).unwrap_err(), TOO_MUCH);
     }
 
     #[test]
@@ -682,6 +691,57 @@ mod tests {
         let repeated = format!("<{subject}> {triples} <b> <c> .\n");
         let mut budget = 16 << 20;
         assert_eq!(parse_within(&repeated, &mut budget).unwrap_err(), TOO_MUCH);
+    }
+
+    /// One statement can hold any number of copies of a long text, so it stops as it grows, not at its end.
+    #[test]
+    fn a_statement_stops_where_its_triples_no_longer_fit() {
+        let long = "s".repeat(1 << 16);
+        let more = 1 << 10;
+        let prefix = format!("@prefix p: <{long}> .\n");
+        for text in [
+            format!("<{long}> <b> <c>{} .\n", " , <c>".repeat(more)),
+            format!("<{long}> <b> <c>{} .\n", " ; <b> <c>".repeat(more)),
+            format!("<a> <{long}> <c>{} .\n", " , <c>".repeat(more)),
+            format!("{prefix}<a> <b> p:c{} .\n", " , p:c".repeat(more)),
+            format!("{prefix}<a> p:b <c>{} .\n", " ; p:b <c>".repeat(more)),
+            format!("{prefix}<a> <b> \"x\"^^p:c{} .\n", " , \"x\"^^p:c".repeat(more)),
+        ] {
+            let budget = 1 << 20;
+            let (tokens, held) = tokenize(&text, budget).unwrap();
+            let mut parser = Parser {
+                tokens,
+                at: 0,
+                prefixes: HashMap::new(),
+                graph: Graph::default(),
+                left: budget - held,
+            };
+            let stopped = loop {
+                match parser.statement() {
+                    Ok(()) => assert!(parser.peek().is_some(), "{}", &text[text.len() - 20..]),
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(stopped, TOO_MUCH);
+            assert!(parser.graph.triples().len() <= 16, "{}", parser.graph.triples().len());
+        }
+    }
+
+    /// A subject is held twice, in its triples and in the index; a prefix once more, beside what uses it.
+    #[test]
+    fn a_subject_and_a_prefix_count_for_their_own_text() {
+        let long = "s".repeat(1 << 20);
+        let cost = |text: &str| {
+            let mut budget = 16 << 20;
+            parse_within(text, &mut budget).unwrap();
+            (16 << 20) - budget
+        };
+        let short = cost("<a> <b> <c> .\n");
+        assert_eq!(cost(&format!("<{long}> <b> <c> .\n")) - short, (2 << 20) - 2);
+        assert_eq!(
+            cost(&format!("@prefix p: <{long}> .\n<a> <b> <c> .\n")) - short,
+            LINE_COST + 1 + (1 << 20)
+        );
     }
 
     #[test]
