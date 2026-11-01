@@ -5,7 +5,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [3.0.0] - 2026-11-01
+## [2.8.0] - 2026-11-01
 
 ### Changed
 - GUI: once text is typed into a dialog (Correct, case goal, new case or evidence, companion settings, setup), Escape
