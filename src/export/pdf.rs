@@ -14,7 +14,7 @@ use ttf_parser::{Face, GlyphId};
 
 use super::html::{ALERT, evidence_cells, meta_rows, technical_rows};
 use super::model::{
-    ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence, verification_summary,
+    QUOTED, ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence, verification_summary,
 };
 use crate::images::{self, NoteImage};
 use crate::markup::{self, Block, ImageTarget, Inline};
@@ -428,6 +428,17 @@ impl Writer {
             lines.push(line);
         }
         lines
+    }
+
+    /// A line of `integrity_lines` as lines that fit width: the mark of a superseded version's text stays on each.
+    fn marked_lines(&self, style: &Style, line: &str, width: f32) -> Vec<String> {
+        let Some(text) = line.strip_prefix(QUOTED) else {
+            return vec![line.to_string()];
+        };
+        // a little less than the room left, so the marked lines still fit when `wrap` sees them again
+        let room = width - self.width(style, QUOTED) - 1.0;
+        let parts = self.wrap(style, text, room);
+        parts.iter().map(|part| format!("{QUOTED}{part}")).collect()
     }
 
     fn runs(&mut self, style: &Style, text: &str) -> Vec<Run> {
@@ -1471,7 +1482,12 @@ pub fn render_pdf_checked(model: &ReportModel) -> (Vec<u8>, Vec<char>) {
             0.0,
         );
         pdf.space(2.0);
-        pdf.paragraph_with_background(code, &item.integrity_lines().join("\n"), 0.0, Some(CODE_BACKGROUND));
+        let lines: Vec<String> = item
+            .integrity_lines()
+            .iter()
+            .flat_map(|line| pdf.marked_lines(&code, line, CONTENT_WIDTH - 2.0 * CODE_PADDING))
+            .collect();
+        pdf.paragraph_with_background(code, &lines.join("\n"), 0.0, Some(CODE_BACKGROUND));
     }
 
     let title = format!("Case report {}", case.case_file);
@@ -1557,6 +1573,22 @@ mod tests {
         assert!(!warning.contains('\u{1b}') && warning.contains("HTML report"));
         let many: Vec<char> = "abcdefghijklm".chars().collect();
         assert!(unsupported_warning(&many).unwrap().contains("i, j and 3 more"));
+    }
+
+    #[test]
+    fn a_wrapped_line_of_quoted_text_keeps_its_mark() {
+        let mut writer = Writer::new();
+        let style = Style::new(FontId::Mono, 7.0, TEXT);
+        let width = CONTENT_WIDTH - 2.0 * CODE_PADDING;
+        let long = format!("| {} {}", "word ".repeat(60), "x".repeat(400));
+        let lines = writer.marked_lines(&style, &long, width);
+        assert!(lines.len() > 3, "{lines:?}");
+        assert!(lines.iter().all(|line| line.starts_with(QUOTED)), "{lines:?}");
+        // the paragraph that draws them finds nothing left to break
+        assert_eq!(writer.wrap(&style, &lines.join("\n"), width), lines);
+        assert_eq!(writer.marked_lines(&style, "Leaf hash:  x", width), ["Leaf hash:  x"]);
+        assert_eq!(writer.marked_lines(&style, "| ", width), ["| "]);
+        writer.paragraph_with_background(style, &lines.join("\n"), 0.0, Some(CODE_BACKGROUND));
     }
 
     fn cells(lines: usize) -> Vec<String> {

@@ -1,7 +1,8 @@
 //! Self-contained HTML report: the notes first, the verification data at the end.
 
 use super::model::{
-    ReportEntry, ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence, verification_summary,
+    QUOTED, ReportEntry, ReportModel, grouped_findings, readable_utc, seal_folder_line, status_sentence,
+    verification_summary,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -44,6 +45,8 @@ ul.activity { font-size: .9em; color: #57534e; padding-left: 1.2em; }
 .mono { font-family: 'Courier New', monospace; font-size: .85em; word-break: break-all; }
 .appendix pre, details pre { font-size: .75em; white-space: pre-wrap; word-break: break-all; background: #f5f5f4;
                               padding: .5em; }
+/* a superseded version's text: the bar goes on where a long line wraps */
+.appendix .quoted { display: block; border-left: 2px solid #a8a29e; padding-left: .5em; }
 ";
 
 pub const ALERT: &str = "⚠ This note failed the integrity check — see Verification.";
@@ -155,7 +158,14 @@ fn note_html(item: &ReportEntry, print_variant: bool) -> String {
 }
 
 fn appendix_html(item: &ReportEntry, print_variant: bool) -> String {
-    let body = escape(&item.integrity_lines().join("\n"));
+    let mut body = String::new();
+    for line in item.integrity_lines() {
+        if line.starts_with(QUOTED) {
+            body += &format!("<span class='quoted'>{}</span>", escape(&line));
+        } else {
+            body += &format!("{}\n", escape(&line));
+        }
+    }
     if print_variant {
         return format!(
             "<h3>#{} (leaf {})</h3><pre>{body}</pre>",

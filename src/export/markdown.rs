@@ -17,10 +17,13 @@ use crate::verifier::Level;
 static SPECIAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([\\`*_\[\]<>#|&])").unwrap());
 static BACKTICKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`+").unwrap());
 /// What GitHub-style viewers link by themselves: an address with a scheme, www., mailto:, xmpp:, an e-mail address.
-/// Ends before a `|`, which inline code in a table cell would not hide, and before an angle bracket.
+/// Ends before a `|`, which inline code in a table cell would not hide, and before an angle bracket. `_` before the
+/// second kind counts as a word end, as it does for GitHub; group 1 leaves it out of the address.
 static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^\s<>|]+|\b(?:www\.|mailto:|xmpp:)[^\s<>|]+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
-        .unwrap()
+    Regex::new(
+        r"(?i)[a-z][a-z0-9+.-]*://[^\s<>|]+|(?:\b|_)((?:www\.|mailto:|xmpp:)[^\s<>|]+)|[\w.+-]+@[\w-]+(?:\.[\w-]+)+",
+    )
+    .unwrap()
 });
 
 /// a code fence longer than any backtick run in the text, so note text is always shown literally
@@ -40,7 +43,8 @@ pub fn inline(text: &str) -> String {
     let mut out = String::new();
     let mut at = 0;
     // never clickable: an address is inline code, so no viewer turns it into a link
-    for address in ADDRESS.find_iter(&flat) {
+    for found in ADDRESS.captures_iter(&flat) {
+        let address = found.get(1).or_else(|| found.get(0)).expect("a match has a group 0");
         // what ends a sentence stays out of it
         let shown = address
             .as_str()
@@ -207,6 +211,8 @@ fn blocks_markdown(blocks: &[Block], images: &[NoteImage], image_dir: &str, in_i
                 let marks = fence(code);
                 lines.push(marks.clone());
                 if !code.is_empty() {
+                    // a viewer ends a line at a lone \r too, and what follows would stand outside the quote or item
+                    let code = code.replace("\r\n", "\n").replace('\r', "\n");
                     lines.extend(code.split('\n').map(str::to_string));
                 }
                 lines.push(marks);
@@ -452,6 +458,11 @@ mod tests {
             ("www.x.test and WWW.y.test", "`www.x.test` and `WWW.y.test`"),
             ("mail a.b+c@x.test now", "mail `a.b+c@x.test` now"),
             ("mailto:a@x.test", "`mailto:a@x.test`"),
+            ("_www.x.test", r"\_`www.x.test`"),
+            ("a_www.x.test", r"a\_`www.x.test`"),
+            ("_mailto:a@x.test", r"\_`mailto:a@x.test`"),
+            ("_xmpp:a@x.test", r"\_`xmpp:a@x.test`"),
+            ("_a@x.test", "`_a@x.test`"),
             ("(see https://x.test/a.)", "(see `https://x.test/a`.)"),
             ("xmpp:a@x.test/r", "`xmpp:a@x.test/r`"),
             ("<https://x.test>", r"\<`https://x.test`\>"),
@@ -467,6 +478,25 @@ mod tests {
         for text in ["version 1.2.3", "a@b", "http:/x", "C:\\x", "awww.x"] {
             assert!(!inline(text).contains('`'), "{text}");
         }
+    }
+
+    #[test]
+    fn a_carriage_return_in_a_note_ends_no_line_of_the_report() {
+        for note in [
+            "x\ry",
+            "- ```\n  a\r  b\n  ```",
+            "> ```\n> a\r> b\n> ```",
+            "```\na\rb\n```",
+            "> ```\n> a\rb\n> ```",
+        ] {
+            let lines = markup_markdown(note, &[], "images");
+            assert!(!lines.concat().contains('\r'), "{note:?}: {lines:?}");
+        }
+        // code cannot leave the item it stands in
+        assert_eq!(
+            markup_markdown("- ```\n  a\r# b\n  ```", &[], "images"),
+            ["- ```", "  a", "  # b", "  ```"]
+        );
     }
 
     #[test]

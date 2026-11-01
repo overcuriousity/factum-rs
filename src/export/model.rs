@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::cases::Case;
 use crate::error::Result;
 use crate::images::NoteImage;
-use crate::pystr::{head, tail};
+use crate::pystr::{head, splitlines, tail};
 use crate::seals::TreeHead;
 use crate::services::Factum;
 use crate::verifier::{CaseReport, Level, SignatureCheck};
@@ -21,6 +21,9 @@ pub fn readable_utc(timestamp: Option<&str>) -> String {
         }
     }
 }
+
+/// What starts each line of a superseded version's text in `integrity_lines`.
+pub const QUOTED: &str = "| ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvidenceRow {
@@ -119,10 +122,11 @@ impl ReportEntry {
             ),
         ]);
         if self.superseded {
-            // marked, as a note's text could read like the lines around it
+            // marked, as a note's text could read like the lines around it; every line break a renderer may honour
+            // ends a line here, a lone \r too. Reports keep the mark where a long line wraps, see QUOTED
             lines.push(String::new());
             lines.push("Text of this version:".to_string());
-            lines.extend(self.text.lines().map(|line| format!("| {line}")));
+            lines.extend(splitlines(&self.text).iter().map(|line| format!("{QUOTED}{line}")));
         }
         if let Some(signature) = self.signature.as_deref().filter(|s| !s.is_empty()) {
             lines.push(String::new());

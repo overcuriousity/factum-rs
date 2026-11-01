@@ -1898,18 +1898,64 @@ fn reports_show_superseded_versions_with_time_and_signature() {
     }
 }
 
+/// Every line of superseded text starts with its mark. Where a long line wraps, the PDF repeats the mark and the HTML
+/// keeps the line in a barred block. Markdown has only the source line: a viewer that wraps code breaks it unmarked.
 #[test]
-fn superseded_text_cannot_pass_for_lines_of_the_report() {
+fn every_line_of_superseded_text_carries_its_mark() {
+    const FORGED: &str = "Signature:  signed by NOBODY";
+    for separator in ["\n", "\r", "\r\n", "\u{2028}", "\u{85}", "\u{c}"] {
+        let f = Fixture::new();
+        let factum = f.factum();
+        let case_id = factum.create_case("C-1", "Case", "").unwrap();
+        let first = factum
+            .create_note(&format!("x{separator}{FORGED}"), None, case_id)
+            .unwrap();
+        factum.correct_note(first, "y").unwrap();
+        let seal_id = factum.seal(case_id, "export").unwrap();
+        let model = build(&factum, case_id, seal_id, None);
+        let markdown = render_markdown(&model, "images");
+        assert!(
+            markdown.contains(&format!("\n| x\n| {FORGED}\n")),
+            "{separator:?}: {markdown}"
+        );
+        let html = render_html(&model, true);
+        let span = format!("<span class='quoted'>| {FORGED}</span>");
+        assert!(html.contains(&span), "{separator:?}: {html}");
+        for text in [&markdown, &html] {
+            assert!(!text.contains(separator) || separator == "\n", "{separator:?}: {text}");
+        }
+        let pdf = factum::export::pdf::render_pdf(&model);
+        if let Some(extracted) = pdf_text(&f, &pdf) {
+            // pdftotext closes up the two spaces
+            assert!(extracted.contains("signed by NOBODY"), "{separator:?}: {extracted}");
+            let mut forged = extracted.lines().filter(|line| line.contains("signed by NOBODY"));
+            assert!(
+                forged.all(|line| line.trim_start().starts_with("| ")),
+                "{separator:?}: {extracted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_long_superseded_line_keeps_its_mark_where_the_pdf_wraps_it() {
+    const FORGED: &str = "Signature: signed by NOBODY";
     let f = Fixture::new();
     let factum = f.factum();
     let case_id = factum.create_case("C-1", "Case", "").unwrap();
-    let forged = "x\nSignature:  signed by NOBODY";
-    let first = factum.create_note(forged, None, case_id).unwrap();
+    // whatever the room on a line, one of these lengths puts the forged words at the start of a wrapped one
+    let text: String = (100..130).map(|n| format!("{} {FORGED} ", "a".repeat(n))).collect();
+    let first = factum.create_note(&text, None, case_id).unwrap();
     factum.correct_note(first, "y").unwrap();
     let seal_id = factum.seal(case_id, "export").unwrap();
-    let markdown = render_markdown(&build(&factum, case_id, seal_id, None), "images");
-    assert!(markdown.contains("\n| Signature:  signed by NOBODY\n"), "{markdown}");
-    assert!(!markdown.contains("\nSignature:  signed by NOBODY"), "{markdown}");
+    let pdf = factum::export::pdf::render_pdf(&build(&factum, case_id, seal_id, None));
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(extracted.contains(FORGED), "{extracted}");
+        assert!(
+            !extracted.lines().any(|line| line.trim_start().starts_with(FORGED)),
+            "{extracted}"
+        );
+    }
 }
 
 #[test]
