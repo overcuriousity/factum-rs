@@ -3161,6 +3161,26 @@ mod script {
         assert!(output.contains("Result: OK"), "{output}");
     }
 
+    /// Long lines within the cap: what a line's text holds in the graph counts, not only what the text held meanwhile.
+    #[test]
+    fn the_script_counts_the_text_a_graph_keeps() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let path = s.container_path();
+        let mut text = turtle_text(&path);
+        let long = "y".repeat(1 << 19);
+        for n in 0..10 {
+            text.push_str(&format!("\n<aff4://long/{n}>\n    aff4l:fileName \"{long}\" .\n"));
+        }
+        write_turtle(&path, &text);
+        // room for the text and its decoded copy, not for those and what the graph keeps
+        let Some(output) = script_within(&path, 12 << 20) else {
+            return;
+        };
+        assert!(output.contains("[too_large]"), "{output}");
+    }
+
     #[test]
     fn the_script_refuses_a_line_factum_never_writes() {
         let s = Setup::with_signer(FakeSigner::new(false));

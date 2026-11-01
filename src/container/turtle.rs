@@ -661,6 +661,13 @@ mod tests {
     }
 
     #[test]
+    fn tokens_count_for_their_text_while_they_are_held() {
+        let text = format!("\"{}\" ", "x".repeat(1 << 16));
+        assert_eq!(tokenize(&text.repeat(2), 1 << 16).unwrap_err(), TOO_MUCH);
+        assert_eq!(tokenize(&text.repeat(2), (2 << 16) + 2 * TOKEN_COST).unwrap().len(), 2);
+    }
+
+    #[test]
     fn text_counts_for_what_it_holds() {
         // a long literal
         let long = format!("<a> <b> \"{}\" .\n", "x".repeat(1 << 20));

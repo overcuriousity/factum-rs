@@ -1951,6 +1951,10 @@ mod crafted {
         assert!(budget.parse(&text).is_err() && budget.exhausted);
         let mut budget = Budget::new(16 << 12);
         assert!(budget.parse(&text).unwrap().is_ok());
+        // in a comment, where nothing of it reaches a token: only what it is read as counts
+        let comment = [b"# ".as_slice(), &[0xFF; 1 << 12], b"\n"].concat();
+        let mut budget = Budget::new(2 << 12);
+        assert!(budget.parse(&comment).is_err() && budget.exhausted);
     }
 
     #[test]
