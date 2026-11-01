@@ -6,6 +6,11 @@ use serde_json::Value;
 
 use super::questions::{Archetype, NewQuestion, Question, RatedExample, Rating};
 
+/// Characters of a reply that repair reads: far beyond what a real reply holds, however much a model may think.
+const MAX_REPAIR_CHARS: usize = 256 * 1024;
+/// Candidates repair tries; each is a walk over the rest of the reply.
+const MAX_REPAIR_STARTS: usize = 32;
+
 /// Cuts the first JSON object out of a model reply (fences and prose dropped) and repairs trailing commas,
 /// single-quoted or bare keys and a cut-off tail. A `{` in the prose before the object is skipped: the first
 /// candidate whose repair parses wins, else the repair from the first `{`. A candidate inside an earlier, closed one
@@ -17,12 +22,21 @@ pub fn repair_json(text: &str) -> Option<String> {
 }
 
 fn repair_first_parsing(text: &str, open: &[char], accept: impl Fn(&Value) -> bool) -> Option<String> {
+    let text = text
+        .char_indices()
+        .nth(MAX_REPAIR_CHARS)
+        .map_or(text, |(at, _)| &text[..at]);
     let mut first = None;
     let mut end = 0;
+    let mut tried = 0;
     for (start, _) in text.match_indices(open) {
         if start < end {
             continue;
         }
+        if tried == MAX_REPAIR_STARTS {
+            break;
+        }
+        tried += 1;
         let (repaired, consumed, closed) = repair_from(text, start);
         if serde_json::from_str::<Value>(&repaired).is_ok_and(|value| accept(&value)) {
             return Some(repaired);
@@ -372,7 +386,39 @@ pub fn jaccard(a: &str, b: &str) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    #[test]
+    fn a_degenerate_reply_does_not_hang_the_repair() {
+        for reply in [
+            "{".repeat(10_000_000),
+            "[".repeat(10_000_000),
+            "{\"a\":[".repeat(2_000_000),
+        ] {
+            let start = Instant::now();
+            let _ = parse_pass_output(&reply);
+            let _ = parse_enrichment_output(&reply);
+            assert!(start.elapsed() < Duration::from_secs(60), "{:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    fn repair_reads_only_the_capped_reply_and_tries_a_capped_number_of_starts() {
+        let object = r#"{"questions":[]}"#;
+        // within both caps, behind stray braces
+        assert!(parse_pass_output(&format!("{}{object}", "{ ".repeat(3))).is_ok());
+        // behind more stray starts than are tried
+        let many = format!("{}{object}", "{ ".repeat(MAX_REPAIR_STARTS + 1));
+        assert!(parse_pass_output(&many).is_err());
+        // behind the cap
+        let far = format!("{}{object}", "x".repeat(MAX_REPAIR_CHARS));
+        assert!(parse_pass_output(&far).is_err());
+        // a character cut at the cap does not split it
+        let wide = format!("{}{object}", "€".repeat(MAX_REPAIR_CHARS + 1));
+        assert!(parse_pass_output(&wide).is_err());
+    }
     use crate::companion::questions::{QuestionState, Rating};
 
     fn question(id: i64, text: &str, created: &str, rating: Rating) -> Question {

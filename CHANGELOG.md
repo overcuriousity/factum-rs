@@ -181,6 +181,7 @@ All notable changes to this project are documented here. The format follows
 - Export file names are shortened: 80 CJK characters in a case file number failed with "file name too long"
 - Export builds only the requested formats, so PDF or Markdown alone no longer build the HTML with its embedded images
 - Companion: related older entries are found when the newest entries are the best matches
+- Companion: a huge or malformed model reply can no longer hang the repair of its JSON
 
 ## [2.7.1] - 2026-10-29
 
