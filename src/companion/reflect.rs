@@ -309,7 +309,9 @@ fn reflect(
     if reasoning.text.trim().is_empty() {
         return Err(PassError::Output("the reasoning is empty".into()));
     }
-    let shortened = reasoning_for_call_two(client, packed.tokens, &reasoning.text);
+    // without a count from the server the calibration has not moved since the prompt was packed
+    let prompt_tokens = reasoning.prompt_tokens.map_or(packed.tokens, |tokens| tokens as usize);
+    let shortened = reasoning_for_call_two(client, prompt_tokens, &reasoning.text);
     if shortened != reasoning.text {
         log::warn!("companion pass {pass_id}: the reasoning was shortened for space");
     }
@@ -439,12 +441,18 @@ fn timeline_lost_new(entries: &[Entry], packed: &Packed, last_seen: i64) -> bool
 }
 
 /// The reasoning as far as it fits call two beside the prompt, the instruction and the answer: a thinking model's
-/// call one has more room than `OUTPUT_RESERVE`, and a request over the window is refused for good. A tenth of the
-/// window stays spare, as for the thinking allowance.
+/// call one has more room than `OUTPUT_RESERVE`, and a request over the window is refused for good. For a thinking
+/// model a tenth of the window stays spare, as for the thinking allowance, and half of the rest is left to its
+/// thinking in call two, which `OUTPUT_RESERVE` alone would not hold.
 fn reasoning_for_call_two(client: &Client, prompt_tokens: usize, reasoning: &str) -> String {
     let calibration = client.calibration();
     let used = prompt_tokens + calibration.estimate(&serialize_instruction(), TextKind::Prose) + OUTPUT_RESERVE;
-    let room = (client.window() as usize * 9 / 10).saturating_sub(used);
+    let window = client.window() as usize;
+    let room = if client.thinks() {
+        (window * 9 / 10).saturating_sub(used) / 2
+    } else {
+        window.saturating_sub(used)
+    };
     truncate(reasoning, calibration.chars_for(room, TextKind::Prose))
 }
 

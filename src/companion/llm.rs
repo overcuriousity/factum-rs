@@ -381,6 +381,11 @@ impl Client {
         self.calibration.get()
     }
 
+    /// The model has returned thinking.
+    pub fn thinks(&self) -> bool {
+        self.thinks.get()
+    }
+
     pub fn learned(&self) -> Learned {
         Learned {
             context_window: self.context_window.get(),

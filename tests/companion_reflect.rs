@@ -368,31 +368,80 @@ fn an_answer_that_comes_after_the_stop_is_not_applied() {
     assert_eq!(e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id, 0);
 }
 
+/// A thinking model's answer, with the prompt tokens the server counted, if it says.
+fn thinking_answer(text: &str, prompt_tokens: Option<u32>) -> String {
+    let mut answer: Value = serde_json::from_str(&openai_chat_thinking(Some(text), "thinking", "stop")).unwrap();
+    match prompt_tokens {
+        Some(tokens) => answer["usage"]["prompt_tokens"] = json!(tokens),
+        None => answer["usage"] = Value::Null,
+    }
+    answer.to_string()
+}
+
 #[test]
-fn a_thinking_models_long_reasoning_is_shortened_for_call_two() {
+fn a_thinking_models_long_reasoning_is_shortened_for_call_two_and_leaves_room_to_think() {
+    for counted in [Some(1800), None] {
+        let e = env();
+        let mut settings = e.client.settings().clone();
+        settings.context_window = Some(8000);
+        let small = Client::with_retry_delay(settings, Duration::ZERO);
+        let reasoning = "The model goes on and on. ".repeat(2000);
+        e.fake.push(200, &thinking_answer("[]", None));
+        e.fake.push(200, &thinking_answer(&reasoning, counted));
+        e.fake.push(200, &ok(r#"{"questions":[]}"#));
+        run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Full).unwrap();
+        let last = e.fake.requests().last().unwrap().clone();
+        let body: Value = serde_json::from_str(&last.body).unwrap();
+        let turns = body["messages"].as_array().unwrap();
+        let sent = turns[1]["content"].as_str().unwrap();
+        assert!(sent.chars().count() < reasoning.chars().count());
+        assert!(sent.starts_with("The model goes on and on."));
+        assert!(sent.ends_with('…'));
+        let chars: usize = turns
+            .iter()
+            .map(|t| t["content"].as_str().unwrap().chars().count())
+            .sum();
+        let ratio = f64::from(small.calibration().chars_per_token);
+        let max_tokens = body["max_tokens"].as_u64().unwrap();
+        assert!((chars as f64 / ratio) as u64 + max_tokens <= 8000, "{counted:?}");
+        assert!(max_tokens >= 1500 + 1000, "room to think: {max_tokens}");
+    }
+}
+
+#[test]
+fn the_reasoning_uses_the_prompt_size_the_server_counted() {
     let e = env();
     let mut settings = e.client.settings().clone();
     settings.context_window = Some(8000);
     let small = Client::with_retry_delay(settings, Duration::ZERO);
     let reasoning = "The model goes on and on. ".repeat(2000);
-    e.fake.push(200, &openai_chat_thinking(Some("[]"), "thinking", "stop"));
-    e.fake
-        .push(200, &openai_chat_thinking(Some(&reasoning), "more thinking", "stop"));
+    e.fake.push(200, &thinking_answer("[]", None));
+    // the packed estimate is far below what the server counted
+    e.fake.push(200, &thinking_answer(&reasoning, Some(5000)));
     e.fake.push(200, &ok(r#"{"questions":[]}"#));
     run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Full).unwrap();
     let last = e.fake.requests().last().unwrap().clone();
     let body: Value = serde_json::from_str(&last.body).unwrap();
-    let turns = body["messages"].as_array().unwrap();
-    let sent = turns[1]["content"].as_str().unwrap();
-    assert!(sent.chars().count() < reasoning.chars().count());
-    assert!(sent.starts_with("The model goes on and on."));
-    assert!(sent.ends_with('…'));
-    let chars: usize = turns
-        .iter()
-        .map(|t| t["content"].as_str().unwrap().chars().count())
-        .sum();
-    let ratio = f64::from(small.calibration().chars_per_token);
-    assert!((chars as f64 / ratio) as u64 + body["max_tokens"].as_u64().unwrap() <= 8000);
+    let sent = body["messages"][1]["content"].as_str().unwrap().chars().count() as f64;
+    let tokens = sent / f64::from(small.calibration().chars_per_token);
+    assert!(tokens <= (7200.0 - 5000.0 - 1500.0) / 2.0, "{tokens}");
+}
+
+#[test]
+fn a_model_that_does_not_think_keeps_its_reasoning_at_the_default_window() {
+    let e = env();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(16_000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    // a prompt at its full budget: the spare tenth would cut this
+    let reasoning = "Entry #1 is new. ".repeat(180);
+    e.fake.push(200, &ok("[]"));
+    e.fake.push(200, &openai_chat(&reasoning, "stop", 11_300));
+    e.fake.push(200, &ok(r#"{"questions":[]}"#));
+    run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Full).unwrap();
+    let last = e.fake.requests().last().unwrap().clone();
+    let body: Value = serde_json::from_str(&last.body).unwrap();
+    assert_eq!(body["messages"][1]["content"], reasoning);
 }
 
 #[test]
