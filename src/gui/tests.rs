@@ -3553,7 +3553,7 @@ fn a_refusal_that_names_no_member_says_what_the_format_says() {
     );
 }
 
-/// A close job for the refused-addition route that is over with `outcome`.
+/// A close job of the refused-addition route; the tests hand `finish_close` its outcome.
 fn refused_job(harness: &Harness<'_, FactumApp>, id: i64) -> CloseJob {
     let input = harness.state().factum().recheck_input(id).unwrap();
     let cancel = Arc::<std::sync::atomic::AtomicBool>::default();
@@ -4098,6 +4098,77 @@ fn quitting_during_an_addition_cancels_it_and_waits_for_the_rewind() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(closed && harness.state().add_job.is_none());
+}
+
+/// A verification for `then` that runs until the flag it returns is set.
+fn held_verification(harness: &mut Harness<'_, FactumApp>, then: AfterVerify) -> Arc<std::sync::atomic::AtomicBool> {
+    let (case_id, _) = unsigned_ids(harness);
+    let report = harness.state().factum().verify_case(case_id, None).unwrap();
+    let release = Arc::<std::sync::atomic::AtomicBool>::default();
+    let wait = release.clone();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().verify_job = Some(VerifyJob {
+        worker: workers::Worker::spawn(&ctx, move || {
+            while !wait.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(report)
+        }),
+        progress: Arc::new(workers::Progress {
+            done: Default::default(),
+            total: Default::default(),
+        }),
+        // the progress dialog is up
+        started: Instant::now() - Duration::from_secs(1),
+        then,
+    });
+    release
+}
+
+#[test]
+fn a_verification_for_a_signature_or_an_export_asks_before_quitting() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (_, note) = unsigned_ids(&harness);
+    let release = held_verification(&mut harness, AfterVerify::SignEntry(note));
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("nothing is signed"));
+    harness.run_ok();
+    click_label(&mut harness, "Quit");
+    assert!(harness.state().quitting);
+    release.store(true, Ordering::Relaxed);
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    // given up: not the "No GPG key" of a signing that went on
+    assert!(
+        !harness
+            .state()
+            .dialogs
+            .iter()
+            .any(|d| matches!(d, Dialog::Message { .. }))
+    );
+
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, _) = unsigned_ids(&harness);
+    let folder = fixture.path.with_file_name("out");
+    let plan = harness
+        .state()
+        .factum()
+        .begin_export(case_id, &["html"], &folder)
+        .unwrap();
+    let release = held_verification(&mut harness, AfterVerify::Export(plan, folder.display().to_string()));
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("no files are written"));
+    release.store(true, Ordering::Relaxed);
+
+    // showing a report loses nothing
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let release = held_verification(&mut harness, AfterVerify::ShowReport);
+    release.store(true, Ordering::Relaxed);
+    let wait = harness.state_mut().verify_job.as_mut().unwrap();
+    wait.worker.wait();
+    assert!(harness.state().quit_reasons().is_empty());
 }
 
 #[test]

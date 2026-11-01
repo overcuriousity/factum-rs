@@ -1909,6 +1909,9 @@ impl FactumApp {
     }
 
     fn after_verification(&mut self, then: AfterVerify, report: CaseReport) {
+        if self.quitting {
+            return; // given up with the quit, which said so
+        }
         match then {
             AfterVerify::ShowReport => self.show_case_report(report),
             AfterVerify::SignEntry(entry_id) => {
@@ -2725,6 +2728,17 @@ impl FactumApp {
         }
         if let Some(job) = &self.close_job {
             reasons.push(format!("\"{}\" is being re-checked: it stays open.", job.name));
+        }
+        match self.verify_job.as_ref().map(|job| &job.then) {
+            Some(AfterVerify::SignEntry(_) | AfterVerify::SignSeal(_) | AfterVerify::SignAll) => {
+                reasons.push("The case is being verified for signing: nothing is signed.".to_string());
+            }
+            Some(AfterVerify::Export(..)) => {
+                reasons.push(
+                    "The case is being verified for an export: its seal stays, no files are written.".to_string(),
+                );
+            }
+            Some(AfterVerify::ShowReport) | None => {}
         }
         if !strip(&self.composer).is_empty() || !self.composer_images.is_empty() {
             reasons.push("The note being written is lost.".to_string());

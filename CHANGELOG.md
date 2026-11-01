@@ -217,8 +217,8 @@ All notable changes to this project are documented here. The format follows
 - GUI: archiving or deleting evidence clears the selection only when it still points there and the call worked
 - GUI: a signing key changed on the command line is picked up while the window is open
 - GUI: Locate and Close Without File wait for a running addition or re-check, and so does archiving for a re-check
-- GUI: quitting with a running addition or re-check, a note being written or typed text in an open dialog asks once
-  ("Quit anyway?", with the reason). Confirmed, a running addition is cancelled and the window closes after its rewind;
+- GUI: quitting with a running addition or re-check, a verification for a signature or an export, a note being written
+  or typed text in an open dialog asks once ("Quit anyway?", with the reason). Confirmed, a running addition is cancelled and the window closes after its rewind;
   a finished addition is logged before the window closes
 
 ## [2.7.1] - 2026-10-29
