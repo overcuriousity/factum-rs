@@ -157,11 +157,11 @@ impl CompanionSettingsDialog {
 
     /// Polls the workers and starts a listing once the connection fields have been left alone for a moment.
     fn update_models(&mut self, ctx: &egui::Context) {
-        if let Some(result) = self.models_worker.as_mut().and_then(Worker::poll) {
+        if let Some(result) = self.models_worker.as_mut().and_then(Worker::poll_result) {
             self.models_worker = None;
             self.take_models(result);
         }
-        if let Some(result) = self.probe_worker.as_mut().and_then(Worker::poll) {
+        if let Some(result) = self.probe_worker.as_mut().and_then(Worker::poll_result) {
             self.probe_worker = None;
             self.probe = Some(match &result {
                 Ok(models) => Ok(models.len()),

@@ -1901,6 +1901,10 @@ fn add_status_line() {
         containers::add_status(&progress, "FS01"),
         "Adding to \"FS01\": 1 / 3 files · 2.0 kB / 7.0 MB"
     );
+    assert_eq!(
+        containers::recheck_status(&progress, "Adding to FS01"),
+        "Re-checking \"Adding to FS01\": 1 / 3 files · 2.0 kB / 7.0 MB"
+    );
 }
 
 #[test]
@@ -3160,4 +3164,78 @@ fn a_path_is_cut_between_graphemes() {
     let shown = widgets::elide_middle("Fotos/Ba\u{301}dfoto-Urlaub.png", "", |c| c == '/', 18.0, &width);
     assert!(!shown.contains("…\u{301}"), "{shown}");
     assert_eq!(shown, "…dfoto-Urlaub.png");
+}
+
+#[test]
+fn a_worker_that_panics_clears_its_job_and_says_so() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().verify_job = Some(VerifyJob {
+        worker: workers::Worker::spawn(&ctx, || panic!("verification panics (expected in this test)")),
+        progress: Arc::new(workers::Progress {
+            done: Default::default(),
+            total: Default::default(),
+        }),
+        started: Instant::now(),
+    });
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert!(harness.state().verify_job.is_none());
+    let Some(Dialog::Message { text, .. }) = harness.state_mut().dialogs.pop() else {
+        panic!("no message");
+    };
+    assert_eq!(text, format!("Verification failed: {}", workers::STOPPED));
+
+    harness.state_mut().add_job = Some(AddJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker: workers::Worker::spawn(&ctx, || panic!("addition panics (expected in this test)")),
+        progress: Default::default(),
+        cancel: Default::default(),
+    });
+    run_until(&mut harness, |h| h.state().add_job.is_none());
+    assert!(harness.state().add_job.is_none(), "the guard must not block the session");
+    let Some(Dialog::Message { text, .. }) = harness.state_mut().dialogs.pop() else {
+        panic!("no message");
+    };
+    assert_eq!(text, "The background task stopped unexpectedly");
+
+    harness.state_mut().close_job = Some(CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker: workers::Worker::spawn(&ctx, || panic!("re-check panics (expected in this test)")),
+        progress: Default::default(),
+        cancel: Default::default(),
+        then_archive: None,
+    });
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    assert!(harness.state().close_job.is_none());
+    assert!(matches!(harness.state().dialogs.last(), Some(Dialog::Message { .. })));
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_non_ascii_hash_in_the_log_does_not_panic_the_view() {
+    let (fixture, id, _) = Fixture::with_container();
+    let sha256 = {
+        let db = fixture.db();
+        let signer = FakeSigner::new(false);
+        let detail = Factum::with_seal_dir(&db, &signer, None).container(id).unwrap();
+        detail.adds[0].files[0].sha256.clone()
+    };
+    // 15 ASCII characters and a two-byte one: byte 16 falls inside it
+    let tampered = format!("{}é{}", "a".repeat(15), "b".repeat(48));
+    fixture
+        .db()
+        .conn
+        .execute(
+            "UPDATE entries SET payload_json = replace(payload_json, ?, ?)",
+            [&sha256, &tampered],
+        )
+        .unwrap();
+    let mut harness = fixture.harness();
+    let evidence = container_evidence(&fixture, id);
+    harness.state_mut().select(None, Some(evidence));
+    harness.run_ok();
+    assert!(harness.query_by_label_contains(&format!("{}é", "a".repeat(15))).is_some());
 }

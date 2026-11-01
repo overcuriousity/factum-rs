@@ -196,6 +196,9 @@ All notable changes to this project are documented here. The format follows
 - Ask: large pinned notes no longer crowd out the retrieved entries or end in "Not in the case log." without asking the
   model: they are shortened when they do not fit, half of the room is kept for the retrieved entries, and an excerpt
   that does not fit no longer stops the ones after it. Ask uses the model's window and token ratio the companion found
+- GUI: a background task that dies no longer leaves its job hanging (the verify progress forever, additions blocked for
+  the session): it is reported as a failure and the job ends
+- GUI: a non-ASCII hash in a tampered log no longer panics the container view on every frame
 
 ## [2.7.1] - 2026-10-29
 

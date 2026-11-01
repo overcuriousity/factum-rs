@@ -987,14 +987,17 @@ impl FactumApp {
         if let Some(worker) = self.signature_worker.as_mut()
             && let Some(checks) = worker.poll()
         {
-            self.signature_checks.extend(checks);
+            match checks {
+                Ok(checks) => self.signature_checks.extend(checks),
+                Err(stopped) => log::error!("Checking signatures failed: {stopped}"),
+            }
             self.signature_worker = None;
             if std::mem::take(&mut self.signature_check_pending) {
                 self.check_shown_signatures(ctx);
             }
         }
         if let Some(job) = self.verify_job.as_mut()
-            && let Some(result) = job.worker.poll()
+            && let Some(result) = job.worker.poll_result()
         {
             self.verify_job = None;
             match result {
@@ -1003,7 +1006,7 @@ impl FactumApp {
             }
         }
         if let Some(job) = self.container_verify_job.as_mut()
-            && let Some(result) = job.worker.poll()
+            && let Some(result) = job.worker.poll_result()
         {
             self.container_verify_job = None;
             match result {
@@ -1020,7 +1023,7 @@ impl FactumApp {
             }
         }
         if let Some(job) = self.add_job.as_mut() {
-            if let Some(result) = job.worker.poll() {
+            if let Some(result) = job.worker.poll_result() {
                 let job = self.add_job.take().expect("polled");
                 self.finish_add(job.container_id, result);
             } else {
@@ -1028,7 +1031,7 @@ impl FactumApp {
             }
         }
         if let Some(job) = self.close_job.as_mut() {
-            if let Some(result) = job.worker.poll() {
+            if let Some(result) = job.worker.poll_result() {
                 let job = self.close_job.take().expect("polled");
                 self.finish_close(job.container_id, job.then_archive, result);
             } else {
@@ -1036,7 +1039,7 @@ impl FactumApp {
             }
         }
         let mut finished = Vec::new();
-        self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll() {
+        self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll_result() {
             Some(result) => {
                 finished.push((*case_id, result));
                 false
@@ -1354,7 +1357,7 @@ impl FactumApp {
             }
             Err(e) => {
                 failed(self);
-                return self.message("Factum", e);
+                return self.message("Factum", capitalize(&e));
             }
         };
         let mut notes = Vec::new();
@@ -1515,7 +1518,7 @@ impl FactumApp {
         self.dirty = true;
         let recheck = match result {
             Ok(recheck) => recheck,
-            Err(e) => return self.message("Factum", e),
+            Err(e) => return self.message("Factum", capitalize(&e)),
         };
         if !recheck.mismatches.is_empty() {
             let add_again = self

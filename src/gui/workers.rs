@@ -16,6 +16,9 @@ use crate::services::Factum;
 use crate::signer::GnupgSigner;
 use crate::verifier::{CaseReport, SignatureCheck};
 
+/// Why a worker gave no result: it died (a panic takes its sender with it).
+pub const STOPPED: &str = "the background task stopped unexpectedly";
+
 pub struct Worker<T> {
     receiver: mpsc::Receiver<T>,
     handle: Option<JoinHandle<()>>,
@@ -35,9 +38,13 @@ impl<T: Send + 'static> Worker<T> {
         }
     }
 
-    /// The result, once the work is done.
-    pub fn poll(&mut self) -> Option<T> {
-        let result = self.receiver.try_recv().ok()?;
+    /// The result, once the work is done; [`STOPPED`] when the worker died without one.
+    pub fn poll(&mut self) -> Option<Result<T, &'static str>> {
+        let result = match self.receiver.try_recv() {
+            Ok(result) => Ok(result),
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err(STOPPED),
+        };
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -53,6 +60,13 @@ impl<T: Send + 'static> Worker<T> {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl<T: Send + 'static> Worker<Result<T, String>> {
+    /// [`poll`](Self::poll) for work that fails with a message: a dead worker is one more failure.
+    pub fn poll_result(&mut self) -> Option<Result<T, String>> {
+        Some(self.poll()?.unwrap_or_else(|stopped| Err(stopped.to_string())))
     }
 }
 
