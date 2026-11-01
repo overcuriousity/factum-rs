@@ -7,11 +7,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 - GUI: once text is typed into a dialog (Correct, case goal, new case or evidence, companion settings, setup), Escape
-  and a click outside no longer close it; Cancel does. The Correct dialog's text field scrolls, so the buttons stay in
-  view, and has its own undo history per dialog. The Seal Folder dialog and the setup refuse a folder that is not an
-  existing absolute path. A container's file name may not hold a path and gets `.aff4l`. Add Label is off for a label
-  that is only `#`. A key missing or not trusted shows as failed (✗), like the verifier rates it, and the signature
-  line says "key not trusted". The verify window lays out only the OK entries in view.
+  and a click outside no longer close it, and the field keeps its focus; Cancel closes it
+- GUI: the Correct dialog's text field scrolls, so its buttons stay in view, and each Correct dialog has its own undo
+  history
+- GUI: the Seal Folder dialog and the setup refuse a folder that is not an existing absolute path
+- GUI: a container's file name may not hold a path, a drive or `..`, and gets `.aff4l` when it lacks it
+- GUI: Add Label is off for a label that is only `#` and blanks
+- GUI: a key missing or not trusted shows as failed (✗), as the verifier rates it, and the signature line says "key not
+  trusted"
+- GUI: the verify window lays out only the OK entries in view
 - `verify.py` prints its own SHA-256 when it starts; `factum --version` prints the SHA-256 of the embedded `verify.py`
   and `verify_container.py` (`-V` stays one line), the release notes list both, and the bundle README says to run a
   trusted copy or compare the hash
@@ -224,8 +228,8 @@ All notable changes to this project are documented here. The format follows
 - GUI: a signing key changed on the command line is picked up while the window is open
 - GUI: Locate and Close Without File wait for a running addition or re-check, and so does archiving for a re-check
 - GUI: quitting with a running addition or re-check, a verification for a signature or an export, a note being written
-  or typed text in an open dialog asks once ("Quit anyway?", with the reason). Confirmed, a running addition is cancelled and the window closes after its rewind;
-  a finished addition is logged before the window closes
+  or typed text in an open dialog asks once ("Quit anyway?", with the reason). Confirmed, a running addition is
+  cancelled and the window closes after its rewind; a finished addition is logged before the window closes
 
 ## [2.7.1] - 2026-10-29
 
