@@ -876,7 +876,8 @@ fn planted_gpg(folder: &Path, ran: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(folder).unwrap();
     let gpg = folder.join("gpg");
-    std::fs::write(&gpg, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+    // the PATH it runs with holds no `touch`
+    std::fs::write(&gpg, format!("#!/bin/sh\n: > '{}'\n", ran.display())).unwrap();
     std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
