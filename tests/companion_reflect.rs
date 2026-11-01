@@ -3,7 +3,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::Fixture;
 use common::fake_llm::{FakeLlm, openai_chat, openai_chat_thinking};
@@ -333,7 +333,8 @@ fn pass_stopped_at(e: &Env, calls: usize) -> Result<factum::companion::reflect::
     let fake = &e.fake;
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            while fake.requests().len() < calls {
+            let start = Instant::now();
+            while fake.requests().len() < calls && start.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(5));
             }
             epochs.bump_case(case);

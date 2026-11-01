@@ -389,36 +389,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-
-    #[test]
-    fn a_degenerate_reply_does_not_hang_the_repair() {
-        for reply in [
-            "{".repeat(10_000_000),
-            "[".repeat(10_000_000),
-            "{\"a\":[".repeat(2_000_000),
-        ] {
-            let start = Instant::now();
-            let _ = parse_pass_output(&reply);
-            let _ = parse_enrichment_output(&reply);
-            assert!(start.elapsed() < Duration::from_secs(60), "{:?}", start.elapsed());
-        }
-    }
-
-    #[test]
-    fn repair_reads_only_the_capped_reply_and_tries_a_capped_number_of_starts() {
-        let object = r#"{"questions":[]}"#;
-        // within both caps, behind stray braces
-        assert!(parse_pass_output(&format!("{}{object}", "{ ".repeat(3))).is_ok());
-        // behind more stray starts than are tried
-        let many = format!("{}{object}", "{ ".repeat(MAX_REPAIR_STARTS + 1));
-        assert!(parse_pass_output(&many).is_err());
-        // behind the cap
-        let far = format!("{}{object}", "x".repeat(MAX_REPAIR_CHARS));
-        assert!(parse_pass_output(&far).is_err());
-        // a character cut at the cap does not split it
-        let wide = format!("{}{object}", "€".repeat(MAX_REPAIR_CHARS + 1));
-        assert!(parse_pass_output(&wide).is_err());
-    }
     use crate::companion::questions::{QuestionState, Rating};
 
     fn question(id: i64, text: &str, created: &str, rating: Rating) -> Question {
@@ -677,5 +647,35 @@ mod tests {
         let v = check(&open, &[], vec![new_item("First fresh topic gamma", &[10])]);
         assert!(v.withdraw.is_empty() && v.new.is_empty());
         assert_eq!(v.dropped.len(), 1);
+    }
+
+    #[test]
+    fn a_degenerate_reply_does_not_hang_the_repair() {
+        for reply in [
+            "{".repeat(10_000_000),
+            "[".repeat(10_000_000),
+            "{\"a\":[".repeat(2_000_000),
+        ] {
+            let start = Instant::now();
+            let _ = parse_pass_output(&reply);
+            let _ = parse_enrichment_output(&reply);
+            assert!(start.elapsed() < Duration::from_secs(60), "{:?}", start.elapsed());
+        }
+    }
+
+    #[test]
+    fn repair_reads_only_the_capped_reply_and_tries_a_capped_number_of_starts() {
+        let object = r#"{"questions":[]}"#;
+        // within both caps, behind stray braces
+        assert!(parse_pass_output(&format!("{}{object}", "{ ".repeat(3))).is_ok());
+        // behind more stray starts than are tried
+        let many = format!("{}{object}", "{ ".repeat(MAX_REPAIR_STARTS + 1));
+        assert!(parse_pass_output(&many).is_err());
+        // behind the cap
+        let far = format!("{}{object}", "x".repeat(MAX_REPAIR_CHARS));
+        assert!(parse_pass_output(&far).is_err());
+        // a character cut at the cap does not split it
+        let wide = format!("{}{object}", "€".repeat(MAX_REPAIR_CHARS + 1));
+        assert!(parse_pass_output(&wide).is_err());
     }
 }

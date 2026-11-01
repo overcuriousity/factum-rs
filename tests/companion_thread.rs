@@ -99,11 +99,13 @@ fn script_first_pass(fake: &FakeLlm) {
     fake.push(200, &openai_chat(r#"{"questions":[]}"#, "stop", 100));
 }
 
-/// Starts the thread and gives it the selected case's `Rethink`.
-fn rethink(f: &Fixture, case: i64) -> CompanionHandle {
+/// Starts the thread, selects the case and, once the thread has ticked with it selected, sends its `Rethink`.
+fn rethink(f: &Fixture, fake: &FakeLlm, case: i64) -> CompanionHandle {
     let handle = start(f);
     wait_for(&handle, Duration::from_secs(5), |s| s.state == State::Idle);
     handle.send(Command::Selected(Some(case)));
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(chats(fake).len(), 0, "nothing goes out before the pass");
     handle.send(Command::Rethink(case));
     handle
 }
@@ -135,7 +137,7 @@ fn a_selected_case_whose_passes_all_failed_gets_no_backlog() {
     for _ in 0..2 {
         fake.push(404, r#"{"error":{"message":"no such model"}}"#);
     }
-    let handle = rethink(&f, case);
+    let handle = rethink(&f, &fake, case);
     let status = wait_for(&handle, Duration::from_secs(5), |s| matches!(s.state, State::Failed(_)));
     assert!(matches!(status.state, State::Failed(_)), "{status:?}");
     std::thread::sleep(Duration::from_millis(2500));
@@ -153,7 +155,7 @@ fn the_backlog_follows_the_first_pass_oldest_last() {
     for _ in 0..3 {
         fake.push(200, &openai_chat("[]", "stop", 100));
     }
-    let handle = rethink(&f, case);
+    let handle = rethink(&f, &fake, case);
     wait_for_chats(&fake, 7);
     let calls = chats(&fake);
     assert!(calls[6].body.contains("Finding 01"), "{}", calls[6].body);
@@ -235,7 +237,7 @@ fn opting_out_stops_the_backlog_between_its_calls() {
     script_first_pass(&fake);
     fake.push_delayed(200, &openai_chat("[]", "stop", 100), Duration::from_millis(600));
     fake.push(200, &openai_chat("[]", "stop", 100));
-    let handle = rethink(&f, case);
+    let handle = rethink(&f, &fake, case);
     wait_for_chats(&fake, 5);
     CompanionDb::open_for(&f.db.path)
         .unwrap()
