@@ -380,7 +380,7 @@ fn shown_ids(ctx: &egui::Context, text: &str) -> Vec<String> {
     }
     let ids = images::referenced_ids(text);
     // the composer and a dialog may both show thumbnails; a few texts are enough
-    cache.truncate(3);
+    cache.truncate(2);
     cache.insert(0, (key, ids.clone()));
     ctx.data_mut(|data| data.insert_temp(id, cache));
     ids

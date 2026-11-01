@@ -63,10 +63,10 @@ impl<T: Send + 'static> Worker<T> {
     }
 }
 
-impl<T: Send + 'static> Worker<Result<T, String>> {
+impl<T: Send + 'static, E: From<String> + Send + 'static> Worker<Result<T, E>> {
     /// [`poll`](Self::poll) for work that fails with a message: a dead worker is one more failure.
-    pub fn poll_result(&mut self) -> Option<Result<T, String>> {
-        Some(self.poll()?.unwrap_or_else(|stopped| Err(stopped.to_string())))
+    pub fn poll_result(&mut self) -> Option<Result<T, E>> {
+        Some(self.poll()?.unwrap_or_else(|stopped| Err(stopped.to_string().into())))
     }
 }
 
@@ -193,7 +193,22 @@ pub fn add_to_container(
     (worker, progress)
 }
 
-pub type RecheckResult = Result<crate::container::volume::Recheck, String>;
+/// Why a re-check gave no result; `cancelled` when it was asked to stop.
+pub struct RecheckError {
+    pub message: String,
+    pub cancelled: bool,
+}
+
+impl From<String> for RecheckError {
+    fn from(message: String) -> Self {
+        RecheckError {
+            message,
+            cancelled: false,
+        }
+    }
+}
+
+pub type RecheckResult = Result<crate::container::volume::Recheck, RecheckError>;
 
 /// Re-reads what a close checks, on a thread of its own (spec 5.2).
 pub fn recheck(
@@ -204,8 +219,12 @@ pub fn recheck(
     let progress = Arc::new(AddProgress::default());
     let shared = progress.clone();
     let worker = Worker::spawn(ctx, move || {
-        crate::container::volume::recheck(&input.path, input.end, &input.records, &shared, &cancel)
-            .map_err(|e| e.to_string())
+        crate::container::volume::recheck(&input.path, input.end, &input.records, &shared, &cancel).map_err(|e| {
+            RecheckError {
+                message: e.to_string(),
+                cancelled: cancel.load(Ordering::Relaxed),
+            }
+        })
     });
     (worker, progress)
 }

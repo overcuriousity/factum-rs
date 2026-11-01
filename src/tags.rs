@@ -95,8 +95,16 @@ pub fn get_tags_for_entry(conn: &Connection, entry_id: i64) -> Result<Vec<(Strin
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// A label without the `#`s it was typed with: those and the blanks between them go until neither is left in front.
 pub fn clean_label(label: &str) -> &str {
-    crate::pystr::strip(label).trim_start_matches('#')
+    let mut label = crate::pystr::strip(label);
+    loop {
+        let cleaned = crate::pystr::strip(label.trim_start_matches('#'));
+        if cleaned.len() == label.len() {
+            return cleaned;
+        }
+        label = cleaned;
+    }
 }
 
 pub fn add_label(db: &Db, entry_id: i64, label: &str) -> Result<usize> {
@@ -251,6 +259,21 @@ mod tests {
 
     fn names<'a>(found: &[(&'a str, usize, Match)]) -> Vec<&'a str> {
         found.iter().map(|(name, _, _)| *name).collect()
+    }
+
+    #[test]
+    fn a_cleaned_label_has_nothing_left_to_clean() {
+        for (typed, cleaned) in [
+            ("#a", "a"),
+            ("  ## b ", "b"),
+            ("# #", ""),
+            ("##", ""),
+            ("# # c #", "c #"),
+            ("d", "d"),
+        ] {
+            assert_eq!(clean_label(typed), cleaned, "{typed:?}");
+            assert_eq!(clean_label(clean_label(typed)), cleaned, "{typed:?} again");
+        }
     }
 
     #[test]

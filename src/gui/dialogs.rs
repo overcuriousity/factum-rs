@@ -322,7 +322,7 @@ pub(super) fn folder_field(ui: &mut egui::Ui, folder: &mut String, label: Option
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let browse = IconButton::new(icons::FOLDER, "Choose folder").show(ui);
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                let field = ui.add(TextEdit::singleline(folder).desired_width(f32::INFINITY));
+                let field = ui.add(single_line(folder).desired_width(f32::INFINITY));
                 if let Some(label) = label {
                     field.labelled_by(label);
                 }
@@ -507,7 +507,7 @@ pub(super) fn note(ui: &mut egui::Ui, text: &str) {
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, focus: bool) -> egui::Response {
     let label = ui.label(label);
     let response = ui
-        .add(TextEdit::singleline(value).hint_text(hint).desired_width(f32::INFINITY))
+        .add(single_line(value).hint_text(hint).desired_width(f32::INFINITY))
         .labelled_by(label.id);
     if focus {
         focus_once(ui, &response);
@@ -646,11 +646,30 @@ fn key_row(ui: &mut egui::Ui, key: &GpgKey, chosen: bool) -> egui::Response {
     response.on_hover_text(tip)
 }
 
+/// A dialog's text field. Escape leaves it focused: egui would drop the focus, and with the dialog held open by the
+/// text typed into it, later keystrokes would go nowhere.
+fn keeps_focus_on_escape() -> egui::EventFilter {
+    egui::EventFilter {
+        horizontal_arrows: true,
+        vertical_arrows: true,
+        tab: false,
+        escape: true,
+    }
+}
+
+pub(super) fn single_line(text: &mut String) -> TextEdit<'_> {
+    TextEdit::singleline(text).event_filter(keeps_focus_on_escape())
+}
+
+pub(super) fn multi_line(text: &mut String) -> TextEdit<'_> {
+    TextEdit::multiline(text).event_filter(keeps_focus_on_escape())
+}
+
 /// A multiline "Description" under its label.
 fn description_field(ui: &mut egui::Ui, value: &mut String, hint: &str) {
     let label = ui.label("Description");
     ui.add(
-        TextEdit::multiline(value)
+        multi_line(value)
             .hint_text(hint)
             .desired_rows(3)
             .desired_width(f32::INFINITY),
@@ -668,8 +687,8 @@ fn container_file_name(typed: &str, default: &str) -> Result<String, String> {
     if typed.is_empty() {
         return Ok(default.to_string());
     }
-    if typed.contains(['/', '\\']) || typed.contains("..") {
-        return Err("The file name is a name, not a path: no separators and no \"..\".".into());
+    if typed.contains(['/', '\\', ':']) || typed.contains("..") {
+        return Err("The file name is a name, not a path: no separators, no \":\" and no \"..\".".into());
     }
     Ok(if typed.ends_with(".aff4l") {
         typed.to_string()
@@ -870,7 +889,7 @@ impl Dialog {
                     ui,
                     "What this case has to establish; the companion asks its questions toward it.",
                 );
-                ui.add(TextEdit::multiline(goal).desired_rows(4).desired_width(f32::INFINITY))
+                ui.add(multi_line(goal).desired_rows(4).desired_width(f32::INFINITY))
                     .labelled_by(heading.id);
                 let (ok, cancel) = buttons(ui, "OK", true);
                 if ok {
@@ -1108,11 +1127,10 @@ impl Dialog {
                 if single_file && !*metadata_only {
                     ui.horizontal(|ui| {
                         let from = ui.label("Excerpt: from byte");
-                        ui.add(TextEdit::singleline(excerpt_from).desired_width(90.0))
+                        ui.add(single_line(excerpt_from).desired_width(90.0))
                             .labelled_by(from.id);
                         let to = ui.label("to");
-                        ui.add(TextEdit::singleline(excerpt_to).desired_width(90.0))
-                            .labelled_by(to.id);
+                        ui.add(single_line(excerpt_to).desired_width(90.0)).labelled_by(to.id);
                     });
                     note(ui, "Empty: the whole file.");
                 }
@@ -1171,7 +1189,7 @@ impl Dialog {
                 field(ui, "Name", name, "Case name (defaults to the file number)", false);
                 ui.label("Description");
                 ui.add(
-                    TextEdit::multiline(description)
+                    multi_line(description)
                         .hint_text("Case description (optional)")
                         .desired_rows(3)
                         .desired_width(f32::INFINITY),
@@ -1268,11 +1286,7 @@ impl Dialog {
                 error_line(ui, error);
                 field(ui, "Name", name, "Case name (defaults to the file number)", false);
                 ui.label("Description");
-                ui.add(
-                    TextEdit::multiline(description)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY),
-                );
+                ui.add(multi_line(description).desired_rows(3).desired_width(f32::INFINITY));
                 let (ok, cancel) = buttons(ui, "Save", true);
                 if ok {
                     if strip(file).is_empty() {
@@ -1320,7 +1334,7 @@ impl Dialog {
                 let name = ui.label("Label");
                 let input = ui
                     .add(
-                        TextEdit::singleline(label)
+                        single_line(label)
                             .id(field_id)
                             .hint_text("Type to search the tags and labels in use")
                             .desired_width(f32::INFINITY),
@@ -1385,7 +1399,7 @@ impl Dialog {
                 title(ui, "Delete Case Permanently?");
                 ui.add(egui::Label::new(message.as_str()).wrap());
                 ui.add(
-                    TextEdit::singleline(typed)
+                    single_line(typed)
                         .hint_text(expected.as_str())
                         .desired_width(f32::INFINITY),
                 );
@@ -1428,7 +1442,7 @@ impl Dialog {
                     .max_height((ui.ctx().content_rect().height() - 320.0).max(160.0))
                     .show(ui, |ui| {
                         ui.add(
-                            TextEdit::multiline(text)
+                            multi_line(text)
                                 .id(editor)
                                 .font(egui::FontId::proportional(theme::NOTE_SIZE))
                                 .desired_rows(8)
@@ -1620,7 +1634,7 @@ impl Dialog {
                 let mut details = lines.join("\n");
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.add(
-                        TextEdit::multiline(&mut details)
+                        multi_line(&mut details)
                             .font(egui::FontId::monospace(MONO_SIZE))
                             .desired_width(f32::INFINITY)
                             .interactive(true),
@@ -1789,6 +1803,7 @@ impl VerifyWindow {
                                    details: String,
                                    entry_id: Option<i64>,
                                    head_id: Option<i64>,
+                                   wrap: bool,
                                    actions: &mut Vec<VerifyAction>| {
                             let id = ui.scope_id().with(("verify-row", &item, &details));
                             let shown = actions_shown(ui, id);
@@ -1811,7 +1826,8 @@ impl VerifyWindow {
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                         ui.label(RichText::new(verdict_mark(status)).color(verdict_color(ui, status)));
                                         ui.label(RichText::new(format!("{item:<10}")).monospace().color(p.secondary));
-                                        ui.add(egui::Label::new(details.as_str()).wrap().sense(egui::Sense::click()))
+                                        let label = egui::Label::new(details.as_str()).sense(egui::Sense::click());
+                                        ui.add(if wrap { label.wrap() } else { label.truncate() })
                                     })
                                     .inner
                                 })
@@ -1850,6 +1866,7 @@ impl VerifyWindow {
                                         f.message.clone(),
                                         f.entry_id,
                                         f.tree_head_id,
+                                        true,
                                         actions,
                                     );
                                 }
@@ -1865,6 +1882,7 @@ impl VerifyWindow {
                                         f.message.clone(),
                                         f.entry_id,
                                         f.tree_head_id,
+                                        true,
                                         actions,
                                     );
                                 }
@@ -1873,10 +1891,11 @@ impl VerifyWindow {
                             .default_open(false)
                             .show(ui, |ui| {
                                 // a long report has thousands of these: only the rows in view are laid out
-                                let height = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+                                // a row is as high as its icon button, which sits in it on hover
+                                let height = ui.text_style_height(&egui::TextStyle::Body).max(22.0);
                                 egui::ScrollArea::vertical()
                                     .id_salt("verify-entries-ok")
-                                    .max_height(height * 12.0)
+                                    .max_height((height + ui.spacing().item_spacing.y) * 12.0)
                                     .show_rows(ui, height, ok_entries.len(), |ui, rows| {
                                         for r in ok_entries[rows].iter().map(|&i| &report.entries[i]) {
                                             let item = format!("#{} leaf {}", r.entry.id, r.entry.leaf_index);
@@ -1887,6 +1906,7 @@ impl VerifyWindow {
                                                 first_line(&r.entry.text),
                                                 Some(r.entry.id),
                                                 None,
+                                                false,
                                                 actions,
                                             );
                                         }
@@ -1903,6 +1923,7 @@ impl VerifyWindow {
                                         signature_text(&h.signature),
                                         None,
                                         h.tree_head_id,
+                                        true,
                                         actions,
                                     );
                                 }
@@ -1967,7 +1988,7 @@ mod tests {
         assert_eq!(container_file_name("", "fs01.aff4l").unwrap(), "fs01.aff4l");
         assert_eq!(container_file_name("image", "x.aff4l").unwrap(), "image.aff4l");
         assert_eq!(container_file_name("image.aff4l", "x.aff4l").unwrap(), "image.aff4l");
-        for bad in ["/etc/x", "../x", "a/b", "a\\b", "..", "C:\\x"] {
+        for bad in ["/etc/x", "../x", "a/b", "a\\b", "..", "C:\\x", "C:x"] {
             assert!(container_file_name(bad, "x.aff4l").is_err(), "{bad}");
         }
     }

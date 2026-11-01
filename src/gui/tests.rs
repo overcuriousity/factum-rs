@@ -3651,11 +3651,17 @@ fn a_recheck_after_a_refused_addition_that_ends_shows_the_refusal() {
     let (fixture, id, _) = Fixture::with_container();
     let mut harness = fixture.harness();
     let job = refused_job(&harness, id);
-    let cancelled = Err("Re-check cancelled — the container was not closed.".to_string());
+    let cancelled = Err(workers::RecheckError {
+        message: "Re-check cancelled — the container was not closed.".into(),
+        cancelled: true,
+    });
     harness.state_mut().finish_close(job, cancelled);
     assert_eq!(message_text(&harness), "The container was not opened.");
     let job = refused_job(&harness, id);
-    let failed = Err("the file cannot be read".to_string());
+    let failed = Err(workers::RecheckError {
+        message: "the file cannot be read".into(),
+        cancelled: false,
+    });
     harness.state_mut().finish_close(job, failed);
     assert_eq!(
         message_text(&harness),
@@ -4045,7 +4051,10 @@ fn a_close_being_rechecked_blocks_locate_and_close_without_file() {
         while !wait.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        Err("Re-check cancelled — the container was not closed.".to_string())
+        Err(workers::RecheckError {
+            message: "Re-check cancelled — the container was not closed.".into(),
+            cancelled: true,
+        })
     });
     harness.state_mut().close_job = Some(CloseJob {
         container_id: id,

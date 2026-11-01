@@ -1687,9 +1687,11 @@ impl FactumApp {
         let mut recheck = match (result, &refused) {
             (Ok(recheck), _) => recheck,
             // nobody asked for a close here: what stands is the refusal
-            (Err(e), Some(refused)) if e.contains("cancelled") => return self.message("Factum", refused.to_string()),
-            (Err(e), Some(refused)) => return self.message("Factum", format!("{refused}\n\n{}", capitalize(&e))),
-            (Err(e), None) => return self.message("Factum", capitalize(&e)),
+            (Err(e), Some(refused)) if e.cancelled => return self.message("Factum", refused.to_string()),
+            (Err(e), Some(refused)) => {
+                return self.message("Factum", format!("{refused}\n\n{}", capitalize(&e.message)));
+            }
+            (Err(e), None) => return self.message("Factum", capitalize(&e.message)),
         };
         // what opening it refused counts, whether or not the re-check, which reads less, came across it
         if let Some(refused) = refused.filter(|_| recheck.directory_faults.is_empty()) {
