@@ -162,8 +162,10 @@ fn appendix_html(item: &ReportEntry, print_variant: bool) -> String {
             item.entry_id, item.leaf_index
         );
     }
+    // a superseded version's text is on no other part of the page
+    let open = if item.superseded { " open" } else { "" };
     format!(
-        "<details><summary class='mono'>{}</summary><pre>{body}</pre></details>",
+        "<details{open}><summary class='mono'>{}</summary><pre>{body}</pre></details>",
         escape(&item.short_line())
     )
 }

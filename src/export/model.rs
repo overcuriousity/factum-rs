@@ -1,6 +1,6 @@
 //! What a report shows, built once from a verification report and rendered as HTML, Markdown and PDF.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cases::Case;
 use crate::error::Result;
@@ -50,7 +50,9 @@ pub struct ReportEntry {
     pub labels: Vec<String>,
     /// 1 = never corrected
     pub version: usize,
-    /// OK / WARN / FAIL from the verifier
+    /// a newer version of the line exists; the appendix then shows this version's text
+    pub superseded: bool,
+    /// OK / WARN / FAIL from the verifier; in the timeline, FAIL when any version of the line failed
     pub status: Level,
     /// "signed", "signed later", "unsigned", "invalid", "untrusted"
     pub signature_state: &'static str,
@@ -92,8 +94,14 @@ impl ReportEntry {
     }
 
     pub fn integrity_lines(&self) -> Vec<String> {
-        let mut lines = vec![
-            format!("Entry #{}, leaf {}", self.entry_id, self.leaf_index),
+        let mut lines = vec![format!("Entry #{}, leaf {}", self.entry_id, self.leaf_index)];
+        if self.superseded {
+            lines.push(format!(
+                "Superseded: version {}, written {}",
+                self.version, self.created_utc
+            ));
+        }
+        lines.extend([
             format!("Leaf hash:  {}", self.leaf_hash),
             format!("Tree head:  size {}, root {}", self.tree_size, self.root_hash),
             format!(
@@ -109,7 +117,13 @@ impl ReportEntry {
                         .map(|subkey| format!(" (subkey {subkey})"))
                         .unwrap_or_default()
             ),
-        ];
+        ]);
+        if self.superseded {
+            // marked, as a note's text could read like the lines around it
+            lines.push(String::new());
+            lines.push("Text of this version:".to_string());
+            lines.extend(self.text.lines().map(|line| format!("| {line}")));
+        }
         if let Some(signature) = self.signature.as_deref().filter(|s| !s.is_empty()) {
             lines.push(String::new());
             lines.push(crate::pystr::strip(signature).to_string());
@@ -409,6 +423,7 @@ impl Factum<'_> {
                 images: if entry.is_note() { entry.images() } else { Vec::new() },
                 labels,
                 version: line_version,
+                superseded: false,
                 status: result.status(),
                 signature_state: signature_state(check),
                 signer_key: check
@@ -427,10 +442,14 @@ impl Factum<'_> {
                 root_hash: entry.root_hash.clone(),
             });
         }
-        let mut newest: HashMap<i64, &ReportEntry> = HashMap::new();
+        let mut newest: HashMap<i64, usize> = HashMap::new();
         let mut line_labels: HashMap<i64, Vec<String>> = HashMap::new();
-        for item in &appendix {
-            newest.insert(item.origin_id, item); // log order: the last one seen is the newest version
+        let mut failed_lines: HashSet<i64> = HashSet::new();
+        for (index, item) in appendix.iter().enumerate() {
+            newest.insert(item.origin_id, index); // log order: the last one seen is the newest version
+            if item.status == Level::Fail {
+                failed_lines.insert(item.origin_id);
+            }
             // labels stay on the version they were added to; the timeline shows those of the whole line
             let labels = line_labels.entry(item.origin_id).or_default();
             for label in &item.labels {
@@ -439,13 +458,19 @@ impl Factum<'_> {
                 }
             }
         }
+        for (index, item) in appendix.iter_mut().enumerate() {
+            item.superseded = newest[&item.origin_id] != index;
+        }
         let timeline = appendix
             .iter()
             .filter(|item| item.entry_id == item.origin_id)
             .map(|item| {
                 // a copy: the appendix (and case.json) keep each label on the version it was added to
-                let mut line = newest[&item.entry_id].clone();
+                let mut line = appendix[newest[&item.entry_id]].clone();
                 line.labels = line_labels[&item.entry_id].clone();
+                if failed_lines.contains(&item.entry_id) {
+                    line.status = Level::Fail;
+                }
                 line
             })
             .collect();

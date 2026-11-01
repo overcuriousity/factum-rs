@@ -16,6 +16,12 @@ use crate::verifier::Level;
 
 static SPECIAL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"([\\`*_\[\]<>#|&])").unwrap());
 static BACKTICKS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`+").unwrap());
+/// What GitHub-style viewers link by themselves: an address with a scheme, www., mailto:, xmpp:, an e-mail address.
+/// Ends before a `|`, which inline code in a table cell would not hide, and before an angle bracket.
+static ADDRESS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^\s<>|]+|\b(?:www\.|mailto:|xmpp:)[^\s<>|]+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+        .unwrap()
+});
 
 /// a code fence longer than any backtick run in the text, so note text is always shown literally
 pub fn fence(text: &str) -> String {
@@ -30,7 +36,20 @@ pub fn fence(text: &str) -> String {
 pub fn inline(text: &str) -> String {
     let flat = text.replace(['\r', '\n'], " ");
     // "&" too: otherwise an entity like "&amp;" in a name would render as "&"
-    SPECIAL.replace_all(&flat, r"\$1").into_owned()
+    let escaped = |text: &str| SPECIAL.replace_all(text, r"\$1").into_owned();
+    let mut out = String::new();
+    let mut at = 0;
+    // never clickable: an address is inline code, so no viewer turns it into a link
+    for address in ADDRESS.find_iter(&flat) {
+        // what ends a sentence stays out of it
+        let shown = address
+            .as_str()
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', '\'', '"']);
+        out += &escaped(&flat[at..address.start()]);
+        out += &code_span(shown);
+        at = address.start() + shown.len();
+    }
+    out + &escaped(&flat[at..])
 }
 
 /// Inline code that keeps backticks and edge spaces of its content.
@@ -422,6 +441,41 @@ mod tests {
     #[test]
     fn inline_keeps_entities_literal() {
         assert_eq!(inline("R&D &amp; <b>"), "R\\&D \\&amp; \\<b\\>");
+    }
+
+    #[test]
+    fn addresses_become_inline_code() {
+        for (text, expected) in [
+            ("see https://x.test/a_b ok", "see `https://x.test/a_b` ok"),
+            ("ftp://x.test", "`ftp://x.test`"),
+            ("HTTP://X.TEST", "`HTTP://X.TEST`"),
+            ("www.x.test and WWW.y.test", "`www.x.test` and `WWW.y.test`"),
+            ("mail a.b+c@x.test now", "mail `a.b+c@x.test` now"),
+            ("mailto:a@x.test", "`mailto:a@x.test`"),
+            ("(see https://x.test/a.)", "(see `https://x.test/a`.)"),
+            ("xmpp:a@x.test/r", "`xmpp:a@x.test/r`"),
+            ("<https://x.test>", r"\<`https://x.test`\>"),
+            ("https://x.test|b", r"`https://x.test`\|b"),
+            (
+                "two https://a.test https://b.test",
+                "two `https://a.test` `https://b.test`",
+            ),
+        ] {
+            assert_eq!(inline(text), expected, "{text}");
+        }
+        // no address: nothing changes
+        for text in ["version 1.2.3", "a@b", "http:/x", "C:\\x", "awww.x"] {
+            assert!(!inline(text).contains('`'), "{text}");
+        }
+    }
+
+    #[test]
+    fn links_and_autolinks_are_defanged() {
+        let line = |text: &str| markup_markdown(text, &[], "images").concat();
+        assert_eq!(line("<https://x.test/a>"), "`https://x.test/a`");
+        assert_eq!(line("[https://x.test](https://x.test)"), "`https://x.test`");
+        assert_eq!(line("[site](https://x.test)"), "site (`https://x.test`)");
+        assert_eq!(line("<a@x.test>"), "`a@x.test`");
     }
 
     #[test]

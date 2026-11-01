@@ -1490,7 +1490,7 @@ fn markdown_report_marks_missing_and_external_images() {
         "{markdown}"
     );
     assert!(
-        markdown.contains("[external image https://x.test/a.png not loaded]"),
+        markdown.contains("[external image `https://x.test/a.png` not loaded]"),
         "{markdown}"
     );
     assert!(!markdown.contains("!["), "{markdown}");
@@ -1864,6 +1864,99 @@ fn pdf_has_no_warning_for_characters_its_fonts_have() {
             .unwrap()
             .warnings
             .is_empty()
+    );
+}
+
+#[test]
+fn reports_show_superseded_versions_with_time_and_signature() {
+    let f = Fixture::new();
+    let model = model(&f);
+    let old = model.appendix.iter().find(|item| item.superseded).unwrap();
+    assert_eq!(model.appendix.iter().filter(|item| item.superseded).count(), 1);
+    let time = old.created_utc.clone();
+    let written = format!("Superseded: version 1, written {time}");
+    let html = render_html(&model, false);
+    let markdown = render_markdown(&model, "images");
+    for text in [&html, &markdown, &render_html(&model, true)] {
+        let appendix = &text[text.find("Integrity appendix").unwrap()..];
+        for expected in [&written, "Signature:  signed", "| first"] {
+            assert!(appendix.contains(expected), "{expected} in {appendix}");
+        }
+        // the timeline keeps the newest text only
+        assert!(!text[..text.find("Integrity appendix").unwrap()].contains("| first"));
+    }
+    // the plain variant does not hide the text in a closed section
+    let before = &html[..html.find(&written).unwrap()];
+    assert!(before.rfind("<details").unwrap() == before.rfind("<details open>").unwrap());
+    assert_eq!(html.matches("<details open>").count(), 1);
+    let pdf = factum::export::pdf::render_pdf(&model);
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(
+            extracted.contains(&written) && extracted.contains("| first"),
+            "{extracted}"
+        );
+    }
+}
+
+#[test]
+fn superseded_text_cannot_pass_for_lines_of_the_report() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = factum.create_case("C-1", "Case", "").unwrap();
+    let forged = "x\nSignature:  signed by NOBODY";
+    let first = factum.create_note(forged, None, case_id).unwrap();
+    factum.correct_note(first, "y").unwrap();
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let markdown = render_markdown(&build(&factum, case_id, seal_id, None), "images");
+    assert!(markdown.contains("\n| Signature:  signed by NOBODY\n"), "{markdown}");
+    assert!(!markdown.contains("\nSignature:  signed by NOBODY"), "{markdown}");
+}
+
+#[test]
+fn the_timeline_flags_a_note_when_an_earlier_version_failed() {
+    let f = Fixture::new();
+    let factum = f.factum();
+    let case_id = model_case(&factum);
+    let seal_id = factum.seal(case_id, "export").unwrap();
+    let clean = build(&factum, case_id, seal_id, None);
+    let old = clean.appendix.iter().find(|item| item.superseded).unwrap().entry_id;
+    assert!(!render_html(&clean, false).contains("This note failed the integrity check"));
+    // a text change would fail the entries after it too; a signature fails on its own
+    f.exec(&format!("UPDATE entries SET signature = 'forged' WHERE id = {old}"));
+    let failing = build(&factum, case_id, seal_id, None);
+    let line = failing.timeline.iter().find(|item| item.origin_id == old).unwrap();
+    assert_eq!(line.status, Level::Fail);
+    assert_eq!(line.text, "first, corrected");
+    // the appendix keeps each version's own status
+    let newest = failing
+        .appendix
+        .iter()
+        .find(|item| item.entry_id == line.entry_id)
+        .unwrap();
+    assert_ne!(newest.status, Level::Fail);
+    let html = render_html(&failing, false);
+    assert!(html[..html.find("<h2>Evidence").unwrap()].contains("This note failed the integrity check"));
+    let markdown = render_markdown(&failing, "images");
+    assert!(markdown[..markdown.find("## Evidence").unwrap()].contains("This note failed the integrity check"));
+    let pdf = factum::export::pdf::render_pdf(&failing);
+    if let Some(extracted) = pdf_text(&f, &pdf) {
+        assert!(
+            extracted.contains("This note failed the integrity check"),
+            "{extracted}"
+        );
+    }
+}
+
+#[test]
+fn markdown_report_defangs_addresses() {
+    let f = Fixture::new();
+    let text = "See https://evil.test/a_b, www.evil.test, me@evil.test, <https://auto.test> and [https://same.test](https://same.test).";
+    let markdown = markdown_of_note(&f, text, &[]);
+    assert!(
+        markdown.contains(
+            "See `https://evil.test/a_b`, `www.evil.test`, `me@evil.test`, `https://auto.test` and `https://same.test`."
+        ),
+        "{markdown}"
     );
 }
 

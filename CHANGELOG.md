@@ -170,6 +170,10 @@ All notable changes to this project are documented here. The format follows
 - Characters neither PDF font has are drawn as a visible `�`, and copy and search give the real character (glyph 0
   was mapped to the first such character in the whole report); the export warns about them and says the HTML report
   shows them
+- Reports show the text of superseded note versions in the integrity appendix, with their time and signature, and a
+  note in the timeline is flagged when any of its versions failed verification, not only the newest
+- The Markdown report puts bare URLs, autolinks, e-mail addresses and link text equal to its address in code spans:
+  GitHub-style viewers made them clickable, which the report says links never are
 - An export that fails leaves no files behind: all are written to a temporary folder in the target folder and renamed
   at the end, so reports no longer stay behind when the bundle fails
 - Export file names are shortened: 80 CJK characters in a case file number failed with "file name too long"
