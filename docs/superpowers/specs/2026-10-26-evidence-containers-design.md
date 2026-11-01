@@ -306,10 +306,9 @@ verifier. The size counted is that of exactly the members it reads: the root `in
 `information.turtle.hashes`, and those of each `factum/history/<n>/`. So stored bytes nothing reads buy nothing, the
 factor leaves room for near-identical files, which compress to about 11:1 with factum's writer, and the ceiling caps a
 crafted file whichever way it is built. The limit is on what is charged, and a verifier can pass it by the text of one
-member, which exists before it can be charged. Measured on crafted files: 5.0 GiB at a limit of 4.0 GiB in either
-verifier; at a limit of 9.1 GiB, 10.1 GiB in factum and 11.1 GiB in the script, whose decoded copy of 1 GiB of invalid
-bytes takes 2 GiB. A member is at most 1 GiB, so this should not grow with the limit; it was not measured at the
-ceiling.
+member, which exists before it can be charged. Measured on crafted files at a limit of 6.1 GiB: 6.1 GiB in factum and
+7.1 GiB in the script, whose decoded copy of 1 GiB of invalid bytes takes 2 GiB; at a limit of 4.0 GiB, 5.0 GiB in the
+script. A member is at most 1 GiB, so this should not grow with the limit; it was not measured at the ceiling.
 
 Each verifier counts the bytes of the members it holds and, for what it parses, 200 bytes for a triple, a subject or a
 prefix plus the text that one holds, expanded, and before it is held, so a parse stops at the limit whatever the shape

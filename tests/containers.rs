@@ -3217,7 +3217,7 @@ mod script {
             // beyond the copies, 200 for a line and at most 150 for what a str holds around its text, three to a line
             let copied = lines * copies * (1 << 16);
             let prefix = (1 << 16) + 400;
-            assert!(charged >= copied + (1 << 16), "{line}: {charged}");
+            assert!(charged >= copied + (1 << 16) + lines * 200, "{line}: {charged}");
             assert!(charged <= copied + prefix + lines * 400, "{line}: {charged}");
         }
         // a subject is kept once

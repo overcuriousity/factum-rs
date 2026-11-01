@@ -307,7 +307,7 @@ fn tokenize(text: &str, budget: u64) -> Result<(Vec<Token>, u64), String> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut at = 0;
     let delimiter = |c: char| c.is_whitespace() || ";,<>\"'()[]#".contains(c);
-    // what the tokens so far hold: each owns its text
+    // what the tokens so far hold: each owns its text, and a long one holds it while it grows
     let (mut counted, mut held) = (0, 0);
     while let Some(c) = char_at(at) {
         if c.is_whitespace() {
@@ -318,6 +318,9 @@ fn tokenize(text: &str, budget: u64) -> Result<(Vec<Token>, u64), String> {
             at += 1;
             let mut iri = String::new();
             loop {
+                if held + iri.capacity() as u64 > budget {
+                    return Err(TOO_MUCH.into());
+                }
                 let mut ch = char_at(at).ok_or("unterminated IRI")?;
                 at += ch.len_utf8();
                 if ch == '>' {
@@ -340,6 +343,9 @@ fn tokenize(text: &str, budget: u64) -> Result<(Vec<Token>, u64), String> {
             at += if long { 3 } else { 1 };
             let mut value = String::new();
             loop {
+                if held + value.capacity() as u64 > budget {
+                    return Err(TOO_MUCH.into());
+                }
                 let Some(ch) = char_at(at) else {
                     return Err("unterminated string".into());
                 };
@@ -414,6 +420,9 @@ fn tokenize(text: &str, budget: u64) -> Result<(Vec<Token>, u64), String> {
             if at == start {
                 return Err(format!("unexpected {c:?}"));
             }
+            if held + (at - start) as u64 > budget {
+                return Err(TOO_MUCH.into());
+            }
             let mut word = text[start..at].to_string();
             // a name never ends with a dot: that one ends the statement
             let mut dots = 0;
@@ -478,7 +487,11 @@ impl Parser {
             .prefixes
             .get(prefix)
             .ok_or_else(|| format!("unknown prefix '{prefix}:'"))?;
-        Ok(format!("{namespace}{local}"))
+        // it exists before its triple is charged, and one prefix can make any number of them
+        if (namespace.len() + local.len()) as u64 > self.left {
+            return Err(TOO_MUCH.into());
+        }
+        Ok([namespace.as_str(), local].concat())
     }
 
     fn iri(&mut self, what: &str) -> Result<String, String> {
@@ -694,6 +707,32 @@ mod tests {
         let repeated = format!("<{subject}> {triples} <b> <c> .\n");
         let mut budget = 16 << 20;
         assert_eq!(parse_within(&repeated, &mut budget).unwrap_err(), TOO_MUCH);
+    }
+
+    /// A token is held as it grows: one with no end is refused for its size, not for having none.
+    #[test]
+    fn a_token_stops_as_it_grows_not_at_its_end() {
+        let long = "x".repeat(1 << 16);
+        for text in [format!("\"{long}"), format!("'''{long}"), format!("<{long}")] {
+            assert_eq!(tokenize(&text, 1 << 10).unwrap_err(), TOO_MUCH, "{}", &text[..4]);
+            assert_ne!(tokenize(&text, 1 << 20).unwrap_err(), TOO_MUCH, "{}", &text[..4]);
+        }
+    }
+
+    /// An expansion exists before its triple is charged, so one that cannot fit is not made, and it holds only its text.
+    #[test]
+    fn an_expansion_that_does_not_fit_is_not_made() {
+        let long = "s".repeat(1 << 16);
+        let parser = |left| Parser {
+            tokens: Vec::new(),
+            at: 0,
+            prefixes: HashMap::from([("p".to_string(), long.clone())]),
+            graph: Graph::default(),
+            left,
+        };
+        assert_eq!(parser(1 << 16).resolve("p:c").unwrap_err(), TOO_MUCH);
+        let expanded = parser((1 << 16) + 1).resolve("p:c").unwrap();
+        assert_eq!((expanded.len(), expanded.capacity()), ((1 << 16) + 1, (1 << 16) + 1));
     }
 
     /// One statement can hold any number of copies of a long text, so it stops as it grows, not at its end.
