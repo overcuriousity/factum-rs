@@ -117,7 +117,12 @@ jobs:
           export FACTUM_DB="$RUNNER_TEMP/smoke/factum.db"
           "$bin" --new-case SMOKE-1 "Release smoke test"
           "$bin" "a note from the release build #smoke 10.0.0.1"
-          "$bin" --export --format html,pdf,md,bundle --out "$RUNNER_TEMP/smoke/out"
+          # no gpg key here, so the case fails verification: the export exits 1 and still writes its files
+          status=0
+          written=$("$bin" --export --format html,pdf,md,bundle --out "$RUNNER_TEMP/smoke/out") || status=$?
+          [ "$status" -eq 1 ]
+          [ "$(printf '%s\n' "$written" | wc -l)" -eq 4 ]
+          printf '%s\n' "$written" | while read -r file; do test -s "$file" || exit 1; done
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about
