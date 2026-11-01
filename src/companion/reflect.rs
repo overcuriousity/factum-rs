@@ -71,7 +71,7 @@ pub struct PassSummary {
     pub withdrawn: usize,
     pub rephrased: usize,
     pub created: usize,
-    /// the newest entry the pass has read
+    /// where the case's `last_seen_entry_id` now stands: entries after it get a later pass
     pub entries_to: i64,
     /// one reason per item validation discarded
     pub dropped: Vec<String>,
@@ -292,7 +292,8 @@ fn reflect(
     }
     log.entries_to = match kind {
         PassKind::Diff => covered_to(&new, &packed, last_seen),
-        PassKind::Full if timeline_lost_new(&data.entries, &packed, last_seen) => last_seen,
+        // a case's first timeline is an overview: what it cut counts as seen, and the history is enriched after it
+        PassKind::Full if last_seen > 0 && timeline_lost_new(&data.entries, &packed, last_seen) => last_seen,
         PassKind::Full => log.entries_to,
     };
 
@@ -422,8 +423,8 @@ fn covered_to(new: &[&Entry], packed: &Packed, last_seen: i64) -> i64 {
         .unwrap_or(last_seen)
 }
 
-/// A full pass's timeline loses its oldest lines, so when one of those is a new entry the first new entry is gone
-/// (pinned ones are shown in their own section): `last_seen` stays, and later diff passes cover the new entries.
+/// A later full pass's timeline loses its oldest lines, so when one of those is a new entry the first new entry is
+/// gone (pinned ones are shown in their own section): `last_seen` stays, and diff passes cover the new entries.
 fn timeline_lost_new(entries: &[Entry], packed: &Packed, last_seen: i64) -> bool {
     let dropped = packed
         .cut

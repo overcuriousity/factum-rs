@@ -245,6 +245,43 @@ fn full_pass_that_cut_new_entries_leaves_them_for_later_passes() {
 }
 
 #[test]
+fn first_pass_that_cut_its_timeline_counts_it_as_seen() {
+    let e = env();
+    for n in 1..=30 {
+        let text = format!("Finding {n}: {}", "carved file fragment ".repeat(20));
+        e.f.factum().create_note(&text, None, e.case).unwrap();
+    }
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(5000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    e.fake.push(200, &ok("[]")); // the newest 20 are enriched in two batches
+    script(&e, json!({"questions": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Full).unwrap();
+    assert!(!e.fake.requests().last().unwrap().body.contains("Image of /dev/sda"));
+    assert_eq!(s.entries_to, newest(&e));
+    assert_eq!(
+        e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id,
+        newest(&e)
+    );
+
+    // a note written now is read by the next pass, not after the whole history
+    e.f.factum()
+        .create_note("A note written just now", None, e.case)
+        .unwrap();
+    script(&e, json!({"questions": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).unwrap();
+    assert!(
+        e.fake
+            .requests()
+            .last()
+            .unwrap()
+            .body
+            .contains("A note written just now")
+    );
+    assert_eq!(s.entries_to, newest(&e));
+}
+
+#[test]
 fn full_pass_that_cut_only_older_lines_covers_the_new_entries() {
     let e = env();
     for n in 1..=70 {

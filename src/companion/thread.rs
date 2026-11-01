@@ -528,7 +528,7 @@ impl Companion {
                 self.backlog_done.clear();
                 lock(&self.status).last_pass_utc.insert(case_id, utc_now());
                 self.set_state(State::Idle);
-                // a diff pass that cut new entries for space leaves the rest to a pass after the spacing
+                // a pass that cut new entries for space leaves them to a pass after the spacing
                 match self.entry_ids(case_id) {
                     Ok(ids) if ids.first().is_some_and(|&newest| newest > summary.entries_to) => {
                         self.scheduler.changed(case_id, Instant::now());

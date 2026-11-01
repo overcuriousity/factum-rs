@@ -147,9 +147,9 @@ passes for it. Case menu → "Case goal…" opens a multi-line text dialog that 
 
 First configuration, and cases without a `case_settings` row: no model work happens for a case until it is selected
 in the tree. Selecting a case that has entries but no companion state runs one full pass (4.7) with the compact
-timeline, so the first questions appear within one pass; the newest 20 entries are enriched before it, the rest of
-the history is enriched after a successful pass in batches of 50, newest first, only while the thread has nothing
-else to do.
+timeline, an overview of the case: entries it cuts for space count as seen. The first questions appear within one
+pass; the newest 20 entries are enriched before it, the rest of the history is enriched after a successful pass in
+batches of 50, newest first, only while the thread has nothing else to do.
 Retrieval over not-yet-enriched entries works on their raw text. The status item shows "indexing n of m" during
 backlog enrichment. While the endpoint is unreachable the companion thread re-probes every 60 s on its own; after a
 pass fails with a model-call error the case is retried once after the minimum spacing. The companion thread serves
@@ -241,8 +241,9 @@ Order and cutting rule for a reflection pass:
 5. Open questions: id, archetype, text, entry ids, rating (never cut; the ≤ 7 cap keeps this small).
 6. New entries since the last pass, verbatim, oldest first, each as `#id · timestamp · evidence · text` (cut from the
    newest end second in a diff pass, so `last_seen_entry_id` advances only to the newest entry that stayed in the
-   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end, and when that
-   cuts a new entry `last_seen_entry_id` stays where it was, so diff passes cover them). A diff pass
+   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end; when a later
+   full pass cuts a new entry `last_seen_entry_id` stays where it was, so diff passes cover it, while what a case's
+   first pass cuts counts as seen, its timeline being an overview). A diff pass
    always keeps its oldest new entry, as a last resort cut to 400 characters, so no single entry can stall the case.
 
 Last resort order, once 7, 8 and the cuttable lines of 6 are gone: pinned lines shortened, evidence lines shortened,
