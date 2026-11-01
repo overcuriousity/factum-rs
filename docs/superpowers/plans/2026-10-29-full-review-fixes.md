@@ -393,6 +393,9 @@ Files: src/export/*.rs, src/export/verify.py, src/main.rs or src/cli.rs (only fo
    from Task 1 item 6.
 9. export/mod.rs:52. The HTML report (with base64 images) is built on every export even for pdf-only/md-only. Build
    only the requested formats (the bundle needs whatever it contains).
+10. Carry-over from Task 10: the README, the container README and the spec point to `factum --version` and the release
+    notes for the scripts' hashes. `.github/workflows/release.yml` must put both SHA-256 lines in the release notes, so
+    that claim is true. Make sure `verify_container.py` prints the same hash `factum --version` shows.
 
 ### Task 12: Companion
 
