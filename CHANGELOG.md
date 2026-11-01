@@ -214,7 +214,8 @@ All notable changes to this project are documented here. The format follows
 - GUI: a re-check or a container verification counts as cancelled only when stopping it ended it, not when a read error
   did after Cancel or a path holds the word
 - Close as Damaged refuses a re-check of another state or another container
-- A container whose logged state is gone from its file says what to do when it is refused: Locate… or Close as Damaged
+- A container whose file holds no state as new as the log says is refused saying so, and that a copy holding that state
+  can be put back with Locate…
 - A seal that changed after the verification is no longer signed: signing on a verification's report compares the
   seal with what was verified and asks to verify again
 - GUI: Sign, Sign All Unsigned, Sign Seal and Export verify the case on a worker with the progress dialog, instead of

@@ -4206,14 +4206,13 @@ fn a_file_without_the_logged_state_says_what_to_do() {
     let error = factum.open_container_for_add(id).err().unwrap();
     assert!(error.to_string().contains("was not opened"), "{error}");
     assert!(
-        error
-            .to_string()
-            .ends_with("Locate… the file to continue from the state it holds, or Close as Damaged."),
+        error.to_string().ends_with(
+            "The file holds no state as new as the case log says. A copy that holds that state can be put back: \
+             move this file away and use Locate…."
+        ),
         "{error}"
     );
-    // the way out it names, without opening the file
-    let recheck = factum.recheck_container(id).unwrap();
-    factum.close_container_damaged(id, &recheck).unwrap();
+    assert!(!error.to_string().contains("Close as Damaged"), "{error}");
 }
 
 #[test]

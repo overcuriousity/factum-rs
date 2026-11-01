@@ -1036,14 +1036,15 @@ impl Volume {
             ))
         };
         let end = match find_newest_end(&mut file, known) {
-            // the log's state is gone from the file, and what is left can be continued from
+            // the log's state is gone from the file
             Err(e)
                 if e.kind() == io::ErrorKind::InvalidData
                     && matches!(find_newest_end(&mut file, None), Ok(Some(end)) if known.is_some_and(|k| end < k)) =>
             {
                 let refusal = refused(e);
                 return Err(FactumError::general(format!(
-                    "{refusal} Locate… the file to continue from the state it holds, or Close as Damaged."
+                    "{refusal} The file holds no state as new as the case log says. A copy that holds that state can \
+                     be put back: move this file away and use Locate…."
                 )));
             }
             end => end,
