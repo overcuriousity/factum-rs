@@ -3098,15 +3098,14 @@ mod script {
         }
     }
 
-    /// The script, with what a check may hold set to `limit`.
-    fn script_within(path: &Path, limit: u64) -> Option<String> {
+    /// `code` with this build's script loaded as `v`, and `path` in sys.argv[2]; None without python3.
+    fn with_script(code: &str, path: &Path) -> Option<std::process::Output> {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("verify_container.py");
         std::fs::write(&script, VERIFY_CONTAINER_PY).unwrap();
         let code = format!(
             "import importlib.util as u, sys\ns = u.spec_from_file_location('v', sys.argv[1])\nv = u.module_from_spec(s)\n\
-             s.loader.exec_module(v)\nv.MIN_METADATA_BUDGET = {limit}\nv.METADATA_BUDGET_PER_STORED_BYTE = 0\n\
-             sys.exit(v.main(sys.argv[2:]))\n"
+             s.loader.exec_module(v)\n{code}\n"
         );
         let output = Command::new(which::which("python3").ok()?)
             .args(["-I", "-X", "utf8", "-c", &code])
@@ -3114,8 +3113,31 @@ mod script {
             .arg(path)
             .output()
             .unwrap();
+        Some(output)
+    }
+
+    /// The script, with what a check may hold set to `limit`.
+    fn script_within(path: &Path, limit: u64) -> Option<String> {
+        let output = with_script(
+            &format!(
+                "v.MIN_METADATA_BUDGET = {limit}\nv.METADATA_BUDGET_PER_STORED_BYTE = 0\nsys.exit(v.main(sys.argv[2:]))"
+            ),
+            path,
+        )?;
         assert_eq!(output.status.code(), Some(1));
         Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// What the script takes from its budget to parse `text`, of which it keeps the graph.
+    fn script_charge(text: &str) -> Option<u64> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("text");
+        std::fs::write(&path, text).unwrap();
+        let code = "v.Memory.left = 1 << 40\nv.parse_turtle(open(sys.argv[2], encoding='utf-8').read())\n\
+                    print((1 << 40) - v.Memory.left)";
+        let output = with_script(code, &path)?;
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        Some(String::from_utf8_lossy(&output.stdout).trim().parse().unwrap())
     }
 
     /// A check that runs out of what it may hold says that, once, and reads nothing into what it did not get to.
@@ -3179,6 +3201,83 @@ mod script {
             return;
         };
         assert!(output.contains("[too_large]"), "{output}");
+    }
+
+    /// Short lines of a long prefix: what they cost is the expanded text the graph keeps, not the line.
+    #[test]
+    fn the_script_charges_a_triple_as_it_is_held() {
+        let long = "s".repeat(1 << 16);
+        let lines = 100u64;
+        for (line, copies) in [("p:x p:y", 2), ("<x> p:y", 1), ("p:x \"v\"^^p:y", 2), ("<x> \"v\"", 0)] {
+            let body = format!("    {line} ;\n").repeat(lines as usize - 1);
+            let text = format!("@prefix p: <{long}> .\n<a>\n{body}    {line} .\n");
+            let Some(charged) = script_charge(&text) else {
+                return;
+            };
+            // beyond the copies, 200 for a line and at most 150 for what a str holds around its text, three to a line
+            let copied = lines * copies * (1 << 16);
+            let prefix = (1 << 16) + 400;
+            assert!(charged >= copied + (1 << 16), "{line}: {charged}");
+            assert!(charged <= copied + prefix + lines * 400, "{line}: {charged}");
+        }
+        // a subject is kept once
+        let Some(charged) = script_charge(&format!("<{long}>\n    <x> <y> .\n")) else {
+            return;
+        };
+        assert!((1 << 16..(1 << 16) + 800).contains(&charged), "{charged}");
+    }
+
+    /// A file of a few KiB whose graph needs 100 MiB stops within what it may hold, by itself and not by a MemoryError.
+    #[test]
+    fn the_script_stops_on_a_long_prefix_in_short_lines() {
+        let s = Setup::with_signer(FakeSigner::new(false));
+        let id = s.create();
+        s.add(id, &[s.file("a.txt")]);
+        let path = s.container_path();
+        let long = "s".repeat(1 << 19);
+        let body = "    p:x p:y ;\n".repeat(99);
+        let text = format!(
+            "@prefix p: <{long}> .\n{}\n<aff4://long>\n{body}    p:x p:y .\n",
+            turtle_text(&path)
+        );
+        write_turtle(&path, &text);
+        let Some(output) = script_within(&path, 32 << 20) else {
+            return;
+        };
+        assert!(output.contains("[too_large]"), "{output}");
+    }
+
+    /// The number of a close is 32 bits here as in factum: above that nothing is read, so nothing is paid for.
+    #[test]
+    fn the_script_counts_only_the_closes_it_can_read() {
+        let budget = |name: &str| {
+            let code = format!(
+                "e = v.Entry(b'{name}', 0, 0, 0, 1 << 30, 0, 0)\nprint(v.metadata_budget(v.Archive(None, [e], b''), 2 << 30))"
+            );
+            let output = with_script(&code, Path::new("unused"))?;
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let printed = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>().unwrap();
+            Some(printed)
+        };
+        for name in [
+            "information.turtle",
+            "information.turtle.hashes",
+            "factum/history/1/information.turtle",
+            "factum/history/4294967295/information.turtle.hashes",
+        ] {
+            let Some(found) = budget(name) else {
+                return;
+            };
+            assert_eq!(found, 16 << 30, "{name}");
+        }
+        for name in [
+            "factum/history/4294967296/information.turtle",
+            "factum/history/5000000000/information.turtle.hashes",
+            "factum/history/0/information.turtle",
+            "factum/history/01/information.turtle",
+        ] {
+            assert_eq!(budget(name), Some(4 << 30), "{name}");
+        }
     }
 
     #[test]

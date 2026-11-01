@@ -42,7 +42,7 @@ U32_MAX = (1 << 32) - 1
 U64_MAX = (1 << 64) - 1
 MAX_IN_MEMORY = 1 << 30  # of one member
 # of a container's metadata, all its states and their graphs together: this much for each byte the file stores of the
-# members it reads, as near-identical files compress to about 11.5:1 with factum's writer ...
+# members it reads, as near-identical files compress to about 11:1 with factum's writer ...
 METADATA_BUDGET_PER_STORED_BYTE = 128
 # ... and never less than this, as what is small always fits ...
 MIN_METADATA_BUDGET = 4 << 30
@@ -51,7 +51,7 @@ MAX_METADATA_BUDGET = 16 << 30
 # of a signature or a certificate chain: no reason to be more, and openssl makes many times that of it when it prints it
 MAX_SIGNATURE_MEMBER = 4 << 20
 # what a parsed line holds in memory, its text apart (a triple, a subject, a prefix), as measured on large containers;
-# factum charges the same
+# factum charges the same. Its text is charged as it is held, expanded, not as the line writes it
 LINE_COST = 200
 # factum writes no line near this, and the regular expressions below take many times a line's length to match it
 MAX_LINE = 1 << 20
@@ -94,6 +94,11 @@ def take_memory(count):
     if count > Memory.left:
         raise TooLarge()
     Memory.left -= count
+
+
+def holds(*texts):
+    """What these strs hold in memory; None is no text."""
+    return sum(sys.getsizeof(text) for text in texts if text is not None)
 
 
 def decimal(text, limit):
@@ -179,18 +184,19 @@ def parse_turtle(text):
             raise ValueError("unknown prefix " + prefix)
         return prefixes[prefix] + local
 
-    # bytes a character takes in this str, its header apart: what a line's text holds in the graph
-    width = max((sys.getsizeof(text) - sys.getsizeof("")) // max(len(text), 1), 1)
     for content in CONTENT_LINE.finditer(text):
         line = content.group().rstrip("\r")
         if len(line) > MAX_LINE:
             raise ValueError("not factum's Turtle layout: a line of %d characters" % len(line))
-        take_memory(LINE_COST + len(line) * width)
+        take_memory(LINE_COST)
         match = PREFIX.match(line)
         if match and subject is None:
-            prefixes[match.group(1)] = iri_value(match.group(2))
+            namespace = iri_value(match.group(2))
+            take_memory(holds(match.group(1), namespace))
+            prefixes[match.group(1)] = namespace
         elif line.startswith("<") and line.endswith(">") and subject is None:
             subject = iri_value(line[1:-1])
+            take_memory(holds(subject))
             graph.setdefault(subject, [])
         elif line.startswith("    ") and subject is not None and line[-2:] in (" ;", " ."):
             predicate, _, obj = line[4:-2].partition(" ")
@@ -198,9 +204,12 @@ def parse_turtle(text):
             literal = LITERAL.match(obj)
             if literal:
                 datatype = expand(literal.group(2)) if literal.group(2) else None
-                graph[subject].append((predicate, unescape(literal.group(1)), False, datatype))
+                triple = (predicate, unescape(literal.group(1)), False, datatype)
             else:
-                graph[subject].append((predicate, expand(obj), True, None))
+                triple = (predicate, expand(obj), True, None)
+            # the graph keeps the expanded text, however short the line was
+            take_memory(holds(triple[0], triple[1], triple[3]))
+            graph[subject].append(triple)
             if line.endswith(" ."):
                 subject = None
         else:
@@ -299,7 +308,7 @@ EOCD64_SIG = b"PK\x06\x06"
 LOCATOR_SIG = b"PK\x06\x07"
 HISTORY = b"factum/history/"
 # the members the check reads as a state's metadata: the root's, or those of a close
-READ_METADATA = re.compile(rb"(?:factum/history/[1-9][0-9]{0,9}/)?information\.turtle(?:\.hashes)?")
+READ_METADATA = re.compile(rb"(?:factum/history/([1-9][0-9]{0,9})/)?information\.turtle(?:\.hashes)?")
 EOCD_LEN = 22
 LOCATOR_LEN = 20
 EOCD64_LEN = 56
@@ -773,10 +782,16 @@ def read_signature(archive, name, code):
     return read_limited(archive, name, code, MAX_IN_MEMORY if name.endswith(SIGNATURES[1]) else MAX_SIGNATURE_MEMBER)
 
 
+def is_read_metadata(name):
+    """Whether the check reads a member of this name: a close's number is 32 bits, others are no close of it."""
+    match = READ_METADATA.fullmatch(name)
+    return match is not None and int(match.group(1) or 0) <= U32_MAX
+
+
 def metadata_budget(archive, length):
     """For a file of `length` bytes: a directory can claim any compressed size, the file holds no more than it holds.
     What counts is what the check reads, so stored bytes that nothing reads buy nothing."""
-    stored = sum(entry.compressed for entry in archive.entries if READ_METADATA.fullmatch(entry.name))
+    stored = sum(entry.compressed for entry in archive.entries if is_read_metadata(entry.name))
     return max(MIN_METADATA_BUDGET, min(min(stored, length) * METADATA_BUDGET_PER_STORED_BYTE, MAX_METADATA_BUDGET))
 
 
