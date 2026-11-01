@@ -3217,6 +3217,7 @@ fn a_worker_that_panics_clears_its_job_and_says_so() {
         progress: Default::default(),
         cancel: Default::default(),
         then_archive: None,
+        refused: None,
     });
     run_until(&mut harness, |h| h.state().close_job.is_none());
     assert!(harness.state().close_job.is_none());
@@ -3365,4 +3366,104 @@ fn a_deleted_case_leaves_no_verified_status() {
         .state_mut()
         .handle_dialog_result(DialogResult::TypedConfirmed { case_id, typed }, &ctx);
     assert!(!harness.state().verified.contains_key(&case_id));
+}
+
+/// Flips the CRC-32 the newest directory holds for `member`: the member's bytes stay.
+fn flip_directory_crc(path: &std::path::Path, member: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let bytes = std::fs::read(path).unwrap();
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let archive = crate::container::zip64::read_archive(&mut std::fs::File::open(path).unwrap(), bytes.len() as u64);
+    let crc32 = archive.unwrap().get(member).unwrap().crc32;
+    // the name as the directory has it: followed by the ZIP64 extra
+    let name = [member.as_bytes(), &[1, 0, 24, 0]].concat();
+    let at = bytes.windows(name.len()).rposition(|w| w == name).unwrap() as u64;
+    file.seek(SeekFrom::Start(at - 46 + 16)).unwrap();
+    file.write_all(&(crc32 ^ 1).to_le_bytes()).unwrap();
+}
+
+#[test]
+fn a_directory_fault_can_be_closed_as_damaged_from_the_dialog() {
+    let (fixture, id, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let length = std::fs::metadata(&path).unwrap().len();
+    let mut harness = fixture.harness();
+    close_from_menu(&mut harness, id);
+    let Some(Dialog::Damaged { recheck, add_again, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog: {}", message_text(&harness));
+    };
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
+    assert!(add_again.is_err(), "a container with a directory fault is not added to");
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("1 directory fault").is_some());
+    assert!(harness.query_by_label("version.txt").is_some());
+    click_label(&mut harness, "Close as Damaged");
+    let detail = harness.state().factum().container(id).unwrap();
+    assert!(detail.summary.damaged && !detail.summary.open && !detail.summary.signed);
+    assert_eq!(detail.damaged_closes[0].3, ["version.txt"]);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), length);
+}
+
+#[test]
+fn close_and_archive_goes_through_a_directory_fault() {
+    let (fixture, id, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness
+        .state_mut()
+        .carry_out(Pending::CloseContainersAndArchive(case_id));
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let Some(Dialog::Damaged { then_archive, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(*then_archive, Some(case_id));
+    click_label(&mut harness, "Close as Damaged");
+    let factum = harness.state().factum();
+    assert!(factum.get_case(case_id).unwrap().unwrap().is_archived());
+}
+
+#[test]
+fn an_addition_refused_for_a_directory_fault_offers_close_as_damaged() {
+    let (fixture, id, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let mut harness = fixture.harness();
+    let options = crate::container::volume::AddOptions::default();
+    let sources = vec![fixture._dir.path().join("mnt/notes.txt")];
+    assert!(!harness.state_mut().start_add(id, sources, options, Default::default()));
+    assert!(harness.state().close_job.is_some());
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_refused_open_the_recheck_does_not_see_is_not_a_close() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let input = harness.state().factum().recheck_input(id).unwrap();
+    let clean = harness.state().factum().recheck_container(id).unwrap();
+    assert!(clean.directory_faults.is_empty() && clean.mismatches.is_empty());
+    let ctx = harness.ctx.clone();
+    let cancel = Arc::<std::sync::atomic::AtomicBool>::default();
+    let (worker, progress) = workers::recheck(&ctx, input, cancel.clone());
+    let job = CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress,
+        cancel,
+        then_archive: None,
+        refused: Some("refused when opened".into()),
+    };
+    harness.state_mut().finish_close(job, Ok(clean));
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(recheck.directory_faults, ["refused when opened"]);
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
 }

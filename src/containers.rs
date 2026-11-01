@@ -291,6 +291,15 @@ fn plural(count: usize, word: &str) -> String {
     format!("{count} {word}{}", if count == 1 { "" } else { "s" })
 }
 
+/// What a re-check found, in words.
+pub fn damage_text(files: usize, faults: usize) -> String {
+    match (files, faults) {
+        (files, 0) => mismatch_text(files),
+        (0, faults) => plural(faults, "directory fault"),
+        (files, faults) => format!("{} · {}", mismatch_text(files), plural(faults, "directory fault")),
+    }
+}
+
 /// Records where the container's logged state ends, in the transaction of its log entry.
 fn store_end(conn: &rusqlite::Connection, uuid: &str, end: u64) -> Result<()> {
     conn.execute(
@@ -1144,8 +1153,8 @@ impl Factum<'_> {
         }
         if !recheck.directory_faults.is_empty() {
             return Err(FactumError::container_crc(format!(
-                "Container #{id} was not closed: a fault of its directory, so its state is not signed ({}). Verify \
-                 Container shows whether the content is intact; it can only be closed as damaged.",
+                "Container #{id} was not closed: a fault of its directory or of reading it, so its state is not signed \
+                 ({}). Verify Container shows whether the content is intact; it can only be closed as damaged.",
                 recheck.directory_faults.join(", ")
             )));
         }
@@ -1255,15 +1264,12 @@ impl Factum<'_> {
         let file_count = detail.summary.file_count;
         let paths: Vec<&str> = damaged.iter().map(|r| r.path.as_str()).collect();
         let unchecked = (recheck.arns.len() as u64).saturating_sub(recheck.files);
-        let found = match (damaged.len(), faults.len()) {
-            (files, 0) => mismatch_text(files),
-            (0, faults) => plural(faults, "directory fault"),
-            (files, faults) => format!("{} · {}", mismatch_text(files), plural(faults, "directory fault")),
-        };
-        let reason = match (recheck.ended_early, damaged.is_empty()) {
-            (true, _) => format!("{found}, files not checked"),
-            (false, true) => format!("{found}, no file found damaged"),
-            (false, false) => found,
+        let found = damage_text(damaged.len(), faults.len());
+        let reason = match (recheck.ended_early, damaged.is_empty(), recheck.files) {
+            // nothing since the last close to read back is no finding about the files either
+            (true, ..) | (false, true, 0) => format!("{found}, files not checked"),
+            (false, true, _) => format!("{found}, no file found damaged"),
+            (false, false, _) => found,
         };
         let mut payload = json!({"event": "container_closed", "case_id": detail.summary.case_id,
                                  "container_id": detail.summary.uuid, "damaged": paths,

@@ -4842,6 +4842,25 @@ fn metadata_that_differs_from_its_crc_and_cannot_be_read_is_a_directory_fault() 
 }
 
 #[test]
+fn a_directory_fault_with_nothing_to_read_back_claims_nothing_about_the_files() {
+    let s = Setup::new();
+    let id = s.create();
+    s.add(id, &[s.file("a.txt")]);
+    let factum = s.f.factum();
+    factum.close_container(id).unwrap();
+    factum.reopen_container(id).unwrap();
+    let path = s.container_path();
+    flip_directory_crc(&path, &directory_entry(&path, |archive| archive.get("version.txt")));
+    let recheck = factum.recheck_container(id).unwrap();
+    assert_eq!((recheck.files, recheck.ended_early), (0, false));
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
+    let entry = factum.close_container_damaged(id, &recheck).unwrap();
+    let text = s.entry_text(entry);
+    assert!(text.contains("1 directory fault, files not checked"), "{text}");
+    assert!(!text.contains("no file found damaged"), "{text}");
+}
+
+#[test]
 fn a_content_crc_fault_stops_the_signature_and_names_the_member() {
     let s = Setup::new();
     let id = s.create();

@@ -202,6 +202,8 @@ struct CloseJob {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Close and Archive: the case to archive once its containers are closed
     then_archive: Option<i64>,
+    /// why the file was refused when it was opened: not a close then, the re-check is to say what can be done
+    refused: Option<String>,
 }
 
 /// A container file being verified.
@@ -1055,7 +1057,7 @@ impl FactumApp {
         if let Some(job) = self.close_job.as_mut() {
             if let Some(result) = job.worker.poll_result() {
                 let job = self.close_job.take().expect("polled");
-                self.finish_close(job.container_id, job.then_archive, result);
+                self.finish_close(job, result);
             } else {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
@@ -1348,8 +1350,17 @@ impl FactumApp {
             );
             return false;
         }
-        let result = self.factum().open_container_for_add(id);
-        let Some(volume) = self.run(result) else { return false };
+        let volume = match self.factum().open_container_for_add(id) {
+            // a directory fault: it is not added to, and closing it as damaged is the way out
+            Err(e) if e.is(ErrorKind::ContainerCrc) => {
+                self.start_recheck(id, None, Some(e.to_string()));
+                return false;
+            }
+            result => match self.run(result) {
+                Some(volume) => volume,
+                None => return false,
+            },
+        };
         let name = self.factum().container(id).map(|d| d.summary.name).unwrap_or_default();
         let ctx = self.egui_ctx.clone();
         let (worker, progress) = workers::add_to_container(&ctx, volume, sources, options, cancel.clone());
@@ -1515,6 +1526,10 @@ impl FactumApp {
 
     /// Close: the re-check runs on a worker thread; `finish_close` closes, or asks what to do about damage.
     fn start_close(&mut self, id: i64, then_archive: Option<i64>) {
+        self.start_recheck(id, then_archive, None);
+    }
+
+    fn start_recheck(&mut self, id: i64, then_archive: Option<i64>, refused: Option<String>) {
         if self.add_job.is_some() || self.close_job.is_some() {
             self.message(
                 "Factum",
@@ -1534,29 +1549,53 @@ impl FactumApp {
             progress,
             cancel,
             then_archive,
+            refused,
         });
     }
 
-    fn finish_close(&mut self, id: i64, then_archive: Option<i64>, result: workers::RecheckResult) {
+    /// Asks what to do about what the re-check found. A directory fault leaves one way: its container is neither
+    /// added to nor signed.
+    fn show_damage(&mut self, id: i64, recheck: crate::container::volume::Recheck, then_archive: Option<i64>) {
+        let add_again = if recheck.directory_faults.is_empty() {
+            let plan = self.factum().add_again_plan(id, &recheck.mismatches);
+            plan.map_err(|e| e.to_string())
+        } else {
+            Err("A container with a directory fault is not added to.".to_string())
+        };
+        self.dialogs.push(Dialog::Damaged {
+            container_id: id,
+            recheck,
+            add_again,
+            then_archive,
+        });
+    }
+
+    fn finish_close(&mut self, job: CloseJob, result: workers::RecheckResult) {
+        let CloseJob {
+            container_id: id,
+            then_archive,
+            refused,
+            ..
+        } = job;
         self.dirty = true;
-        let recheck = match result {
+        let mut recheck = match result {
             Ok(recheck) => recheck,
             Err(e) => return self.message("Factum", capitalize(&e)),
         };
-        if !recheck.mismatches.is_empty() {
-            let add_again = self
-                .factum()
-                .add_again_plan(id, &recheck.mismatches)
-                .map_err(|e| e.to_string());
-            self.dialogs.push(Dialog::Damaged {
-                container_id: id,
-                recheck,
-                add_again,
-                then_archive,
-            });
-            return;
+        // what opening it refused counts, whether or not the re-check, which reads less, came across it
+        if let Some(refused) = refused.filter(|_| recheck.directory_faults.is_empty()) {
+            recheck.directory_faults.push(refused);
         }
-        let result = self.factum().close_container_with(id, &self.factum().gpgsm(), &recheck);
+        if !recheck.mismatches.is_empty() || !recheck.directory_faults.is_empty() {
+            return self.show_damage(id, recheck, then_archive);
+        }
+        let result = match self.factum().close_container_with(id, &self.factum().gpgsm(), &recheck) {
+            Err(e) if e.is(ErrorKind::ContainerCrc) => {
+                recheck.directory_faults.push(e.to_string());
+                return self.show_damage(id, recheck, then_archive);
+            }
+            result => result,
+        };
         let Some(close) = self.run(result) else { return };
         if let Some(reason) = close.x509_refused {
             self.message(

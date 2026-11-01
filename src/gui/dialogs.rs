@@ -157,7 +157,7 @@ pub enum Dialog {
         selected: Option<String>,
         chain_files: Vec<String>,
     },
-    /// a close's re-check found files that do not match their hashes
+    /// a close's re-check found files that do not match their hashes, or faults of the directory
     Damaged {
         container_id: i64,
         recheck: crate::container::volume::Recheck,
@@ -904,25 +904,40 @@ impl Dialog {
                 add_again,
                 then_archive,
             } => {
-                let mismatches = &recheck.mismatches;
+                let (mismatches, faults) = (&recheck.mismatches, &recheck.directory_faults);
                 title(ui, "Container Damaged");
                 note(
                     ui,
                     &format!(
-                        "In the container, {}. The container file or its disk may be damaged.",
-                        crate::containers::mismatch_text(mismatches.len())
+                        "In the container, {}.{} The container file or its disk may be damaged.",
+                        crate::containers::damage_text(mismatches.len(), faults.len()),
+                        if recheck.ended_early {
+                            " The files were not checked."
+                        } else {
+                            ""
+                        }
                     ),
                 );
-                let shown: Vec<&str> = mismatches.iter().take(6).map(|r| r.path.as_str()).collect();
+                let found = mismatches
+                    .iter()
+                    .map(|r| r.path.as_str())
+                    .chain(faults.iter().map(String::as_str));
+                let shown: Vec<&str> = found.take(6).collect();
                 let mut listed = shown.join("\n");
-                if mismatches.len() > shown.len() {
-                    listed += &format!("\n… and {} more", mismatches.len() - shown.len());
+                let all = mismatches.len() + faults.len();
+                if all > shown.len() {
+                    listed += &format!("\n… and {} more", all - shown.len());
                 }
                 ui.add(egui::Label::new(RichText::new(listed).size(SMALL_SIZE).monospace()).wrap());
                 note(
                     ui,
-                    "Add Again copies them again from their sources and then closes. Close as Damaged closes \
-                     without signing; the log records which files failed.",
+                    if faults.is_empty() {
+                        "Add Again copies them again from their sources and then closes. Close as Damaged closes \
+                         without signing; the log records which files failed."
+                    } else {
+                        "Close as Damaged closes without signing or writing; the log records what was found. Verify \
+                         Container shows whether the content is intact."
+                    },
                 );
                 let mut result = None;
                 button_row(ui, |ui| {
