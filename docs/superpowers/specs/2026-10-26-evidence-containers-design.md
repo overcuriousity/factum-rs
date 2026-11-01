@@ -286,7 +286,9 @@ reads only factum's fixed Turtle layout, so valid Turtle in another layout (a co
 a line over 1 MiB) fails; what ends a name in Turtle (whitespace, `;,<>"'()[]#`) is refused in one, so it never reads a line otherwise than
 factum does. It takes
 every file for factum's, so it is stricter on other files: what another tool's container may lack fails or warns where
-factum, which reads those, warns, and an older AFF4 file fails where factum warns. It is not meant to pass anything
+factum, which reads those, warns, and an older AFF4 file fails where factum warns. A `version.txt` other than AFF4-L
+v1.0 fails (`unsupported`) in both on factum's layout too, but the script stops there, where factum goes on to check
+the rest. It is not meant to pass anything
 factum fails, but for what only the log can tell. Neither calls an unsigned file good: `not_signed` is a warning in any
 format, and the script, which exits 0 as nothing failed, ends with `Result: NOT SIGNED` and not `OK`.
 
