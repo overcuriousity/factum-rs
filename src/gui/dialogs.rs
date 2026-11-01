@@ -963,7 +963,7 @@ impl Dialog {
                     &format!(
                         "In the container, {}.{} The container file or its disk may be damaged.",
                         crate::containers::damage_text(mismatches.len(), faults.len()),
-                        if recheck.ended_early {
+                        if recheck.files_not_checked() {
                             " The files were not checked."
                         } else {
                             ""

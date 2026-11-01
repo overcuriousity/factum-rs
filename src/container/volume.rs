@@ -299,7 +299,8 @@ fn open_error(path: &Path, e: io::Error, other: impl Fn(String) -> FactumError) 
             "The container {} was not opened, nothing in it was changed: {member} differs from the CRC-32 of the \
              directory. Verify Container shows whether the content is intact; it can only be closed as damaged.",
             path.display()
-        )),
+        ))
+        .with_member(member),
         None if matches!(e.kind(), InvalidData | UnexpectedEof | Unsupported) => other(e.to_string()),
         None => read_refused(path, e),
     }
@@ -329,6 +330,11 @@ pub struct Recheck {
 }
 
 impl Recheck {
+    /// Whether it can say nothing about the files: it stopped early, or nothing was due since the last close.
+    pub fn files_not_checked(&self) -> bool {
+        self.ended_early || (self.files == 0 && self.mismatches.is_empty())
+    }
+
     /// Whether this re-check read what the log and the locked volume hold now: `mark` is the volume's, its write
     /// position the end of a state that was set aside, which a re-check before that read.
     pub fn is_of(&self, logged_end: Option<u64>, records: &[FileRecord], mark: Mark) -> bool {

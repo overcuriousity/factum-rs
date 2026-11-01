@@ -4789,6 +4789,7 @@ fn a_directory_fault_of_the_metadata_can_only_be_closed_as_damaged() {
         if member_name != HASHES {
             let error = factum.open_container_for_add(id).err().unwrap();
             assert!(error.is(ErrorKind::ContainerCrc), "{error}");
+            assert_eq!(error.member.as_deref(), Some(member_name));
         }
         // nor signed
         let recheck = factum.recheck_container(id).unwrap();

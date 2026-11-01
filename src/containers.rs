@@ -1265,11 +1265,10 @@ impl Factum<'_> {
         let paths: Vec<&str> = damaged.iter().map(|r| r.path.as_str()).collect();
         let unchecked = (recheck.arns.len() as u64).saturating_sub(recheck.files);
         let found = damage_text(damaged.len(), faults.len());
-        let reason = match (recheck.ended_early, damaged.is_empty(), recheck.files) {
-            // nothing since the last close to read back is no finding about the files either
-            (true, ..) | (false, true, 0) => format!("{found}, files not checked"),
-            (false, true, _) => format!("{found}, no file found damaged"),
-            (false, false, _) => found,
+        let reason = match (recheck.files_not_checked(), damaged.is_empty()) {
+            (true, _) => format!("{found}, files not checked"),
+            (false, true) => format!("{found}, no file found damaged"),
+            (false, false) => found,
         };
         let mut payload = json!({"event": "container_closed", "case_id": detail.summary.case_id,
                                  "container_id": detail.summary.uuid, "damaged": paths,

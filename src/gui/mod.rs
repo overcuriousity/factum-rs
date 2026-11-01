@@ -208,7 +208,7 @@ struct CloseJob {
     /// Close and Archive: the case to archive once its containers are closed
     then_archive: Option<i64>,
     /// why the file was refused when it was opened: not a close then, the re-check is to say what can be done
-    refused: Option<String>,
+    refused: Option<FactumError>,
 }
 
 /// A container file being verified.
@@ -1441,6 +1441,7 @@ impl FactumApp {
         sources: Vec<PathBuf>,
         options: crate::container::volume::AddOptions,
         cancel: Arc<std::sync::atomic::AtomicBool>,
+        then_archive: Option<i64>,
     ) -> bool {
         if self.add_job.is_some() {
             self.message(
@@ -1452,7 +1453,7 @@ impl FactumApp {
         let volume = match self.factum().open_container_for_add(id) {
             // a directory fault: it is not added to, and closing it as damaged is the way out
             Err(e) if e.is(ErrorKind::ContainerCrc) => {
-                self.start_recheck(id, None, Some(e.to_string()));
+                self.start_recheck(id, then_archive, Some(e));
                 return false;
             }
             result => match self.run(result) {
@@ -1518,7 +1519,7 @@ impl FactumApp {
                 match self.pending_adds.pop_front() {
                     Some((sources, options)) => {
                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        if !self.start_add(id, sources, options, cancel) {
+                        if !self.start_add(id, sources, options, cancel, then_archive) {
                             failed(self);
                         }
                     }
@@ -1631,7 +1632,7 @@ impl FactumApp {
         self.start_recheck(id, then_archive, None);
     }
 
-    fn start_recheck(&mut self, id: i64, then_archive: Option<i64>, refused: Option<String>) {
+    fn start_recheck(&mut self, id: i64, then_archive: Option<i64>, refused: Option<FactumError>) {
         if self.add_job.is_some() || self.close_job.is_some() {
             self.message(
                 "Factum",
@@ -1683,20 +1684,23 @@ impl FactumApp {
         if self.quitting {
             return; // the close was given up, whatever the re-check found
         }
-        let mut recheck = match result {
-            Ok(recheck) => recheck,
-            Err(e) => return self.message("Factum", capitalize(&e)),
+        let mut recheck = match (result, &refused) {
+            (Ok(recheck), _) => recheck,
+            // nobody asked for a close here: what stands is the refusal
+            (Err(e), Some(refused)) if e.contains("cancelled") => return self.message("Factum", refused.to_string()),
+            (Err(e), Some(refused)) => return self.message("Factum", format!("{refused}\n\n{}", capitalize(&e))),
+            (Err(e), None) => return self.message("Factum", capitalize(&e)),
         };
         // what opening it refused counts, whether or not the re-check, which reads less, came across it
         if let Some(refused) = refused.filter(|_| recheck.directory_faults.is_empty()) {
-            recheck.directory_faults.push(refused);
+            recheck.directory_faults.push(refused_fault(&refused));
         }
         if !recheck.mismatches.is_empty() || !recheck.directory_faults.is_empty() {
             return self.show_damage(id, recheck, then_archive);
         }
         let result = match self.factum().close_container_with(id, &self.factum().gpgsm(), &recheck) {
             Err(e) if e.is(ErrorKind::ContainerCrc) => {
-                recheck.directory_faults.push(e.to_string());
+                recheck.directory_faults.push(refused_fault(&e));
                 return self.show_damage(id, recheck, then_archive);
             }
             result => result,
@@ -2368,7 +2372,7 @@ impl FactumApp {
                             ..Default::default()
                         };
                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        self.start_add(id, vec![acquire], options, cancel);
+                        self.start_add(id, vec![acquire], options, cancel, None);
                     }
                 }
             }
@@ -2382,7 +2386,7 @@ impl FactumApp {
                 options,
             } => {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                self.start_add(container_id, sources, options, cancel);
+                self.start_add(container_id, sources, options, cancel, None);
             }
             DialogResult::AddAgain {
                 container_id,
@@ -2393,7 +2397,7 @@ impl FactumApp {
                 if let Some((sources, options)) = plan.pop_front() {
                     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     // the run continues only once its first addition is under way
-                    if self.start_add(container_id, sources, options, cancel) {
+                    if self.start_add(container_id, sources, options, cancel, then_archive) {
                         self.pending_adds = plan;
                         self.close_after_adds = Some((container_id, then_archive));
                     }
@@ -4021,6 +4025,15 @@ enum TreeAction {
     /// New Container for an evidence item
     NewContainerFor(i64),
     Container(ContainerAction),
+}
+
+/// A refusal to open as the log records a directory fault: the member. Opening names it; without a name all that is
+/// known is the format's other case.
+fn refused_fault(refused: &FactumError) -> String {
+    refused
+        .member
+        .clone()
+        .unwrap_or_else(|| "the directory cannot be read".to_string())
 }
 
 fn capitalize(text: &str) -> String {

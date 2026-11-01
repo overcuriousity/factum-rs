@@ -1888,7 +1888,7 @@ fn cancel_adds_nothing() {
         replaces: Vec::new(),
     };
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    harness.state_mut().start_add(id, vec![source], options, cancel);
+    harness.state_mut().start_add(id, vec![source], options, cancel, None);
     run_until(&mut harness, |h| h.state().add_job.is_none());
     assert_eq!(harness.state().factum().container(id).unwrap().adds.len(), 1);
     assert!(harness.query_by_label_contains("Nothing was added.").is_some());
@@ -3431,7 +3431,11 @@ fn an_addition_refused_for_a_directory_fault_offers_close_as_damaged() {
     let mut harness = fixture.harness();
     let options = crate::container::volume::AddOptions::default();
     let sources = vec![fixture._dir.path().join("mnt/notes.txt")];
-    assert!(!harness.state_mut().start_add(id, sources, options, Default::default()));
+    assert!(
+        !harness
+            .state_mut()
+            .start_add(id, sources, options, Default::default(), None)
+    );
     assert!(harness.state().close_job.is_some());
     run_until(&mut harness, |h| h.state().close_job.is_none());
     let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
@@ -3465,11 +3469,13 @@ fn a_close_the_open_refuses_after_the_recheck_offers_close_as_damaged() {
     let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
         panic!("no damaged dialog");
     };
-    assert!(recheck.directory_faults[0].contains("version.txt"));
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
     harness.run_ok();
     click_label(&mut harness, "Close as Damaged");
     let detail = harness.state().factum().container(id).unwrap();
     assert!(detail.summary.damaged && !detail.summary.open);
+    // the log holds the member, not the refusal's sentence
+    assert_eq!(detail.damaged_closes[0].3, ["version.txt"]);
 }
 
 #[test]
@@ -3489,14 +3495,96 @@ fn a_refused_open_the_recheck_does_not_see_is_not_a_close() {
         progress,
         cancel,
         then_archive: None,
-        refused: Some("refused when opened".into()),
+        refused: Some(FactumError::container_crc("refused when opened").with_member("version.txt")),
     };
     harness.state_mut().finish_close(job, Ok(clean));
     let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
         panic!("no damaged dialog");
     };
-    assert_eq!(recheck.directory_faults, ["refused when opened"]);
+    assert_eq!(recheck.directory_faults, ["version.txt"]);
     assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_refusal_that_names_no_member_says_what_the_format_says() {
+    assert_eq!(
+        refused_fault(&FactumError::container_crc("refused when opened")),
+        "the directory cannot be read"
+    );
+}
+
+/// A close job for the refused-addition route that is over with `outcome`.
+fn refused_job(harness: &Harness<'_, FactumApp>, id: i64) -> CloseJob {
+    let input = harness.state().factum().recheck_input(id).unwrap();
+    let cancel = Arc::<std::sync::atomic::AtomicBool>::default();
+    let (worker, progress) = workers::recheck(&harness.ctx, input, cancel.clone());
+    CloseJob {
+        container_id: id,
+        name: "FS01 preserved".into(),
+        worker,
+        progress,
+        cancel,
+        then_archive: None,
+        refused: Some(FactumError::container_crc("The container was not opened.")),
+    }
+}
+
+#[test]
+fn a_recheck_after_a_refused_addition_that_ends_shows_the_refusal() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let job = refused_job(&harness, id);
+    let cancelled = Err("Re-check cancelled — the container was not closed.".to_string());
+    harness.state_mut().finish_close(job, cancelled);
+    assert_eq!(message_text(&harness), "The container was not opened.");
+    let job = refused_job(&harness, id);
+    let failed = Err("the file cannot be read".to_string());
+    harness.state_mut().finish_close(job, failed);
+    assert_eq!(
+        message_text(&harness),
+        "The container was not opened.\n\nThe file cannot be read"
+    );
+}
+
+#[test]
+fn close_and_archive_survives_an_add_again_refused_for_a_directory_fault() {
+    let (fixture, id, path) = Fixture::with_container();
+    flip_directory_crc(&path, "version.txt");
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    let ctx = harness.ctx.clone();
+    let plan = vec![(vec![fixture._dir.path().join("mnt/notes.txt")], Default::default())];
+    let again = DialogResult::AddAgain {
+        container_id: id,
+        plan,
+        then_archive: Some(case_id),
+    };
+    harness.state_mut().handle_dialog_result(again, &ctx);
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    let Some(Dialog::Damaged { then_archive, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert_eq!(*then_archive, Some(case_id));
+}
+
+#[test]
+fn a_directory_fault_with_nothing_to_read_back_says_the_files_were_not_checked() {
+    let (fixture, id, path) = Fixture::with_container();
+    close_container(&fixture, id);
+    let mut harness = fixture.harness();
+    harness.state().factum().reopen_container(id).unwrap();
+    flip_directory_crc(&path, "version.txt");
+    close_from_menu(&mut harness, id);
+    let Some(Dialog::Damaged { recheck, .. }) = harness.state().dialogs.last() else {
+        panic!("no damaged dialog");
+    };
+    assert!(!recheck.ended_early && recheck.files == 0);
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("The files were not checked.").is_some());
+    click_label(&mut harness, "Close as Damaged");
+    let closes = harness.state().factum().container(id).unwrap().damaged_closes;
+    let entry = harness.state().factum().get_entry(closes[0].0).unwrap().unwrap();
+    assert!(entry.text.contains("files not checked"), "{}", entry.text);
 }
 
 /// Types into the search field the way the user does.
@@ -3999,7 +4087,7 @@ fn a_finished_addition_is_logged_before_the_window_closes() {
     assert!(
         harness
             .state_mut()
-            .start_add(id, vec![source], options, Default::default())
+            .start_add(id, vec![source], options, Default::default(), None)
     );
     while harness.state().add_job.as_ref().unwrap().worker.is_running() {
         std::thread::sleep(Duration::from_millis(5));
