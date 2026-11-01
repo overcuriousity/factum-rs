@@ -310,6 +310,10 @@ struct FactumApp {
     /// each case's last verification in this session
     verified: HashMap<i64, Verified>,
     dialogs: Vec<Dialog>,
+    /// each open dialog's text when it opened, for telling what quitting would lose
+    dialog_starts: Vec<String>,
+    /// Quit was confirmed: the window closes once the running jobs have ended
+    quitting: bool,
     verify_windows: Vec<VerifyWindow>,
     companion_windows: Vec<CompanionWindow>,
     // running Ask calls: (case, request number, worker)
@@ -433,6 +437,8 @@ impl FactumApp {
             container_verify_windows: Vec::new(),
             verified: HashMap::new(),
             dialogs: Vec::new(),
+            dialog_starts: Vec::new(),
+            quitting: false,
             verify_windows: Vec::new(),
             companion_windows: Vec::new(),
             ask_jobs: Vec::new(),
@@ -1674,6 +1680,9 @@ impl FactumApp {
             ..
         } = job;
         self.dirty = true;
+        if self.quitting {
+            return; // the close was given up, whatever the re-check found
+        }
         let mut recheck = match result {
             Ok(recheck) => recheck,
             Err(e) => return self.message("Factum", capitalize(&e)),
@@ -1745,6 +1754,18 @@ impl FactumApp {
                 let archived = self.factum().get_case(case_id).ok().flatten();
                 if archived.is_some_and(|c| c.is_archived()) && self.current_case_id() == Some(case_id) {
                     self.select(None, None);
+                }
+            }
+            Pending::Quit => {
+                self.quitting = true;
+                self.pending_adds.clear();
+                self.close_after_adds = None;
+                // the addition rewinds the file; what it had finished by then is still logged
+                if let Some(job) = &self.add_job {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                if let Some(job) = &self.close_job {
+                    job.cancel.store(true, Ordering::Relaxed);
                 }
             }
             Pending::CloseContainersAndArchive(case_id) => self.close_next_and_archive(case_id),
@@ -2690,6 +2711,54 @@ impl FactumApp {
         let _ = self
             .db
             .set_setting(COMPOSER_HEIGHT_SETTING, &format!("{:.0}", self.composer_height));
+    }
+
+    /// What quitting now would lose, in words.
+    fn quit_reasons(&self) -> Vec<String> {
+        let mut reasons = Vec::new();
+        if let Some(job) = &self.add_job {
+            reasons.push(format!("Files are being added to \"{}\": that is cancelled.", job.name));
+        }
+        if let Some(job) = &self.close_job {
+            reasons.push(format!("\"{}\" is being re-checked: it stays open.", job.name));
+        }
+        if !strip(&self.composer).is_empty() || !self.composer_images.is_empty() {
+            reasons.push("The note being written is lost.".to_string());
+        }
+        let mut dialogs = self.dialogs.iter().zip(&self.dialog_starts);
+        if dialogs.any(|(dialog, start)| dialog.typed_text() != *start) {
+            reasons.push("The text in the open dialog is lost.".to_string());
+        }
+        reasons
+    }
+
+    /// The window is asked to close. With something to lose it stays open and asks once; after Yes it stays open
+    /// until the running jobs have ended.
+    fn close_requested(&mut self, ctx: &egui::Context) {
+        // an addition that is done is logged, whatever comes next
+        if self.add_job.as_ref().is_some_and(|job| !job.worker.is_running()) {
+            self.poll(ctx);
+        }
+        let reasons = self.quit_reasons();
+        let busy = self.add_job.is_some() || self.close_job.is_some();
+        let nothing_lost = if self.quitting { !busy } else { reasons.is_empty() };
+        if nothing_lost {
+            return self.quit();
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        let asked = matches!(
+            self.dialogs.last(),
+            Some(Dialog::Confirm {
+                then: Pending::Quit,
+                ..
+            })
+        );
+        if !self.quitting && !asked {
+            self.dialogs.push(Dialog::Confirm {
+                message: reasons.join("\n"),
+                then: Pending::Quit,
+            });
+        }
     }
 
     fn quit(&mut self) {
@@ -4149,10 +4218,16 @@ impl eframe::App for FactumApp {
             self.handle_window_action(action, &ctx);
         }
         self.verification_progress(&ctx);
+        // the dialogs that opened since the last frame, before anything is typed into them
+        for dialog in self.dialogs.iter().skip(self.dialog_starts.len()) {
+            self.dialog_starts.push(dialog.typed_text());
+        }
+        self.dialog_starts.truncate(self.dialogs.len());
         if let Some(dialog) = self.dialogs.last_mut()
             && let Some(result) = dialog.show(&ctx)
         {
             let closed = self.dialogs.pop();
+            self.dialog_starts.truncate(self.dialogs.len());
             if matches!(
                 (&closed, &result),
                 (Some(Dialog::CompanionSettings(_)), DialogResult::Cancel)
@@ -4162,7 +4237,9 @@ impl eframe::App for FactumApp {
             self.handle_dialog_result(result, &ctx);
         }
         if ctx.input(|i| i.viewport().close_requested()) {
-            self.quit();
+            self.close_requested(&ctx);
+        } else if self.quitting && self.add_job.is_none() && self.close_job.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 }

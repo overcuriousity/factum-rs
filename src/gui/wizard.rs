@@ -109,6 +109,11 @@ fn theme_label(theme: &str) -> &'static str {
 }
 
 impl Wizard {
+    /// The text of the fields, in one string (see [`Dialog::typed_text`](super::dialogs::Dialog::typed_text)).
+    pub fn typed_text(&self) -> String {
+        format!("{}\0{}", self.seal_folder, self.companion.typed_text())
+    }
+
     pub fn new(start: WizardStart) -> Self {
         let mut companion = CompanionSettingsDialog::new(&start.companion, start.db_path);
         // the wizard turns the companion on or off with its own choice

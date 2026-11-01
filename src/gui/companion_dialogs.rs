@@ -69,6 +69,22 @@ fn reason(e: LlmError) -> String {
 }
 
 impl CompanionSettingsDialog {
+    /// The text of the fields, in one string (see [`Dialog::typed_text`](super::dialogs::Dialog::typed_text)).
+    pub fn typed_text(&self) -> String {
+        let draft = &self.draft;
+        [
+            &draft.endpoint_url,
+            &draft.api_key,
+            &draft.user_agent,
+            &draft.extra_headers,
+            &draft.model,
+            &draft.global_guideline,
+            &self.context_window,
+        ]
+        .map(String::as_str)
+        .join("\0")
+    }
+
     pub fn new(settings: &Settings, db_path: PathBuf) -> Self {
         let key_stored = !settings.api_key_from_env && !settings.api_key.is_empty();
         let mut draft = settings.clone();

@@ -22,6 +22,8 @@ use crate::verifier::{CaseReport, EntryResult, Finding, Level, SealSource, Signa
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pending {
     Archive(i64),
+    /// quit in spite of what would be lost
+    Quit,
     /// close the case's open containers, then archive it
     CloseContainersAndArchive(i64),
     /// close an open container whose file is missing
@@ -725,6 +727,56 @@ pub fn gpg_help_text() -> &'static str {
 }
 
 impl Dialog {
+    /// The text the dialog holds, in one string: when it differs from what the dialog opened with, closing loses it.
+    pub fn typed_text(&self) -> String {
+        match self {
+            Dialog::NewCase {
+                file,
+                name,
+                description,
+                ..
+            }
+            | Dialog::EditCase {
+                file,
+                name,
+                description,
+                ..
+            } => [file, name, description].map(String::as_str).join("\0"),
+            Dialog::NewEvidence {
+                name, hash, details, ..
+            }
+            | Dialog::EditEvidence {
+                name, hash, details, ..
+            } => [name, hash, details].map(String::as_str).join("\0"),
+            Dialog::AddLabel { label: text, .. }
+            | Dialog::TypedConfirm { typed: text, .. }
+            | Dialog::Export { folder: text, .. }
+            | Dialog::SealFolder { folder: text }
+            | Dialog::CaseGoal { goal: text, .. } => text.clone(),
+            Dialog::Correct { text, images, .. } => format!("{text}\0{}", images.len()),
+            Dialog::NewContainer {
+                name,
+                hash,
+                details,
+                acquire,
+                folder,
+                file_name,
+                ..
+            } => [name, hash, details, acquire, folder, file_name]
+                .map(String::as_str)
+                .join("\0"),
+            Dialog::AddToContainer {
+                base,
+                excerpt_from,
+                excerpt_to,
+                ..
+            } => [base, excerpt_from, excerpt_to].map(String::as_str).join("\0"),
+            Dialog::CompanionSettings(dialog) => dialog.typed_text(),
+            Dialog::Wizard(wizard) => wizard.typed_text(),
+            _ => String::new(),
+        }
+    }
+
     /// Draws the dialog; Some(result) closes it.
     pub fn show(&mut self, ctx: &egui::Context) -> Option<DialogResult> {
         // one id per kind of dialog: a modal keeps its last size under its id
@@ -1250,6 +1302,7 @@ impl Dialog {
             Dialog::Confirm { message, then } => {
                 let (heading, verb) = match then {
                     Pending::Archive(_) => ("Archive Case?", "Archive"),
+                    Pending::Quit => ("Quit anyway?", "Quit"),
                     Pending::CloseContainersAndArchive(_) => ("Archive Case?", "Close and Archive"),
                     Pending::CloseContainerWithoutFile(_) => ("Close Without File?", "Close Without File"),
                     Pending::DeleteEvidence(_) => ("Delete Evidence?", "Delete"),

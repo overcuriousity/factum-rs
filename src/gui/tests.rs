@@ -3754,3 +3754,150 @@ fn a_close_being_rechecked_blocks_locate_and_close_without_file() {
     release.store(true, Ordering::Relaxed);
     run_until(&mut harness, |h| h.state().close_job.is_none());
 }
+
+/// One frame in which the window is asked to close; whether the close was held back.
+fn request_close(harness: &mut Harness<'_, FactumApp>) -> bool {
+    let root = egui::ViewportId::ROOT;
+    let info = harness.input_mut().viewports.entry(root).or_default();
+    info.events.push(egui::ViewportEvent::Close);
+    harness.step();
+    let commands = &harness.output().viewport_output[&root].commands;
+    commands.contains(&egui::ViewportCommand::CancelClose)
+}
+
+fn quit_question(harness: &Harness<'_, FactumApp>) -> String {
+    match harness.state().dialogs.last() {
+        Some(Dialog::Confirm {
+            message,
+            then: Pending::Quit,
+        }) => message.clone(),
+        _ => panic!("not asked"),
+    }
+}
+
+#[test]
+fn nothing_to_lose_quits_without_asking() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let evidence = evidence_named(&harness, "disk").id;
+    harness.state_mut().open_edit_evidence(evidence);
+    harness.run_ok();
+    // a dialog that holds what it opened with, and a blank note
+    harness.state_mut().composer = "  \n".into();
+    assert!(!request_close(&mut harness));
+    assert_eq!(harness.state().dialogs.len(), 1);
+}
+
+#[test]
+fn a_note_being_written_asks_before_quitting() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    harness.state_mut().composer = "half a note".into();
+    assert!(request_close(&mut harness), "the window stays");
+    assert!(quit_question(&harness).contains("note being written"));
+    assert!(request_close(&mut harness));
+    assert_eq!(harness.state().dialogs.len(), 1, "asked once");
+    harness.run_ok();
+    assert!(harness.query_by_label("Quit anyway?").is_some());
+    click_label(&mut harness, "Cancel");
+    assert!(harness.state().dialogs.is_empty());
+    assert_eq!(harness.state().composer, "half a note");
+    assert!(!harness.state().quitting);
+}
+
+#[test]
+fn text_typed_into_a_dialog_asks_before_quitting() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let evidence = evidence_named(&harness, "disk").id;
+    harness.state_mut().open_edit_evidence(evidence);
+    harness.run_ok();
+    let Some(Dialog::EditEvidence { details, .. }) = harness.state_mut().dialogs.last_mut() else {
+        panic!("no dialog");
+    };
+    details.push_str("more");
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("open dialog"));
+}
+
+#[test]
+fn quitting_during_an_addition_cancels_it_and_waits_for_the_rewind() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let release = running_add_job(&mut harness, id);
+    harness
+        .state_mut()
+        .pending_adds
+        .push_back((Vec::new(), Default::default()));
+    harness.state_mut().close_after_adds = Some((id, None));
+    assert!(request_close(&mut harness));
+    assert!(quit_question(&harness).contains("being added"));
+    harness.run_ok();
+    click_label(&mut harness, "Quit");
+    assert!(harness.state().quitting);
+    let cancelled = harness.state().add_job.as_ref().unwrap().cancel.load(Ordering::Relaxed);
+    assert!(cancelled);
+    assert!(harness.state().pending_adds.is_empty() && harness.state().close_after_adds.is_none());
+    // another request does not get past the worker, and does not ask again
+    assert!(request_close(&mut harness));
+    assert!(!matches!(harness.state().dialogs.last(), Some(Dialog::Confirm { .. })));
+    harness.step();
+    let root = egui::ViewportId::ROOT;
+    let sent = |h: &Harness<'_, FactumApp>| {
+        h.output().viewport_output[&root]
+            .commands
+            .contains(&egui::ViewportCommand::Close)
+    };
+    assert!(!sent(&harness), "the worker is still rewinding");
+    release.store(true, Ordering::Relaxed);
+    let mut closed = false;
+    for _ in 0..30 {
+        harness.step();
+        closed = sent(&harness);
+        if closed {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(closed && harness.state().add_job.is_none());
+}
+
+#[test]
+fn quitting_during_a_recheck_gives_the_close_up() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    harness
+        .state_mut()
+        .container_action(ContainerAction::Close(id), &egui::Context::default());
+    assert!(harness.state().close_job.is_some());
+    harness.state_mut().carry_out(Pending::Quit);
+    run_until(&mut harness, |h| h.state().close_job.is_none());
+    assert!(harness.state().factum().container(id).unwrap().summary.open);
+}
+
+#[test]
+fn a_finished_addition_is_logged_before_the_window_closes() {
+    let (fixture, id, _) = Fixture::with_container();
+    let mut harness = fixture.harness();
+    let source = fixture._dir.path().join("mnt/more.txt");
+    std::fs::write(&source, b"more").unwrap();
+    let options = crate::container::volume::AddOptions {
+        base: fixture._dir.path().join("mnt"),
+        keep_path: true,
+        ..Default::default()
+    };
+    assert!(
+        harness
+            .state_mut()
+            .start_add(id, vec![source], options, Default::default())
+    );
+    while harness.state().add_job.as_ref().unwrap().worker.is_running() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // the frame's own poll ran before: a worker can finish after it, the close then does the logging
+    let ctx = harness.ctx.clone();
+    harness.state_mut().close_requested(&ctx);
+    assert!(harness.state().add_job.is_none());
+    assert_eq!(harness.state().factum().container(id).unwrap().adds.len(), 2);
+}
