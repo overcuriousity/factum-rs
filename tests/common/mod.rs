@@ -154,11 +154,12 @@ impl GpgHome {
         self.dir.path().to_path_buf()
     }
 
-    /// Sets the clock of every gpg run in this home; None is the real time.
+    /// Sets the clock of every gpg run in this home; None is the real time. Stopped (the `!`): a clock that ran on would
+    /// start at `time` in each run, and a key made as a second turned over would lie in the future of the next run.
     pub fn set_clock(&self, time: Option<&str>) {
         let config = self.dir.path().join("gpg.conf");
         match time {
-            Some(time) => std::fs::write(config, format!("faked-system-time {time}\n")).unwrap(),
+            Some(time) => std::fs::write(config, format!("faked-system-time {time}!\n")).unwrap(),
             None => drop(std::fs::remove_file(config)),
         }
     }
