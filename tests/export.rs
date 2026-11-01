@@ -766,6 +766,8 @@ fn verify_py_accepts_an_expired_subkey_on_a_certified_primary_key() {
 
 /// Adds a member with python's zipfile, which writes what the zip crate refuses (repeated names).
 fn append_member(bundle: &Path, name: &str, content: &str) {
+    // Python on Windows stores `\\` as `/`: written under a name as long, and the name's bytes changed afterwards
+    let stored = name.replace('\\', "_");
     let code = "import sys, warnings, zipfile\n\
                 warnings.simplefilter('ignore')\n\
                 zipfile.ZipFile(sys.argv[1], 'a').writestr(sys.argv[2], sys.argv[3])";
@@ -774,11 +776,22 @@ fn append_member(bundle: &Path, name: &str, content: &str) {
         .arg("-c")
         .arg(code)
         .arg(bundle)
-        .arg(name)
+        .arg(&stored)
         .arg(content)
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    if stored != name {
+        let mut bytes = std::fs::read(bundle).unwrap();
+        let places: Vec<usize> = (0..bytes.len() - stored.len())
+            .filter(|&at| bytes[at..].starts_with(stored.as_bytes()))
+            .collect();
+        assert_eq!(places.len(), 2, "the local and the central header");
+        for at in places {
+            bytes[at..at + name.len()].copy_from_slice(name.as_bytes());
+        }
+        std::fs::write(bundle, bytes).unwrap();
+    }
 }
 
 #[test]
