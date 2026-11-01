@@ -822,11 +822,158 @@ fn verify_py_checks_the_names_in_an_extracted_folder() {
     };
     assert!(!clean.contains("differ only in case"), "{clean}");
     std::fs::write(folder.join("CASE.JSON"), "{}").unwrap();
-    if std::fs::read_dir(&folder).unwrap().count() == read_zip(&bundle).len() {
-        return; // a file system that folds case
+    if std::fs::read(folder.join("case.json")).unwrap() == b"{}" {
+        return; // a file system that folds case: there is only the one file, overwritten
     }
     let (_, output) = run_verify(&folder, None, &[]).unwrap();
     assert!(output.contains("differ only in case"), "{output}");
+}
+
+#[test]
+fn verify_py_fails_a_case_json_that_cannot_be_read() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    for shape in [
+        &b"{}"[..],
+        b"[]",
+        b"null",
+        b"1",
+        b"\"x\"",
+        b"true",
+        br#"{"case":1}"#,
+        br#"{"case":{},"entries":[{}],"tree_heads":[{}],"evidence":[{}]}"#,
+        b"{",
+        b"\xff",
+    ] {
+        rewrite_zip(&bundle, &[("case.json", shape.to_vec())]);
+        let Some((code, output)) = run_verify(&bundle, None, &[]) else {
+            return;
+        };
+        if output.contains("Nothing was checked.") {
+            return; // no gpg to go on with
+        }
+        assert!(!output.contains("Traceback"), "{output}");
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("  FAIL  case.json cannot be read"), "{output}");
+        assert!(output.contains("Result: FAIL"), "{output}");
+    }
+}
+
+/// Runs verify.py's `main` in one process on each of `shapes` as the bundle's case.json, gpg left out, and prints a
+/// line for each that raises or passes.
+const CASE_SHAPES_DRIVER: &str = r#"
+import contextlib, importlib.util, io, json, sys
+spec = importlib.util.spec_from_file_location("verify", sys.argv[1])
+verify = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verify)
+
+class Gpg(object):
+    def __init__(self, *args):
+        self.signers = {}
+    def check(self, *args, **kwargs):
+        return True
+    def cleanup(self):
+        pass
+
+verify.Gpg = Gpg
+verify.find_gpg = lambda bundle: ("gpg", None)
+verify.old_gpg = lambda program: None
+files, listed = verify.load_bundle(sys.argv[2])
+with open(sys.argv[3], encoding="utf-8") as handle:
+    shapes = json.load(handle)
+for shape in shapes:
+    verify.load_bundle = lambda path: (dict(files, **{"case.json": shape.encode("utf-8")}), listed)
+    del verify.FAILS[:]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = verify.main(["bundle"])
+    except Exception as e:
+        print("raised %r: %s" % (e, shape[:300]))
+        continue
+    if code != 1 or not verify.FAILS:
+        print("passed: %s" % shape[:300])
+print("%d shapes" % len(shapes))
+"#;
+
+/// `clean` with each value the script reads gone or of another type, in every row and every event's payload.
+fn wrong_shapes(clean: &serde_json::Value) -> Vec<String> {
+    use serde_json::json;
+    let values = [
+        json!(null),
+        json!(true),
+        json!(1),
+        json!(1.5),
+        json!("x"),
+        json!([1]),
+        json!({"a": 1}),
+    ];
+    let mut shapes: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+    let mut objects = vec![String::new(), "/case".to_string()];
+    for list in ["entries", "tree_heads", "evidence"] {
+        let rows = clean[list].as_array().unwrap();
+        assert!(!rows.is_empty(), "{list}");
+        for (index, row) in rows.iter().enumerate() {
+            objects.push(format!("/{list}/{index}"));
+            if row["payload"].is_object() {
+                objects.push(format!("/{list}/{index}/payload"));
+            }
+            for value in &values {
+                let mut changed = clean.clone();
+                changed[list][index] = value.clone();
+                shapes.push(changed.to_string());
+            }
+        }
+    }
+    for object in objects {
+        for key in clean.pointer(&object).unwrap().as_object().unwrap().keys() {
+            let mut gone = clean.clone();
+            let holder = gone.pointer_mut(&object).unwrap();
+            holder.as_object_mut().unwrap().remove(key);
+            shapes.push(gone.to_string());
+            for value in &values {
+                let mut changed = clean.clone();
+                changed.pointer_mut(&object).unwrap()[key] = value.clone();
+                shapes.push(changed.to_string());
+            }
+        }
+    }
+    // what serde_json does not write: an unpaired surrogate, and nesting deeper than Python goes
+    let mut marked = clean.clone();
+    marked["entries"][0]["text"] = json!("SURROGATE");
+    marked["tree_heads"][0]["reason"] = json!("SURROGATE");
+    shapes.push(marked.to_string().replace("SURROGATE", "\\ud800"));
+    for depth in [500, 900, 100_000] {
+        let mut marked = clean.clone();
+        marked["entries"][0]["payload"] = json!("NESTED");
+        let nested = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        shapes.push(marked.to_string().replace("\"NESTED\"", &nested));
+    }
+    shapes
+}
+
+#[test]
+fn verify_py_never_stops_on_a_value_of_case_json() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let shapes = wrong_shapes(&case_json(&bundle));
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let list = dir.path().join("shapes.json");
+    std::fs::write(&list, serde_json::to_string(&shapes).unwrap()).unwrap();
+    let output = Command::new(python)
+        .args(["-I", "-X", "utf8", "-c", CASE_SHAPES_DRIVER])
+        .arg(&script)
+        .arg(&bundle)
+        .arg(&list)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(text.trim(), format!("{} shapes", shapes.len()), "{text}");
 }
 
 #[test]

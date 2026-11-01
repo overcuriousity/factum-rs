@@ -307,6 +307,82 @@ def check_signed(gpg, files, what, item, expected):
         warn("%s was signed later on %s." % (what, item.get("late_signed_utc")))
 
 
+def is_id(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def is_id_or_none(value):
+    return value is None or is_id(value)
+
+
+def is_name_or_none(value):
+    return value is None or isinstance(value, str)
+
+
+def any_value(_):
+    return True
+
+
+# what the checks need of each row of case.json to go on; any_value is only compared or hashed, whatever it is
+CASE_FIELDS = {"id": any_value, "case_file": any_value, "case_name": any_value, "description": any_value,
+               "created_utc": any_value, "archived_utc": any_value}
+ENTRY_FIELDS = {"id": is_id, "leaf_index": is_id, "corrects_id": is_id_or_none, "evidence_id": is_id_or_none,
+                "created_utc": any_value, "format": any_value, "kind": any_value, "payload": any_value,
+                "text": any_value, "leaf_hash": any_value, "tree_size": any_value, "root_hash": any_value}
+HEAD_FIELDS = {"id": is_id, "tree_size": is_id, "case_file": any_value, "created_utc": any_value, "reason": any_value,
+               "root_hash": any_value}
+EVIDENCE_FIELDS = {"id": is_id, "description": any_value, "evidence_hash": any_value, "created_utc": any_value,
+                   "deleted_utc": any_value}
+SIGNED_FIELDS = ("signature_file", "late_signature_file")
+EVIDENCE_EVENTS = ("evidence_created", "evidence_edited", "evidence_deleted")
+
+
+def row_problem(what, row, fields):
+    if not isinstance(row, dict):
+        return "%s is not an object" % what
+    for key, valid in sorted(fields.items()):
+        if key not in row:
+            return "%s has no %s" % (what, key)
+        if not valid(row[key]):
+            return "%s has a %s of the wrong type" % (what, key)
+    if not all(is_name_or_none(row.get(key)) for key in SIGNED_FIELDS):
+        return "%s has a signature file name of the wrong type" % what
+    return None
+
+
+def shape_problem(data):
+    """What keeps case.json from being read: it comes with the bundle, so any valid JSON can stand there."""
+    if not isinstance(data, dict):
+        return "it is not an object"
+    for key in ("entries", "tree_heads", "evidence"):
+        if not isinstance(data.get(key), list):
+            return "%s is not a list" % key
+    rows = [("case", data.get("case"), CASE_FIELDS)]
+    rows += [("entry %d" % n, row, ENTRY_FIELDS) for n, row in enumerate(data["entries"])]
+    rows += [("seal %d" % n, row, HEAD_FIELDS) for n, row in enumerate(data["tree_heads"])]
+    rows += [("evidence %d" % n, row, EVIDENCE_FIELDS) for n, row in enumerate(data["evidence"])]
+    for what, row, fields in rows:
+        problem = row_problem(what, row, fields)
+        if problem:
+            return problem
+    for n, entry in enumerate(data["entries"]):
+        payload = entry["payload"]
+        if (entry["kind"] == "system" and isinstance(payload, dict) and payload.get("event") in EVIDENCE_EVENTS
+                and not is_id(payload.get("evidence_id"))):
+            return "entry %d has an evidence id of the wrong type" % n
+    return None
+
+
+def read_case(content):
+    """case.json as data, or None and what keeps it from being read."""
+    try:
+        data = json.loads(content.decode("utf-8"))
+        canonical_json(data)  # as deep as the checks will go
+    except (ValueError, RecursionError) as e:
+        return None, "it is not JSON (%s)" % e
+    return data, shape_problem(data)
+
+
 def check_log(data, files, gpg):
     case = data["case"]
     entries = sorted(data["entries"], key=lambda entry: entry["leaf_index"])
@@ -317,7 +393,8 @@ def check_log(data, files, gpg):
         what = "Entry #%d (leaf %d)" % (entry["id"], entry["leaf_index"])
         if entry["leaf_index"] != position:
             fail("%s: expected leaf index %d — entries are missing or out of order." % (what, position))
-        leaf = leaf_hash(leaf_data(case["id"], entry).encode("utf-8"))
+        # surrogatepass: JSON can spell a surrogate, which factum never writes, and a hash that differs says what it is
+        leaf = leaf_hash(leaf_data(case["id"], entry).encode("utf-8", "surrogatepass"))
         if leaf.hex() != entry["leaf_hash"]:
             fail("%s: content does not match its leaf hash (modified)." % what)
         accumulator.add(leaf)
@@ -442,11 +519,14 @@ def main(argv=None):
         if "case.json" not in files:
             fail("case.json is missing.")
         else:
-            data = json.loads(files["case.json"].decode("utf-8"))
-            print("Case log")
-            accumulator = check_log(data, files, gpg)
-            print("Case and evidence details")
-            check_metadata(data)
+            data, problem = read_case(files["case.json"])
+            if problem:
+                fail("case.json cannot be read: %s." % problem)
+            else:
+                print("Case log")
+                accumulator = check_log(data, files, gpg)
+                print("Case and evidence details")
+                check_metadata(data)
     finally:
         gpg.cleanup()
         if home:
