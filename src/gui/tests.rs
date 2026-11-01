@@ -91,6 +91,13 @@ fn export_finished_names_what_the_pdf_cannot_show() {
         formats: vec!["pdf".to_string()],
         folder: folder.display().to_string(),
     });
+    assert!(harness.state().verify_job.is_some(), "the worker verifies");
+    // polled, not drawn: the test fonts have no glyph for the text
+    let ctx = harness.ctx.clone();
+    while harness.state().verify_job.is_some() {
+        harness.state_mut().poll(&ctx);
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let Some(Dialog::Message { title, text }) = harness.state().dialogs.last() else {
         panic!("no message");
     };
@@ -317,9 +324,8 @@ fn verification_runs_in_the_background_and_opens_a_report() {
     let fixture = Fixture::new();
     let mut harness = fixture.harness();
     select_case(&mut harness);
-    let ctx = harness.ctx.clone();
     let case_id = harness.state().case_id.unwrap();
-    harness.state_mut().verify_case(&ctx, case_id);
+    harness.state_mut().verify_case(case_id);
     for _ in 0..200 {
         harness.step();
         if !harness.state().verify_windows.is_empty() {
@@ -3178,6 +3184,7 @@ fn a_worker_that_panics_clears_its_job_and_says_so() {
             total: Default::default(),
         }),
         started: Instant::now(),
+        then: AfterVerify::ShowReport,
     });
     run_until(&mut harness, |h| h.state().verify_job.is_none());
     assert!(harness.state().verify_job.is_none());
@@ -3194,7 +3201,10 @@ fn a_worker_that_panics_clears_its_job_and_says_so() {
         cancel: Default::default(),
     });
     run_until(&mut harness, |h| h.state().add_job.is_none());
-    assert!(harness.state().add_job.is_none(), "the guard must not block the session");
+    assert!(
+        harness.state().add_job.is_none(),
+        "the guard must not block the session"
+    );
     let Some(Dialog::Message { text, .. }) = harness.state_mut().dialogs.pop() else {
         panic!("no message");
     };
@@ -3237,5 +3247,78 @@ fn a_non_ascii_hash_in_the_log_does_not_panic_the_view() {
     let evidence = container_evidence(&fixture, id);
     harness.state_mut().select(None, Some(evidence));
     harness.run_ok();
-    assert!(harness.query_by_label_contains(&format!("{}é", "a".repeat(15))).is_some());
+    assert!(
+        harness
+            .query_by_label_contains(&format!("{}é", "a".repeat(15)))
+            .is_some()
+    );
+}
+
+/// The fixture's database in the state the signing paths need: an unsigned case.
+fn unsigned_ids(harness: &Harness<'_, FactumApp>) -> (i64, i64) {
+    let factum = harness.state().factum();
+    let case_id = factum.list_cases(false).unwrap()[0];
+    let entries = factum.list_entries(case_id, &EntryFilter::notes()).unwrap();
+    (case_id, entries[0])
+}
+
+fn message_text(harness: &Harness<'_, FactumApp>) -> String {
+    match harness.state().dialogs.last() {
+        Some(Dialog::Message { text, .. }) => text.clone(),
+        _ => panic!("no message"),
+    }
+}
+
+#[test]
+fn signing_verifies_on_the_worker_and_signs_after_it() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, note) = unsigned_ids(&harness);
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Sign(note), &ctx);
+    assert!(
+        harness.state().verify_job.is_some() && harness.state().dialogs.is_empty(),
+        "nothing happens on the GUI thread yet"
+    );
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    // the signing itself comes after the verification: here it reports the missing key
+    assert!(message_text(&harness).contains("No GPG key is active"));
+    harness.state_mut().dialogs.clear();
+
+    harness.state_mut().sign_all_unsigned(case_id);
+    assert!(harness.state().verify_job.is_some());
+    harness.state_mut().sign_all_unsigned(case_id);
+    assert_eq!(message_text(&harness), "A verification is already running.");
+    harness.state_mut().dialogs.clear();
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert!(message_text(&harness).contains("No GPG key is active"));
+}
+
+#[test]
+fn a_broken_log_stops_signing_after_the_worker() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (_, note) = unsigned_ids(&harness);
+    fixture
+        .db()
+        .conn
+        .execute("UPDATE entries SET text = 'tampered' WHERE id = ?", [note])
+        .unwrap();
+    let ctx = harness.ctx.clone();
+    harness.state_mut().handle_card_action(CardAction::Sign(note), &ctx);
+    run_until(&mut harness, |h| h.state().verify_job.is_none());
+    assert!(message_text(&harness).contains("Nothing was signed"));
+}
+
+#[test]
+fn a_seal_is_signed_after_the_worker_too() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let (case_id, _) = unsigned_ids(&harness);
+    let head = harness.state().factum().seal(case_id, REASON_CHECKPOINT).unwrap();
+    let report = harness.state().factum().verify_case(case_id, None).unwrap();
+    harness
+        .state_mut()
+        .after_verification(AfterVerify::SignSeal(head), report);
+    assert!(message_text(&harness).contains("No GPG key is active"));
 }

@@ -14,7 +14,7 @@ use crate::export::model::ReportModel;
 use crate::files::safe_filename_capped;
 use crate::seals::REASON_EXPORT;
 use crate::services::Factum;
-use crate::verifier::Level;
+use crate::verifier::{CaseReport, Level};
 
 pub const FORMATS: [&str; 4] = ["html", "pdf", "md", "bundle"];
 
@@ -29,6 +29,16 @@ pub struct Exported {
     pub verdict: Level,
     /// what a reader of the files should know; the export itself worked
     pub warnings: Vec<String>,
+}
+
+/// An export between its seal and its files: the sealed case is verified next, then
+/// [`finish_export`](Factum::finish_export) writes them. Dropped, it leaves only the seal.
+#[derive(Debug)]
+pub struct ExportPlan {
+    formats: Vec<String>,
+    out_dir: PathBuf,
+    staging: tempfile::TempDir,
+    seal_id: i64,
 }
 
 /// The reports an export needs; one no format asks for stays empty. The HTML holds the images as base64.
@@ -78,6 +88,13 @@ impl Factum<'_> {
     /// Like [`export`](Self::export), with the verdict and the warnings. All files appear together at the end; an
     /// export that fails leaves none, only its seal.
     pub fn export_checked(&self, case_id: i64, formats: &[&str], out_dir: &Path) -> Result<Exported> {
+        let plan = self.begin_export(case_id, formats, out_dir)?;
+        let report = self.verify_case(case_id, None)?;
+        self.finish_export(plan, report)
+    }
+
+    /// The first half of an export: checks the formats and the folder, and seals the case.
+    pub fn begin_export(&self, case_id: i64, formats: &[&str], out_dir: &Path) -> Result<ExportPlan> {
         let mut unique: Vec<&str> = Vec::new();
         for format in formats {
             if !unique.contains(format) {
@@ -101,7 +118,24 @@ impl Factum<'_> {
         let staging = tempfile::Builder::new().prefix(".factum-export-").tempdir_in(out_dir)?;
         // seal first, so the report and the bundle describe exactly the sealed state
         let seal_id = self.seal(case_id, REASON_EXPORT)?;
-        let report = self.verify_case(case_id, None)?;
+        Ok(ExportPlan {
+            formats: unique.into_iter().map(str::to_string).collect(),
+            out_dir: out_dir.to_path_buf(),
+            staging,
+            seal_id,
+        })
+    }
+
+    /// The second half of an export: writes the files, from `report`, the verification made after the seal.
+    pub fn finish_export(&self, plan: ExportPlan, report: CaseReport) -> Result<Exported> {
+        let ExportPlan {
+            formats,
+            out_dir,
+            staging,
+            seal_id,
+        } = plan;
+        let unique: Vec<&str> = formats.iter().map(String::as_str).collect();
+        let out_dir = out_dir.as_path();
         let verdict = report.overall();
         let exported_utc = utc_now();
         let seal = self.get_tree_head(seal_id)?.expect("the seal was just created");

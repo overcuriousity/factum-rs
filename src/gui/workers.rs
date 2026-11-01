@@ -77,10 +77,12 @@ pub struct Progress {
 
 pub type VerifyResult = Result<CaseReport, String>;
 
+/// `seal_dir`: the seal folder the window uses (its [`Factum::env_seal_dir`]).
 pub fn verify_case(
     ctx: &egui::Context,
     db_path: PathBuf,
     gpg_home: Option<PathBuf>,
+    seal_dir: Option<PathBuf>,
     case_id: i64,
 ) -> (Worker<VerifyResult>, Arc<Progress>) {
     let progress = Arc::new(Progress {
@@ -92,7 +94,12 @@ pub fn verify_case(
     let worker = Worker::spawn(ctx, move || {
         let db = Db::open(&db_path).map_err(|e| e.to_string())?;
         let signer = GnupgSigner::without_key(gpg_home);
-        let factum = Factum::new(&db, &signer);
+        let factum = Factum {
+            db: &db,
+            signer: &signer,
+            seal_dir_override: None,
+            env_seal_dir: seal_dir,
+        };
         let mut report_progress = |done: usize, total: usize| {
             shared.done.store(done, Ordering::Relaxed);
             shared.total.store(total, Ordering::Relaxed);

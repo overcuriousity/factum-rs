@@ -205,6 +205,18 @@ struct VerifyJob {
     worker: workers::Worker<workers::VerifyResult>,
     progress: Arc<workers::Progress>,
     started: Instant,
+    then: AfterVerify,
+}
+
+/// What a case's verification is for. Signing and exporting need it, gpg per signature, so it runs on the worker
+/// and they go on here on the GUI thread (pinentry) when it is done.
+enum AfterVerify {
+    ShowReport,
+    SignEntry(i64),
+    SignSeal(i64),
+    SignAll,
+    /// (the export, sealed already; its folder)
+    Export(crate::export::ExportPlan, String),
 }
 
 struct FactumApp {
@@ -999,9 +1011,9 @@ impl FactumApp {
         if let Some(job) = self.verify_job.as_mut()
             && let Some(result) = job.worker.poll_result()
         {
-            self.verify_job = None;
+            let then = self.verify_job.take().expect("polled").then;
             match result {
-                Ok(report) => self.show_case_report(report),
+                Ok(report) => self.after_verification(then, report),
                 Err(message) => self.message("Factum", format!("Verification failed: {message}")),
             }
         }
@@ -1039,13 +1051,14 @@ impl FactumApp {
             }
         }
         let mut finished = Vec::new();
-        self.ask_jobs.retain_mut(|(case_id, worker)| match worker.poll_result() {
-            Some(result) => {
-                finished.push((*case_id, result));
-                false
-            }
-            None => true,
-        });
+        self.ask_jobs
+            .retain_mut(|(case_id, worker)| match worker.poll_result() {
+                Some(result) => {
+                    finished.push((*case_id, result));
+                    false
+                }
+                None => true,
+            });
         for (case_id, result) in finished {
             self.set_ask_state(case_id, |answer, error, running| {
                 *running = false;
@@ -1624,16 +1637,13 @@ impl FactumApp {
                 formats,
                 folder,
             } => {
+                if self.verification_running() {
+                    return;
+                }
                 let formats: Vec<&str> = formats.iter().map(String::as_str).collect();
-                let result = self.factum().export_checked(case_id, &formats, &PathBuf::from(&folder));
-                if let Some(exported) = self.run(result) {
-                    let _ = self.db.set_setting(EXPORT_DIR_SETTING, &folder);
-                    let written: Vec<String> = exported.paths.iter().map(|p| p.display().to_string()).collect();
-                    let mut text = format!("Written:\n{}", written.join("\n"));
-                    for warning in &exported.warnings {
-                        text += &format!("\n\n{warning}");
-                    }
-                    self.message("Export finished", text);
+                let result = self.factum().begin_export(case_id, &formats, &PathBuf::from(&folder));
+                if let Some(plan) = self.run(result) {
+                    self.start_verification(case_id, AfterVerify::Export(plan, folder));
                 }
             }
         }
@@ -1692,17 +1702,67 @@ impl FactumApp {
         });
     }
 
-    fn verify_case(&mut self, ctx: &egui::Context, case_id: i64) {
-        if self.verify_job.as_ref().is_some_and(|job| job.worker.is_running()) {
-            self.message("Factum", "A verification is already running.");
-            return;
+    fn verify_case(&mut self, case_id: i64) {
+        if !self.verification_running() {
+            self.start_verification(case_id, AfterVerify::ShowReport);
         }
-        let (worker, progress) = workers::verify_case(ctx, self.db.path.clone(), self.signer.gpg_home(), case_id);
+    }
+
+    /// One verification at a time: says so when one is running. A finished one counts until it was polled, its
+    /// result has something to go on with.
+    fn verification_running(&mut self) -> bool {
+        let running = self.verify_job.is_some();
+        if running {
+            self.message("Factum", "A verification is already running.");
+        }
+        running
+    }
+
+    fn start_verification(&mut self, case_id: i64, then: AfterVerify) {
+        let (worker, progress) = workers::verify_case(
+            &self.egui_ctx.clone(),
+            self.db.path.clone(),
+            self.signer.gpg_home(),
+            self.factum().env_seal_dir,
+            case_id,
+        );
         self.verify_job = Some(VerifyJob {
             worker,
             progress,
             started: Instant::now(),
+            then,
         });
+    }
+
+    fn after_verification(&mut self, then: AfterVerify, report: CaseReport) {
+        match then {
+            AfterVerify::ShowReport => self.show_case_report(report),
+            AfterVerify::SignEntry(entry_id) => {
+                let result = self.factum().sign_entry_checked(&report, entry_id);
+                if self.run(result).is_some() {
+                    self.signature_checks.remove(&entry_id);
+                }
+            }
+            AfterVerify::SignSeal(tree_head_id) => {
+                let result = self.factum().sign_tree_head_checked(&report, tree_head_id);
+                if self.run(result).is_some() {
+                    self.message("Factum", format!("Seal #{tree_head_id} signed."));
+                }
+            }
+            AfterVerify::SignAll => self.finish_sign_all(report),
+            AfterVerify::Export(plan, folder) => {
+                let result = self.factum().finish_export(plan, report);
+                if let Some(exported) = self.run(result) {
+                    let _ = self.db.set_setting(EXPORT_DIR_SETTING, &folder);
+                    let written: Vec<String> = exported.paths.iter().map(|p| p.display().to_string()).collect();
+                    let mut text = format!("Written:\n{}", written.join("\n"));
+                    for warning in &exported.warnings {
+                        text += &format!("\n\n{warning}");
+                    }
+                    self.message("Export finished", text);
+                }
+            }
+        }
     }
 
     fn show_case_report(&mut self, report: CaseReport) {
@@ -1824,8 +1884,26 @@ impl FactumApp {
     }
 
     fn sign_all_unsigned(&mut self, case_id: i64) {
-        let result = self.factum().sign_all_unsigned(case_id);
-        let Some(count) = self.run(result) else { return };
+        if !self.verification_running() {
+            self.start_verification(case_id, AfterVerify::SignAll);
+        }
+    }
+
+    fn finish_sign_all(&mut self, report: CaseReport) {
+        let result = self.factum().sign_all_checked(&report);
+        let Some((count, stopped)) = self.run(result) else {
+            return;
+        };
+        match stopped {
+            // a failure at once may be the passphrase prompt that cannot show: run() knows what to say about that
+            Some(e) if count == 0 => {
+                self.run::<()>(Err(e));
+                return;
+            }
+            Some(e) => return self.message("Factum", e.to_string()),
+            None => {}
+        }
+        let case_id = report.case.id;
         // the entries are signed already: say so even when the containers are not
         let (containers, skipped) = match self.factum().sign_unsigned_containers(case_id) {
             Ok(done) => done,
@@ -1983,9 +2061,11 @@ impl FactumApp {
                 _ => log::warn!("No GPG signature found."),
             },
             CardAction::Sign(entry_id) => {
-                let result = self.factum().sign_entry(entry_id);
-                if self.run(result).is_some() {
-                    self.signature_checks.remove(&entry_id);
+                let result = self.factum().case_of_unsigned_entry(entry_id);
+                if !self.verification_running()
+                    && let Some(case_id) = self.run(result)
+                {
+                    self.start_verification(case_id, AfterVerify::SignEntry(entry_id));
                 }
             }
             CardAction::Verify(entry_id) => {
@@ -2461,7 +2541,7 @@ impl FactumApp {
         if pressed(VERIFY_CASE)
             && let Some(case_id) = self.current_case_id()
         {
-            self.verify_case(ctx, case_id);
+            self.verify_case(case_id);
         }
         if pressed(SHOW_SYSTEM) {
             self.show_system = !self.show_system;
@@ -2691,7 +2771,7 @@ impl FactumApp {
             )
             .clicked()
         {
-            self.verify_case(ctx, case_id.unwrap());
+            self.verify_case(case_id.unwrap());
         }
         if ui.button("Verify Container…").clicked()
             && let Some(path) = rfd::FileDialog::new()
@@ -3026,7 +3106,7 @@ impl FactumApp {
             TreeAction::Edit(case_id) => self.open_edit_case(case_id),
             TreeAction::CliCase(case_id) => self.set_cli_active_case(case_id),
             TreeAction::CliEvidence(evidence_id) => self.set_cli_active_evidence(evidence_id),
-            TreeAction::Verify(case_id) => self.verify_case(ctx, case_id),
+            TreeAction::Verify(case_id) => self.verify_case(case_id),
             TreeAction::Seal(case_id) => self.with_key_check(Pending::Seal(case_id)),
             TreeAction::Export(case_id) => self.export(case_id),
             TreeAction::SignAll(case_id) => self.sign_all_unsigned(case_id),
@@ -3834,9 +3914,11 @@ impl eframe::App for FactumApp {
             match action {
                 VerifyAction::ShowEntry(entry_id) => self.jump_to_entry(entry_id),
                 VerifyAction::SignSeal(tree_head_id) => {
-                    let result = self.factum().sign_tree_head(tree_head_id);
-                    if self.run(result).is_some() {
-                        self.message("Factum", format!("Seal #{tree_head_id} signed."));
+                    let result = self.factum().unsigned_tree_head(tree_head_id);
+                    if !self.verification_running()
+                        && let Some(head) = self.run(result)
+                    {
+                        self.start_verification(head.case_id, AfterVerify::SignSeal(tree_head_id));
                     }
                 }
             }

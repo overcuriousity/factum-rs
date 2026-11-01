@@ -430,7 +430,10 @@ fn dispatch(factum: &Factum, args: &Args, out: &mut dyn Write) -> Result<i32> {
         )?;
     } else if let Some(query) = &args.sign_unsigned {
         let case_id = resolve_case(factum, query)?;
-        let count = factum.sign_all_unsigned(case_id)?;
+        let (count, stopped) = factum.sign_all_unsigned(case_id)?;
+        if let Some(e) = stopped {
+            return Err(e);
+        }
         writeln!(out, "Signed {count} item(s).")?;
     } else if let Some(query) = &args.export {
         let case_id = resolve_case(factum, query)?;

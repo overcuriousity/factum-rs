@@ -1042,14 +1042,14 @@ fn sign_all_unsigned_then_only_warnings_remain() {
     let f = Fixture::new();
     let (case_id, _, _) = unsigned_case(&f);
     let factum = f.factum();
-    assert_eq!(factum.sign_all_unsigned(case_id).unwrap(), 3); // case created entry, note, seal
+    assert_eq!(factum.sign_all_unsigned(case_id).unwrap(), (3, None)); // case created entry, note, seal
     let report = factum.verify_case(case_id, None).unwrap();
     assert!(
         !report.findings.iter().any(|f| f.level == Level::Fail),
         "{:?}",
         report.findings
     );
-    assert_eq!(factum.sign_all_unsigned(case_id).unwrap(), 0);
+    assert_eq!(factum.sign_all_unsigned(case_id).unwrap(), (0, None));
 }
 
 #[test]
@@ -1059,6 +1059,46 @@ fn already_signed_entry_is_refused() {
     let factum = f.factum();
     factum.sign_entry(note).unwrap();
     assert!(factum.sign_entry(note).unwrap_err().message.contains("already signed"));
+}
+
+#[test]
+fn a_run_that_stops_says_how_far_it_got() {
+    let f = Fixture::new();
+    let (case_id, ..) = unsigned_case(&f);
+    let factum = f.factum();
+    f.signer.fail_text_after.set(Some(1));
+    let (signed, stopped) = factum.sign_all_unsigned(case_id).unwrap();
+    assert_eq!(signed, 1);
+    let stopped = stopped.unwrap();
+    assert!(stopped.is(ErrorKind::Signing));
+    assert_eq!(stopped.message, "Signed 1 of 3; stopped: GPG signing failed.");
+    // what was signed stays signed, and the next run does the rest
+    assert_eq!(factum.sign_all_unsigned(case_id).unwrap(), (2, None));
+}
+
+#[test]
+fn signing_on_a_report_refuses_what_it_refuses_without_one() {
+    let f = Fixture::new();
+    let (case_id, note, tree_head_id) = unsigned_case(&f);
+    let factum = f.factum();
+    let report = factum.verify_case(case_id, None).unwrap();
+    factum.sign_entry_checked(&report, note).unwrap();
+    let again = factum.sign_entry_checked(&report, note).unwrap_err();
+    assert!(again.message.contains("already signed"));
+    factum.sign_tree_head_checked(&report, tree_head_id).unwrap();
+
+    let f = Fixture::new();
+    let (case_id, note, tree_head_id) = unsigned_case(&f);
+    let factum = f.factum();
+    f.exec(&format!("UPDATE entries SET text = 'tampered' WHERE id = {note}"));
+    let report = factum.verify_case(case_id, None).unwrap();
+    for error in [
+        factum.sign_entry_checked(&report, note).unwrap_err(),
+        factum.sign_tree_head_checked(&report, tree_head_id).unwrap_err(),
+        factum.sign_all_checked(&report).unwrap_err(),
+    ] {
+        assert!(error.is(ErrorKind::LogBroken) && error.message.contains("Nothing was signed"));
+    }
 }
 
 #[test]
