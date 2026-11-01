@@ -6,7 +6,8 @@
 
 On Windows, use "py" instead of "python3".
 
-Needs Python 3.8 or newer and gpg 2.1 or newer on the PATH; uses only the Python standard library.
+Needs Python 3.8 or newer and gpg 2.1 or newer on the PATH; uses only the Python standard library. A gpg in the current
+folder or in the bundle's is refused.
 Exit code 0: no failures (warnings are possible). Exit code 1: at least one failure.
 The format is specified in README.md next to this file.
 """
@@ -92,19 +93,40 @@ def seal_payload(case, head):
 
 
 def load_bundle(path):
+    """The files by name, and every name as it stands in the bundle, repeated ones and folders too."""
     files = {}
+    listed = []
     if os.path.isdir(path):
         for folder, _, names in os.walk(path):
             for name in names:
                 full = os.path.join(folder, name)
+                name = os.path.relpath(full, path).replace(os.sep, "/")
+                listed.append(name)
                 with open(full, "rb") as handle:
-                    files[os.path.relpath(full, path).replace(os.sep, "/")] = handle.read()
+                    files[name] = handle.read()
     else:
         with zipfile.ZipFile(path) as bundle:
-            for name in bundle.namelist():
-                if not name.endswith("/"):
-                    files[name] = bundle.read(name)
-    return files
+            for info in bundle.infolist():
+                # orig_filename: filename has lost what follows a NUL, and on Windows its backslashes
+                listed.append(info.orig_filename)
+                if not info.filename.endswith("/"):
+                    files[info.filename] = bundle.read(info)
+    return files, listed
+
+
+def check_names(listed):
+    """Names that make ZIP tools, an extraction and this script see different files."""
+    exact = set()
+    folded = {}
+    for name in listed:
+        if re.match(r"/|[A-Za-z]:", name) or ".." in name.split("/") or "\\" in name or "\0" in name:
+            fail("%r is not a safe name for a file in a bundle." % name)
+        if name in exact:
+            fail("%r is in the bundle more than once: ZIP tools may read a different copy than this check." % name)
+        exact.add(name)
+        first = folded.setdefault(name.casefold(), name)
+        if first != name:
+            fail("%r and %r differ only in case." % (first, name))
 
 
 def signature_problem(status, exit_code):
@@ -132,8 +154,45 @@ def signature_problem(status, exit_code):
     return None
 
 
+def own_hash():
+    """The SHA-256 of this file: it comes with the bundle it checks, so nothing vouches for it but a copy to compare
+    with. factum --version and the release notes give the hash."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except (NameError, OSError):
+        return "unknown"
+
+
+def same_folder(one, other):
+    return os.path.normcase(os.path.realpath(one)) == os.path.normcase(os.path.realpath(other))
+
+
+def inside_folder(path, folder):
+    path, folder = (os.path.normcase(os.path.realpath(item)) for item in (path, folder))
+    return path == folder or path.startswith(os.path.join(folder, ""))
+
+
+def find_gpg(bundle):
+    """gpg as an absolute path, or None with the reason. Windows looks in the current folder before the PATH, for a bare
+    name and in shutil.which, and what lies beside a bundle comes from whoever made it: a gpg there is not run."""
+    found = shutil.which("gpg")
+    if found is None:
+        return None, "gpg is not installed or not on the PATH."
+    found = os.path.abspath(found)
+    folder = os.path.dirname(found)
+    if os.path.isdir(bundle):
+        beside_bundle = inside_folder(folder, bundle)
+    else:
+        beside_bundle = same_folder(folder, os.path.dirname(os.path.abspath(bundle)))
+    if beside_bundle or same_folder(folder, os.getcwd()):
+        return None, "Refusing %s: a gpg in the current folder or the bundle's is not run. Nothing was checked." % found
+    return found, None
+
+
 class Gpg(object):
-    def __init__(self, home, bundled_keys):
+    def __init__(self, program, home, bundled_keys):
+        self.program = program
         self.home = home
         self.bundled_keys = bundled_keys
         self.workdir = tempfile.mkdtemp(prefix="fv-")
@@ -141,7 +200,7 @@ class Gpg(object):
 
     def run(self, args):
         # what is checked comes from the bundle: gpg must never ask for anything
-        command = ["gpg", "--batch", "--pinentry-mode", "error", "--status-fd", "2"]
+        command = [self.program, "--batch", "--pinentry-mode", "error", "--status-fd", "2"]
         if self.home:
             command += ["--homedir", self.home]
         result = subprocess.run(command + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -206,9 +265,9 @@ class Gpg(object):
         shutil.rmtree(self.workdir, ignore_errors=True)
 
 
-def old_gpg():
+def old_gpg(program):
     """The version of gpg when it is older than 2.1, which has no --pinentry-mode; None otherwise."""
-    result = subprocess.run(["gpg", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run([program, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     lines = result.stdout.decode("utf-8", "replace").splitlines()
     match = re.search(r"(\d+)\.(\d+)\S*", lines[0]) if lines else None
     if match and (int(match.group(1)), int(match.group(2))) < (2, 1):
@@ -353,22 +412,27 @@ def main(argv=None):
     parser.add_argument("--use-bundled-keys", action="store_true",
                         help="verify against public-keys.asc from the bundle, in a temporary keyring")
     args = parser.parse_args(argv)
-    if shutil.which("gpg") is None:
-        print("gpg is not installed or not on the PATH.")
+    print("verify.py SHA-256 %s" % own_hash())
+    print("Compare it with factum --version or the release notes: this script comes with the bundle it checks.")
+    program, problem = find_gpg(args.bundle)
+    if problem:
+        print(problem)
         return 1
-    version = old_gpg()
+    version = old_gpg(program)
     if version:
         print("verify.py needs gpg 2.1 or newer, this is gpg %s. Nothing was checked." % version)
         return 1
-    files = load_bundle(args.bundle)
+    files, listed = load_bundle(args.bundle)
     home = None
     if args.use_bundled_keys:
         home = tempfile.mkdtemp(prefix="fk-")
-        subprocess.run(["gpg", "--batch", "--homedir", home, "--import"], input=files.get("public-keys.asc", b""),
+        subprocess.run([program, "--batch", "--homedir", home, "--import"], input=files.get("public-keys.asc", b""),
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    gpg = Gpg(home, args.use_bundled_keys)
+    gpg = Gpg(program, home, args.use_bundled_keys)
     accumulator = None
     try:
+        print("File names")
+        check_names(listed)
         print("Manifest")
         check_manifest(files)
         if "MANIFEST.sha256.asc" in files and "MANIFEST.sha256" in files:
@@ -386,8 +450,13 @@ def main(argv=None):
     finally:
         gpg.cleanup()
         if home:
-            subprocess.run(["gpgconf", "--homedir", home, "--kill", "gpg-agent"],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # beside gpg, for the reason gpg is found the way it is
+            gpgconf = os.path.join(os.path.dirname(program), "gpgconf")
+            try:
+                subprocess.run([gpgconf, "--homedir", home, "--kill", "gpg-agent"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except OSError:
+                pass
             shutil.rmtree(home, ignore_errors=True)
     print("")
     if gpg.signers:

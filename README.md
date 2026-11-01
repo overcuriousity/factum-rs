@@ -110,7 +110,9 @@ Every release has `SHA256SUMS` and [build provenance attestations](https://docs.
 - Case report as **HTML** (integrity details in collapsible sections, no JavaScript), **PDF** (A4, rendered by factum
   itself — no browser or Qt needed) and **Markdown** (short integrity line per entry plus an integrity appendix)
 - **Verification bundle** (ZIP): `case.json`, all signatures, signers' public keys, the three reports, a signed
-  `MANIFEST.sha256` and a dependency-free `verify.py`: `python3 verify.py bundle.zip`
+  `MANIFEST.sha256` and a dependency-free `verify.py`: `python3 verify.py bundle.zip`. The script comes with the
+  bundle it checks: run a copy you trust, or compare the SHA-256 it prints when it starts with `factum --version` or
+  the release notes
 - Exporting seals the case first; a case that fails verification is still exported, with the failures on top
 
 ### IOC extraction

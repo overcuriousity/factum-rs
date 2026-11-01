@@ -2,11 +2,15 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use clap::Parser;
+use sha2::{Digest, Sha256};
 
+use crate::container::volume::VERIFY_CONTAINER_PY;
 use crate::db::Db;
 use crate::error::{FactumError, Result};
+use crate::export::bundle::VERIFY_PY;
 use crate::pystr::{head, splitlines, strip};
 use crate::seals::REASON_CHECKPOINT;
 use crate::services::Factum;
@@ -16,10 +20,21 @@ use crate::verifier::{CaseReport, Level};
 /// value of an optional CASE argument given without a value: use the active case
 pub const ACTIVE: &str = "";
 
+/// `--version`: the verifier scripts come with the bundles and containers they check, this is what to compare them with
+static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}\nverify.py SHA-256 {}\nverify_container.py SHA-256 {}",
+        env!("CARGO_PKG_VERSION"),
+        hex::encode(Sha256::digest(VERIFY_PY)),
+        hex::encode(Sha256::digest(VERIFY_CONTAINER_PY)),
+    )
+});
+
 #[derive(Debug, Parser, Default, Clone)]
 #[command(
     name = "factum",
     version,
+    long_version = LONG_VERSION.as_str(),
     about = "Factum Notes Application",
     after_help = "A case or evidence is given as #<id>, a file number or name, or an id (digits only, no sign). Exit codes: 0 done (a verification with warnings only is done), 1 a verification failed (also \
                   --export of a case that fails it; the files are still written), 2 an error: unknown case, bad \

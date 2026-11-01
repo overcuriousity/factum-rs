@@ -15,7 +15,7 @@ use crate::error::{FactumError, Result};
 use crate::notes::parse_payload;
 use crate::services::Factum;
 
-/// The dependency-free verifier shipped in every bundle, byte for byte the one of factum-notes.
+/// The dependency-free verifier shipped in every bundle.
 pub const VERIFY_PY: &[u8] = include_bytes!("verify.py");
 
 pub const BUNDLE_README: &str = r#"# factum case bundle
@@ -28,7 +28,13 @@ This archive is a self-contained, verifiable export of one factum case.
 
 On Windows, run `py verify.py <this-bundle>.zip` instead.
 
-Needs Python 3.8+ and gpg 2.1 or newer (on Windows: Gpg4win). By default your own keyring is used, so the signer's key must be in it and trusted.
+`verify.py` and this README are part of the bundle: whoever could change the bundle could change them too, and a script
+changed that way can say anything. Run a copy you trust, or compare the SHA-256 the script prints when it starts with
+what `factum --version` prints on a machine you trust, or with the release notes of that version. Neither needs a
+network.
+
+Needs Python 3.8+ and gpg 2.1 or newer (on Windows: Gpg4win). A gpg in the current folder or the bundle's folder is
+refused. By default your own keyring is used, so the signer's key must be in it and trusted.
 A signature made before its key expired still counts, with a warning. gpg gives no trust level for an expired key: it
 counts as trusted if ultimately trusted, or if only its signing subkey expired and the primary key is valid.
 Without the key: `python3 verify.py <bundle>.zip --use-bundled-keys` imports `public-keys.asc` into a temporary

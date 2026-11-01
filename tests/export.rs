@@ -716,6 +716,163 @@ fn verify_py_accepts_an_expired_subkey_on_a_certified_primary_key() {
     assert!(output.contains("has expired since"), "{output}");
 }
 
+/// Adds a member with python's zipfile, which writes what the zip crate refuses (repeated names).
+fn append_member(bundle: &Path, name: &str, content: &str) {
+    let code = "import sys, warnings, zipfile\n\
+                warnings.simplefilter('ignore')\n\
+                zipfile.ZipFile(sys.argv[1], 'a').writestr(sys.argv[2], sys.argv[3])";
+    let python = which::which("python3").unwrap();
+    let output = Command::new(python)
+        .arg("-c")
+        .arg(code)
+        .arg(bundle)
+        .arg(name)
+        .arg(content)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn verify_py_fails_on_names_tools_read_differently() {
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let Some((_, clean)) = run_verify(&bundle, None, &[]) else {
+        return;
+    };
+    assert!(clean.contains("File names\nManifest\n"), "{clean}");
+    for (name, expected) in [
+        ("case.json", "'case.json' is in the bundle more than once"),
+        ("Case.json", "'case.json' and 'Case.json' differ only in case"),
+        ("/etc/passwd", "'/etc/passwd' is not a safe name"),
+        ("C:/windows/x", "'C:/windows/x' is not a safe name"),
+        ("images/../../x", "'images/../../x' is not a safe name"),
+        ("..", "'..' is not a safe name"),
+        (r"images\x", r"'images\\x' is not a safe name"),
+    ] {
+        let copy = f.path().join("copy.zip");
+        std::fs::copy(&bundle, &copy).unwrap();
+        append_member(&copy, name, "{}");
+        let (code, output) = run_verify(&copy, None, &[]).unwrap();
+        assert_eq!(code, 1, "{name}: {output}");
+        assert!(output.contains(&format!("FAIL  {expected}")), "{name}: {output}");
+    }
+}
+
+#[test]
+fn verify_py_checks_the_names_in_an_extracted_folder() {
+    // an extracted folder can hold case-only variants on a file system that tells them apart
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let folder = f.path().join("extracted");
+    for (name, content) in read_zip(&bundle) {
+        let path = folder.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    let Some((_, clean)) = run_verify(&folder, None, &[]) else {
+        return;
+    };
+    assert!(!clean.contains("differ only in case"), "{clean}");
+    std::fs::write(folder.join("CASE.JSON"), "{}").unwrap();
+    if std::fs::read_dir(&folder).unwrap().count() == read_zip(&bundle).len() {
+        return; // a file system that folds case
+    }
+    let (_, output) = run_verify(&folder, None, &[]).unwrap();
+    assert!(output.contains("differ only in case"), "{output}");
+}
+
+#[test]
+fn version_shows_the_hashes_the_scripts_print() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let version = |flag: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_factum"))
+            .arg(flag)
+            .env("HOME", f.path())
+            .env("XDG_CONFIG_HOME", f.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let scripts = [
+        ("verify.py", factum::export::bundle::VERIFY_PY),
+        ("verify_container.py", factum::container::volume::VERIFY_CONTAINER_PY),
+    ];
+    let lines: Vec<String> = scripts
+        .iter()
+        .map(|(name, content)| format!("{name} SHA-256 {}", hex::encode(sha2::Sha256::digest(content))))
+        .collect();
+    let first = format!("factum {}", env!("CARGO_PKG_VERSION"));
+    assert_eq!(version("--version"), format!("{first}\n{}\n{}\n", lines[0], lines[1]));
+    // one line, for what reads the version
+    assert_eq!(version("-V"), format!("{first}\n"));
+    for ((name, content), line) in scripts.iter().zip(&lines) {
+        let script = f.path().join(name);
+        std::fs::write(&script, content).unwrap();
+        let output = Command::new(&python)
+            .arg(&script)
+            .arg(f.path().join("missing"))
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(text.lines().next(), Some(line.as_str()), "{text}");
+    }
+}
+
+/// A gpg that leaves `ran` behind if it is ever started.
+#[cfg(unix)]
+fn planted_gpg(folder: &Path, ran: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(folder).unwrap();
+    let gpg = folder.join("gpg");
+    std::fs::write(&gpg, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+    std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_py_refuses_a_gpg_beside_the_bundle_or_in_the_current_folder() {
+    let Ok(python) = which::which("python3") else {
+        return;
+    };
+    let f = Fixture::new();
+    let bundle = make_bundle(&f.db, &f.signer, &f.seal_dir, f.path(), "C-1");
+    let scripts = tempfile::tempdir().unwrap();
+    let script = scripts.path().join("verify.py");
+    std::fs::write(&script, factum::export::bundle::VERIFY_PY).unwrap();
+    let ran = f.path().join("gpg-ran");
+    let folder = f.path().join("extracted");
+    let current = f.path().join("current");
+    planted_gpg(&folder.join("sub"), &ran);
+    planted_gpg(&current, &ran);
+    planted_gpg(f.path(), &ran);
+    for (target, path, working_folder) in [
+        // inside an extracted bundle
+        (&folder, folder.join("sub"), f.path()),
+        // beside the ZIP
+        (&bundle, f.path().to_path_buf(), &current),
+        // the current folder: what Windows looks in first, here through the PATH
+        (&bundle, PathBuf::from("."), &current),
+    ] {
+        let output = Command::new(&python)
+            .arg(&script)
+            .arg(target)
+            .env("PATH", path)
+            .current_dir(working_folder)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(1), "{text}");
+        assert!(text.contains("Refusing ") && text.contains("Nothing was checked."), "{text}");
+        assert!(!text.contains("Result:"), "{text}");
+        assert!(!ran.exists(), "{text}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn verify_py_says_when_gpg_is_too_old() {

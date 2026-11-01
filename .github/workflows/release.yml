@@ -212,6 +212,17 @@ jobs:
           and run \`sh install.sh --archive <archive>\`. See docs/AIRGAP.md. Check the build provenance with
           \`gh attestation verify <file> --repo ${{ github.repository }}\`.
           EOF
+          # README.md and the READMEs in bundles and containers send readers here for these
+          cat > script-hashes.md <<EOF
+
+          ## Verifier scripts
+
+          The scripts in bundles and containers print their SHA-256 when they start; \`factum --version\` prints the same:
+
+              verify.py SHA-256 $(sha256sum src/export/verify.py | cut -d' ' -f1)
+              verify_container.py SHA-256 $(sha256sum src/container/verify_container.py | cut -d' ' -f1)
+          EOF
+          cat script-hashes.md >> notes.md
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -219,6 +230,12 @@ jobs:
           tag="${{ needs.prepare.outputs.tag }}"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
+            # a release made in the web interface has its own notes: they keep them and gain the script hashes
+            notes=$(gh release view "$tag" --json body --jq .body)
+            case "$notes" in
+              *"verify.py SHA-256"*) ;;
+              *) printf '%s\n' "$notes" | cat - script-hashes.md | gh release edit "$tag" --notes-file - ;;
+            esac
           else
             gh release create "$tag" dist/* --title "factum ${{ needs.prepare.outputs.version }}" --notes-file notes.md --verify-tag
           fi

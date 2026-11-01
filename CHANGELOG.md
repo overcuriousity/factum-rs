@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- `verify.py` prints its own SHA-256 when it starts; `factum --version` prints the SHA-256 of the embedded `verify.py`
+  and `verify_container.py` (`-V` stays one line), the release notes list both, and the bundle README says to run a
+  trusted copy or compare the hash
+- `verify.py` runs gpg by its absolute path and refuses one in the current folder or the bundle's, which Windows would
+  otherwise run before the one on the `PATH`
 - CLI: a case or evidence item is found by `#<id>`, then an exact file number, then an exact name; a plain number is an
   id only when nothing matches, several matches are an error that lists them, `_` is no longer dropped from numbers.
   Exit codes: 0 done, 1 verification failed (also `--export` of a failing case, which warns and still writes the
@@ -158,6 +163,8 @@ All notable changes to this project are documented here. The format follows
   undamaged ones it never reached (`unchecked_files`)
 - A hostile `factum/history/0/` member is a failure in Verify Container instead of a crash, a crafted high close
   number no longer exhausts memory (one finding per gap) and a container cannot be closed past the highest number
+- `verify.py` fails on ZIP member names read differently by other tools: repeated names (Python reads the last copy,
+  unzip the first), absolute names, `..`, a backslash, names differing only in case
 
 ## [2.7.1] - 2026-10-29
 

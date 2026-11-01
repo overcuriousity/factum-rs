@@ -192,7 +192,7 @@ src=$(find "$tmp" -mindepth 2 -maxdepth 2 -type f -name factum | head -n 1)
 [ -n "$src" ] || die "the archive contains no factum binary"
 mkdir -p "$DIR"
 install -m 755 "$src" "$DIR/factum" 2>/dev/null || { cp "$src" "$DIR/factum" && chmod 755 "$DIR/factum"; }
-say "installed $DIR/factum ($("$DIR/factum" --version 2>/dev/null || echo "version unknown"))"
+say "installed $DIR/factum ($("$DIR/factum" -V 2>/dev/null || echo "version unknown"))"
 
 if [ "$DESKTOP" = 1 ]; then
     share_src=$(dirname "$src")/share
