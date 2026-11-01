@@ -203,6 +203,7 @@ All notable changes to this project are documented here. The format follows
   freezing the window for a gpg run per signature; signing follows on the GUI thread when the verification passed
 - Sign All Unsigned that stops part way says so ("Signed 5 of 20; stopped: ..."), in the GUI and the CLI, instead of
   "nothing was signed"
+- GUI: a case whose id was reused after a permanent delete no longer shows the deleted case's verification status
 
 ## [2.7.1] - 2026-10-29
 

@@ -3322,3 +3322,47 @@ fn a_seal_is_signed_after_the_worker_too() {
         .after_verification(AfterVerify::SignSeal(head), report);
     assert!(message_text(&harness).contains("No GPG key is active"));
 }
+
+#[test]
+fn a_verified_status_covers_one_log_only() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    select_case(&mut harness);
+    let case_id = harness.state().case_id.unwrap();
+    let report = harness.state().factum().verify_case(case_id, None).unwrap();
+    harness.state_mut().show_case_report(report);
+    harness.state_mut().verify_windows.clear();
+    harness.state_mut().dirty = true;
+    harness.run_ok();
+    // unsigned entries fail
+    let shown = |h: &Harness<'_, FactumApp>| h.query_by_label_contains("verification failed").is_some();
+    assert!(shown(&harness));
+    // the same size, another log: what a new case with a reused id would have
+    harness.state_mut().verified.get_mut(&case_id).unwrap().root_hash = "another log".into();
+    harness.run_ok();
+    assert!(!shown(&harness));
+}
+
+#[test]
+fn a_deleted_case_leaves_no_verified_status() {
+    let fixture = Fixture::new();
+    let mut harness = fixture.harness();
+    let case_id = harness.state().factum().list_cases(false).unwrap()[0];
+    harness.state().factum().archive_case(case_id).unwrap();
+    let report = harness.state().factum().verify_case(case_id, None).unwrap();
+    harness.state_mut().show_case_report(report);
+    harness.state_mut().verify_windows.clear();
+    assert!(harness.state().verified.contains_key(&case_id));
+    let ctx = harness.ctx.clone();
+    let typed = "not the number".to_string();
+    harness
+        .state_mut()
+        .handle_dialog_result(DialogResult::TypedConfirmed { case_id, typed }, &ctx);
+    assert!(harness.state().verified.contains_key(&case_id), "not deleted");
+    harness.state_mut().dialogs.clear();
+    let typed = "C-1".to_string();
+    harness
+        .state_mut()
+        .handle_dialog_result(DialogResult::TypedConfirmed { case_id, typed }, &ctx);
+    assert!(!harness.state().verified.contains_key(&case_id));
+}

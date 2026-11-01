@@ -142,6 +142,17 @@ struct CaseStatus {
     entries: usize,
     /// when the newest seal was made
     last_seal: Option<String>,
+    /// the root hash of the newest entry
+    root_hash: String,
+}
+
+/// A case's last verification in this session and the log it covered: only that log (not a newer state, not a case
+/// that got the id of a deleted one) shows it.
+struct Verified {
+    level: Level,
+    utc: String,
+    tree_size: i64,
+    root_hash: String,
 }
 
 /// Everything the window shows, read from the database in one go.
@@ -282,8 +293,8 @@ struct FactumApp {
     note_images: std::cell::RefCell<HashMap<i64, Arc<[NoteImage]>>>,
     container_verify_job: Option<ContainerVerifyJob>,
     container_verify_windows: Vec<containers::ContainerVerifyWindow>,
-    /// each case's last verification in this session: outcome, time and the tree size it covered
-    verified: HashMap<i64, (Level, String, i64)>,
+    /// each case's last verification in this session
+    verified: HashMap<i64, Verified>,
     dialogs: Vec<Dialog>,
     verify_windows: Vec<VerifyWindow>,
     companion_windows: Vec<CompanionWindow>,
@@ -846,14 +857,13 @@ impl FactumApp {
             }
             // the newest entry is never a superseded one; its tree size counts every entry, earlier versions too
             let newest = factum.list_entries(case.id, &EntryFilter::default())?.into_iter().max();
-            let entries = match newest {
-                Some(id) => factum
-                    .get_entry_without_payload(id)?
-                    .map_or(0, |entry| entry.tree_size as usize),
-                None => 0,
+            let newest = match newest {
+                Some(id) => factum.get_entry_without_payload(id)?,
+                None => None,
             };
             view.case_status = Some(CaseStatus {
-                entries,
+                entries: newest.as_ref().map_or(0, |entry| entry.tree_size as usize),
+                root_hash: newest.map(|entry| entry.root_hash).unwrap_or_default(),
                 last_seal: factum
                     .list_tree_heads(case.id)?
                     .into_iter()
@@ -1767,8 +1777,18 @@ impl FactumApp {
 
     fn show_case_report(&mut self, report: CaseReport) {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        self.verified
-            .insert(report.case.id, (report.overall(), now, report.tree_size));
+        let verified = Verified {
+            level: report.overall(),
+            utc: now,
+            tree_size: report.tree_size,
+            // as stored, like the status bar's: a log that fails has another one recomputed
+            root_hash: report
+                .entries
+                .last()
+                .map(|r| r.entry.root_hash.clone())
+                .unwrap_or_default(),
+        };
+        self.verified.insert(report.case.id, verified);
         for result in &report.entries {
             if result.signature.present {
                 self.signature_checks.insert(result.entry.id, result.signature.clone());
@@ -2222,9 +2242,11 @@ impl FactumApp {
             }
             DialogResult::TypedConfirmed { case_id, typed } => {
                 let result = self.factum().delete_case_permanently(case_id, &typed);
-                if self.run(result).is_some()
-                    && let Some(cdb) = &self.companion_db
-                {
+                let deleted = self.run(result).is_some();
+                if deleted {
+                    self.verified.remove(&case_id);
+                }
+                if deleted && let Some(cdb) = &self.companion_db {
                     if let Err(e) = cdb.delete_case(case_id) {
                         log::error!("The companion data of case {case_id} cannot be deleted: {e}");
                     }
@@ -3644,10 +3666,12 @@ impl FactumApp {
                     .map(widgets::display_time)
                     .unwrap_or_else(|| "Case ▸ Seal Now".into());
                 ui.label(small(&sealed, p.muted)).on_hover_text(tip);
-                if let Some((level, utc, size)) = self.verified.get(&case.id)
-                    && *size as usize == status.entries
+                if let Some(verified) = self.verified.get(&case.id)
+                    && verified.tree_size as usize == status.entries
+                    && verified.root_hash == status.root_hash
                 {
-                    let (text, color) = match level {
+                    let utc = &verified.utc;
+                    let (text, color) = match verified.level {
                         Level::Ok => ("✓ verified", p.ok),
                         Level::Warn => ("⚠ verified with warnings", p.warn),
                         Level::Fail => ("✗ verification failed", p.fail),
