@@ -1510,7 +1510,8 @@ def check_container(argv):
                 for arn in file_images(graph):
                     if arn not in listed:
                         fail("history", "%s (%s) is no longer listed." % (display(graph, arn), label))
-                    elif sorted(graph[arn], key=repr) != sorted(newest[arn], key=repr):
+                    # the same triples, as many times each; a copy of their text here would be charged to nothing
+                    elif collections.Counter(graph[arn]) != collections.Counter(newest[arn]):
                         fail("history", "%s: its metadata in %s differs from the newest state."
                              % (display(graph, arn), label))
             ok("%d file(s) checked against their hashes." % check_files(archive, newest))
