@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::Fixture;
-use common::fake_llm::{FakeLlm, openai_chat};
+use common::fake_llm::{FakeLlm, openai_chat, openai_chat_thinking};
 use factum::companion::llm::{Client, Epochs, LlmError};
 use factum::companion::reflect::{PassError, choose_kind, run_pass};
 use factum::companion::{Archetype, CompanionDb, NewQuestion, PassKind, Protocol, QuestionState, Rating, Settings};
-use serde_json::json;
+use serde_json::{Value, json};
 
 struct Env {
     f: Fixture,
@@ -216,6 +216,55 @@ fn diff_pass_cut_new_entries_are_covered_next_time() {
 }
 
 #[test]
+fn full_pass_that_cut_new_entries_leaves_them_for_later_passes() {
+    let e = env();
+    let before = newest(&e);
+    e.cdb.set_last_seen(e.case, before, 0).unwrap();
+    for n in 1..=6 {
+        let text = format!("Fragment {n}: {}", "carved file fragment ".repeat(95));
+        e.f.factum().create_note(&text, None, e.case).unwrap();
+    }
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(5000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    e.fake.push(200, &ok("[]")); // at this window enrichment needs two batches
+    script(&e, json!({"questions": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Full).unwrap();
+    // the timeline is cut from the oldest end, so the first fragment is gone
+    assert!(!e.fake.requests().last().unwrap().body.contains("Fragment 1:"));
+    assert_eq!(s.entries_to, before);
+    assert_eq!(e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id, before);
+    assert_eq!(last_status(&e), "ok");
+
+    // diff passes read them, oldest first
+    e.fake.push(200, &ok("[]"));
+    script(&e, json!({"questions": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Diff).unwrap();
+    assert!(e.fake.requests().last().unwrap().body.contains("Fragment 1:"));
+    assert!(s.entries_to > before);
+}
+
+#[test]
+fn full_pass_that_cut_only_older_lines_covers_the_new_entries() {
+    let e = env();
+    for n in 1..=70 {
+        let text = format!("Older finding {n}: {}", "carved file fragment ".repeat(10));
+        e.f.factum().create_note(&text, None, e.case).unwrap();
+    }
+    e.cdb.set_last_seen(e.case, newest(&e), 0).unwrap();
+    e.f.factum().create_note("One new finding", None, e.case).unwrap();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(5000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    script(&e, json!({"questions": []}));
+    let s = run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Full).unwrap();
+    let body = e.fake.requests().last().unwrap().body.clone();
+    assert!(!body.contains("Older finding 1:"), "the timeline was cut");
+    assert!(body.contains("One new finding"));
+    assert_eq!(s.entries_to, newest(&e));
+}
+
+#[test]
 fn a_dead_endpoint_ends_the_pass_at_its_enrichment() {
     let e = env();
     e.fake.push_hangup();
@@ -280,6 +329,46 @@ fn an_answer_that_comes_after_the_stop_is_not_applied() {
     assert!(matches!(pass_stopped_at(&e, 3), Err(PassError::Cancelled)));
     assert!(open_ids(&e).is_empty());
     assert_eq!(e.cdb.case_settings(e.case).unwrap().unwrap().last_seen_entry_id, 0);
+}
+
+#[test]
+fn a_thinking_models_long_reasoning_is_shortened_for_call_two() {
+    let e = env();
+    let mut settings = e.client.settings().clone();
+    settings.context_window = Some(8000);
+    let small = Client::with_retry_delay(settings, Duration::ZERO);
+    let reasoning = "The model goes on and on. ".repeat(2000);
+    e.fake.push(200, &openai_chat_thinking(Some("[]"), "thinking", "stop"));
+    e.fake
+        .push(200, &openai_chat_thinking(Some(&reasoning), "more thinking", "stop"));
+    e.fake.push(200, &ok(r#"{"questions":[]}"#));
+    run_pass(&e.f.db, &e.cdb, &small, e.case, PassKind::Full).unwrap();
+    let last = e.fake.requests().last().unwrap().clone();
+    let body: Value = serde_json::from_str(&last.body).unwrap();
+    let turns = body["messages"].as_array().unwrap();
+    let sent = turns[1]["content"].as_str().unwrap();
+    assert!(sent.chars().count() < reasoning.chars().count());
+    assert!(sent.starts_with("The model goes on and on."));
+    assert!(sent.ends_with('…'));
+    let chars: usize = turns
+        .iter()
+        .map(|t| t["content"].as_str().unwrap().chars().count())
+        .sum();
+    let ratio = f64::from(small.calibration().chars_per_token);
+    assert!((chars as f64 / ratio) as u64 + body["max_tokens"].as_u64().unwrap() <= 8000);
+}
+
+#[test]
+fn a_reasoning_that_fits_goes_to_call_two_unchanged() {
+    let e = env();
+    let reasoning = "Entry #1 is new; I would ask about the tool.";
+    e.fake.push(200, &ok("[]"));
+    e.fake.push(200, &ok(reasoning));
+    e.fake.push(200, &ok(r#"{"questions":[]}"#));
+    pass(&e, PassKind::Full).unwrap();
+    let last = e.fake.requests().last().unwrap().clone();
+    let body: Value = serde_json::from_str(&last.body).unwrap();
+    assert_eq!(body["messages"][1]["content"], reasoning);
 }
 
 #[test]

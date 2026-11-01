@@ -15,7 +15,7 @@ use super::prompts::{
 use super::questions::{PassKind, Question, Rating};
 use super::retrieval::{RetrievalQuery, fts_query, retrieve};
 use super::store::CompanionDb;
-use super::tokens::{BudgetError, CUT_MARKER, Cut, Packed, Section, TextKind, budget, pack};
+use super::tokens::{BudgetError, CUT_MARKER, Cut, Packed, Section, TextKind, budget, pack, truncate};
 use super::validate::{OutputQuestion, ValidationContext, parse_pass_output, validate};
 use crate::Factum;
 use crate::cases::Case;
@@ -34,6 +34,7 @@ const OUTPUT_RESERVE: usize = 1500;
 const TIMEOUT: Duration = Duration::from_secs(180);
 const NO_GOAL: &str = "No case goal has been set.";
 const NEW_ENTRIES: &str = "new entries";
+const TIMELINE: &str = "timeline";
 const RELATED: &str = "related";
 /// Rated examples of each kind in the prompt.
 const EXAMPLES: usize = 3;
@@ -289,9 +290,11 @@ fn reflect(
             packed.shortened
         );
     }
-    if kind == PassKind::Diff {
-        log.entries_to = covered_to(&new, &packed, last_seen);
-    }
+    log.entries_to = match kind {
+        PassKind::Diff => covered_to(&new, &packed, last_seen),
+        PassKind::Full if timeline_lost_new(&data.entries, &packed, last_seen) => last_seen,
+        PassKind::Full => log.entries_to,
+    };
 
     // the packed prompt is the first user turn of both calls, so a prompt cache can serve the second
     let reasoning = client.chat(&ChatRequest {
@@ -305,7 +308,11 @@ fn reflect(
     if reasoning.text.trim().is_empty() {
         return Err(PassError::Output("the reasoning is empty".into()));
     }
-    let output = match serialize(client, &packed.text, &reasoning.text, log) {
+    let shortened = reasoning_for_call_two(client, packed.tokens, &reasoning.text);
+    if shortened != reasoning.text {
+        log::warn!("companion pass {pass_id}: the reasoning was shortened for space");
+    }
+    let output = match serialize(client, &packed.text, &shortened, log) {
         Err(PassError::Output(reason)) => {
             // the prompt as sent, with half of the related lines it kept; without any, a retry could not be smaller
             let mut retry = packed.sections;
@@ -324,7 +331,7 @@ fn reflect(
             }
             log::warn!("companion pass {pass_id}: {reason}; retrying with half the related entries");
             let smaller = pack(retry, room, &calibration)?;
-            serialize(client, &smaller.text, &reasoning.text, log)?
+            serialize(client, &smaller.text, &shortened, log)?
         }
         other => other?,
     };
@@ -413,6 +420,31 @@ fn covered_to(new: &[&Entry], packed: &Packed, last_seen: i64) -> i64 {
         .filter(|&id| id < first_cut.id)
         .max()
         .unwrap_or(last_seen)
+}
+
+/// A full pass's timeline loses its oldest lines, so when one of those is a new entry the first new entry is gone
+/// (pinned ones are shown in their own section): `last_seen` stays, and later diff passes cover the new entries.
+fn timeline_lost_new(entries: &[Entry], packed: &Packed, last_seen: i64) -> bool {
+    let dropped = packed
+        .cut
+        .iter()
+        .find(|(name, _)| *name == TIMELINE)
+        .map_or(0, |&(_, n)| n);
+    entries
+        .iter()
+        .filter(|e| !e.is_pinned)
+        .take(dropped)
+        .any(|e| e.id > last_seen)
+}
+
+/// The reasoning as far as it fits call two beside the prompt, the instruction and the answer: a thinking model's
+/// call one has more room than `OUTPUT_RESERVE`, and a request over the window is refused for good. A tenth of the
+/// window stays spare, as for the thinking allowance.
+fn reasoning_for_call_two(client: &Client, prompt_tokens: usize, reasoning: &str) -> String {
+    let calibration = client.calibration();
+    let used = prompt_tokens + calibration.estimate(&serialize_instruction(), TextKind::Prose) + OUTPUT_RESERVE;
+    let room = (client.window() as usize * 9 / 10).saturating_sub(used);
+    truncate(reasoning, calibration.chars_for(room, TextKind::Prose))
 }
 
 /// Call two: the reasoning back to the model, a flat JSON object out. A cut-off, empty or unreadable answer is an
@@ -531,7 +563,7 @@ impl PromptInput<'_> {
                     }
                 })
                 .collect();
-            ("timeline", timeline)
+            (TIMELINE, timeline)
         } else {
             let lines = self
                 .new

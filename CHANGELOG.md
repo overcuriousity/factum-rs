@@ -186,6 +186,8 @@ All notable changes to this project are documented here. The format follows
   after the model call in hand instead of after the whole pass or backlog batch; a pass ends at once when the endpoint
   stopped answering during its enrichment, instead of waiting out two more timeouts
 - Companion: related older entries are found when the newest entries are the best matches
+- Companion: new entries a full pass had to cut for space are left to later passes instead of being marked as seen
+- Companion: the long reasoning of a thinking model is shortened to what fits the second call, which failed with HTTP 400
 - Companion: token estimates follow the server's counts more carefully, so an identifier-heavy prompt no longer overflows
   the window after a prose-heavy one
 - Companion: a huge or malformed model reply can no longer hang the repair of its JSON

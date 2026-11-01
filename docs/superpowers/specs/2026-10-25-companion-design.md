@@ -241,7 +241,8 @@ Order and cutting rule for a reflection pass:
 5. Open questions: id, archetype, text, entry ids, rating (never cut; the ≤ 7 cap keeps this small).
 6. New entries since the last pass, verbatim, oldest first, each as `#id · timestamp · evidence · text` (cut from the
    newest end second in a diff pass, so `last_seen_entry_id` advances only to the newest entry that stayed in the
-   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end). A diff pass
+   prompt and a later pass covers the cut entries; a full pass's timeline is cut from the oldest end, and when that
+   cuts a new entry `last_seen_entry_id` stays where it was, so diff passes cover them). A diff pass
    always keeps its oldest new entry, as a last resort cut to 400 characters, so no single entry can stall the case.
 
 Last resort order, once 7, 8 and the cuttable lines of 6 are gone: pinned lines shortened, evidence lines shortened,
