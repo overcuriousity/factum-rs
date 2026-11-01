@@ -175,7 +175,7 @@ fn a_seal_folder_left_in_the_database_is_named_but_never_read() {
     let warning = report.findings.iter().find(|f| f.code == "seal_dir_unused").unwrap();
     assert_eq!(warning.level, Level::Warn);
     assert!(
-        warning.message.contains(&format!("'{}'", old.display())),
+        warning.message.contains(&factum::pystr::repr(old.to_str().unwrap())),
         "{}",
         warning.message
     );
